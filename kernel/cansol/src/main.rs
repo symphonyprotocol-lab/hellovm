@@ -1,20 +1,33 @@
 //! `cansol`: runs a Linux program inside the cansol kernel.
 //!
 //! ```text
-//! cansol [--trace] [--] PROGRAM [ARGS...]
+//! cansol [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
 //!
-//! The program's console output goes to cansol's own stdout and stderr, and
-//! cansol exits with the program's exit status (128 + signal number if it
-//! was killed). `--trace` prints every syscall the kernel handled to stderr.
+//! `DIR` is the sandbox's read-only image: the program sees it as `/`, with
+//! an in-memory writable layer on top (writes never reach `DIR`). `PROGRAM`
+//! is a path inside the sandbox, e.g. `/bin/busybox`. The environment is
+//! `PATH` and `HOME` plus every `--env`.
+//!
+//! The program's console output goes to cansol's own stdout and stderr, its
+//! input comes from cansol's stdin, and cansol exits with the program's exit
+//! status (128 + signal number if it was killed; 125 if it could not be
+//! started). `--trace` prints every syscall the kernel handled to stderr.
 //! `CANSOL_LOG` sets the log level (`error`, `warn` (default), `info`,
 //! `debug`, `trace`).
 
 use std::ffi::OsString;
 use std::io::Write;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: cansol [--trace] [--] PROGRAM [ARGS...]";
+const USAGE: &str = "usage: cansol [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+
+const DEFAULT_ENV: [&str; 2] = [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME=/root",
+];
 
 struct StderrLogger;
 
@@ -45,15 +58,34 @@ fn init_logging() {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct Options {
     trace: bool,
-    argv: Vec<OsString>,
+    root: PathBuf,
+    env: Vec<Vec<u8>>,
+    argv: Vec<Vec<u8>>,
 }
 
 fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut trace = false;
+    let mut root = None;
+    let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
     let mut args = args.peekable();
     while let Some(arg) = args.peek() {
         match arg.to_str() {
             Some("--trace") => trace = true,
+            Some("--root") => {
+                args.next();
+                root = Some(PathBuf::from(args.next().ok_or("--root needs a directory")?));
+                continue;
+            }
+            Some("--env") => {
+                args.next();
+                let var = args.next().ok_or("--env needs NAME=VALUE")?.into_vec();
+                let Some(eq) = var.iter().position(|&b| b == b'=') else {
+                    return Err(format!("--env {}: expected NAME=VALUE", String::from_utf8_lossy(&var)));
+                };
+                env.retain(|e| !e.starts_with(&var[..=eq]));
+                env.push(var);
+                continue;
+            }
             Some("--") => {
                 args.next();
                 break;
@@ -66,11 +98,17 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         }
         args.next();
     }
-    let argv: Vec<OsString> = args.collect();
+    let argv: Vec<Vec<u8>> = args.map(OsString::into_vec).collect();
     if argv.is_empty() {
         return Err(USAGE.to_string());
     }
-    Ok(Options { trace, argv })
+    let root = root.ok_or_else(|| format!("--root is required\n{USAGE}"))?;
+    Ok(Options {
+        trace,
+        root,
+        env,
+        argv,
+    })
 }
 
 fn main() -> ExitCode {
@@ -98,15 +136,17 @@ fn main() -> ExitCode {
 #[cfg(target_os = "linux")]
 fn run(options: &Options) -> Result<cansol_core::ExitStatus, Box<dyn std::error::Error>> {
     use cansol_core::Kernel;
-    use cansol_host::StdioHost;
+    use cansol_host::{ImageDir, StdioHost};
     use cansol_platform_seccomp::SeccompApp;
 
-    let program = std::path::Path::new(&options.argv[0]);
-    let mut app = SeccompApp::spawn(program, &options.argv)?;
-    let mut kernel = Kernel::new(StdioHost);
+    let image = ImageDir::open(&options.root)
+        .map_err(|err| format!("image {}: {err}", options.root.display()))?;
+    let mut app = SeccompApp::new()?;
+    let mut kernel = Kernel::new(StdioHost::new(Some(image)));
     if options.trace {
         kernel = kernel.with_trace();
     }
+    kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
     let status = kernel.run(&mut app);
     for record in kernel.trace() {
         eprintln!("cansol: trace: {record}");

@@ -1,11 +1,24 @@
 //! The host interface: what the kernel core needs from the OS it runs on.
 //!
 //! Everything the kernel does to the outside world goes through [`Host`], so
-//! that the same core runs on a Linux or a macOS host. It only covers console
-//! output for now; files, sockets, memory, time and threads are added as the
-//! syscalls that need them are emulated.
+//! that the same core runs on a Linux or a macOS host. The operations are
+//! deliberately narrow:
+//!
+//! * console output and input for the app's standard streams;
+//! * read-only access to the image, the sandbox's lower filesystem layer,
+//!   by [`ImagePath`]: a path the core has already resolved itself, made of
+//!   plain names only (no `.`, `..`, empty components or `/`). The host
+//!   never sees a path the guest supplied, never follows a symlink on the
+//!   core's behalf (symlinks are reported, the core interprets them), and
+//!   never writes to the image;
+//! * random bytes, clocks and sleeping.
+//!
+//! Host errors are `std::io::Error`s; the core translates them by kind
+//! ([`crate::errno::Errno::from_host`]), never by host errno number.
 
+use std::fmt;
 use std::io;
+use std::time::Duration;
 
 /// The sandbox console stream a guest write goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,14 +27,182 @@ pub enum ConsoleStream {
     Stderr,
 }
 
+/// A path inside the image, relative to its root. The empty path is the
+/// root. Every component is a plain name: non-empty, without `/` or NUL,
+/// and neither `.` nor `..`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ImagePath(Vec<u8>);
+
+impl ImagePath {
+    /// The image root.
+    pub fn root() -> ImagePath {
+        ImagePath(Vec::new())
+    }
+
+    /// Whether `name` may be a component of an image path.
+    pub fn valid_name(name: &[u8]) -> bool {
+        !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+    }
+
+    /// This path with `name` appended, if `name` is a valid component.
+    pub fn join(&self, name: &[u8]) -> Option<ImagePath> {
+        if !Self::valid_name(name) {
+            return None;
+        }
+        let mut path = self.0.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name);
+        Some(ImagePath(path))
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The path as bytes (`a/b/c`; empty for the root).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The components, each a valid name.
+    pub fn components(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.split(|&b| b == b'/').filter(|c| !c.is_empty())
+    }
+}
+
+impl fmt::Display for ImagePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&String::from_utf8_lossy(&self.0))
+    }
+}
+
+/// The type of an image entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostFileKind {
+    File,
+    Directory,
+    Symlink,
+    /// Devices, sockets, FIFOs: present in the image but not usable.
+    Other,
+}
+
+/// Metadata of an image entry (the entry itself, never a symlink target).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostStat {
+    pub kind: HostFileKind,
+    /// Permission bits (`0o7777`).
+    pub mode: u32,
+    pub size: u64,
+    pub nlink: u64,
+    /// Modification time: seconds and nanoseconds since the Unix epoch.
+    pub mtime: (i64, u32),
+}
+
+fn no_image() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, "no image")
+}
+
 pub trait Host {
     /// Writes guest output to the sandbox console. Returns how many bytes of
     /// `data` were accepted, like a host `write`.
     fn console_write(&mut self, stream: ConsoleStream, data: &[u8]) -> io::Result<usize>;
+
+    /// Reads console input (the app's standard input). 0 is end of input.
+    fn console_read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+
+    /// Whether there is an image at all. Without one, the sandbox
+    /// filesystem starts empty.
+    fn has_image(&self) -> bool {
+        false
+    }
+
+    /// Metadata of an image entry, without following a final symlink.
+    fn image_stat(&mut self, _path: &ImagePath) -> io::Result<HostStat> {
+        Err(no_image())
+    }
+
+    /// The target of an image symlink, uninterpreted.
+    fn image_read_link(&mut self, _path: &ImagePath) -> io::Result<Vec<u8>> {
+        Err(no_image())
+    }
+
+    /// The names in an image directory, without `.` and `..`.
+    fn image_read_dir(&mut self, _path: &ImagePath) -> io::Result<Vec<Vec<u8>>> {
+        Err(no_image())
+    }
+
+    /// Reads from an image file at `offset`; 0 is end of file.
+    fn image_read(&mut self, _path: &ImagePath, _offset: u64, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(no_image())
+    }
+
+    /// Fills `buf` with cryptographically secure random bytes.
+    fn random(&mut self, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Wall-clock time since the Unix epoch.
+    fn clock_realtime(&mut self) -> Duration;
+
+    /// A monotonic clock, starting at some arbitrary point.
+    fn clock_monotonic(&mut self) -> Duration;
+
+    /// Blocks the kernel for `duration` (the app is single-threaded).
+    fn sleep(&mut self, _duration: Duration) {}
 }
 
 impl<H: Host + ?Sized> Host for &mut H {
     fn console_write(&mut self, stream: ConsoleStream, data: &[u8]) -> io::Result<usize> {
         (**self).console_write(stream, data)
+    }
+    fn console_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (**self).console_read(buf)
+    }
+    fn has_image(&self) -> bool {
+        (**self).has_image()
+    }
+    fn image_stat(&mut self, path: &ImagePath) -> io::Result<HostStat> {
+        (**self).image_stat(path)
+    }
+    fn image_read_link(&mut self, path: &ImagePath) -> io::Result<Vec<u8>> {
+        (**self).image_read_link(path)
+    }
+    fn image_read_dir(&mut self, path: &ImagePath) -> io::Result<Vec<Vec<u8>>> {
+        (**self).image_read_dir(path)
+    }
+    fn image_read(&mut self, path: &ImagePath, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        (**self).image_read(path, offset, buf)
+    }
+    fn random(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        (**self).random(buf)
+    }
+    fn clock_realtime(&mut self) -> Duration {
+        (**self).clock_realtime()
+    }
+    fn clock_monotonic(&mut self) -> Duration {
+        (**self).clock_monotonic()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        (**self).sleep(duration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_paths_only_hold_plain_names() {
+        let root = ImagePath::root();
+        assert!(root.is_root());
+        let p = root.join(b"etc").unwrap().join(b"passwd").unwrap();
+        assert_eq!(p.as_bytes(), b"etc/passwd");
+        assert_eq!(p.components().collect::<Vec<_>>(), vec![&b"etc"[..], b"passwd"]);
+        for bad in [&b""[..], b".", b"..", b"a/b", b"a\0"] {
+            assert!(root.join(bad).is_none(), "{bad:?}");
+        }
+        assert!(root.join(b"...").is_some());
     }
 }

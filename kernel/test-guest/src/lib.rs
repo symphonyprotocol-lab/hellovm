@@ -19,3 +19,9 @@ pub const HELLO_EXIT_CODE: i32 = 42;
 /// when the syscall is refused, something else if it reached the host.
 #[cfg(target_os = "linux")]
 pub const ENOSYS: &str = env!("CANSOL_GUEST_ENOSYS");
+
+/// A static-PIE C program linked against glibc. Prints one line:
+/// `main=<addr> argc=<n> argv1=<arg> tls=42 big=x small pagesz=<n>
+/// random=yes`. Empty when cross-compiling (no target libc).
+#[cfg(target_os = "linux")]
+pub const PIE: &str = env!("CANSOL_GUEST_PIE");

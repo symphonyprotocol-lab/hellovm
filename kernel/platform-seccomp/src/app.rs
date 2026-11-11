@@ -1,94 +1,288 @@
 //! [`SeccompApp`], the seccomp implementation of the platform traits.
 
-use std::ffi::OsString;
 use std::io;
-use std::path::Path;
+use std::marker::PhantomData;
+use std::ops::Range;
 
 use cansol_core::platform::{
-    AddressSpace, AppMemory, Fault, GuestAddr, Platform, PlatformError, Prot, Resume, SyscallTrap,
-    Trap,
+    AddressSpace, AddressSpaceInfo, AppMemory, CpuInfo, Fault, GuestAddr, Platform, PlatformError,
+    Prot, Resume, SyscallTrap, Trap,
 };
-use cansol_core::Arch;
+use cansol_core::{Arch, Sysno};
 
-use crate::notify::{Child, Event};
+use crate::regs::{Regs, SYSCALL_INSN_LEN};
 use crate::spawn;
+use crate::stub;
 use crate::sys;
+use crate::tracer::{Run, Stop, Tracee};
+
+/// Linux `mmap` flags used for injected mappings.
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
+
+/// The lowest address the core may map. Linux refuses user mappings below
+/// `vm.mmap_min_addr`, whose usual default is 64 KiB.
+const MIN_ADDR: u64 = 0x1_0000;
 
 #[derive(Debug)]
 enum State {
-    /// Spawned, waiting for `Resume::Start`; holds the first event.
-    NotStarted(Event),
-    /// Blocked in the syscall with this notification id.
-    InSyscall(u64),
+    /// At a syscall-exit stop of a syscall the kernel process made the app
+    /// execute (the bootstrap `execveat` or an injected call). The app
+    /// resumes with `saved`.
+    AtExit { saved: Regs },
+    /// At the seccomp stop of an app syscall, which has not run.
+    AtEntry { regs: Regs },
+    /// At a signal-delivery stop; the app can only be terminated.
+    AtSignal,
     /// The process is gone.
     Dead,
 }
 
-/// An app running as a child process under a seccomp filter.
+/// An app running as a traced child process under a seccomp filter.
+///
+/// It must be used from the thread that created it (a ptrace rule), so it is
+/// neither `Send` nor `Sync`.
 #[derive(Debug)]
 pub struct SeccompApp {
-    child: Child,
+    tracee: Tracee,
     arch: Arch,
     state: State,
+    started: bool,
+    info: AddressSpaceInfo,
+    hwcap: CpuInfo,
+    thread_pointer: Option<u64>,
+    nr_mmap: u64,
+    nr_munmap: u64,
+    nr_mprotect: u64,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl SeccompApp {
-    /// Starts `program` with arguments `argv` (including `argv[0]`) and an
-    /// empty environment. The app is stopped before it runs any code that
-    /// makes a syscall; it continues on the first [`Platform::run`].
-    ///
-    /// The host kernel builds the app's initial stack and loads the ELF
-    /// image here (via `execve`). In U1 the kernel core takes this over.
-    pub fn spawn(program: &Path, argv: &[OsString]) -> io::Result<SeccompApp> {
+    /// Starts an app process with an empty address space (apart from the
+    /// platform's reserved stub page). The core loads a program into it and
+    /// starts it with [`Resume::Start`].
+    pub fn new() -> io::Result<SeccompApp> {
         let arch = Arch::native().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "unsupported host architecture")
         })?;
-        let spawned = spawn::spawn(arch, program, argv)?;
-        Ok(SeccompApp {
-            child: spawned.child,
+        let spawned = spawn::spawn(arch)?;
+        let page_size = sys::page_size();
+        let number = |sysno: Sysno| arch.syscall_nr(sysno).expect("generic syscall");
+        let max_addr = spawned.top & !(page_size - 1);
+        let mut app = SeccompApp {
+            tracee: spawned.tracee,
             arch,
-            state: State::NotStarted(spawned.first),
-        })
+            state: State::AtExit {
+                saved: spawned.regs,
+            },
+            started: false,
+            info: AddressSpaceInfo {
+                page_size,
+                min_addr: MIN_ADDR.max(page_size),
+                max_addr,
+                reserved: vec![stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED],
+            },
+            hwcap: host_cpu_info(),
+            thread_pointer: None,
+            nr_mmap: number(Sysno::Mmap),
+            nr_munmap: number(Sysno::Munmap),
+            nr_mprotect: number(Sysno::Mprotect),
+            _not_send: PhantomData,
+        };
+        for &(start, len) in &spawned.foreign {
+            let ret = app.inject(app.nr_munmap, [start, len, 0, 0, 0, 0])?;
+            if ret != 0 {
+                return Err(io::Error::other(format!(
+                    "clearing the app address space: munmap({start:#x}, {len:#x}) = {ret}"
+                )));
+            }
+        }
+        let (left, _) = spawn::foreign_mappings(app.tracee.pid)?;
+        if !left.is_empty() {
+            return Err(io::Error::other(format!(
+                "host mappings left in the app address space: {left:#x?}"
+            )));
+        }
+        Ok(app)
     }
 
     /// The host pid of the app process.
     pub fn pid(&self) -> libc::pid_t {
-        self.child.pid
+        self.tracee.pid
     }
 
-    fn trap_for(&mut self, event: Event) -> Result<Trap, PlatformError> {
-        match event {
-            Event::Syscall(notif) => {
-                if notif.pid as libc::pid_t != self.child.pid {
-                    // Impossible while clone() is not emulated.
-                    return Err(PlatformError::AppGone(format!(
-                        "syscall from unknown task {}",
-                        notif.pid
-                    )));
+    fn kill(&mut self) {
+        self.state = State::Dead;
+        let _ = self.tracee.kill();
+    }
+
+    fn violation(&mut self, what: String) -> PlatformError {
+        self.kill();
+        PlatformError::Violation(what)
+    }
+
+    /// Moves from a seccomp stop to a syscall-exit stop by skipping the app
+    /// syscall, so that syscalls can be injected.
+    fn to_exit_stop(&mut self) -> Result<(), PlatformError> {
+        match self.state {
+            State::AtExit { .. } => Ok(()),
+            State::AtEntry { regs } => {
+                self.tracee.skip_syscall(&regs, 0)?;
+                self.tracee.resume(Run::Syscall, 0)?;
+                match self.wait_quietly(Run::Syscall)? {
+                    Stop::SyscallExit => {
+                        self.state = State::AtExit { saved: regs };
+                        Ok(())
+                    }
+                    stop => Err(self.violation(format!("unexpected stop {stop:?} at skip"))),
                 }
-                // The filter kills on any other arch, so this always holds.
-                debug_assert_eq!(notif.data.arch, sys::audit_arch(self.arch));
-                self.state = State::InSyscall(notif.id);
-                Ok(Trap::Syscall(SyscallTrap {
-                    nr: u64::from(notif.data.nr as u32),
-                    args: notif.data.args,
+            }
+            State::AtSignal => Err(PlatformError::Unsupported("resuming after a signal")),
+            State::Dead => Err(PlatformError::AppGone("already ended".into())),
+        }
+    }
+
+    /// Waits for the next stop, suppressing signals that do not affect the
+    /// app (see [`ignored_signal`]). Other signals are not expected while
+    /// the kernel process drives the app; they end it.
+    ///
+    /// `run` is how the tracee was resumed; it is resumed the same way after
+    /// a suppressed signal.
+    fn wait_quietly(&mut self, run: Run) -> Result<Stop, PlatformError> {
+        loop {
+            match self.tracee.wait()? {
+                Stop::Signal(sig) if ignored_signal(sig) => {
+                    self.tracee.resume(run, 0)?;
+                }
+                Stop::Killed(sig) => {
+                    self.state = State::Dead;
+                    return Err(PlatformError::AppGone(format!("killed by signal {sig}")));
+                }
+                Stop::Exited(code) => {
+                    self.state = State::Dead;
+                    return Err(PlatformError::AppGone(format!("exited with {code}")));
+                }
+                stop => return Ok(stop),
+            }
+        }
+    }
+
+    /// Makes the app execute syscall `nr` with `args` from the stub and
+    /// returns the raw result. The app's own registers are restored when it
+    /// resumes.
+    fn inject(&mut self, nr: u64, args: [u64; 6]) -> Result<i64, PlatformError> {
+        self.to_exit_stop()?;
+        let State::AtExit { saved } = self.state else {
+            unreachable!("to_exit_stop leaves the app at an exit stop");
+        };
+        let mut regs = saved;
+        regs.prepare_syscall(stub::STUB_SYSCALL, nr, args);
+        self.tracee.set_regs(&regs)?;
+        self.tracee.resume(Run::Cont, 0)?;
+        match self.wait_quietly(Run::Cont)? {
+            Stop::Seccomp => {}
+            stop => return Err(self.violation(format!("injected syscall: unexpected {stop:?}"))),
+        }
+        // Only the exact syscall prepared above may run.
+        let at = self.tracee.regs()?;
+        if at.pc() != stub::STUB_SYSCALL + SYSCALL_INSN_LEN || at.syscall() != (nr, args) {
+            let what = format!(
+                "injected syscall {nr} {args:#x?} stopped as {:?} at {:#x}",
+                at.syscall(),
+                at.pc()
+            );
+            return Err(self.violation(what));
+        }
+        self.tracee.resume(Run::Syscall, 0)?;
+        match self.wait_quietly(Run::Syscall)? {
+            Stop::SyscallExit => {}
+            stop => return Err(self.violation(format!("injected syscall: unexpected {stop:?}"))),
+        }
+        Ok(self.tracee.regs()?.ret())
+    }
+
+    /// Checks a range the core wants changed, independently of the core:
+    /// page-aligned, inside the app's address range and clear of the stub.
+    fn check_range(&self, addr: GuestAddr, len: u64) -> Result<(), PlatformError> {
+        let page = self.info.page_size;
+        let bad = || PlatformError::BadAddress {
+            addr,
+            len: len as usize,
+        };
+        let end = addr.checked_add(len).ok_or_else(bad)?;
+        if addr % page != 0
+            || len % page != 0
+            || len == 0
+            || addr < self.info.min_addr
+            || end > self.info.max_addr
+            || self
+                .info
+                .reserved
+                .iter()
+                .any(|r: &Range<u64>| addr < r.end && end > r.start)
+        {
+            return Err(bad());
+        }
+        Ok(())
+    }
+
+    fn checked_inject(&mut self, what: &str, nr: u64, args: [u64; 6]) -> Result<i64, PlatformError> {
+        let ret = self.inject(nr, args)?;
+        if (-4095..0).contains(&ret) {
+            // A host errno: for the kernel process's log only.
+            return Err(PlatformError::Host(io::Error::new(
+                io::Error::from_raw_os_error((-ret) as i32).kind(),
+                format!("{what} in the app process failed: {}", io::Error::from_raw_os_error((-ret) as i32)),
+            )));
+        }
+        Ok(ret)
+    }
+
+    fn trap(&mut self) -> Result<Trap, PlatformError> {
+        match self.wait_quietly(Run::Cont)? {
+            Stop::Seccomp => {
+                let regs = self.tracee.regs()?;
+                let (nr, args) = regs.syscall();
+                self.state = State::AtEntry { regs };
+                Ok(Trap::Syscall(SyscallTrap { nr, args }))
+            }
+            Stop::Signal(sig) => {
+                let addr = self.tracee.fault_addr(sig);
+                self.state = State::AtSignal;
+                Ok(Trap::Fault(Fault {
+                    signal: sig as u32,
+                    addr,
+                    fatal: false,
                 }))
             }
-            Event::Died(status) => {
-                self.state = State::Dead;
-                if libc::WIFSIGNALED(status) {
-                    Ok(Trap::Fault(Fault {
-                        signal: libc::WTERMSIG(status) as u32,
-                        fatal: true,
-                    }))
-                } else {
-                    // Every exit is trapped and emulated, so the process can
-                    // only end by a signal. Anything else is a bug.
-                    Err(PlatformError::AppGone(format!(
-                        "app process ended on the host with wait status {status:#x}"
-                    )))
-                }
-            }
+            stop => Err(self.violation(format!("unexpected stop {stop:?}"))),
+        }
+    }
+}
+
+/// Signals whose default action is to do nothing. The app cannot have
+/// handlers (signal delivery is not emulated yet) and never sees them.
+fn ignored_signal(sig: i32) -> bool {
+    matches!(
+        sig,
+        libc::SIGCHLD
+            | libc::SIGCONT
+            | libc::SIGURG
+            | libc::SIGWINCH
+            | libc::SIGSTOP
+            | libc::SIGTSTP
+            | libc::SIGTTIN
+            | libc::SIGTTOU
+    )
+}
+
+fn host_cpu_info() -> CpuInfo {
+    // SAFETY: plain libc calls.
+    unsafe {
+        CpuInfo {
+            hwcap: libc::getauxval(libc::AT_HWCAP),
+            hwcap2: libc::getauxval(libc::AT_HWCAP2),
         }
     }
 }
@@ -108,7 +302,7 @@ impl AppMemory for SeccompApp {
         };
         // SAFETY: `local` describes `buf`, which is writable for its length;
         // `remote` is only interpreted in the app process.
-        let n = unsafe { libc::process_vm_readv(self.child.pid, &local, 1, &remote, 1, 0) };
+        let n = unsafe { libc::process_vm_readv(self.tracee.pid, &local, 1, &remote, 1, 0) };
         if n != buf.len() as isize {
             return Err(PlatformError::BadAddress {
                 addr,
@@ -132,7 +326,7 @@ impl AppMemory for SeccompApp {
         };
         // SAFETY: `local` describes `data`, which is only read; `remote` is
         // only interpreted in the app process.
-        let n = unsafe { libc::process_vm_writev(self.child.pid, &local, 1, &remote, 1, 0) };
+        let n = unsafe { libc::process_vm_writev(self.tracee.pid, &local, 1, &remote, 1, 0) };
         if n != data.len() as isize {
             return Err(PlatformError::BadAddress {
                 addr,
@@ -143,20 +337,32 @@ impl AppMemory for SeccompApp {
     }
 }
 
-/// The host kernel owns the app's address space on this platform, and with
-/// user notification the kernel process cannot make the app call `mmap`.
-/// Implementing these needs a syscall-injection stub in the app (U1).
+/// Address-space changes are injected syscalls; see `spawn` for the
+/// mechanism and its residual host-syscall surface.
 impl AddressSpace for SeccompApp {
-    fn map(&mut self, _addr: GuestAddr, _len: u64, _prot: Prot) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("map"))
+    fn map(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), PlatformError> {
+        self.check_range(addr, len)?;
+        let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+        let prot = u64::from(prot.0 & Prot::ALL.0);
+        let args = [addr, len, prot, flags, u64::MAX, 0];
+        let ret = self.checked_inject("mmap", self.nr_mmap, args)?;
+        if ret as u64 != addr {
+            return Err(self.violation(format!("mmap returned {ret:#x}, not {addr:#x}")));
+        }
+        Ok(())
     }
 
-    fn unmap(&mut self, _addr: GuestAddr, _len: u64) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("unmap"))
+    fn unmap(&mut self, addr: GuestAddr, len: u64) -> Result<(), PlatformError> {
+        self.check_range(addr, len)?;
+        self.checked_inject("munmap", self.nr_munmap, [addr, len, 0, 0, 0, 0])?;
+        Ok(())
     }
 
-    fn protect(&mut self, _addr: GuestAddr, _len: u64, _prot: Prot) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("protect"))
+    fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), PlatformError> {
+        self.check_range(addr, len)?;
+        let prot = u64::from(prot.0 & Prot::ALL.0);
+        self.checked_inject("mprotect", self.nr_mprotect, [addr, len, prot, 0, 0, 0])?;
+        Ok(())
     }
 }
 
@@ -165,25 +371,111 @@ impl Platform for SeccompApp {
         self.arch
     }
 
+    fn address_space(&self) -> AddressSpaceInfo {
+        self.info.clone()
+    }
+
+    fn cpu_info(&self) -> CpuInfo {
+        self.hwcap
+    }
+
+    fn set_thread_pointer(&mut self, value: u64) -> Result<(), PlatformError> {
+        if self.arch != Arch::X86_64 {
+            return Err(PlatformError::Unsupported("set_thread_pointer"));
+        }
+        self.thread_pointer = Some(value);
+        Ok(())
+    }
+
     fn run(&mut self, resume: Resume) -> Result<Trap, PlatformError> {
-        let state = std::mem::replace(&mut self.state, State::Dead);
-        let event = match (state, resume) {
-            (State::NotStarted(first), Resume::Start) => first,
-            (State::InSyscall(id), Resume::Return(ret)) => {
-                self.child.reply(id, ret)?;
-                self.child.next_event()?
+        let thread_pointer = self.thread_pointer.take();
+        let with_tp = |mut regs: Regs| {
+            if let Some(tp) = thread_pointer {
+                regs.set_thread_pointer(tp);
+            }
+            regs
+        };
+        match (&self.state, resume) {
+            (State::AtExit { saved }, Resume::Start { entry, stack }) if !self.started => {
+                let mut regs = *saved;
+                regs.start(entry, stack);
+                self.tracee.set_regs(&with_tp(regs))?;
+                self.started = true;
+            }
+            (State::AtExit { saved }, Resume::Return(ret)) if self.started => {
+                let mut regs = with_tp(*saved);
+                regs.set_ret(ret);
+                self.tracee.set_regs(&regs)?;
+            }
+            (State::AtEntry { regs }, Resume::Return(ret)) => {
+                self.tracee.skip_syscall(&with_tp(*regs), ret)?;
             }
             (State::Dead, _) => return Err(PlatformError::AppGone("already ended".into())),
             (state, resume) => {
                 panic!("run({resume:?}) does not fit app state {state:?}");
             }
-        };
-        self.trap_for(event)
+        }
+        self.tracee.resume(Run::Cont, 0)?;
+        self.trap()
     }
 
     fn terminate(&mut self) -> Result<(), PlatformError> {
         self.state = State::Dead;
-        self.child.kill()?;
+        self.tracee.kill()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn maps(app: &SeccompApp) -> String {
+        std::fs::read_to_string(format!("/proc/{}/maps", app.pid())).unwrap()
+    }
+
+    #[test]
+    fn starts_with_only_the_stub() {
+        let app = SeccompApp::new().unwrap();
+        let maps = maps(&app);
+        let lines: Vec<_> = maps.lines().filter(|l| !l.ends_with("[vsyscall]")).collect();
+        assert_eq!(lines.len(), 1, "{maps}");
+        assert!(lines[0].starts_with(&format!("{:x}-", stub::STUB_BASE)), "{maps}");
+        let info = app.address_space();
+        assert!(info.max_addr > stub::STUB_BASE + stub::STUB_RESERVED);
+    }
+
+    #[test]
+    fn map_protect_unmap_and_memory_access() {
+        let mut app = SeccompApp::new().unwrap();
+        let page = app.address_space().page_size;
+        let addr = 0x2000_0000;
+        app.map(addr, 4 * page, Prot::RW).unwrap();
+        app.write(addr + 10, b"hello").unwrap();
+        let mut buf = [0; 5];
+        app.read(addr + 10, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        app.protect(addr, page, Prot::READ).unwrap();
+        assert!(app.write(addr, b"x").is_err(), "page is read-only");
+        app.unmap(addr + page, page).unwrap();
+        assert!(app.read(addr + page, &mut buf).is_err());
+        let maps = maps(&app);
+        assert!(maps.contains(&format!("{:x}-{:x} r--p", addr, addr + page)), "{maps}");
+        assert!(
+            maps.contains(&format!("{:x}-{:x} rw-p", addr + 2 * page, addr + 4 * page)),
+            "{maps}"
+        );
+    }
+
+    #[test]
+    fn refuses_ranges_outside_the_app_area() {
+        let mut app = SeccompApp::new().unwrap();
+        let page = app.address_space().page_size;
+        assert!(app.map(stub::STUB_BASE, page, Prot::RW).is_err());
+        assert!(app.map(0, page, Prot::RW).is_err());
+        assert!(app.map(0x2000_0001, page, Prot::RW).is_err());
+        assert!(app.unmap(u64::MAX - page + 1, page).is_err());
+        // The stub is still there and working.
+        app.map(0x2000_0000, page, Prot::RW).unwrap();
     }
 }
