@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["core", "host", "platform-seccomp", "test-guest", "cansol"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license-file = "../LICENSE"
+publish = false
+
+[workspace.dependencies]
+cansol-core = { path = "core" }
+cansol-host = { path = "host" }
+cansol-platform-seccomp = { path = "platform-seccomp" }
+cansol-test-guest = { path = "test-guest" }
+libc = "0.2"
+log = "0.4"

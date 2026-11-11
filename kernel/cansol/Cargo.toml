@@ -1,0 +1,18 @@
+[package]
+name = "cansol"
+description = "Runs a Linux program inside the cansol kernel"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+cansol-core.workspace = true
+cansol-host.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cansol-platform-seccomp.workspace = true
+
+[dev-dependencies]
+cansol-test-guest.workspace = true
