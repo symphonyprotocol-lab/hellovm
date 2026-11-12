@@ -13,6 +13,8 @@ jobs:
   test-x86_64:
     name: test-x86_64
     runs-on: ubuntu-latest
+    # A hung ptrace/sandbox test would otherwise hold the runner for 6 hours.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -65,6 +67,7 @@ jobs:
   test-x86_64-dev-image:
     name: test-x86_64-dev-image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7

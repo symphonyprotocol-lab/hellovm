@@ -38,9 +38,13 @@ fi
 # libraries. A typical static binary makes ldd exit non-zero and print
 # "not a dynamic executable". ldd cannot tell a static musl busybox from
 # a static glibc one; the supported image is still Debian/Ubuntu
-# busybox-static.
-ldd_status=0
-ldd_out=$(ldd "$bb" 2>&1) || ldd_status=$?
+# busybox-static. Output that matches neither case fails, so a missing or
+# broken ldd cannot let a dynamic busybox through.
+if ! command -v ldd >/dev/null 2>&1; then
+  echo "run-e2e: ldd not found; it is needed to check that $bb is statically linked (install libc-bin)" >&2
+  exit 1
+fi
+ldd_out=$(ldd "$bb" 2>&1) || true
 case "$ldd_out" in
   *"=>"*|*ld-linux*|*"dynamic linker"*)
     echo "run-e2e: $bb is dynamically linked. Install Debian/Ubuntu busybox-static (a busybox.net build is not the supported image). This check only verifies that the binary is static." >&2
@@ -51,10 +55,8 @@ esac
 case "$ldd_out" in
   *"not a dynamic executable"*|*"statically linked"*) ;;
   *)
-    if [ "$ldd_status" -eq 0 ]; then
-      echo "run-e2e: $bb does not look statically linked (ldd: $ldd_out). Install Debian/Ubuntu busybox-static (a busybox.net build is not the supported image). This check only verifies that the binary is static." >&2
-      exit 1
-    fi
+    echo "run-e2e: cannot tell that $bb is statically linked (ldd: $ldd_out). Install Debian/Ubuntu busybox-static (a busybox.net build is not the supported image). This check only verifies that the binary is static." >&2
+    exit 1
     ;;
 esac
 
