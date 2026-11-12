@@ -1,7 +1,8 @@
 //! `hellovm`: runs a Linux program inside the hellovm kernel.
 //!
 //! ```text
-//! hellovm [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
+//! hellovm [--trace] [--timeout SECONDS] --root DIR [--env NAME=VALUE]...
+//!         [--] PROGRAM [ARGS...]
 //! ```
 //!
 //! `DIR` is the sandbox's read-only image: the program sees it as `/`, with
@@ -12,7 +13,9 @@
 //! The program's console output goes to hellovm's own stdout and stderr, its
 //! input comes from hellovm's stdin, and hellovm exits with the program's exit
 //! status (128 + signal number if it was killed; 125 if it could not be
-//! started). `--trace` prints every syscall the kernel handled to stderr.
+//! started). `--timeout` kills the program after that many seconds (decimals
+//! allowed) and makes hellovm exit with 124, like `timeout(1)`. `--trace`
+//! prints every syscall the kernel handled to stderr.
 //! `HELLOVM_LOG` sets the log level (`error`, `warn` (default), `info`,
 //! `debug`, `trace`).
 
@@ -22,8 +25,11 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "usage: hellovm [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] --root DIR \
+     [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+
+/// Exit status when the program was killed by `--timeout`.
+const EXIT_TIMEOUT: u8 = 124;
 
 const DEFAULT_ENV: [&str; 2] = [
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -59,6 +65,7 @@ fn init_logging() {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct Options {
     trace: bool,
+    timeout: Option<std::time::Duration>,
     root: PathBuf,
     env: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
@@ -66,6 +73,7 @@ struct Options {
 
 fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut trace = false;
+    let mut timeout = None;
     let mut root = None;
     let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
     let mut args = args.peekable();
@@ -77,6 +85,22 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 root = Some(PathBuf::from(
                     args.next().ok_or("--root needs a directory")?,
                 ));
+                continue;
+            }
+            Some("--timeout") => {
+                args.next();
+                let value = args.next().ok_or("--timeout needs a number of seconds")?;
+                let seconds = value
+                    .to_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "--timeout {}: expected a number of seconds",
+                            value.to_string_lossy()
+                        )
+                    })?;
+                timeout = Some(seconds);
                 continue;
             }
             Some("--env") => {
@@ -111,6 +135,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let root = root.ok_or_else(|| format!("--root is required\n{USAGE}"))?;
     Ok(Options {
         trace,
+        timeout,
         root,
         env,
         argv,
@@ -127,11 +152,11 @@ fn main() -> ExitCode {
         }
     };
     match run(&options) {
-        Ok(hellovm_core::ExitStatus::Exited(code)) => ExitCode::from(code as u8),
-        Ok(hellovm_core::ExitStatus::Signaled(signal)) => {
-            eprintln!("hellovm: program killed by signal {signal}");
-            ExitCode::from((128 + signal).min(255) as u8)
+        Ok(Ended::TimedOut(after)) => {
+            eprintln!("hellovm: program timed out after {after:?}");
+            ExitCode::from(EXIT_TIMEOUT)
         }
+        Ok(Ended::Status(status)) => exit_code(status),
         Err(err) => {
             eprintln!("hellovm: {err}");
             ExitCode::from(125)
@@ -139,8 +164,29 @@ fn main() -> ExitCode {
     }
 }
 
+/// How a run ended.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum Ended {
+    Status(hellovm_core::ExitStatus),
+    /// Killed by `--timeout` after this long.
+    TimedOut(std::time::Duration),
+}
+
+fn exit_code(status: hellovm_core::ExitStatus) -> ExitCode {
+    match status {
+        hellovm_core::ExitStatus::Exited(code) => ExitCode::from(code as u8),
+        hellovm_core::ExitStatus::Signaled(signal) => {
+            eprintln!("hellovm: program killed by signal {signal}");
+            ExitCode::from((128 + signal).min(255) as u8)
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn run(options: &Options) -> Result<hellovm_core::ExitStatus, Box<dyn std::error::Error>> {
+fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     use hellovm_core::Kernel;
     use hellovm_host::{ImageDir, StdioHost};
     use hellovm_platform_seccomp::SeccompApp;
@@ -153,14 +199,36 @@ fn run(options: &Options) -> Result<hellovm_core::ExitStatus, Box<dyn std::error
         kernel = kernel.with_trace();
     }
     kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
+    // The watchdog thread is detached: it holds no more than a pidfd, and
+    // killing through it after the program has ended does nothing.
+    let timed_out = Arc::new(AtomicBool::new(false));
+    if let Some(timeout) = options.timeout {
+        let killer = app.killer();
+        let timed_out = Arc::clone(&timed_out);
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            timed_out.store(true, Ordering::SeqCst);
+            if let Err(err) = killer.kill() {
+                eprintln!("hellovm: cannot stop the program at its timeout: {err}");
+            }
+        });
+    }
     let status = kernel.run(&mut app);
     for record in kernel.trace() {
         eprintln!("hellovm: trace: {record}");
     }
-    Ok(status?)
+    let status = status?;
+    match (status, options.timeout) {
+        (hellovm_core::ExitStatus::Signaled(9), Some(timeout))
+            if timed_out.load(Ordering::SeqCst) =>
+        {
+            Ok(Ended::TimedOut(timeout))
+        }
+        _ => Ok(Ended::Status(status)),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(_options: &Options) -> Result<hellovm_core::ExitStatus, Box<dyn std::error::Error>> {
+fn run(_options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
     Err("no platform for this host yet: only Linux (seccomp) is implemented".into())
 }

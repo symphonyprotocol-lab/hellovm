@@ -54,7 +54,8 @@ skipped with a message.
 
 Run a program in a sandbox whose root is an image directory. The program path
 is a path inside the sandbox; `--trace` lists every syscall the kernel
-handled:
+handled, and `--timeout SECONDS` kills a program that runs longer (hellovm
+then exits with 124):
 
 ```sh
 mkdir -p /tmp/image/bin && cp /bin/busybox /tmp/image/bin/

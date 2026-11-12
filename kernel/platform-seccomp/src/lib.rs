@@ -25,4 +25,4 @@ mod stub;
 mod sys;
 mod tracer;
 
-pub use app::SeccompApp;
+pub use app::{AppKiller, SeccompApp};

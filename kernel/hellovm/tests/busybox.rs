@@ -333,3 +333,61 @@ fn dot_dot_and_symlinks_cannot_escape_the_root() {
     );
     assert_eq!(sb.ok(&["cat", "/secret.txt"]), "pwned\n");
 }
+
+#[test]
+fn writing_through_a_dangling_symlink_creates_its_target() {
+    let (_image, mut sandbox) = setup!();
+    sandbox.ok(&["ln", "-s", "/tmp/target", "/tmp/link"]);
+    sandbox.ok(&["sh", "-c", "echo hi > /tmp/link"]);
+    assert_eq!(sandbox.ok(&["cat", "/tmp/target"]), "hi\n");
+    assert_eq!(sandbox.ok(&["readlink", "/tmp/link"]), "/tmp/target\n");
+}
+
+#[test]
+fn removing_image_directories_leaves_the_root_usable() {
+    let Some(busybox) = busybox() else { return };
+    let image = image(&busybox);
+    for dir in ["mnt", "media", "srv"] {
+        image.mkdir(dir);
+    }
+    let mut sandbox = Sandbox::new(image.path());
+    sandbox.ok(&["rmdir", "/mnt", "/media", "/srv"]);
+    let listing = sandbox.ok(&["ls", "/"]);
+    assert!(
+        listing.contains("bin") && !listing.contains("mnt"),
+        "{listing}"
+    );
+    sandbox.ok(&["touch", "/created"]);
+    assert!(sandbox.ok(&["ls", "/"]).contains("created"));
+}
+
+#[test]
+fn the_in_memory_layer_is_limited() {
+    let Some(busybox) = busybox() else { return };
+    let image = image(&busybox);
+    let mut sandbox = Sandbox::new(image.path());
+    sandbox.kernel.set_fs_limit(1 << 20);
+    let out = sandbox.bb(&["dd", "if=/dev/zero", "of=/tmp/big", "bs=65536", "count=64"]);
+    assert_ne!(out.code(), 0, "{out:?}");
+    assert!(out.stderr.contains("No space left"), "{out:?}");
+    // Freeing space makes room again.
+    sandbox.ok(&["rm", "/tmp/big"]);
+    sandbox.ok(&["dd", "if=/dev/zero", "of=/tmp/small", "bs=65536", "count=4"]);
+}
+
+#[test]
+fn timeout_stops_a_program_that_spins() {
+    let Some(busybox) = busybox() else { return };
+    let image = image(&busybox);
+    let started = std::time::Instant::now();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hellovm"))
+        .args(["--timeout", "0.5", "--root"])
+        .arg(image.path())
+        .args(["/bin/busybox", "sh", "-c", "while :; do :; done"])
+        .output()
+        .expect("run hellovm");
+    assert_eq!(output.status.code(), Some(124), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "{stderr}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}

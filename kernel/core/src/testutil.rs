@@ -239,6 +239,8 @@ pub struct MockHost {
     pub stdin: VecDeque<u8>,
     pub image: Option<BTreeMap<String, MockEntry>>,
     pub asked: Vec<String>,
+    /// Total time the kernel asked to sleep.
+    pub slept: std::time::Duration,
 }
 
 impl MockHost {
@@ -266,6 +268,10 @@ impl MockHost {
 }
 
 impl Host for MockHost {
+    fn sleep(&mut self, duration: std::time::Duration) {
+        self.slept += duration;
+    }
+
     fn console_write(&mut self, stream: ConsoleStream, data: &[u8]) -> io::Result<usize> {
         match stream {
             ConsoleStream::Stdout => self.stdout.extend_from_slice(data),

@@ -77,6 +77,28 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         self.app.write(addr, data).map_err(|_| Errno(EFAULT))
     }
 
+    /// Writes as much of `data` as the guest memory at `addr` takes, page
+    /// by page, and returns how many bytes were written.
+    pub fn write_mem_prefix(&mut self, addr: GuestAddr, data: &[u8]) -> usize {
+        if self.app.write(addr, data).is_ok() {
+            return data.len();
+        }
+        // 4 KiB is the smallest page size, so no writable page is skipped.
+        const CHUNK: u64 = 4096;
+        let mut done = 0;
+        while done < data.len() {
+            let Some(at) = addr.checked_add(done as u64) else {
+                break;
+            };
+            let n = ((CHUNK - at % CHUNK) as usize).min(data.len() - done);
+            if self.app.write(at, &data[done..done + n]).is_err() {
+                break;
+            }
+            done += n;
+        }
+        done
+    }
+
     pub fn write_u64(&mut self, addr: GuestAddr, value: u64) -> SysResult<()> {
         self.write_mem(addr, &value.to_le_bytes())
     }
@@ -168,8 +190,8 @@ where
         Some(Ioctl) => ctx.sys_ioctl(int(a[0]), a[1], a[2]),
         Some(Poll) => ctx.sys_poll(a[0], a[1], Some(int(a[2]))),
         Some(Ppoll) => ctx.sys_ppoll(a[0], a[1], a[2]),
-        Some(Select) => ctx.sys_select(int(a[0]), a[1], a[2], a[3]),
-        Some(Pselect6) => ctx.sys_select(int(a[0]), a[1], a[2], a[3]),
+        Some(Select) => ctx.sys_select(int(a[0]), a[1], a[2], a[3], a[4], false),
+        Some(Pselect6) => ctx.sys_select(int(a[0]), a[1], a[2], a[3], a[4], true),
         Some(Fsync | Fdatasync) => ctx.sys_fsync(int(a[0])),
         Some(Sync) => Ok(0),
         Some(Fadvise64 | Flock) => ctx.sys_fsync(int(a[0])),

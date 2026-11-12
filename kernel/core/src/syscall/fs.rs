@@ -9,7 +9,8 @@ use crate::fd::{Access, FileId, FileObject, OpenFile, MAX_FDS};
 use crate::host::Host;
 use crate::platform::{GuestAddr, Platform};
 use crate::vfs::{
-    Device, DirEntry, FileType, Ino, NewNode, Stat, Timespec, S_IFCHR, S_IFMT, S_IFREG,
+    CreateTarget, Device, DirEntry, FileType, Ino, NewNode, Stat, Timespec, S_IFCHR, S_IFMT,
+    S_IFREG,
 };
 
 use super::{int, Ctx, AT_FDCWD, MAX_IO};
@@ -272,9 +273,45 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 return Err(Errno(EISDIR));
             }
         }
+        let console = file.object == FileObject::ConsoleIn;
+        let before = file.offset;
+        if console && len > 0 {
+            // Console input cannot be put back: make sure the buffer can
+            // take at least a byte before consuming any.
+            self.probe_writable(buf)?;
+        }
         let data = self.read_file(id, offset, len as usize)?;
-        self.write_mem(buf, &data)?;
-        Ok(data.len() as u64)
+        let done = self.write_mem_prefix(buf, &data);
+        self.finish_read(id, offset, before, data.len(), done)
+    }
+
+    /// Checks that the guest byte at `addr` is writable, leaving it as is.
+    fn probe_writable(&mut self, addr: GuestAddr) -> SysResult<()> {
+        let byte: [u8; 1] = self.read_array(addr)?;
+        self.write_mem(addr, &byte)
+    }
+
+    /// Completes a read that got `got` bytes of which `done` reached the
+    /// guest: a partial copy is a short read, as on Linux, and the file
+    /// position only moves past what the guest received.
+    fn finish_read(
+        &mut self,
+        id: FileId,
+        offset: Option<u64>,
+        before: u64,
+        got: usize,
+        done: usize,
+    ) -> SysResult<u64> {
+        if done < got {
+            let file = self.proc.fds.file_mut(id);
+            if offset.is_none() && file.offset == before + got as u64 {
+                file.offset = before + done as u64;
+            }
+            if done == 0 {
+                return Err(Errno(EFAULT));
+            }
+        }
+        Ok(done as u64)
     }
 
     pub fn sys_write(
@@ -345,7 +382,18 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             self.seekable(fd)?;
         }
         let iovecs = self.read_iovecs(iov, count)?;
-        let total: u64 = iovecs.iter().map(|v| v.1).sum();
+        // Guest-chosen lengths: the sum must not overflow.
+        let total = iovecs
+            .iter()
+            .fold(0u64, |sum, v| sum.saturating_add(v.1))
+            .min(MAX_IO as u64);
+        let file = self.proc.fds.file(id);
+        let before = file.offset;
+        if file.object == FileObject::ConsoleIn {
+            if let Some(&(base, _)) = iovecs.iter().find(|v| v.1 > 0) {
+                self.probe_writable(base)?;
+            }
+        }
         let data = self.read_file(id, offset, total as usize)?;
         let mut done = 0;
         for (base, len) in iovecs {
@@ -353,10 +401,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 break;
             }
             let n = (len as usize).min(data.len() - done);
-            self.write_mem(base, &data[done..done + n])?;
-            done += n;
+            let written = self.write_mem_prefix(base, &data[done..done + n]);
+            done += written;
+            if written < n {
+                break;
+            }
         }
-        Ok(data.len() as u64)
+        self.finish_read(id, offset, before, data.len(), done)
     }
 
     pub fn sys_writev(
@@ -457,22 +508,18 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let start = self.start_dir(dirfd, &path)?;
         let follow = !flags.nofollow;
         let ino = if flags.creat && !flags.path {
-            let parent = self.vfs.resolve_parent(self.host, start, &path)?;
-            if parent.trailing_slash {
-                return Err(Errno(EISDIR));
-            }
-            let existing = match self
+            // O_EXCL never follows a final symlink: the name itself must
+            // be free.
+            match self
                 .vfs
-                .resolve(self.host, start, &path, follow && !flags.excl)
+                .resolve_for_create(self.host, start, &path, follow && !flags.excl)?
             {
-                Ok(ino) => Some(ino),
-                Err(Errno(ENOENT)) => None,
-                Err(err) => return Err(err),
-            };
-            match existing {
-                Some(_) if flags.excl => return Err(Errno(EEXIST)),
-                Some(ino) => ino,
-                None => {
+                CreateTarget::Existing(_) if flags.excl => return Err(Errno(EEXIST)),
+                CreateTarget::Existing(ino) => ino,
+                CreateTarget::Missing(parent) => {
+                    if parent.trailing_slash {
+                        return Err(Errno(EISDIR));
+                    }
                     let perm = (mode as u32) & 0o7777 & !self.proc.umask;
                     let now = self.now();
                     self.vfs.create(
@@ -713,13 +760,34 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     /// `select`/`pselect6`: every valid fd is ready for reading and writing.
+    /// With nothing to report, the call sleeps for its timeout, a `timeval`
+    /// (`select`) or a `timespec` (`pselect6`) at `timeout`.
     pub fn sys_select(
         &mut self,
         nfds: i64,
         readfds: GuestAddr,
         writefds: GuestAddr,
         exceptfds: GuestAddr,
+        timeout: GuestAddr,
+        timeout_is_timespec: bool,
     ) -> SysResult<u64> {
+        let timeout = if timeout == 0 {
+            None
+        } else {
+            let (sec, sub) = abi::decode_pair(&self.read_array(timeout)?);
+            let (max, to_nanos) = if timeout_is_timespec {
+                (1_000_000_000, 1)
+            } else {
+                (1_000_000, 1000)
+            };
+            if sec < 0 || !(0..max).contains(&sub) {
+                return Err(Errno(EINVAL));
+            }
+            Some(std::time::Duration::new(
+                sec as u64,
+                (sub * to_nanos) as u32,
+            ))
+        };
         if !(0..=MAX_FDS as i64).contains(&nfds) {
             return Err(Errno(EINVAL));
         }
@@ -739,6 +807,15 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
         if exceptfds != 0 {
             self.write_mem(exceptfds, &vec![0; bytes])?;
+        }
+        if ready == 0 {
+            match timeout {
+                Some(duration) => self.host.sleep(duration),
+                None => {
+                    log::warn!("select would block forever (nothing can become ready)");
+                    return Err(Errno(crate::errno::EINTR));
+                }
+            }
         }
         Ok(ready)
     }

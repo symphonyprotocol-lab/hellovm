@@ -8,7 +8,6 @@
 //! Every offset and size is bounds-checked, and the image may only land in
 //! free, non-reserved parts of the address space.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::arch::Arch;
@@ -297,8 +296,9 @@ pub fn load<P: AddressSpace + AppMemory + ?Sized>(
         0
     };
 
-    // Page-level protection: pages shared by two segments get both.
-    let mut pages: BTreeMap<u64, Prot> = BTreeMap::new();
+    // Page-aligned spans of the segments. Nothing here may cost time or
+    // memory in proportion to a segment's size, which the file controls.
+    let mut spans: Vec<(u64, u64, Prot)> = Vec::new();
     let mut image_end = 0;
     for seg in &elf.segments {
         if seg.vaddr % page != seg.offset % page {
@@ -307,23 +307,35 @@ pub fn load<P: AddressSpace + AppMemory + ?Sized>(
         let start = seg.vaddr.checked_add(bias).ok_or(ElfError::NoRoom)?;
         let end = start.checked_add(seg.memsz).ok_or(ElfError::NoRoom)?;
         let end = mm.page_up(end).ok_or(ElfError::NoRoom)?;
-        image_end = image_end.max(end);
-        for p in (mm.page_down(start)..end).step_by(page as usize) {
-            let prot = pages.entry(p).or_insert(Prot::NONE);
-            *prot = prot.union(seg.prot);
+        if end > mm.max_addr() {
+            return Err(ElfError::NoRoom);
         }
+        image_end = image_end.max(end);
+        spans.push((mm.page_down(start), end, seg.prot));
     }
-    // Runs of contiguous pages, and of pages with equal protection.
+    // Cut the spans where any of them starts or ends. Each piece gets the
+    // protection of every span covering it (a page shared by two segments
+    // gets both). Then join the pieces into runs of contiguous pages, and
+    // of contiguous pages with equal protection.
+    let mut cuts: Vec<u64> = spans.iter().flat_map(|s| [s.0, s.1]).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut prot_runs: Vec<(u64, u64, Prot)> = Vec::new();
-    for (&p, &prot) in &pages {
+    for cut in cuts.windows(2) {
+        let (start, end) = (cut[0], cut[1]);
+        let mut covering = spans.iter().filter(|s| s.0 <= start && end <= s.1);
+        let Some(first) = covering.next() else {
+            continue;
+        };
+        let prot = covering.fold(first.2, |prot, s| prot.union(s.2));
         match runs.last_mut() {
-            Some(run) if run.1 == p => run.1 = p + page,
-            _ => runs.push((p, p + page)),
+            Some(run) if run.1 == start => run.1 = end,
+            _ => runs.push((start, end)),
         }
         match prot_runs.last_mut() {
-            Some(run) if run.1 == p && run.2 == prot => run.1 = p + page,
-            _ => prot_runs.push((p, p + page, prot)),
+            Some(run) if run.1 == start && run.2 == prot => run.1 = end,
+            _ => prot_runs.push((start, end, prot)),
         }
     }
     for &(start, end) in &runs {
@@ -462,6 +474,8 @@ pub fn build_stack<P: AddressSpace + AppMemory + ?Sized>(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::platform::Platform;
     use crate::testutil::MockApp;
@@ -714,6 +728,27 @@ pub(crate) mod tests {
         let file = sample(Arch::Aarch64, ET_EXEC, app.reserved());
         let elf = parse(&file, Arch::Aarch64).unwrap();
         assert_eq!(load(&mut mm, &mut app, &file, &elf), Err(ElfError::NoRoom));
+    }
+
+    #[test]
+    fn huge_segments_are_refused_without_walking_their_pages() {
+        let (mut mm, mut app) = setup();
+        let file = build_elf(
+            Arch::Aarch64,
+            ET_EXEC,
+            0x40_0000,
+            &[Seg {
+                vaddr: 0x40_0000,
+                offset: 0,
+                data: &[0; 0x200],
+                memsz: 1 << 60,
+                flags: PF_R | PF_W,
+            }],
+            None,
+        );
+        let elf = parse(&file, Arch::Aarch64).unwrap();
+        assert_eq!(load(&mut mm, &mut app, &file, &elf), Err(ElfError::NoRoom));
+        assert!(!app.is_mapped(0x40_0000));
     }
 
     fn read_u64(app: &mut MockApp, addr: u64) -> u64 {

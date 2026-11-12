@@ -191,6 +191,19 @@ impl<H: Host> Kernel<H> {
         }
     }
 
+    /// Limits the sandbox's in-memory filesystem layer to `bytes` (file
+    /// contents plus a small fixed cost per file); writes beyond it fail
+    /// with `ENOSPC`. The default is [`crate::vfs::DEFAULT_UPPER_LIMIT`].
+    pub fn with_fs_limit(mut self, bytes: u64) -> Self {
+        self.set_fs_limit(bytes);
+        self
+    }
+
+    /// See [`Kernel::with_fs_limit`].
+    pub fn set_fs_limit(&mut self, bytes: u64) {
+        self.vfs.set_upper_limit(bytes);
+    }
+
     /// Records every syscall the app makes; see [`Kernel::trace`].
     pub fn with_trace(mut self) -> Self {
         self.trace = Some(Vec::new());
@@ -625,6 +638,62 @@ mod tests {
         // fd 4 was at offset 0 (pread does not move it), so the write through
         // fd 1 overwrote the data.
         assert_eq!(kernel.vfs.read_all(&mut kernel.host, f).unwrap(), b"data");
+    }
+
+    #[test]
+    fn reads_are_short_or_efault_and_only_consume_what_arrived() {
+        let arch = Arch::Aarch64;
+        let at_fdcwd = (-100i64) as u64;
+        let iov = SCRATCH + 0x100;
+        let traps = vec![
+            sc(arch, Sysno::Openat, &[at_fdcwd, SCRATCH, 0, 0]),
+            // A bad buffer consumes nothing.
+            sc(arch, Sysno::Read, &[3, 0x10_0000_0000, 5]),
+            // Four bytes fit before the end of the mapped memory.
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x3ffc, 12]),
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x1000, 100]),
+            // iovec lengths that overflow when added.
+            sc(arch, Sysno::Lseek, &[3, 0, 0]),
+            sc(arch, Sysno::Readv, &[3, iov, 2]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut iovecs = Vec::new();
+        for _ in 0..2 {
+            iovecs.extend_from_slice(&(SCRATCH + 0x2000).to_le_bytes());
+            iovecs.extend_from_slice(&u64::MAX.to_le_bytes());
+        }
+        let (mut kernel, mut app) =
+            setup(arch, traps, &[(SCRATCH, b"/etc/motd\0"), (iov, &iovecs)]);
+        kernel.run(&mut app).unwrap();
+        assert_eq!(app.returns, vec![3, -EFAULT, 4, 8, 0, 12]);
+        assert_eq!(app.peek(SCRATCH + 0x3ffc, 4), b"hell");
+        assert_eq!(app.peek(SCRATCH + 0x1000, 8), b"o image\n");
+        assert_eq!(app.peek(SCRATCH + 0x2000, 12), b"hello image\n");
+    }
+
+    #[test]
+    fn select_waits_for_its_timeout() {
+        let arch = Arch::Aarch64;
+        let mut timeout = Vec::new();
+        timeout.extend_from_slice(&0i64.to_le_bytes());
+        timeout.extend_from_slice(&1000i64.to_le_bytes());
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&0i64.to_le_bytes());
+        bad.extend_from_slice(&2_000_000_000i64.to_le_bytes());
+        let traps = vec![
+            sc(arch, Sysno::Pselect6, &[0, 0, 0, 0, SCRATCH, 0]),
+            sc(arch, Sysno::Pselect6, &[0, 0, 0, 0, SCRATCH + 0x100, 0]),
+            sc(arch, Sysno::Pselect6, &[0, 0, 0, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (mut kernel, mut app) =
+            setup(arch, traps, &[(SCRATCH, &timeout), (SCRATCH + 0x100, &bad)]);
+        kernel.run(&mut app).unwrap();
+        assert_eq!(
+            app.returns,
+            vec![0, -crate::errno::EINVAL, -crate::errno::EINTR]
+        );
+        assert_eq!(kernel.host().slept, std::time::Duration::from_nanos(1000));
     }
 
     #[test]

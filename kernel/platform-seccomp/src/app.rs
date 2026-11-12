@@ -3,6 +3,8 @@
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
 
 use hellovm_core::platform::{
     AddressSpace, AddressSpaceInfo, AppMemory, CpuInfo, Fault, GuestAddr, Platform, PlatformError,
@@ -46,6 +48,8 @@ enum State {
 #[derive(Debug)]
 pub struct SeccompApp {
     tracee: Tracee,
+    /// A pidfd of the app process, shared with every [`AppKiller`].
+    pidfd: Arc<OwnedFd>,
     arch: Arch,
     state: State,
     started: bool,
@@ -67,12 +71,24 @@ impl SeccompApp {
             io::Error::new(io::ErrorKind::Unsupported, "unsupported host architecture")
         })?;
         let spawned = spawn::spawn(arch)?;
+        // The process is our unreaped child, so the pid cannot have been
+        // reused: the pidfd names the app for good.
+        // SAFETY: plain syscall; a non-negative result is a new fd we own.
+        let pidfd = unsafe {
+            let fd = libc::syscall(libc::SYS_pidfd_open, spawned.tracee.pid, 0);
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                return Err(io::Error::new(err.kind(), format!("pidfd_open: {err}")));
+            }
+            OwnedFd::from_raw_fd(fd as i32)
+        };
         let page_size = sys::page_size();
         let number = |sysno: Sysno| arch.syscall_nr(sysno).expect("generic syscall");
         let max_addr = spawned.top & !(page_size - 1);
         let stub_range = stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED;
         let mut app = SeccompApp {
             tracee: spawned.tracee,
+            pidfd: Arc::new(pidfd),
             arch,
             state: State::AtExit {
                 saved: spawned.regs,
@@ -115,6 +131,41 @@ impl SeccompApp {
     /// The host pid of the app process.
     pub fn pid(&self) -> libc::pid_t {
         self.tracee.pid
+    }
+
+    /// A handle that ends the app from any thread, for timeouts and
+    /// cancellation: the app may be running code that never makes a
+    /// syscall, and then the thread driving it is blocked in
+    /// [`Platform::run`].
+    pub fn killer(&self) -> AppKiller {
+        AppKiller {
+            pidfd: Arc::clone(&self.pidfd),
+        }
+    }
+
+    /// The app process is gone (a ptrace request failed with `ESRCH`):
+    /// reaps it and reports how it ended.
+    fn gone(&mut self) -> Result<Trap, PlatformError> {
+        loop {
+            match self.tracee.wait()? {
+                Stop::Killed(sig) => return Ok(self.killed(sig)),
+                Stop::Exited(code) => {
+                    self.state = State::Dead;
+                    return Err(PlatformError::AppGone(format!("exited with {code}")));
+                }
+                // Stops queued before it died.
+                _ => continue,
+            }
+        }
+    }
+
+    fn killed(&mut self, sig: i32) -> Trap {
+        self.state = State::Dead;
+        Trap::Fault(Fault {
+            signal: sig as u32,
+            addr: None,
+            fatal: true,
+        })
     }
 
     fn kill(&mut self) {
@@ -253,23 +304,35 @@ impl SeccompApp {
     }
 
     fn trap(&mut self) -> Result<Trap, PlatformError> {
-        match self.wait_quietly(Run::Cont)? {
-            Stop::Seccomp => {
-                let regs = self.tracee.regs()?;
-                let (nr, args) = regs.syscall();
-                self.state = State::AtEntry { regs };
-                Ok(Trap::Syscall(SyscallTrap { nr, args }))
+        loop {
+            match self.tracee.wait()? {
+                Stop::Signal(sig) if ignored_signal(sig) => {
+                    self.tracee.resume(Run::Cont, 0)?;
+                }
+                Stop::Seccomp => {
+                    let regs = self.tracee.regs()?;
+                    let (nr, args) = regs.syscall();
+                    self.state = State::AtEntry { regs };
+                    return Ok(Trap::Syscall(SyscallTrap { nr, args }));
+                }
+                Stop::Signal(sig) => {
+                    let addr = self.tracee.fault_addr(sig);
+                    self.state = State::AtSignal;
+                    return Ok(Trap::Fault(Fault {
+                        signal: sig as u32,
+                        addr,
+                        fatal: false,
+                    }));
+                }
+                // Killed from outside the sandbox, e.g. by an
+                // [`AppKiller`]: the app ended by that signal.
+                Stop::Killed(sig) => return Ok(self.killed(sig)),
+                Stop::Exited(code) => {
+                    self.state = State::Dead;
+                    return Err(PlatformError::AppGone(format!("exited with {code}")));
+                }
+                stop => return Err(self.violation(format!("unexpected stop {stop:?}"))),
             }
-            Stop::Signal(sig) => {
-                let addr = self.tracee.fault_addr(sig);
-                self.state = State::AtSignal;
-                Ok(Trap::Fault(Fault {
-                    signal: sig as u32,
-                    addr,
-                    fatal: false,
-                }))
-            }
-            stop => Err(self.violation(format!("unexpected stop {stop:?}"))),
         }
     }
 }
@@ -401,6 +464,58 @@ impl Platform for SeccompApp {
     }
 
     fn run(&mut self, resume: Resume) -> Result<Trap, PlatformError> {
+        match self.resume_app(resume) {
+            // The app was killed while it was stopped for the kernel.
+            Err(PlatformError::Host(err))
+                if err.raw_os_error() == Some(libc::ESRCH)
+                    && !matches!(self.state, State::Dead) =>
+            {
+                self.gone()
+            }
+            other => other,
+        }
+    }
+
+    fn terminate(&mut self) -> Result<(), PlatformError> {
+        self.state = State::Dead;
+        self.tracee.kill()?;
+        Ok(())
+    }
+}
+
+/// Ends an app from any thread. See [`SeccompApp::killer`].
+#[derive(Clone, Debug)]
+pub struct AppKiller {
+    pidfd: Arc<OwnedFd>,
+}
+
+impl AppKiller {
+    /// Kills the app process. [`Platform::run`] then reports it as ended by
+    /// `SIGKILL`. Does nothing if the app has already ended: the pidfd
+    /// never names another process.
+    pub fn kill(&self) -> io::Result<()> {
+        // SAFETY: plain syscall on an fd we own.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SeccompApp {
+    fn resume_app(&mut self, resume: Resume) -> Result<Trap, PlatformError> {
         let thread_pointer = self.thread_pointer.take();
         let with_tp = |mut regs: Regs| {
             if let Some(tp) = thread_pointer {
@@ -430,12 +545,6 @@ impl Platform for SeccompApp {
         }
         self.tracee.resume(Run::Cont, 0)?;
         self.trap()
-    }
-
-    fn terminate(&mut self) -> Result<(), PlatformError> {
-        self.state = State::Dead;
-        self.tracee.kill()?;
-        Ok(())
     }
 }
 
@@ -499,5 +608,48 @@ mod tests {
         assert!(app.unmap(u64::MAX - page + 1, page).is_err());
         // The stub is still there and working.
         app.map(0x2000_0000, page, Prot::RW).unwrap();
+    }
+
+    #[test]
+    fn killer_ends_an_app_that_never_traps() {
+        let mut app = SeccompApp::new().unwrap();
+        let page = app.address_space().page_size;
+        let addr = 0x2000_0000;
+        // A branch to itself.
+        #[cfg(target_arch = "aarch64")]
+        let code = [0x00, 0x00, 0x00, 0x14];
+        #[cfg(target_arch = "x86_64")]
+        let code = [0xeb, 0xfe];
+        app.map(addr, 2 * page, Prot::RW).unwrap();
+        app.write(addr, &code).unwrap();
+        app.protect(addr, page, Prot::READ.union(Prot::EXEC))
+            .unwrap();
+        let killer = app.killer();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            killer.kill().unwrap();
+            killer
+        });
+        let trap = app
+            .run(Resume::Start {
+                entry: addr,
+                stack: addr + 2 * page,
+            })
+            .unwrap();
+        assert_eq!(
+            trap,
+            Trap::Fault(Fault {
+                signal: libc::SIGKILL as u32,
+                addr: None,
+                fatal: true,
+            })
+        );
+        // Killing an app that is gone is not an error.
+        let killer = thread.join().unwrap();
+        killer.kill().unwrap();
+        assert!(matches!(
+            app.run(Resume::Return(0)),
+            Err(PlatformError::AppGone(_))
+        ));
     }
 }

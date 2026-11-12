@@ -36,8 +36,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::errno::{
-    Errno, SysResult, EBUSY, EEXIST, EFBIG, EINVAL, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR,
-    ENOTEMPTY, EPERM,
+    Errno, SysResult, EBUSY, EEXIST, EFBIG, EINVAL, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOSPC,
+    ENOTDIR, ENOTEMPTY, EPERM,
 };
 use crate::host::{Host, HostFileKind, HostStat, ImagePath};
 
@@ -55,9 +55,15 @@ pub const PATH_MAX: usize = 4096;
 /// Longest file name.
 pub const NAME_MAX: usize = 255;
 /// Most symlinks followed in one resolution.
-const MAX_SYMLINKS: u32 = 40;
+pub const MAX_SYMLINKS: u32 = 40;
 /// Largest file the in-memory layer holds.
 pub const MAX_FILE_SIZE: u64 = 1 << 30;
+/// Default budget of the in-memory layer: file contents plus a fixed cost
+/// per node created in the sandbox. See [`Vfs::set_upper_limit`].
+pub const DEFAULT_UPPER_LIMIT: u64 = 2 << 30;
+/// What a node created in the sandbox costs against the budget, besides its
+/// name and contents.
+const NODE_COST: u64 = 512;
 
 /// The device numbers of the sandbox filesystem and of `/dev`.
 const FS_DEV: u64 = 0x2a;
@@ -174,6 +180,12 @@ pub struct Node {
     content: Content,
     /// Open file descriptions referring to the node.
     open: u32,
+    /// Budget cost that does not depend on the file size: 0 for image
+    /// nodes, node + name (+ symlink target) for nodes created here.
+    overhead: u64,
+    /// What the node currently costs against the in-memory budget:
+    /// `overhead` plus the length of its upper-layer data.
+    charge: u64,
 }
 
 /// What `stat` reports, independent of the guest ABI.
@@ -220,12 +232,23 @@ pub struct ParentAndName {
     pub trailing_slash: bool,
 }
 
+/// What `open(O_CREAT)` found at a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateTarget {
+    Existing(Ino),
+    /// Nothing there: create this name in this directory.
+    Missing(ParentAndName),
+}
+
 /// The sandbox filesystem.
 #[derive(Clone, Debug)]
 pub struct Vfs {
     nodes: HashMap<Ino, Node>,
     next_ino: Ino,
     root: Ino,
+    /// Bytes charged against the in-memory budget, and the budget.
+    upper_used: u64,
+    upper_limit: u64,
 }
 
 fn host_errno(err: std::io::Error) -> Errno {
@@ -240,6 +263,8 @@ impl Vfs {
             nodes: HashMap::new(),
             next_ino: 2,
             root: 2,
+            upper_used: 0,
+            upper_limit: DEFAULT_UPPER_LIMIT,
         };
         let root_stat = if host.has_image() {
             match host.image_stat(&ImagePath::root()) {
@@ -267,7 +292,10 @@ impl Vfs {
             root_stat.map_or(now, |s| host_time(s.mtime)),
         );
         vfs.root = root;
-        vfs.node_mut(root).nlink = 2;
+        // Like any image directory: the host's count covers the image's
+        // subdirectories, which `rmdir` and `rename` subtract again.
+        vfs.node_mut(root).nlink =
+            root_stat.map_or(2, |s| s.nlink.clamp(2, u32::MAX as u64) as u32);
 
         let dev = vfs.ensure_dir(host, root, b"dev", 0o755, now);
         let devices: [(&[u8], Device, u32); 8] = [
@@ -331,9 +359,55 @@ impl Vfs {
                 ctime: time,
                 content,
                 open: 0,
+                overhead: 0,
+                charge: 0,
             },
         );
         ino
+    }
+
+    /// Sets the budget of the in-memory layer in bytes. Lowering it below
+    /// what is in use only stops further growth.
+    pub fn set_upper_limit(&mut self, bytes: u64) {
+        self.upper_limit = bytes;
+    }
+
+    /// Bytes currently charged against the in-memory budget.
+    pub fn upper_used(&self) -> u64 {
+        self.upper_used
+    }
+
+    /// Reserves `bytes` of the budget; `ENOSPC` if that exceeds it.
+    fn reserve(&mut self, bytes: u64) -> SysResult<()> {
+        let used = self.upper_used.checked_add(bytes).ok_or(Errno(ENOSPC))?;
+        if used > self.upper_limit {
+            return Err(Errno(ENOSPC));
+        }
+        self.upper_used = used;
+        Ok(())
+    }
+
+    /// Charges `ino` for `len` bytes of upper-layer data (plus its fixed
+    /// overhead), reserving or releasing the difference.
+    fn charge_data(&mut self, ino: Ino, len: u64) -> SysResult<()> {
+        let node = self.node(ino);
+        let (old, new) = (node.charge, node.overhead.saturating_add(len));
+        if new > old {
+            self.reserve(new - old)?;
+        } else {
+            self.upper_used -= old - new;
+        }
+        self.node_mut(ino).charge = new;
+        Ok(())
+    }
+
+    /// Takes one subdirectory off a live directory's link count. Hosts
+    /// that do not count subdirectories (btrfs reports 1) make the count
+    /// start too low, so it never goes below a directory's own two links:
+    /// 0 is reserved for "removed".
+    fn drop_subdir_link(&mut self, dir: Ino) {
+        let node = self.node_mut(dir);
+        node.nlink = node.nlink.saturating_sub(1).max(2);
     }
 
     fn node(&self, ino: Ino) -> &Node {
@@ -422,7 +496,13 @@ impl Vfs {
             return Ok(dir);
         }
         if name == b".." {
-            return Ok(d.parent);
+            // A removed directory that is still open or current may have
+            // outlived its parent.
+            return if self.nodes.contains_key(&d.parent) {
+                Ok(d.parent)
+            } else {
+                Err(Errno(ENOENT))
+            };
         }
         if let Some(&ino) = d.entries.get(name) {
             return Ok(ino);
@@ -557,6 +637,48 @@ impl Vfs {
         })
     }
 
+    /// Resolves `path` for `open(O_CREAT)`: the existing node, or where to
+    /// create it. With `follow`, a final symlink is followed even if its
+    /// target does not exist yet, so that the file is created at the
+    /// target, as on Linux.
+    pub fn resolve_for_create<H: Host + ?Sized>(
+        &mut self,
+        host: &mut H,
+        start: Ino,
+        path: &[u8],
+        follow: bool,
+    ) -> SysResult<CreateTarget> {
+        let mut start = start;
+        let mut path = path.to_vec();
+        let mut links = 0;
+        loop {
+            let parent = self.resolve_parent(host, start, &path)?;
+            let ino = match self.lookup(host, parent.dir, &parent.name) {
+                Ok(ino) => ino,
+                Err(Errno(ENOENT)) => return Ok(CreateTarget::Missing(parent)),
+                Err(err) => return Err(err),
+            };
+            if follow || parent.trailing_slash {
+                if let Content::Symlink(target) = &self.node(ino).content {
+                    links += 1;
+                    if links > MAX_SYMLINKS {
+                        return Err(Errno(ELOOP));
+                    }
+                    path = target.clone();
+                    if parent.trailing_slash {
+                        path.push(b'/');
+                    }
+                    start = parent.dir;
+                    continue;
+                }
+            }
+            if parent.trailing_slash && !self.is_dir(ino) {
+                return Err(Errno(ENOTDIR));
+            }
+            return Ok(CreateTarget::Existing(ino));
+        }
+    }
+
     fn check_new_name(name: &[u8]) -> SysResult<()> {
         if name.len() > NAME_MAX {
             return Err(Errno(ENAMETOOLONG));
@@ -594,6 +716,13 @@ impl Vfs {
             return Err(Errno(ENOENT));
         }
         let is_dir = matches!(what, NewNode::Dir);
+        let overhead = NODE_COST
+            + name.len() as u64
+            + match &what {
+                NewNode::Symlink(target) => target.len() as u64,
+                _ => 0,
+            };
+        self.reserve(overhead)?;
         let content = match what {
             NewNode::File => Content::File(FileData::Upper(Vec::new())),
             NewNode::Dir => Content::Dir(Dir {
@@ -605,6 +734,9 @@ impl Vfs {
             NewNode::Symlink(target) => Content::Symlink(target),
         };
         let ino = self.add_node(content, perm, now);
+        let node = self.node_mut(ino);
+        node.overhead = overhead;
+        node.charge = overhead;
         self.dir_mut(dir).entries.insert(name.to_vec(), ino);
         if is_dir {
             self.node_mut(dir).nlink += 1;
@@ -626,6 +758,7 @@ impl Vfs {
     fn maybe_free(&mut self, ino: Ino) {
         let node = self.node(ino);
         if node.nlink == 0 && node.open == 0 && ino != self.root {
+            self.upper_used -= node.charge;
             self.nodes.remove(&ino);
         }
     }
@@ -680,7 +813,7 @@ impl Vfs {
         }
         self.remove_entry(dir, name);
         self.touch_dir(dir, now);
-        self.node_mut(dir).nlink -= 1;
+        self.drop_subdir_link(dir);
         self.node_mut(ino).nlink = 0;
         self.maybe_free(ino);
         Ok(())
@@ -784,7 +917,7 @@ impl Vfs {
             self.dir_mut(new_dir).entries.remove(new_name);
             if self.is_dir(dst) {
                 self.node_mut(dst).nlink = 0;
-                self.node_mut(new_dir).nlink -= 1;
+                self.drop_subdir_link(new_dir);
             } else {
                 self.node_mut(dst).nlink -= 1;
             }
@@ -793,7 +926,7 @@ impl Vfs {
         }
         self.dir_mut(new_dir).entries.insert(new_name.to_vec(), src);
         if src_is_dir {
-            self.node_mut(old_dir).nlink -= 1;
+            self.drop_subdir_link(old_dir);
             self.node_mut(new_dir).nlink += 1;
             self.dir_mut(src).parent = new_dir;
         }
@@ -956,11 +1089,32 @@ impl Vfs {
         Ok(data)
     }
 
+    /// Replaces an image file's contents with an in-memory copy of its
+    /// first `len` bytes, within the per-file and total limits.
+    fn copy_up<H: Host + ?Sized>(&mut self, host: &mut H, ino: Ino, len: u64) -> SysResult<()> {
+        if len > MAX_FILE_SIZE {
+            return Err(Errno(EFBIG));
+        }
+        self.charge_data(ino, len)?;
+        let mut data = vec![0; len as usize];
+        match self.read(host, ino, 0, &mut data) {
+            // If the image file is shorter than its size said, the rest
+            // reads as zeros.
+            Ok(_) => {
+                self.node_mut(ino).content = Content::File(FileData::Upper(data));
+                Ok(())
+            }
+            Err(err) => {
+                self.charge_data(ino, 0).expect("releasing never fails");
+                Err(err)
+            }
+        }
+    }
+
     /// The upper-layer data of a file, copying it up first.
     fn upper_data<H: Host + ?Sized>(&mut self, host: &mut H, ino: Ino) -> SysResult<&mut Vec<u8>> {
-        if let Content::File(FileData::Lower { .. }) = self.node(ino).content {
-            let data = self.read_all(host, ino)?;
-            self.node_mut(ino).content = Content::File(FileData::Upper(data));
+        if let Content::File(FileData::Lower { size, .. }) = self.node(ino).content {
+            self.copy_up(host, ino, size)?;
         }
         match &mut self.node_mut(ino).content {
             Content::File(FileData::Upper(data)) => Ok(data),
@@ -981,6 +1135,10 @@ impl Vfs {
         let end = offset.checked_add(data.len() as u64).ok_or(Errno(EFBIG))?;
         if end > MAX_FILE_SIZE {
             return Err(Errno(EFBIG));
+        }
+        let len = self.upper_data(host, ino)?.len() as u64;
+        if len < end {
+            self.charge_data(ino, end)?;
         }
         let file = self.upper_data(host, ino)?;
         if file.len() < end as usize {
@@ -1009,11 +1167,21 @@ impl Vfs {
             FileType::Directory => return Err(Errno(EISDIR)),
             _ => return Err(Errno(EINVAL)),
         }
-        if len == 0 {
-            // No need to copy up what is about to be dropped.
-            self.node_mut(ino).content = Content::File(FileData::Upper(Vec::new()));
-        } else {
-            self.upper_data(host, ino)?.resize(len as usize, 0);
+        match self.node(ino).content {
+            // Copy up only what is kept.
+            Content::File(FileData::Lower { size, .. }) if len <= size => {
+                self.copy_up(host, ino, len)?;
+            }
+            _ => {
+                let old = self.upper_data(host, ino)?.len() as u64;
+                if len > old {
+                    self.charge_data(ino, len)?;
+                }
+                self.upper_data(host, ino)?.resize(len as usize, 0);
+                if len < old {
+                    self.charge_data(ino, len)?;
+                }
+            }
         }
         let node = self.node_mut(ino);
         node.mtime = now;
@@ -1347,5 +1515,171 @@ mod tests {
         assert_eq!(vfs.dir_path(root), Some(b"/".to_vec()));
         assert_eq!(makedev(1, 3), 0x103);
         assert_eq!(makedev(0x1000, 0x100), 0x1000_0010_0000);
+    }
+
+    #[test]
+    fn removing_image_directories_keeps_the_parent_alive() {
+        // The mock host reports a link count of 1 for directories, like
+        // btrfs: nothing can be derived from it.
+        let mut host = MockHost::with_image(&[
+            ("a", MockEntry::Dir),
+            ("b", MockEntry::Dir),
+            ("c", MockEntry::Dir),
+        ]);
+        let mut vfs = Vfs::new(&mut host, NOW);
+        let root = vfs.root();
+        for name in ["a", "b", "c"] {
+            vfs.rmdir(&mut host, root, name.as_bytes(), NOW).unwrap();
+        }
+        assert!(vfs.stat(root).nlink >= 2);
+        assert_eq!(names(&mut vfs, &mut host, "/"), ["dev", "tmp"]);
+        vfs.create(&mut host, root, b"f", NewNode::File, 0o644, NOW)
+            .unwrap();
+        // Renaming directories away does not underflow either.
+        let tmp = resolve(&mut vfs, &mut host, "/tmp").unwrap();
+        vfs.rename(&mut host, root, b"dev", tmp, b"dev", false, NOW)
+            .unwrap();
+        assert!(vfs.stat(root).nlink >= 2);
+    }
+
+    #[test]
+    fn dotdot_of_a_removed_directory_whose_parent_is_gone() {
+        let mut host = image();
+        let mut vfs = Vfs::new(&mut host, NOW);
+        let tmp = resolve(&mut vfs, &mut host, "/tmp").unwrap();
+        let a = vfs
+            .create(&mut host, tmp, b"a", NewNode::Dir, 0o755, NOW)
+            .unwrap();
+        let b = vfs
+            .create(&mut host, a, b"b", NewNode::Dir, 0o755, NOW)
+            .unwrap();
+        vfs.opened(b); // the current directory, say
+        vfs.rmdir(&mut host, a, b"b", NOW).unwrap();
+        vfs.rmdir(&mut host, tmp, b"a", NOW).unwrap();
+        assert_eq!(vfs.resolve(&mut host, b, b".", true), Ok(b));
+        assert_eq!(vfs.resolve(&mut host, b, b"..", true), Err(Errno(ENOENT)));
+        assert_eq!(vfs.resolve(&mut host, b, b"../x", true), Err(Errno(ENOENT)));
+        vfs.closed(b);
+    }
+
+    #[test]
+    fn in_memory_layer_has_a_budget() {
+        let mut host = image();
+        let mut vfs = Vfs::new(&mut host, NOW);
+        let base = vfs.upper_used();
+        vfs.set_upper_limit(base + 10_000);
+        let tmp = resolve(&mut vfs, &mut host, "/tmp").unwrap();
+        let f = vfs
+            .create(&mut host, tmp, b"f", NewNode::File, 0o644, NOW)
+            .unwrap();
+        assert_eq!(vfs.write(&mut host, f, 0, &[1; 4000], NOW), Ok(4000));
+        assert_eq!(
+            vfs.write(&mut host, f, 4000, &[1; 8000], NOW),
+            Err(Errno(ENOSPC))
+        );
+        assert_eq!(vfs.truncate(&mut host, f, 100_000, NOW), Err(Errno(ENOSPC)));
+        assert_eq!(vfs.size(f), 4000);
+        // Copying an image file up is charged as well.
+        let passwd = resolve(&mut vfs, &mut host, "/etc/passwd").unwrap();
+        vfs.write(&mut host, passwd, 0, b"x", NOW).unwrap();
+        assert!(vfs.upper_used() > base + 4000 + 11);
+        // Many small files run into the budget, too.
+        let mut created = 0;
+        while vfs
+            .create(
+                &mut host,
+                tmp,
+                format!("n{created}").as_bytes(),
+                NewNode::File,
+                0o644,
+                NOW,
+            )
+            .is_ok()
+        {
+            created += 1;
+            assert!(created < 100, "node creation is not charged");
+        }
+        assert!(created > 0);
+        // Everything is given back.
+        for i in 0..created {
+            vfs.unlink(&mut host, tmp, format!("n{i}").as_bytes(), NOW)
+                .unwrap();
+        }
+        vfs.unlink(&mut host, tmp, b"f", NOW).unwrap();
+        vfs.truncate(&mut host, passwd, 0, NOW).unwrap();
+        assert_eq!(vfs.upper_used(), base);
+    }
+
+    #[test]
+    fn truncating_an_image_file_copies_up_only_what_is_kept() {
+        let mut host = image();
+        let mut vfs = Vfs::new(&mut host, NOW);
+        let base = vfs.upper_used();
+        let passwd = resolve(&mut vfs, &mut host, "/etc/passwd").unwrap();
+        vfs.truncate(&mut host, passwd, 4, NOW).unwrap();
+        assert_eq!(vfs.read_all(&mut host, passwd).unwrap(), b"root");
+        assert_eq!(vfs.upper_used(), base + 4);
+        vfs.truncate(&mut host, passwd, 6, NOW).unwrap();
+        assert_eq!(vfs.read_all(&mut host, passwd).unwrap(), b"root\0\0");
+        assert_eq!(vfs.upper_used(), base + 6);
+    }
+
+    #[test]
+    fn create_through_a_symlink_targets_what_it_points_to() {
+        let mut host = image();
+        let mut vfs = Vfs::new(&mut host, NOW);
+        let root = vfs.root();
+        let tmp = resolve(&mut vfs, &mut host, "/tmp").unwrap();
+        let link = vfs
+            .create(
+                &mut host,
+                tmp,
+                b"link",
+                NewNode::Symlink(b"target".to_vec()),
+                0o777,
+                NOW,
+            )
+            .unwrap();
+        vfs.create(
+            &mut host,
+            tmp,
+            b"abs",
+            NewNode::Symlink(b"/tmp/link".to_vec()),
+            0o777,
+            NOW,
+        )
+        .unwrap();
+        let missing = CreateTarget::Missing(ParentAndName {
+            dir: tmp,
+            name: b"target".to_vec(),
+            trailing_slash: false,
+        });
+        // Followed, also through a second symlink, to the missing target.
+        assert_eq!(
+            vfs.resolve_for_create(&mut host, root, b"/tmp/link", true),
+            Ok(missing.clone())
+        );
+        assert_eq!(
+            vfs.resolve_for_create(&mut host, root, b"/tmp/abs", true),
+            Ok(missing)
+        );
+        // Not followed (O_EXCL, O_NOFOLLOW): the link itself exists.
+        assert_eq!(
+            vfs.resolve_for_create(&mut host, root, b"/tmp/link", false),
+            Ok(CreateTarget::Existing(link))
+        );
+        let etc = resolve(&mut vfs, &mut host, "/etc").unwrap();
+        assert_eq!(
+            vfs.resolve_for_create(&mut host, root, b"/abs", true),
+            Ok(CreateTarget::Existing(etc))
+        );
+        assert_eq!(
+            vfs.resolve_for_create(&mut host, root, b"/loop", true),
+            Err(Errno(ELOOP))
+        );
+        assert_eq!(
+            vfs.resolve_for_create(&mut host, root, b"/nodir/f", true),
+            Err(Errno(ENOENT))
+        );
     }
 }
