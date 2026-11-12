@@ -145,6 +145,8 @@ static void check_loopback(void) {
     expect_ok("again", connect(c, (void *)&dst, sizeof dst) == 0);
     int extra = accept(srv, NULL, NULL);
     close(extra);
+    /* Clean close: the first write is accepted, the second is EPIPE. */
+    expect_ok("write-after-close", send(c, "x", 1, MSG_NOSIGNAL) == 1);
     expect_err("nosignal", send(c, "x", 1, MSG_NOSIGNAL), EPIPE);
     close(c);
     close(srv);
@@ -351,7 +353,11 @@ static int do_epipe(void) {
     connect(c, (void *)&a, sizeof a);
     int conn = accept(srv, NULL, NULL);
     close(conn);
-    // Default SIGPIPE disposition: this write ends the process.
+    /* The first write after a clean close succeeds. The second raises SIGPIPE. */
+    if (send(c, "x", 1, 0) != 1) {
+        printf("epipe-first errno=%d\n", errno);
+        return 1;
+    }
     send(c, "x", 1, 0);
     printf("epipe-survived\n");
     return 1;
@@ -364,6 +370,31 @@ int main(int argc, char **argv) {
     }
     if (strcmp(cmd, "splice") == 0 && argc > 2) {
         return do_splice(argv[2]);
+    }
+    if ((strcmp(cmd, "bulk") == 0 || strcmp(cmd, "bulk-exit") == 0) && argc > 2) {
+        int c = tcp();
+        struct sockaddr_in a = v4(argv[2], 9);
+        if (connect(c, (void *)&a, sizeof a) != 0) {
+            printf("bulk-connect errno=%d\n", errno);
+            return 1;
+        }
+        char block[4096];
+        memset(block, 0x5a, sizeof block);
+        size_t left = 200000;
+        while (left > 0) {
+            size_t n = left < sizeof block ? left : sizeof block;
+            ssize_t w = send(c, block, n, 0);
+            if (w <= 0) {
+                printf("bulk-send errno=%d\n", errno);
+                return 1;
+            }
+            left -= (size_t)w;
+        }
+        if (strcmp(cmd, "bulk") == 0) {
+            close(c);
+        }
+        printf("bulk-sent\n");
+        return 0;
     }
     if (strcmp(cmd, "epipe") == 0) {
         return do_epipe();

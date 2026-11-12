@@ -96,9 +96,11 @@ configured is also `ENETUNREACH`. The guest address is never used as a host
 dial address.
 
 `shutdown(SHUT_WR)` half-closes: the peer reads EOF and the caller can
-still receive. A later write returns `EPIPE` and raises `SIGPIPE`, unless
-the write used `MSG_NOSIGNAL`, once the peer has closed (or the host stream
-reports the peer gone). A non-blocking connect that will proceed returns
+still receive. A bare FIN does not cause `EPIPE`. After a clean full close
+the first write is accepted and the next one returns `EPIPE` and raises
+`SIGPIPE`, unless the write used `MSG_NOSIGNAL`. A reset (the peer closed
+with unread data, or a host write fails) fails the write immediately. A
+non-blocking connect that will proceed returns
 `EINPROGRESS`; `poll` then reports `POLLOUT` and `SO_ERROR` is the result.
 A blocking connect to a loopback address with no listener is `ECONNREFUSED`.
 The same connect on a non-blocking socket is `EINPROGRESS` with
@@ -117,28 +119,24 @@ ioctl. `__check_pf` instead assumes both IPv4 and IPv6 are configured, so
 `AI_ADDRCONFIG` still returns IPv4 answers. Confirmed in the sandbox:
 `getifaddrs` and CPython `socket.if_nameindex()` fail with `EAFNOSUPPORT`,
 while `getaddrinfo("127.0.0.1")` and `getaddrinfo("localhost")` return
-`127.0.0.1`, and busybox `nc` / CPython move bytes over `127.0.0.1`. Netlink
+`127.0.0.1`, and busybox `nc` moves `hi` across `127.0.0.1:5000`. Netlink
 is not implemented.
 
-`--splice-to IP:PORT` is the 002a host hook. It is orthogonal to 002b's
-`--egress`. A guest connect to an issued fake IP is spliced to that
-configured TCP address; the fake IP is not dialed. Nothing issues a fake IP
-unless a test (or, later, egress DNS) asks the kernel to. With no endpoint
-configured, that connect is `ENETUNREACH`.
+`--splice-to 127.0.0.1:PORT` is a **dev-only** hook, restricted to loopback,
+and orthogonal to 002b's `--egress`. 002b will put it behind the
+`insecure-test-hooks` feature. A guest connect to an issued fake IP is
+spliced to that address; the fake IP is not dialed. Nothing issues a fake
+IP unless a test (or, later, egress DNS) calls `Kernel::issue_fake_ip`.
+There are at most 4096 sockets. `SO_REUSEADDR` is stored but a second bind
+of the same port, including `0.0.0.0` against a specific address, is still
+`EADDRINUSE`. With no endpoint configured, a connect to an issued fake IP
+is `ENETUNREACH`.
 
-Loopback, from a CPython image (the trace shows `socket`, `connect`,
-`sendto`, and `recvfrom` handled by the kernel — libc has no separate
-`send`/`recv` syscall):
+Loopback in one command (the trace lists `socket`, `connect`, `sendto`, and
+`recvfrom`; libc has no separate `send`/`recv` syscall):
 
 ```sh
-mkdir -p /tmp/image
-# assemble a CPython image the way kernel/hellovm/tests/python.rs does, then:
-cargo run -p hellovm -- --root /tmp/image --trace /usr/bin/python3 -c '
-import socket
-s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1)
-c = socket.socket(); c.connect(("127.0.0.1", s.getsockname()[1]))
-conn, _ = s.accept(); c.send(b"hello-loopback"); print(conn.recv(16))
-'
+mkdir -p /tmp/image/bin && cp /bin/busybox /tmp/image/bin/busybox && ln -sfn busybox /tmp/image/bin/sh && ln -sfn busybox /tmp/image/bin/nc && ln -sfn busybox /tmp/image/bin/echo && ln -sfn busybox /tmp/image/bin/cat && cargo run -p hellovm -- --root /tmp/image --no-tty --trace /bin/sh -c 'nc -l -p 5000 >/got & echo hello-loopback | nc -w 2 127.0.0.1 5000; wait; cat /got'
 ```
 
 Not yet: the egress proxy (`pip install`, `git clone`), `epoll`, `eventfd`,
@@ -201,8 +199,8 @@ runs it with the host's libraries the same way.
 
 Run a program in a sandbox whose root is an image directory. The program path
 is a path inside the sandbox; `--trace` lists every syscall the kernel
-handled, `--splice-to IP:PORT` is the 002a hook that splices issued fake
-IPs onto a configured TCP address (it is not `--egress`), and `--timeout SECONDS` kills every process of a sandbox that runs
+handled, `--splice-to 127.0.0.1:PORT` is a dev-only loopback hook that
+splices issued fake IPs onto that address (it is not `--egress`), and `--timeout SECONDS` kills every process of a sandbox that runs
 longer (hellovm then exits with 124). When hellovm's stdin and stdout are a
 terminal, the sandbox gets a terminal console (`--tty`/`--no-tty` override
 this), so an interactive shell works:

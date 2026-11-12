@@ -740,8 +740,9 @@ mod tests {
     use super::*;
     use crate::elf::tests::sample;
     use crate::errno::{
-        EADDRNOTAVAIL, EAFNOSUPPORT, EBADF, ECONNREFUSED, EEXIST, EFAULT, EHOSTUNREACH,
-        EINPROGRESS, EINTR, ENETUNREACH, ENOENT, ENOSYS, ENOTDIR, EPIPE,
+        EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EBADF, ECONNABORTED, ECONNREFUSED,
+        ECONNRESET, EEXIST, EFAULT, EHOSTUNREACH, EINPROGRESS, EINTR, ENETUNREACH, ENOENT, ENOSYS,
+        ENOTDIR, EPIPE,
     };
     use crate::platform::Context;
     use crate::signal::{SA_RESTORER, SA_SIGINFO, SIGCHLD, SIGPIPE, SIGUSR1};
@@ -1417,6 +1418,355 @@ mod tests {
         assert_eq!(flow.dest_ip, ip);
         assert_eq!(flow.dest_port, 443);
         assert_eq!(host.splice_outbound(crate::host::HostStreamId(0)), b"ping");
+    }
+
+    fn poll_memory(fd: i32, events: u16) -> [u8; 8] {
+        let mut raw = [0u8; 8];
+        raw[..4].copy_from_slice(&fd.to_le_bytes());
+        raw[4..6].copy_from_slice(&events.to_le_bytes());
+        raw
+    }
+
+    fn revents_of(bytes: &[u8]) -> u16 {
+        u16::from_le_bytes([bytes[6], bytes[7]])
+    }
+
+    /// Peer close must stay visible to `poll`, including unread data.
+    #[test]
+    fn poll_after_peer_close_reports_rdhup() {
+        let arch = Arch::X86_64;
+        let listen = sin([127, 0, 0, 1], 19000);
+        let poll_at = SCRATCH + 0x200;
+        let buf = SCRATCH + 0x300;
+        // POLLIN|POLLOUT|POLLRDHUP
+        let asked = 1u16 | 4 | 0x2000;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 4]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Accept, &[3, 0, 0]),
+            sc(arch, Sysno::Sendto, &[4, SCRATCH + 0x100, 2, 0, 0, 0]),
+            sc(arch, Sysno::Shutdown, &[4, 1]),
+            sc(arch, Sysno::Poll, &[poll_at, 1, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, buf, 8, 0, 0, 0]),
+            sc(arch, Sysno::Close, &[4]),
+            sc(arch, Sysno::Poll, &[poll_at + 16, 1, 0]),
+            // First write after the clean close is accepted; the second is EPIPE.
+            sc(arch, Sysno::Sendto, &[5, buf, 1, 0x4000, 0, 0]),
+            sc(arch, Sysno::Sendto, &[5, buf, 1, 0x4000, 0, 0]),
+            // connect again on the accepted socket must not start a new connection.
+            sc(arch, Sysno::Connect, &[5, SCRATCH, 16]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let owned = [
+            (SCRATCH, listen.to_vec()),
+            (SCRATCH + 0x100, b"hi".to_vec()),
+            (poll_at, poll_memory(5, asked).to_vec()),
+            (poll_at + 16, poll_memory(5, asked).to_vec()),
+        ];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[8], 1, "poll after FIN {got:?}");
+        assert_eq!(
+            revents_of(&plat.mem(INIT).peek(poll_at, 8)),
+            0x2005,
+            "FIN is POLLIN|POLLOUT|POLLRDHUP, not POLLHUP"
+        );
+        assert_eq!(got[9], 2, "unread FIN data {got:?}");
+        assert_eq!(got[11], 1, "poll after clean close {got:?}");
+        assert_ne!(
+            revents_of(&plat.mem(INIT).peek(poll_at + 16, 8)) & 0x2001,
+            0,
+            "peer close must not look like a fresh socket"
+        );
+        assert_eq!(got[12], 1, "first write after clean close {got:?}");
+        assert_eq!(got[13], -EPIPE, "second write {got:?}");
+        assert_eq!(got[14], -crate::errno::EISCONN, "reconnect {got:?}");
+    }
+
+    #[test]
+    fn reset_recv_is_econnreset_and_fresh_socket_polls_out_hup() {
+        let arch = Arch::X86_64;
+        let listen = sin([127, 0, 0, 1], 19002);
+        let closed = sin([127, 0, 0, 1], 1);
+        let opt = SCRATCH + 0x220;
+        let optlen = SCRATCH + 0x230;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 4]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Accept, &[3, 0, 0]),
+            // Server writes bytes the client never reads, then the client closes: RST.
+            sc(arch, Sysno::Sendto, &[5, SCRATCH + 0x100, 6, 0, 0, 0]),
+            sc(arch, Sysno::Close, &[4]),
+            sc(arch, Sysno::Recvfrom, &[5, SCRATCH + 0x180, 8, 0x40, 0, 0]),
+            sc(arch, Sysno::Sendto, &[5, SCRATCH + 0x100, 1, 0x4000, 0, 0]),
+            // fd 4 was closed, so the next socket reuses it.
+            sc(arch, Sysno::Socket, &[2, 1 | 0o4000, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH + 0x40, 16]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH + 0x40, 16]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH + 0x40, 16]),
+            // Blocking refuse leaves SO_ERROR at 0.
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[6, SCRATCH + 0x40, 16]),
+            sc(arch, Sysno::Getsockopt, &[6, 1, 4, opt, optlen]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let owned = [
+            (SCRATCH, listen.to_vec()),
+            (SCRATCH + 0x40, closed.to_vec()),
+            (SCRATCH + 0x100, b"UNREAD".to_vec()),
+            (optlen, 4u32.to_le_bytes().to_vec()),
+        ];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[8], -ECONNRESET, "reset recv {got:?}");
+        assert_eq!(got[9], -EPIPE, "reset write {got:?}");
+        assert_eq!(got[11], -EINPROGRESS, "nb refuse {got:?}");
+        assert_eq!(
+            got[12], -ECONNREFUSED,
+            "second connect returns SO_ERROR {got:?}"
+        );
+        assert_eq!(got[13], -ECONNABORTED, "third connect {got:?}");
+        assert_eq!(got[15], -ECONNREFUSED, "blocking refuse {got:?}");
+        assert_eq!(got[16], 0, "getsockopt {got:?}");
+        assert_eq!(plat.mem(INIT).peek(opt, 4), 0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn fresh_and_refused_poll_masks() {
+        let arch = Arch::X86_64;
+        let closed = sin([127, 0, 0, 1], 1);
+        let poll_at = SCRATCH + 0x200;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Poll, &[poll_at, 1, 0]),
+            sc(arch, Sysno::Socket, &[2, 1 | 0o4000, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Poll, &[poll_at + 16, 1, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let owned = [(SCRATCH, closed.to_vec())];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        plat.mem(INIT).poke(poll_at, &poll_memory(3, 1 | 4));
+        plat.mem(INIT).poke(poll_at + 16, &poll_memory(4, 1 | 4));
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        assert_eq!(
+            revents_of(&plat.mem(INIT).peek(poll_at, 8)),
+            0x14,
+            "fresh TCP socket"
+        );
+        assert_eq!(
+            revents_of(&plat.mem(INIT).peek(poll_at + 16, 8)),
+            0x1d,
+            "refused non-blocking connect"
+        );
+    }
+
+    #[test]
+    fn msg_peek_dontwait_and_shut_rd() {
+        let arch = Arch::X86_64;
+        let listen = sin([127, 0, 0, 1], 19003);
+        let buf = SCRATCH + 0x300;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 1]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Accept, &[3, 0, 0]),
+            sc(arch, Sysno::Sendto, &[4, SCRATCH + 0x100, 2, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, buf, 8, 2, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, buf + 8, 8, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, buf, 8, 0x40, 0, 0]),
+            sc(arch, Sysno::Shutdown, &[5, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, buf, 8, 0, 0, 0]),
+            // UDP SHUT_WR honours MSG_NOSIGNAL (no signal, still EPIPE).
+            sc(arch, Sysno::Socket, &[2, 2, 0]),
+            sc(arch, Sysno::Shutdown, &[6, 1]),
+            sc(arch, Sysno::Sendto, &[6, buf, 1, 0x4000, SCRATCH, 16]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let owned = [
+            (SCRATCH, listen.to_vec()),
+            (SCRATCH + 0x100, b"ab".to_vec()),
+        ];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[7], 2, "peek {got:?}");
+        assert_eq!(plat.mem(INIT).peek(buf, 2), b"ab");
+        assert_eq!(got[8], 2, "recv after peek {got:?}");
+        assert_eq!(plat.mem(INIT).peek(buf + 8, 2), b"ab");
+        assert_eq!(got[9], -EAGAIN, "dontwait {got:?}");
+        assert_eq!(got[11], 0, "shut_rd {got:?}");
+        assert_eq!(got[14], -EPIPE, "udp shut_wr {got:?}");
+    }
+
+    #[test]
+    fn bind_wildcard_conflicts_with_a_specific_address() {
+        let arch = Arch::X86_64;
+        let wild = sin([0, 0, 0, 0], 19010);
+        let spec = sin([127, 0, 0, 1], 19010);
+        let spec2 = sin([127, 0, 0, 1], 19011);
+        let wild2 = sin([0, 0, 0, 0], 19011);
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[4, SCRATCH + 0x20, 16]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[5, SCRATCH + 0x40, 16]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[6, SCRATCH + 0x60, 16]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let owned = [
+            (SCRATCH, wild.to_vec()),
+            (SCRATCH + 0x20, spec.to_vec()),
+            (SCRATCH + 0x40, spec2.to_vec()),
+            (SCRATCH + 0x60, wild2.to_vec()),
+        ];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[1], 0, "wildcard bind {got:?}");
+        assert_eq!(got[3], -EADDRINUSE, "specific after wildcard {got:?}");
+        assert_eq!(got[5], 0, "specific bind {got:?}");
+        assert_eq!(got[7], -EADDRINUSE, "wildcard after specific {got:?}");
+    }
+
+    #[test]
+    fn host_peer_close_half_close_and_failed_connect() {
+        let arch = Arch::X86_64;
+        // Break writes: EPIPE, and MSG_NOSIGNAL so the process continues.
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        host.splice_break_writes = true;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Sendto, &[3, SCRATCH + 0x40, 1, 0x4000, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps.clone()]);
+        let mut kernel = Kernel::new(host).with_trace();
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x200]);
+        let ip = kernel.issue_fake_ip().unwrap();
+        plat.mem(INIT).poke(SCRATCH, &sin(ip, 443));
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        assert_eq!(returns(&plat, INIT)[2], -EPIPE, "host write failure");
+
+        // Peer half-close: recv is EOF, a later write still works.
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        host.splice_peer_fin = true;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x80, 4, 0, 0, 0]),
+            sc(arch, Sysno::Sendto, &[3, SCRATCH + 0x40, 2, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x200]);
+        let ip = kernel.issue_fake_ip().unwrap();
+        plat.mem(INIT).poke(SCRATCH, &sin(ip, 443));
+        plat.mem(INIT).poke(SCRATCH + 0x40, b"ok");
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[2], 0, "host FIN is EOF {got:?}");
+        assert_eq!(got[3], 2, "write after host FIN {got:?}");
+
+        // The connect itself fails.
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        host.splice_fail_connect = true;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Socket, &[2, 1 | 0o4000, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Poll, &[SCRATCH + 0x100, 1, 0]),
+            sc(
+                arch,
+                Sysno::Getsockopt,
+                &[4, 1, 4, SCRATCH + 0x120, SCRATCH + 0x130],
+            ),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x200]);
+        let ip = kernel.issue_fake_ip().unwrap();
+        plat.mem(INIT).poke(SCRATCH, &sin(ip, 443));
+        plat.mem(INIT).poke(SCRATCH + 0x100, &poll_memory(4, 4));
+        plat.mem(INIT).poke(SCRATCH + 0x130, &4u32.to_le_bytes());
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[1], -ECONNREFUSED, "blocking failed splice {got:?}");
+        assert_eq!(got[3], -EINPROGRESS, "nonblock failed splice {got:?}");
+        assert_eq!(got[4], 1, "poll {got:?}");
+        assert_eq!(revents_of(&plat.mem(INIT).peek(SCRATCH + 0x100, 8)) & 4, 4);
+        assert_eq!(
+            i32::from_le_bytes(plat.mem(INIT).peek(SCRATCH + 0x120, 4).try_into().unwrap()),
+            ECONNREFUSED as i32
+        );
+    }
+
+    #[test]
+    fn nonblocking_splice_connect_then_pollout_and_so_error() {
+        let arch = Arch::X86_64;
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1 | 0o4000, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Poll, &[SCRATCH + 0x100, 1, 0]),
+            sc(
+                arch,
+                Sysno::Getsockopt,
+                &[3, 1, 4, SCRATCH + 0x120, SCRATCH + 0x130],
+            ),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x200]);
+        let ip = kernel.issue_fake_ip().unwrap();
+        plat.mem(INIT).poke(SCRATCH, &sin(ip, 443));
+        plat.mem(INIT).poke(SCRATCH + 0x100, &poll_memory(3, 4));
+        plat.mem(INIT).poke(SCRATCH + 0x130, &4u32.to_le_bytes());
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[1], -EINPROGRESS, "{got:?}");
+        assert_eq!(got[2], 1, "{got:?}");
+        assert_ne!(revents_of(&plat.mem(INIT).peek(SCRATCH + 0x100, 8)) & 4, 0);
+        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x120, 4), 0u32.to_le_bytes());
     }
 
     fn action(handler: u64, flags: u64, restorer: u64) -> Vec<u8> {

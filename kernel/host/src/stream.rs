@@ -15,6 +15,10 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
+
+/// A connect that the guest abandons must not block its helper thread forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use hellovm_core::host::{HostStreamId, OutboundFlow, StreamStatus};
 use hellovm_core::platform::Waker;
@@ -34,7 +38,11 @@ struct Inner {
     inbound: VecDeque<u8>,
     outbound: VecDeque<u8>,
     shut_wr: bool,
-    closed: bool,
+    /// Guest closed the socket. The writer drains `outbound`, then half-closes.
+    closing: bool,
+    /// Give up without delivering queued bytes (connect abandoned before it
+    /// finished, or an explicit abort).
+    abort: bool,
     read_eof: bool,
     broken: bool,
     connect_error: Option<io::ErrorKind>,
@@ -95,7 +103,8 @@ impl SpliceTable {
                 inbound: VecDeque::new(),
                 outbound: VecDeque::new(),
                 shut_wr: false,
-                closed: false,
+                closing: false,
+                abort: false,
                 read_eof: false,
                 broken: false,
                 connect_error: None,
@@ -147,7 +156,13 @@ impl SpliceTable {
         let shared = self.shared(id)?;
         let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.inbound.is_empty() {
-            return if inner.read_eof {
+            // A reset is `ECONNRESET`. A bare FIN is EOF.
+            return if inner.broken {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "splice peer reset",
+                ))
+            } else if inner.read_eof {
                 Ok(0)
             } else {
                 Err(io::ErrorKind::WouldBlock.into())
@@ -201,16 +216,18 @@ impl SpliceTable {
         let Some(shared) = self.streams.remove(&id.0) else {
             return;
         };
-        let control = {
+        {
             let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.closed = true;
-            inner.broken = true;
-            inner.control.take()
-        };
-        shared.cv.notify_all();
-        if let Some(control) = control {
-            let _ = control.shutdown(Shutdown::Both);
+            // Graceful: the writer flushes bytes the guest already queued,
+            // then half-closes. Do not discard the queue or `shutdown(Both)`.
+            inner.closing = true;
+            inner.shut_wr = true;
+            if !matches!(inner.phase, Phase::Up) {
+                // Still connecting. The helper must not block past the timeout.
+                inner.abort = true;
+            }
         }
+        shared.cv.notify_all();
     }
 }
 
@@ -234,7 +251,7 @@ impl SpliceTable {
 }
 
 fn drive(addr: SocketAddr, shared: Arc<Shared>) {
-    let stream = match TcpStream::connect(addr) {
+    let stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(stream) => stream,
         Err(err) => {
             {
@@ -263,7 +280,9 @@ fn drive(addr: SocketAddr, shared: Arc<Shared>) {
     };
     {
         let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.closed {
+        if inner.abort || inner.closing {
+            drop(inner);
+            drop(stream);
             return;
         }
         inner.control = Some(stream);
@@ -295,10 +314,10 @@ fn read_loop(mut sock: TcpStream, shared: Arc<Shared>) {
     loop {
         {
             let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            while inner.inbound.len() >= CAP && !inner.closed {
+            while inner.inbound.len() >= CAP && !inner.closing && !inner.abort {
                 inner = shared.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
             }
-            if inner.closed {
+            if inner.abort || inner.closing {
                 return;
             }
         }
@@ -333,13 +352,13 @@ fn write_loop(mut sock: TcpStream, shared: Arc<Shared>) {
     loop {
         let chunk = {
             let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            while inner.outbound.is_empty() && !inner.shut_wr && !inner.closed {
+            while inner.outbound.is_empty() && !inner.shut_wr && !inner.closing && !inner.abort {
                 inner = shared.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
             }
-            if inner.closed {
+            if inner.abort {
                 return;
             }
-            if inner.outbound.is_empty() && inner.shut_wr {
+            if inner.outbound.is_empty() && (inner.shut_wr || inner.closing) {
                 drop(inner);
                 let _ = sock.shutdown(Shutdown::Write);
                 return;

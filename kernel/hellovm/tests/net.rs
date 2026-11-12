@@ -285,45 +285,91 @@ print(conn.recv(16).decode())
     );
 }
 
-/// Distro `busybox-static` is linked with glibc's `getaddrinfo`. `nc` to a
-/// numeric address with nothing listening returns at once (`ECONNREFUSED`),
-/// which is enough to show the name was parsed and the connect was attempted.
+/// `echo hi | nc -w2 127.0.0.1 5000` against `nc -l -p 5000`. The listener
+/// must observe the peer close (`POLLIN|POLLRDHUP`) or this hangs. Retries
+/// cover the listener not being in `accept` yet; `timeout` bounds a regression.
 #[test]
-fn busybox_nc_resolves_a_numeric_address() {
+fn busybox_nc_transfers_bytes_over_loopback() {
     let Some(busybox) = common::require_busybox("net busybox") else {
         return;
     };
     let image = TempDir::new("net-busybox");
     image.install(&busybox, "bin/busybox");
-    for applet in ["sh", "nc", "echo", "cat"] {
+    for applet in ["sh", "nc", "echo", "cat", "timeout"] {
         image.symlink("busybox", &format!("bin/{applet}"));
     }
-    image.write("etc/resolv.conf", b"nameserver 192.0.2.1\n");
-    // No listener on port 1, so connect is ECONNREFUSED immediately. That
-    // still forces glibc `getaddrinfo` on the numeric address (busybox-static
-    // is linked with it) and must not hang. A background `nc -l` races the
-    // client and can leave `wait` blocked, so the transfer itself is covered
-    // by the netcheck and CPython tests.
-    let script = "nc -w 1 127.0.0.1 1; echo status:$?";
-    let out = run_guest(image.path(), &["/bin/sh", "-c", script], None, false);
-    assert_eq!(
-        out.status,
-        ExitStatus::Exited(0),
-        "stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
-    assert!(
-        out.stdout.contains("status:"),
-        "stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
-    let lower = out.stderr.to_ascii_lowercase();
-    assert!(
-        !lower.contains("bad address") && !lower.contains("unknown host"),
-        "getaddrinfo failed:\nstdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
+    let script = r#"
+timeout 3 nc -l -p 5000 > /got &
+i=0
+while [ "$i" -lt 50 ]; do
+  echo hi | nc -w 2 127.0.0.1 5000 && break
+  i=$((i + 1))
+done
+wait
+cat /got
+"#;
+    for n in 0..10 {
+        let out = run_guest(image.path(), &["/bin/sh", "-c", script], None, false);
+        assert_eq!(
+            out.status,
+            ExitStatus::Exited(0),
+            "loop {n} stdout:\n{}\nstderr:\n{}",
+            out.stdout,
+            out.stderr
+        );
+        assert!(
+            out.stdout.contains("hi"),
+            "loop {n} stdout:\n{}\nstderr:\n{}",
+            out.stdout,
+            out.stderr
+        );
+    }
+}
+
+fn read_until_eof(listener: TcpListener) -> thread::JoinHandle<usize> {
+    thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept splice");
+        let mut buf = [0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            // Slow enough that the guest fills the splice buffer before close.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(err) => panic!("splice read: {err}"),
+            }
+        }
+        total
+    })
+}
+
+#[test]
+fn splice_close_and_exit_deliver_every_queued_byte() {
+    if !require_guest(guest::NETCHECK, "netcheck") {
+        return;
+    }
+    let image = image();
+    for (mode, port) in [("bulk", 9u16), ("bulk-exit", 9u16)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = read_until_eof(listener);
+        let out = run_guest(
+            image.path(),
+            &[guest::NETCHECK, mode],
+            Some(SocketAddr::from(([127, 0, 0, 1], addr.port()))),
+            true,
+        );
+        assert_eq!(
+            out.status,
+            ExitStatus::Exited(0),
+            "{mode} stdout:\n{}\nstderr:\n{}",
+            out.stdout,
+            out.stderr
+        );
+        assert!(out.stdout.contains("bulk-sent"), "{mode}: {}", out.stdout);
+        let got = reader.join().expect("reader");
+        assert_eq!(got, 200_000, "{mode} delivered {got}, port {port}");
+        let _ = port;
+    }
 }

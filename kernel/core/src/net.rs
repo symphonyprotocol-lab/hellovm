@@ -28,10 +28,11 @@
 //! the next in-kernel `connect` fail with `ECONNREFUSED`.
 //!
 //! Half-close: `SHUT_WR` delivers EOF to the peer's reads; the caller can
-//! still receive. A later write fails with `EPIPE` (and `SIGPIPE`, unless
-//! `MSG_NOSIGNAL`) only once the peer has **closed** the socket, or the
-//! host stream reports the peer gone — not merely because the peer
-//! half-closed. That is what lets a server still reply after it has read
+//! still receive, and a bare FIN does **not** cause `EPIPE`. After a clean
+//! full close, the first write is accepted and the next one fails with
+//! `EPIPE` (and `SIGPIPE`, unless `MSG_NOSIGNAL`). A reset (the peer closed
+//! with unread data, or the host stream fails a write) fails the write
+//! immediately. That is what lets a server still reply after it has read
 //! the client's FIN.
 
 use std::collections::{BTreeSet, VecDeque};
@@ -132,10 +133,19 @@ pub(crate) struct Socket {
     pub dns_in: Vec<u8>,
     pub shut_rd: bool,
     pub shut_wr: bool,
-    /// Peer half-closed its write side. Reads return 0 after `rx` drains.
+    /// Peer half-closed its write side (or fully closed). Reads return the
+    /// bytes already queued, then 0.
     pub peer_fin: bool,
-    /// Peer closed the socket. Writes fail with `EPIPE`.
+    /// Peer reset the connection (it closed with unread data, or the host
+    /// stream failed). `recv` returns `ECONNRESET` once `rx` is empty.
+    /// Writes fail with `EPIPE`.
     pub peer_reset: bool,
+    /// The one write Linux accepts after a clean peer close has been done.
+    /// The next write is `EPIPE`.
+    pub post_fin_write: bool,
+    /// A non-blocking connect already failed. A later `connect` returns the
+    /// pending `SO_ERROR` once, then `ECONNABORTED`.
+    pub connect_failed: bool,
     pub so_error: i64,
     pub reuseaddr: bool,
     pub keepalive: bool,
@@ -168,6 +178,8 @@ impl Socket {
             shut_wr: false,
             peer_fin: false,
             peer_reset: false,
+            post_fin_write: false,
+            connect_failed: false,
             so_error: 0,
             reuseaddr: false,
             keepalive: false,
@@ -393,6 +405,24 @@ impl Net {
         self.held.contains(&(ip, port, proto_key(proto)))
     }
 
+    /// `bind` conflicts with the same address and with the other of
+    /// `0.0.0.0:port` and a specific address on that port. Linux returns
+    /// `EADDRINUSE` for both orders when `SO_REUSEADDR` is off; this stack
+    /// does that even if the option was set.
+    pub(crate) fn bind_conflicts(&self, ip: u32, port: u16, proto: Proto) -> bool {
+        let key = proto_key(proto);
+        if self.held.contains(&(ip, port, key)) {
+            return true;
+        }
+        if ip == 0 {
+            self.held
+                .iter()
+                .any(|&(other, oport, oproto)| oport == port && oproto == key && other != 0)
+        } else {
+            self.held.contains(&(0, port, key))
+        }
+    }
+
     /// Records that a socket now holds `(ip, port, proto)`.
     pub(crate) fn claim_port(&mut self, ip: u32, port: u16, proto: Proto) {
         self.held.insert((ip, port, proto_key(proto)));
@@ -522,12 +552,16 @@ impl Net {
         dropped
             .reset
             .retain(|&peer| self.sockets.slots.get(peer).is_some_and(|s| s.is_some()));
+        // A close with unread received data is a reset. A close that has
+        // read everything is a clean FIN: the survivor stays connected so
+        // `poll` still sees it, the first write is accepted, and the next
+        // write is `EPIPE`.
+        let reset = !sock.rx.is_empty();
         for &peer in &dropped.reset {
             let peer_sock = self.sockets.get_mut(peer);
-            peer_sock.peer_reset = true;
             peer_sock.peer_fin = true;
-            if peer_sock.link() == Some(Link::Socket(id)) {
-                peer_sock.phase = Phase::Open;
+            if reset {
+                peer_sock.peer_reset = true;
             }
         }
         dropped

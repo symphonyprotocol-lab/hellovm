@@ -35,7 +35,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
-     [--splice-to IP:PORT] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+     [--splice-to 127.0.0.1:PORT] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]\n\
+     --splice-to is a dev-only hook (loopback only). It is not --egress.";
 
 /// Exit status when the program was killed by `--timeout`.
 const EXIT_TIMEOUT: u8 = 124;
@@ -79,8 +80,9 @@ struct Options {
     tty: Option<bool>,
     timeout: Option<std::time::Duration>,
     root: PathBuf,
-    /// 002a host hook: splice issued-fake-IP TCP to this address. Not
-    /// `--egress` (that flag arrives with the 002b proxy).
+    /// Dev-only: splice issued-fake-IP TCP to this loopback address.
+    /// Not `--egress` (that flag arrives with the 002b proxy). 002b will
+    /// gate the hook behind `insecure-test-hooks`.
     splice_to: Option<std::net::SocketAddr>,
     env: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
@@ -134,8 +136,10 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 let addr: std::net::SocketAddr = text.parse().map_err(|_| {
                     format!("--splice-to {text}: expected an IPv4 address and port")
                 })?;
-                if !addr.is_ipv4() {
-                    return Err(format!("--splice-to {text}: expected an IPv4 address"));
+                if !addr.ip().is_loopback() {
+                    return Err(format!(
+                        "--splice-to {text}: dev-only hook, and the address must be loopback"
+                    ));
                 }
                 splice_to = Some(addr);
                 continue;

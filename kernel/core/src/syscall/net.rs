@@ -25,9 +25,9 @@ use std::io;
 use super::{Ctx, MAX_IO};
 use crate::abi;
 use crate::errno::{
-    Errno, SysResult, EAFNOSUPPORT, EAGAIN, EALREADY, ECONNREFUSED, EDESTADDRREQ, EFAULT,
-    EINPROGRESS, EINVAL, EISCONN, EMSGSIZE, ENOTCONN, ENOTSOCK, ENXIO, EOPNOTSUPP, EPIPE,
-    EPROTONOSUPPORT,
+    Errno, SysResult, EAFNOSUPPORT, EAGAIN, EALREADY, ECONNABORTED, ECONNREFUSED, ECONNRESET,
+    EDESTADDRREQ, EFAULT, EINPROGRESS, EINVAL, EISCONN, EMSGSIZE, ENOTCONN, ENOTSOCK, ENXIO,
+    EOPNOTSUPP, EPIPE, EPROTONOSUPPORT,
 };
 use crate::fd::{Access, FileObject, OpenFile};
 use crate::host::{Host, OutboundFlow};
@@ -97,6 +97,9 @@ pub(crate) struct SockPoll {
     pub writable: bool,
     pub err: bool,
     pub hup: bool,
+    /// `POLLRDHUP`: the peer shut its write side. Reported only when the
+    /// guest asked for it.
+    pub rdhup: bool,
 }
 
 struct InetAddr {
@@ -182,7 +185,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let proto = self.st.net.get(id).proto;
         let port = if port == 0 {
             self.st.net.alloc_ephemeral(ip, proto)?
-        } else if self.st.net.port_busy(ip, port, proto) {
+        } else if self.st.net.bind_conflicts(ip, port, proto) {
             return Err(Errno(crate::errno::EADDRINUSE));
         } else {
             port
@@ -201,6 +204,20 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let nonblock = self.sock_nonblock(fd);
         if self.st.net.get(id).domain != Domain::Inet {
             return Err(Errno(EAFNOSUPPORT));
+        }
+        // A failed non-blocking connect leaves `SO_ERROR`. The next `connect`
+        // returns that error and clears it; a further one is `ECONNABORTED`.
+        if !self.st.net.get(id).tcp_connected() {
+            let pending = self.st.net.get(id).so_error;
+            if pending != 0 {
+                let sock = self.st.net.get_mut(id);
+                sock.so_error = 0;
+                sock.connect_failed = true;
+                return Err(Errno(pending));
+            }
+            if self.st.net.get(id).connect_failed {
+                return Err(Errno(ECONNABORTED));
+            }
         }
         if matches!(self.st.net.get(id).phase, Phase::Connecting(_)) {
             if self.parked.is_some() {
@@ -304,7 +321,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let connected = sock.tcp_connected()
             || matches!(sock.phase, Phase::Connecting(_))
             || sock.udp_remote.is_some()
-            || sock.domain == Domain::Unix;
+            || sock.domain == Domain::Unix
+            || sock.proto == Proto::Udp;
         if !connected && !sock.listening() {
             return Err(Errno(ENOTCONN));
         }
@@ -592,40 +610,67 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if sock.proto == Proto::Udp {
             return SockPoll {
                 readable: !sock.dgrams.is_empty() || sock.shut_rd || sock.peer_fin,
-                writable: !sock.shut_wr && !sock.peer_reset,
+                writable: !sock.shut_wr,
                 err: sock.so_error != 0 || sock.peer_reset,
-                hup: sock.peer_fin || sock.peer_reset,
+                // `POLLHUP` is a reset, not a bare FIN.
+                hup: sock.peer_reset,
+                rdhup: sock.peer_fin,
             };
         }
         if sock.listening() {
             return SockPoll {
                 readable: !sock.queue.is_empty(),
-                writable: false,
-                err: false,
-                hup: false,
+                ..SockPoll::default()
             };
         }
+        // Non-blocking connect that was refused: Linux reports
+        // `POLLIN|POLLOUT|POLLERR|POLLHUP` (0x1d).
         if sock.so_error != 0 && !sock.tcp_connected() {
             return SockPoll {
-                readable: false,
+                readable: true,
                 writable: true,
                 err: true,
                 hup: true,
+                rdhup: false,
             };
         }
         if matches!(sock.phase, Phase::Connecting(_)) {
             return SockPoll::default();
         }
-        if !sock.tcp_connected() && sock.domain == Domain::Inet {
-            return SockPoll::default();
+        // A fresh TCP socket is `POLLOUT|POLLHUP`. A socket whose peer has
+        // gone stays in `Connected` (see `Net::drop_owner`) so this is not
+        // that case: `peer_fin` stays visible.
+        if !sock.tcp_connected() && sock.domain == Domain::Inet && !sock.peer_fin {
+            return SockPoll {
+                writable: true,
+                hup: true,
+                ..SockPoll::default()
+            };
         }
-        let writable = self.tcp_writable(id);
+        let writable = !sock.shut_wr
+            && match sock.link() {
+                Some(Link::Socket(peer)) if self.st.net.contains(peer) => {
+                    self.st.net.get(peer).rx_space() > 0
+                }
+                Some(Link::Host(stream)) => self
+                    .host
+                    .stream_status(stream)
+                    .map(|status| status.writable && !status.broken)
+                    .unwrap_or(true),
+                // Peer is already gone, or this is DNS: Linux still reports
+                // `POLLOUT` until `SHUT_WR`.
+                _ => true,
+            };
         let sock = self.st.net.get(id);
         SockPoll {
-            readable: !sock.rx.is_empty() || sock.peer_fin || sock.shut_rd,
+            // A drained FIN still reads as EOF, so `POLLIN` stays set.
+            readable: !sock.rx.is_empty() || sock.peer_fin || sock.peer_reset || sock.shut_rd,
             writable,
-            err: sock.so_error != 0,
-            hup: sock.peer_fin || sock.peer_reset,
+            // `POLLERR` for a reset that was not produced by the one write
+            // Linux accepts after a clean close.
+            err: sock.so_error != 0 || (sock.peer_reset && !sock.post_fin_write),
+            hup: sock.peer_reset || (sock.shut_wr && sock.peer_fin),
+            rdhup: sock.peer_fin || sock.peer_reset,
         }
     }
 
@@ -668,7 +713,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         // `EINPROGRESS` and `SO_ERROR` carries it.
         let deferred = nonblock && (err == ECONNREFUSED);
         if deferred {
-            self.st.net.get_mut(id).so_error = err;
+            let sock = self.st.net.get_mut(id);
+            sock.so_error = err;
+            sock.connect_failed = true;
             Err(Errno(EINPROGRESS))
         } else {
             Err(Errno(err))
@@ -775,9 +822,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             }
             Err(err) => {
                 self.host.stream_close(stream);
+                let errno = io_errno(&err);
                 let sock = self.st.net.get_mut(id);
                 sock.phase = Phase::Open;
-                let errno = io_errno(&err);
+                sock.connect_failed = true;
                 if nonblock && self.parked.is_none() {
                     sock.so_error = errno.0;
                     Err(Errno(EINPROGRESS))
@@ -806,6 +854,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 self.host.stream_close(stream);
                 let sock = self.st.net.get_mut(id);
                 sock.phase = Phase::Open;
+                sock.connect_failed = true;
                 sock.so_error = io_errno(&err).0;
             }
         }
@@ -871,7 +920,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return self.send_stream(id, data, nonblock, nosignal);
         }
         if sock.proto == Proto::Udp {
-            return self.send_udp(id, data, dest, nonblock);
+            return self.send_udp(id, data, dest, nonblock, nosignal);
         }
         if dest.is_some() && sock.domain == Domain::Inet && !sock.tcp_connected() {
             return Err(Errno(ENOTCONN));
@@ -886,7 +935,58 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             }
             return Err(Errno(ENOTCONN));
         }
-        self.send_stream(id, data, nonblock, nosignal)
+        // A blocking stream send waits until every byte is queued, as Linux
+        // `send` does. `MSG_DONTWAIT` and `O_NONBLOCK` may return a short count.
+        if nonblock || data.is_empty() {
+            let n = self.send_stream(id, data, nonblock, nosignal)?;
+            if n > 0 {
+                self.arm_reset_after_clean_close(id);
+            }
+            return Ok(n);
+        }
+        let tid = self.tid;
+        let mut done = if self.parked.is_some() {
+            self.st.thread(tid).io_done.min(data.len())
+        } else {
+            0
+        };
+        while done < data.len() {
+            match self.send_stream(id, &data[done..], false, nosignal) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(err) if self.action.is_some() => {
+                    self.st.thread_mut(tid).io_done = done;
+                    return Err(err);
+                }
+                // Some bytes of this call were queued. The error (and
+                // `SIGPIPE`, if it was posted) belongs to the next call.
+                Err(_) if done > 0 => break,
+                Err(err) => {
+                    self.st.thread_mut(tid).io_done = 0;
+                    return Err(err);
+                }
+            }
+        }
+        self.st.thread_mut(tid).io_done = 0;
+        if done > 0 {
+            self.arm_reset_after_clean_close(id);
+        }
+        Ok(done)
+    }
+
+    /// After the one write Linux accepts following a clean peer close, the
+    /// next write is `EPIPE` and `poll` reports `POLLHUP`.
+    fn arm_reset_after_clean_close(&mut self, id: SockId) {
+        let sock = self.st.net.get(id);
+        let dead = match sock.link() {
+            Some(Link::Socket(peer)) => !self.st.net.contains(peer),
+            _ => false,
+        };
+        if dead && sock.peer_fin && !sock.peer_reset {
+            let sock = self.st.net.get_mut(id);
+            sock.post_fin_write = true;
+            sock.peer_reset = true;
+        }
     }
 
     fn send_udp(
@@ -895,13 +995,14 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         data: &[u8],
         dest: Option<InetAddr>,
         nonblock: bool,
+        nosignal: bool,
     ) -> SysResult<usize> {
         if data.len() > DGRAM_MAX {
             return Err(Errno(EMSGSIZE));
         }
         let sock = self.st.net.get(id);
         if sock.shut_wr || sock.peer_reset {
-            return self.epipe(false);
+            return self.epipe(nosignal);
         }
         let (ip, port) = if let Some(InetAddr { ip, port }) = dest {
             if sock.udp_remote.is_some() {
@@ -991,7 +1092,17 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
         match sock.link() {
             Some(Link::Socket(peer)) => {
-                if !self.st.net.contains(peer) || self.st.net.get(peer).peer_reset {
+                if !self.st.net.contains(peer) {
+                    let sock = self.st.net.get(id);
+                    // Clean FIN: this write is accepted and discarded. The
+                    // caller marks the socket so the next write is `EPIPE`.
+                    if sock.peer_fin && !sock.peer_reset && !sock.post_fin_write {
+                        return Ok(data.len());
+                    }
+                    self.st.net.get_mut(id).peer_reset = true;
+                    return self.epipe(nosignal);
+                }
+                if self.st.net.get(peer).peer_reset {
                     self.st.net.get_mut(id).peer_reset = true;
                     return self.epipe(nosignal);
                 }
@@ -1094,7 +1205,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Ok((data, None));
         }
         let sock = self.st.net.get(id);
-        if sock.peer_fin || sock.peer_reset {
+        if sock.peer_reset {
+            return Err(Errno(ECONNRESET));
+        }
+        if sock.peer_fin {
             return Ok((Vec::new(), None));
         }
         if !sock.tcp_connected() {
@@ -1133,9 +1247,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                         io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
                     ) =>
                 {
-                    self.st.net.get_mut(id).peer_fin = true;
-                    self.st.net.get_mut(id).peer_reset = true;
-                    return Ok((Vec::new(), None));
+                    let sock = self.st.net.get_mut(id);
+                    sock.peer_fin = true;
+                    sock.peer_reset = true;
+                    return Err(Errno(ECONNRESET));
                 }
                 Err(err) => return Err(io_errno(&err)),
             }
@@ -1153,7 +1268,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Ok((Vec::new(), None));
         }
         if sock.dgrams.is_empty() {
-            if sock.peer_fin || sock.peer_reset {
+            if sock.peer_reset {
+                return Err(Errno(ECONNRESET));
+            }
+            if sock.peer_fin {
                 return Ok((Vec::new(), None));
             }
             return if nonblock || self.timed_out() {
@@ -1200,25 +1318,6 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             Some(Link::Dns) | None => {}
         }
         Ok(())
-    }
-
-    fn tcp_writable(&mut self, id: SockId) -> bool {
-        let sock = self.st.net.get(id);
-        if sock.shut_wr || sock.peer_reset {
-            return false;
-        }
-        match sock.link() {
-            Some(Link::Socket(peer)) => {
-                self.st.net.contains(peer) && self.st.net.get(peer).rx_space() > 0
-            }
-            Some(Link::Host(stream)) => self
-                .host
-                .stream_status(stream)
-                .map(|s| s.writable && !s.broken)
-                .unwrap_or(false),
-            Some(Link::Dns) => self.st.net.get(id).dns_in.len() < 16 * 1024,
-            None => false,
-        }
     }
 
     fn epipe(&mut self, nosignal: bool) -> SysResult<usize> {

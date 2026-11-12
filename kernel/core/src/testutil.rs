@@ -457,6 +457,10 @@ pub struct MockHost {
     pub splice_echo: bool,
     /// The peer is already gone: writes fail with `BrokenPipe`.
     pub splice_break_writes: bool,
+    /// The connect itself fails.
+    pub splice_fail_connect: bool,
+    /// The peer half-closes (FIN) as soon as the stream is up. Writes still work.
+    pub splice_peer_fin: bool,
     streams: Vec<MockStream>,
 }
 
@@ -603,9 +607,9 @@ impl Host for MockHost {
             inbound: VecDeque::new(),
             outbound: VecDeque::new(),
             shut_wr: false,
-            read_eof: false,
+            read_eof: self.splice_peer_fin,
             broken: self.splice_break_writes,
-            failed: false,
+            failed: self.splice_fail_connect,
         });
         Ok(HostStreamId(id))
     }
@@ -637,7 +641,12 @@ impl Host for MockHost {
     fn stream_read(&mut self, id: HostStreamId, buf: &mut [u8]) -> io::Result<usize> {
         let stream = self.mock_stream_mut(id)?;
         if stream.inbound.is_empty() {
-            return if stream.read_eof {
+            return if stream.broken {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "mock peer reset",
+                ))
+            } else if stream.read_eof {
                 Ok(0)
             } else {
                 Err(io::ErrorKind::WouldBlock.into())

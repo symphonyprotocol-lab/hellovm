@@ -60,6 +60,8 @@ const POLLHUP: u16 = 0x10;
 const POLLNVAL: u16 = 0x20;
 const POLLRDNORM: u16 = 0x40;
 const POLLWRNORM: u16 = 0x100;
+/// Peer shut down the write half. Returned only if the guest asked for it.
+const POLLRDHUP: u16 = 0x2000;
 
 const UTIME_NOW: i64 = (1 << 30) - 1;
 const UTIME_OMIT: i64 = (1 << 30) - 2;
@@ -1156,6 +1158,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                     | (if ev.writable { any_out } else { 0 })
                     | (if ev.err { POLLERR } else { 0 })
                     | (if ev.hup { POLLHUP } else { 0 })
+                    | (if ev.rdhup { POLLRDHUP } else { 0 })
             }
         }
     }
