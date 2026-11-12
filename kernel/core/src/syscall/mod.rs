@@ -24,6 +24,7 @@ mod tty;
 use std::time::Duration;
 
 pub(crate) use proc::{load_program, reap};
+pub(crate) use tty::{pull_terminal_input, set_window_size};
 
 use crate::arch::{Arch, Sysno};
 use crate::errno::{Errno, SysResult, EFAULT, ENAMETOOLONG, ENOSYS};

@@ -111,6 +111,11 @@ pub enum Device {
     Fd(u32),
     /// An image entry that is neither file, directory nor symlink.
     Unusable,
+    /// `/dev/tty` and `/dev/console`: the sandbox terminal, if the console
+    /// is one.
+    Tty {
+        console: bool,
+    },
 }
 
 impl Device {
@@ -122,6 +127,8 @@ impl Device {
             Device::Full => (1, 7),
             Device::Random => (1, 8),
             Device::Urandom => (1, 9),
+            Device::Tty { console: false } => (5, 0),
+            Device::Tty { console: true } => (5, 1),
             Device::Fd(_) | Device::Unusable => (0, 0),
         };
         makedev(major, minor)
@@ -298,7 +305,9 @@ impl Vfs {
             root_stat.map_or(2, |s| s.nlink.clamp(2, u32::MAX as u64) as u32);
 
         let dev = vfs.ensure_dir(host, root, b"dev", 0o755, now);
-        let devices: [(&[u8], Device, u32); 8] = [
+        let devices: [(&[u8], Device, u32); 10] = [
+            (b"tty", Device::Tty { console: false }, 0o666),
+            (b"console", Device::Tty { console: true }, 0o600),
             (b"null", Device::Null, 0o666),
             (b"zero", Device::Zero, 0o666),
             (b"full", Device::Full, 0o666),

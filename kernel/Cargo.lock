@@ -10,6 +10,7 @@ dependencies = [
  "hellovm-host",
  "hellovm-platform-seccomp",
  "hellovm-test-guest",
+ "libc",
  "log",
 ]
 

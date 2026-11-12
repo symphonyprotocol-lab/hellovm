@@ -211,6 +211,17 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     fn stat_of(&mut self, target: Target) -> Stat {
         match target {
             Target::Node(ino) => self.vfs.stat(ino),
+            Target::Object(FileObject::Tty, _) => {
+                // The terminal is /dev/console (ttyname compares the two).
+                let root = self.vfs.root();
+                match self.vfs.resolve(self.host, root, b"/dev/console", true) {
+                    Ok(ino) => self.vfs.stat(ino),
+                    Err(_) => {
+                        let time = self.now();
+                        object_stat(FileObject::Tty, 0, time)
+                    }
+                }
+            }
             Target::Object(object, size) => {
                 let time = self.now();
                 object_stat(object, size, time)
@@ -299,7 +310,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                             .map_err(|e| Errno::from_host(&e))?;
                         len
                     }
-                    Some(Device::Fd(_) | Device::Unusable) => return Err(Errno(ENXIO)),
+                    Some(Device::Fd(_) | Device::Unusable | Device::Tty { .. }) => {
+                        return Err(Errno(ENXIO))
+                    }
                     None => {
                         let pos = offset.unwrap_or(file.offset);
                         let n = self.vfs.read(self.host, ino, pos, &mut buf)?;
@@ -363,7 +376,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             }
             FileObject::Node(ino) => match self.vfs.device(ino) {
                 Some(Device::Full) => Err(Errno(ENOSPC)),
-                Some(Device::Fd(_) | Device::Unusable) => Err(Errno(ENXIO)),
+                Some(Device::Fd(_) | Device::Unusable | Device::Tty { .. }) => Err(Errno(ENXIO)),
                 Some(_) => Ok(data.len()),
                 None => {
                     let append = file.append;
@@ -831,6 +844,16 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                         .map_err(|e| if e == Errno(EBADF) { Errno(ENXIO) } else { e });
                 }
                 Some(Device::Unusable) => return Err(Errno(ENXIO)),
+                Some(Device::Tty { .. }) => {
+                    // The controlling terminal, or the console.
+                    if self.st.console.tty.is_none() {
+                        return Err(Errno(ENXIO));
+                    }
+                    let mut file = OpenFile::new(FileObject::Tty, access);
+                    file.nonblock = flags.nonblock;
+                    file.path = self.absolute_path(start, &path);
+                    return self.install(file, 0, flags.cloexec).map(|fd| fd as u64);
+                }
                 _ => {}
             }
             if flags.trunc && kind == FileType::Regular && access.writable() {

@@ -1,8 +1,8 @@
 //! `hellovm`: runs a Linux program inside the hellovm kernel.
 //!
 //! ```text
-//! hellovm [--trace] [--timeout SECONDS] --root DIR [--env NAME=VALUE]...
-//!         [--] PROGRAM [ARGS...]
+//! hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] --root DIR
+//!         [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
 //!
 //! `DIR` is the sandbox's read-only image: the program sees it as `/`, with
@@ -13,9 +13,17 @@
 //! The program's console output goes to hellovm's own stdout and stderr, its
 //! input comes from hellovm's stdin, and hellovm exits with the program's exit
 //! status (128 + signal number if it was killed; 125 if it could not be
-//! started). `--timeout` kills the program after that many seconds (decimals
-//! allowed) and makes hellovm exit with 124, like `timeout(1)`. `--trace`
-//! prints every syscall the kernel handled to stderr.
+//! started). The program's processes end when it ends. `--timeout` kills
+//! every process of the sandbox after that many seconds (decimals allowed)
+//! and makes hellovm exit with 124, like `timeout(1)`. `--trace` prints
+//! every syscall the kernel handled to stderr.
+//!
+//! When hellovm's stdin and stdout are terminals (or with `--tty`), the
+//! sandbox console is a terminal: fds 0, 1 and 2 are `/dev/console`, with
+//! hellovm's own line discipline, job control and the host terminal's
+//! window size, and the host terminal is put in raw mode while the program
+//! runs (so Ctrl-C reaches the sandbox's foreground job, not hellovm).
+//! `--no-tty` keeps plain streams.
 //! `HELLOVM_LOG` sets the log level (`error`, `warn` (default), `info`,
 //! `debug`, `trace`).
 
@@ -25,8 +33,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] --root DIR \
-     [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
+     --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
 
 /// Exit status when the program was killed by `--timeout`.
 const EXIT_TIMEOUT: u8 = 124;
@@ -65,6 +73,9 @@ fn init_logging() {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct Options {
     trace: bool,
+    /// `Some(true)`: `--tty`; `Some(false)`: `--no-tty`; `None`: decide by
+    /// whether stdin and stdout are terminals.
+    tty: Option<bool>,
     timeout: Option<std::time::Duration>,
     root: PathBuf,
     env: Vec<Vec<u8>>,
@@ -73,6 +84,7 @@ struct Options {
 
 fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut trace = false;
+    let mut tty = None;
     let mut timeout = None;
     let mut root = None;
     let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
@@ -80,6 +92,8 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     while let Some(arg) = args.peek() {
         match arg.to_str() {
             Some("--trace") => trace = true,
+            Some("--tty") => tty = Some(true),
+            Some("--no-tty") => tty = Some(false),
             Some("--root") => {
                 args.next();
                 root = Some(PathBuf::from(
@@ -135,6 +149,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let root = root.ok_or_else(|| format!("--root is required\n{USAGE}"))?;
     Ok(Options {
         trace,
+        tty,
         timeout,
         root,
         env,
@@ -198,7 +213,22 @@ fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
     if options.trace {
         kernel = kernel.with_trace();
     }
+    let terminal = options
+        .tty
+        .unwrap_or_else(|| host_tty::is_terminal(0) && host_tty::is_terminal(1));
+    // Restores the host terminal when dropped.
+    let _raw = if terminal {
+        kernel = kernel.with_console(hellovm_core::ConsoleMode::Terminal);
+        host_tty::RawMode::enter(0)
+    } else {
+        None
+    };
     kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
+    if terminal {
+        if let Some((rows, cols)) = host_tty::window_size(1) {
+            kernel.set_window_size(rows, cols);
+        }
+    }
     // The watchdog thread is detached: it holds no more than the sandbox's
     // pidfds, and killing through it after the sandbox has ended does
     // nothing.
@@ -232,4 +262,61 @@ fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
 #[cfg(not(target_os = "linux"))]
 fn run(_options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
     Err("no platform for this host yet: only Linux (seccomp) is implemented".into())
+}
+
+/// The host terminal hellovm runs in, if any.
+#[cfg(target_os = "linux")]
+mod host_tty {
+    /// Whether `fd` is a terminal.
+    pub fn is_terminal(fd: i32) -> bool {
+        // SAFETY: plain libc call.
+        unsafe { libc::isatty(fd) == 1 }
+    }
+
+    /// The window size of the terminal at `fd`.
+    pub fn window_size(fd: i32) -> Option<(u16, u16)> {
+        // SAFETY: TIOCGWINSZ writes one winsize to the pointer.
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 {
+                Some((ws.ws_row, ws.ws_col))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// The host terminal in raw mode; dropping it restores the settings.
+    pub struct RawMode {
+        fd: i32,
+        saved: libc::termios,
+    }
+
+    impl RawMode {
+        pub fn enter(fd: i32) -> Option<RawMode> {
+            if !is_terminal(fd) {
+                return None;
+            }
+            // SAFETY: tcgetattr/tcsetattr with valid pointers.
+            unsafe {
+                let mut saved: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(fd, &mut saved) != 0 {
+                    return None;
+                }
+                let mut raw = saved;
+                libc::cfmakeraw(&mut raw);
+                if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+                    return None;
+                }
+                Some(RawMode { fd, saved })
+            }
+        }
+    }
+
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            // SAFETY: restoring settings read by tcgetattr.
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+        }
+    }
 }

@@ -235,6 +235,12 @@ impl<H: Host> Kernel<H> {
         self
     }
 
+    /// Sets the terminal's window size (when the console is a terminal);
+    /// its foreground process group gets `SIGWINCH`.
+    pub fn set_window_size(&mut self, rows: u16, cols: u16) {
+        syscall::set_window_size(&mut self.st, rows, cols);
+    }
+
     /// The syscalls handled so far, if tracing is on.
     pub fn trace(&self) -> &[SyscallRecord] {
         self.trace.as_deref().unwrap_or(&[])
@@ -282,9 +288,13 @@ impl<H: Host> Kernel<H> {
             reason: err.reason,
         })?;
         let start = self.host.clock_monotonic();
-        // Each program gets a fresh view of console input.
-        self.st.console = Console::new();
         let pid = self.st.alloc_pid().expect("an empty sandbox has room");
+        // Each program gets a fresh view of console input; a terminal is
+        // controlled by its session.
+        self.st.console = match self.console_mode {
+            ConsoleMode::Streams => Console::new(),
+            ConsoleMode::Terminal => Console::terminal(pid),
+        };
         let mut proc = Process::new(pid, self.cwd, start);
         self.vfs.opened(self.cwd);
         self.install_console(&mut proc);
@@ -402,7 +412,12 @@ impl<H: Host> Kernel<H> {
                 Some(event) => self.handle_event(platform, event)?,
                 // A timeout (handled at the top) or a wake-up: console
                 // input may have arrived.
-                None => self.st.changed = true,
+                None => {
+                    if self.st.console.tty.is_some() {
+                        syscall::pull_terminal_input(&mut self.st, &mut self.host);
+                    }
+                    self.st.changed = true;
+                }
             }
         }
     }
@@ -1388,5 +1403,47 @@ mod tests {
             .collect();
         assert_eq!(names, [0, 1, 2, 3, 4]);
         assert_eq!(r[6], -crate::errno::EACCES);
+    }
+
+    #[test]
+    fn the_terminal_cooks_input_and_raises_signals() {
+        let arch = Arch::Aarch64;
+        let buf = SCRATCH + 0x100;
+        let mut noflsh = crate::tty::Termios::default();
+        noflsh.lflag |= crate::tty::NOFLSH;
+        let traps = vec![
+            sc(arch, Sysno::Ioctl, &[0, 0x5401, buf]), // TCGETS: a terminal
+            sc(arch, Sysno::Ioctl, &[0, 0x5402, buf + 0x200]), // TCSETS
+            sc(arch, Sysno::Ioctl, &[1, 0x540f, buf + 0x40]), // TIOCGPGRP
+            // Gets the line; the ^C after it raises SIGINT for the
+            // foreground group, which ends this process before the read
+            // returns.
+            sc(arch, Sysno::Read, &[0, buf + 0x80, 100]),
+        ];
+        let host = host_with_prog(arch);
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host)
+            .with_trace()
+            .with_console(ConsoleMode::Terminal);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x1000]);
+        plat.mem(INIT).poke(buf + 0x200, &noflsh.encode());
+        kernel.host_mut().stdin.extend(b"hi\r\x03");
+        kernel.host_mut().stdin_open = true;
+        assert_eq!(
+            kernel.run(&mut plat).unwrap(),
+            ExitStatus::Signaled(crate::signal::SIGINT)
+        );
+        assert_eq!(returns(&plat, INIT), vec![0, 0, 0]);
+        let mem = plat.mem(INIT);
+        assert_eq!(mem.peek(buf, 36), crate::tty::Termios::default().encode());
+        assert_eq!(mem.peek(buf + 0x40, 4), 1u32.to_le_bytes());
+        assert_eq!(mem.peek(buf + 0x80, 3), b"hi\n");
+        let last = kernel.trace().last().unwrap();
+        assert_eq!(last.outcome, Outcome::Returned(3));
+        // The echo: the line (CR echoed as CR NL) and ^C.
+        assert_eq!(kernel.host().stdout, b"hi\r\n^C");
     }
 }
