@@ -1,4 +1,4 @@
-//! The cansol kernel core.
+//! The hellovm kernel core.
 //!
 //! This crate implements Linux syscall semantics for a sandboxed program. It
 //! is deliberately independent of the machine it runs on: everything it needs

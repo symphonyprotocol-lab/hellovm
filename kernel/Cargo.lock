@@ -3,42 +3,42 @@
 version = 4
 
 [[package]]
-name = "cansol"
+name = "hellovm"
 version = "0.0.1"
 dependencies = [
- "cansol-core",
- "cansol-host",
- "cansol-platform-seccomp",
- "cansol-test-guest",
+ "hellovm-core",
+ "hellovm-host",
+ "hellovm-platform-seccomp",
+ "hellovm-test-guest",
  "log",
 ]
 
 [[package]]
-name = "cansol-core"
+name = "hellovm-core"
 version = "0.0.1"
 dependencies = [
  "log",
 ]
 
 [[package]]
-name = "cansol-host"
+name = "hellovm-host"
 version = "0.0.1"
 dependencies = [
- "cansol-core",
+ "hellovm-core",
  "libc",
 ]
 
 [[package]]
-name = "cansol-platform-seccomp"
+name = "hellovm-platform-seccomp"
 version = "0.0.1"
 dependencies = [
- "cansol-core",
+ "hellovm-core",
  "libc",
  "log",
 ]
 
 [[package]]
-name = "cansol-test-guest"
+name = "hellovm-test-guest"
 version = "0.0.1"
 
 [[package]]

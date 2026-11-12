@@ -8,9 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use cansol_core::{ExitStatus, Kernel, KernelError};
-use cansol_host::{CaptureHost, ImageDir};
-use cansol_platform_seccomp::SeccompApp;
+use hellovm_core::{ExitStatus, Kernel, KernelError};
+use hellovm_host::{CaptureHost, ImageDir};
+use hellovm_platform_seccomp::SeccompApp;
 
 /// A directory under the system temp dir, removed on drop.
 pub struct TempDir(pub PathBuf);
@@ -20,7 +20,7 @@ impl TempDir {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("cansol-test-{tag}-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("hellovm-test-{tag}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         TempDir(dir)

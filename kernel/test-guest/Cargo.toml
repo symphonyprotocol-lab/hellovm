@@ -1,6 +1,6 @@
 [package]
-name = "cansol-test-guest"
-description = "Tiny libc-free Linux programs used to test the cansol kernel"
+name = "hellovm-test-guest"
+description = "Tiny libc-free Linux programs used to test the hellovm kernel"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true

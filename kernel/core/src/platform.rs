@@ -9,7 +9,7 @@
 //! map of memory areas, picks addresses and loads ELF images. A platform only
 //! carries out the resulting page-level operations ([`AddressSpace`]) and
 //! copies bytes in and out ([`AppMemory`]). This is the same split whether
-//! the host kernel manages the page tables (seccomp) or cansol does (KVM,
+//! the host kernel manages the page tables (seccomp) or hellovm does (KVM,
 //! Hypervisor.framework).
 //!
 //! The interface models one app thread; threads come with milestone U2.

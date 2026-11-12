@@ -1,7 +1,7 @@
-//! `cansol`: runs a Linux program inside the cansol kernel.
+//! `hellovm`: runs a Linux program inside the hellovm kernel.
 //!
 //! ```text
-//! cansol [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
+//! hellovm [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
 //!
 //! `DIR` is the sandbox's read-only image: the program sees it as `/`, with
@@ -9,11 +9,11 @@
 //! is a path inside the sandbox, e.g. `/bin/busybox`. The environment is
 //! `PATH` and `HOME` plus every `--env`.
 //!
-//! The program's console output goes to cansol's own stdout and stderr, its
-//! input comes from cansol's stdin, and cansol exits with the program's exit
+//! The program's console output goes to hellovm's own stdout and stderr, its
+//! input comes from hellovm's stdin, and hellovm exits with the program's exit
 //! status (128 + signal number if it was killed; 125 if it could not be
 //! started). `--trace` prints every syscall the kernel handled to stderr.
-//! `CANSOL_LOG` sets the log level (`error`, `warn` (default), `info`,
+//! `HELLOVM_LOG` sets the log level (`error`, `warn` (default), `info`,
 //! `debug`, `trace`).
 
 use std::ffi::OsString;
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str =
-    "usage: cansol [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+    "usage: hellovm [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
 
 const DEFAULT_ENV: [&str; 2] = [
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -40,7 +40,7 @@ impl log::Log for StderrLogger {
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
             let level = record.level().as_str().to_lowercase();
-            let _ = writeln!(std::io::stderr(), "cansol: {level}: {}", record.args());
+            let _ = writeln!(std::io::stderr(), "hellovm: {level}: {}", record.args());
         }
     }
 
@@ -48,7 +48,7 @@ impl log::Log for StderrLogger {
 }
 
 fn init_logging() {
-    let level = std::env::var("CANSOL_LOG")
+    let level = std::env::var("HELLOVM_LOG")
         .ok()
         .and_then(|level| level.parse().ok())
         .unwrap_or(log::LevelFilter::Warn);
@@ -127,23 +127,23 @@ fn main() -> ExitCode {
         }
     };
     match run(&options) {
-        Ok(cansol_core::ExitStatus::Exited(code)) => ExitCode::from(code as u8),
-        Ok(cansol_core::ExitStatus::Signaled(signal)) => {
-            eprintln!("cansol: program killed by signal {signal}");
+        Ok(hellovm_core::ExitStatus::Exited(code)) => ExitCode::from(code as u8),
+        Ok(hellovm_core::ExitStatus::Signaled(signal)) => {
+            eprintln!("hellovm: program killed by signal {signal}");
             ExitCode::from((128 + signal).min(255) as u8)
         }
         Err(err) => {
-            eprintln!("cansol: {err}");
+            eprintln!("hellovm: {err}");
             ExitCode::from(125)
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn run(options: &Options) -> Result<cansol_core::ExitStatus, Box<dyn std::error::Error>> {
-    use cansol_core::Kernel;
-    use cansol_host::{ImageDir, StdioHost};
-    use cansol_platform_seccomp::SeccompApp;
+fn run(options: &Options) -> Result<hellovm_core::ExitStatus, Box<dyn std::error::Error>> {
+    use hellovm_core::Kernel;
+    use hellovm_host::{ImageDir, StdioHost};
+    use hellovm_platform_seccomp::SeccompApp;
 
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
@@ -155,12 +155,12 @@ fn run(options: &Options) -> Result<cansol_core::ExitStatus, Box<dyn std::error:
     kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
     let status = kernel.run(&mut app);
     for record in kernel.trace() {
-        eprintln!("cansol: trace: {record}");
+        eprintln!("hellovm: trace: {record}");
     }
     Ok(status?)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(_options: &Options) -> Result<cansol_core::ExitStatus, Box<dyn std::error::Error>> {
+fn run(_options: &Options) -> Result<hellovm_core::ExitStatus, Box<dyn std::error::Error>> {
     Err("no platform for this host yet: only Linux (seccomp) is implemented".into())
 }

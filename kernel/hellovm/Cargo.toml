@@ -1,18 +1,18 @@
 [package]
-name = "cansol"
-description = "Runs a Linux program inside the cansol kernel"
+name = "hellovm"
+description = "Runs a Linux program inside the hellovm kernel"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
 [dependencies]
-cansol-core.workspace = true
-cansol-host.workspace = true
+hellovm-core.workspace = true
+hellovm-host.workspace = true
 log.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cansol-platform-seccomp.workspace = true
+hellovm-platform-seccomp.workspace = true
 
 [dev-dependencies]
-cansol-test-guest.workspace = true
+hellovm-test-guest.workspace = true

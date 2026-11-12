@@ -377,10 +377,10 @@ mod tests {
 
     #[test]
     fn misc_layouts() {
-        let u = encode_utsname(["Linux", "cansol", "6.1.0", "#1", "aarch64", "(none)"]);
+        let u = encode_utsname(["Linux", "hellovm", "6.1.0", "#1", "aarch64", "(none)"]);
         assert_eq!(u.len(), 390);
-        assert_eq!(&u[65..71], b"cansol");
-        assert_eq!(u[71], 0);
+        assert_eq!(&u[65..72], b"hellovm");
+        assert_eq!(u[72], 0);
         let s = encode_statfs(0x794c_7630, 4096, 100, 50, 10, 5);
         assert_eq!(s.len(), 120);
         assert_eq!(u64_at(&s, 0), 0x794c_7630);

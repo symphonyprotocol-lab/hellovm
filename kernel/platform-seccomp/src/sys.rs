@@ -4,7 +4,7 @@
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
 
-use cansol_core::Arch;
+use hellovm_core::Arch;
 
 pub const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
 

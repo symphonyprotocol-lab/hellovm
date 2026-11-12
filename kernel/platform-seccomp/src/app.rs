@@ -4,11 +4,11 @@ use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
 
-use cansol_core::platform::{
+use hellovm_core::platform::{
     AddressSpace, AddressSpaceInfo, AppMemory, CpuInfo, Fault, GuestAddr, Platform, PlatformError,
     Prot, Resume, SyscallTrap, Trap,
 };
-use cansol_core::{Arch, Sysno};
+use hellovm_core::{Arch, Sysno};
 
 use crate::regs::{Regs, SYSCALL_INSN_LEN};
 use crate::spawn;

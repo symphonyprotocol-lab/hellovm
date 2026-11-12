@@ -1,13 +1,13 @@
 [package]
-name = "cansol-platform-seccomp"
-description = "cansol platform layer for Linux hosts, based on seccomp"
+name = "hellovm-platform-seccomp"
+description = "hellovm platform layer for Linux hosts, based on seccomp"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
 [dependencies]
-cansol-core.workspace = true
+hellovm-core.workspace = true
 log.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

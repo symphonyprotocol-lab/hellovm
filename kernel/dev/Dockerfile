@@ -1,4 +1,4 @@
-# Linux build and test environment for the cansol kernel, e.g. on a macOS
+# Linux build and test environment for the hellovm kernel, e.g. on a macOS
 # development machine. See the "Building and testing" section of README.md.
 #
 # busybox-static provides /bin/busybox for the end-to-end tests. The x86_64

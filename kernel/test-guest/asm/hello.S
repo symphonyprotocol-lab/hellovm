@@ -70,7 +70,7 @@ fail:
 #endif
 
         .section .rodata
-out:    .ascii  "Hello from inside the cansol sandbox!\n"
+out:    .ascii  "Hello from inside the hellovm sandbox!\n"
         .set    out_len, . - out
 err:    .ascii  "This line went to stderr.\n"
         .set    err_len, . - err

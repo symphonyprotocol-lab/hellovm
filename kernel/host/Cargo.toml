@@ -1,11 +1,11 @@
 [package]
-name = "cansol-host"
-description = "cansol host interface implementations"
+name = "hellovm-host"
+description = "hellovm host interface implementations"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
 [dependencies]
-cansol-core.workspace = true
+hellovm-core.workspace = true
 libc.workspace = true

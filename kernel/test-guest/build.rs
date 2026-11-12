@@ -3,7 +3,7 @@
 //! system libc).
 //!
 //! They are built for the target architecture with the C compiler driver
-//! (`cc`, or `$CANSOL_GUEST_CC` when cross-compiling). C guests need the
+//! (`cc`, or `$HELLOVM_GUEST_CC` when cross-compiling). C guests need the
 //! target's static libc, so they are only built natively; when
 //! cross-compiling their paths are empty. Only Linux targets build guests;
 //! elsewhere the crate is empty.
@@ -34,15 +34,15 @@ fn build(cc: &str, name: &str, src: &Path, out: &Path, flags: &[&str]) {
 fn main() {
     println!("cargo:rerun-if-changed=asm");
     println!("cargo:rerun-if-changed=c");
-    println!("cargo:rerun-if-env-changed=CANSOL_GUEST_CC");
+    println!("cargo:rerun-if-env-changed=HELLOVM_GUEST_CC");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
     let native = env::var("TARGET") == env::var("HOST");
-    let cc = match env::var("CANSOL_GUEST_CC") {
+    let cc = match env::var("HELLOVM_GUEST_CC") {
         Ok(cc) => cc,
         Err(_) if native => "cc".to_string(),
-        Err(_) => panic!("cross-compiling: set CANSOL_GUEST_CC to a C compiler for the target"),
+        Err(_) => panic!("cross-compiling: set HELLOVM_GUEST_CC to a C compiler for the target"),
     };
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -51,13 +51,13 @@ fn main() {
         let out = out_dir.join(guest);
         build(&cc, guest, &src, &out, &["-nostdlib", "-static", "-no-pie"]);
         println!(
-            "cargo:rustc-env=CANSOL_GUEST_{}={}",
+            "cargo:rustc-env=HELLOVM_GUEST_{}={}",
             guest.to_uppercase(),
             out.display()
         );
     }
     for guest in C_GUESTS {
-        let var = format!("CANSOL_GUEST_{}", guest.to_uppercase());
+        let var = format!("HELLOVM_GUEST_{}", guest.to_uppercase());
         if !native {
             println!("cargo:rustc-env={var}=");
             continue;

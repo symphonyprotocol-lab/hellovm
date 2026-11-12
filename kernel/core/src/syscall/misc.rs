@@ -84,9 +84,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let machine = self.arch.name();
         let uts = abi::encode_utsname([
             "Linux",
-            "cansol",
-            "6.1.0-cansol",
-            "#1 SMP cansol",
+            "hellovm",
+            "6.1.0-hellovm",
+            "#1 SMP hellovm",
             machine,
             "(none)",
         ]);

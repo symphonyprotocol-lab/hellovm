@@ -12,9 +12,9 @@ mod common;
 
 use std::process::Command;
 
-use cansol_core::{ExitStatus, KernelError, Outcome, Sysno};
-use cansol_test_guest as guest;
 use common::{run, try_run, TempDir};
+use hellovm_core::{ExitStatus, KernelError, Outcome, Sysno};
+use hellovm_test_guest as guest;
 
 fn image_with(guest_path: &str, name: &str) -> TempDir {
     let image = TempDir::new(name);
@@ -142,21 +142,21 @@ fn many_apps_in_parallel() {
 #[test]
 fn cli_prints_output_and_propagates_the_exit_code() {
     let image = image_with(guest::HELLO, "hello");
-    let output = Command::new(env!("CARGO_BIN_EXE_cansol"))
+    let output = Command::new(env!("CARGO_BIN_EXE_hellovm"))
         .arg("--trace")
         .arg("--root")
         .arg(image.path())
         .arg("/hello")
         .output()
-        .expect("run cansol");
+        .expect("run hellovm");
 
     assert_eq!(output.status.code(), Some(guest::HELLO_EXIT_CODE));
     assert_eq!(String::from_utf8_lossy(&output.stdout), guest::HELLO_STDOUT);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with(guest::HELLO_STDERR), "{stderr}");
-    assert!(stderr.contains("cansol: trace: write(1, "), "{stderr}");
+    assert!(stderr.contains("hellovm: trace: write(1, "), "{stderr}");
     assert!(
-        stderr.contains("cansol: trace: exit_group(42) = ?"),
+        stderr.contains("hellovm: trace: exit_group(42) = ?"),
         "{stderr}"
     );
 }
@@ -164,12 +164,12 @@ fn cli_prints_output_and_propagates_the_exit_code() {
 #[test]
 fn cli_reports_programs_that_cannot_start() {
     let image = TempDir::new("empty");
-    let output = Command::new(env!("CARGO_BIN_EXE_cansol"))
+    let output = Command::new(env!("CARGO_BIN_EXE_hellovm"))
         .arg("--root")
         .arg(image.path())
         .arg("/bin/missing")
         .output()
-        .expect("run cansol");
+        .expect("run hellovm");
     assert_eq!(output.status.code(), Some(125));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("/bin/missing: no such file"), "{stderr}");

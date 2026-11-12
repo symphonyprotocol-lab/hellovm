@@ -1,6 +1,6 @@
 // A static-PIE glibc program: exercises self-relocation, TLS, brk and mmap
 // (a large malloc), stdio and the auxiliary vector. Keep the output format
-// in sync with the test in cansol/tests/sandbox.rs.
+// in sync with the test in hellovm/tests/sandbox.rs.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,4 +1,4 @@
-//! Implementations of the cansol host interface ([`cansol_core::host::Host`]).
+//! Implementations of the hellovm host interface ([`hellovm_core::host::Host`]).
 //!
 //! Only portable `std` APIs (plus Unix file extensions) are used, so these
 //! work on Linux and macOS hosts alike.
@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cansol_core::host::{ConsoleStream, Host, HostStat, ImagePath};
+use hellovm_core::host::{ConsoleStream, Host, HostStat, ImagePath};
 
 pub use image::ImageDir;
 

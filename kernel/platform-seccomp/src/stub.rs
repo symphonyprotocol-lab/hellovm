@@ -7,7 +7,7 @@
 //! app process execute `mmap`, `munmap` and `mprotect` (see `spawn`). The
 //! stub's own code never runs on its own.
 
-use cansol_core::Arch;
+use hellovm_core::Arch;
 
 use crate::regs::SYSCALL_INSN;
 

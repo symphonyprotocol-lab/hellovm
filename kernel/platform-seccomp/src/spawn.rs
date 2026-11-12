@@ -111,7 +111,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use cansol_core::{Arch, Sysno};
+use hellovm_core::{Arch, Sysno};
 
 use crate::filter;
 use crate::regs::Regs;
@@ -240,10 +240,10 @@ pub fn spawn(arch: Arch) -> io::Result<Spawned> {
         .expect("execveat exists on every architecture");
 
     // Everything C needs is prepared before the fork.
-    let stub_fd: OwnedFd = sys::sealed_memfd(c"cansol-stub", &stub::elf(arch))
+    let stub_fd: OwnedFd = sys::sealed_memfd(c"hellovm-stub", &stub::elf(arch))
         .map_err(|err| context(err, "creating the stub memfd"))?;
     let empty = CString::default();
-    let arg0 = CString::new("cansol-stub").unwrap();
+    let arg0 = CString::new("hellovm-stub").unwrap();
     let argv: [*const libc::c_char; 2] = [arg0.as_ptr(), ptr::null()];
     let envp: [*const libc::c_char; 1] = [ptr::null()];
     let mut filter = filter::trace_all(sys::audit_arch(arch));

@@ -3,7 +3,7 @@
 //! the kernel against a small image directory.
 //!
 //! The busybox binary is copied into each test's image as `/bin/busybox`.
-//! `$CANSOL_BUSYBOX` overrides its host path (default `/bin/busybox`); the
+//! `$HELLOVM_BUSYBOX` overrides its host path (default `/bin/busybox`); the
 //! tests are skipped, loudly, when it does not exist.
 //!
 //! U1 has no `fork`, so each command is one applet. Multi-step scenarios run
@@ -18,13 +18,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use cansol_core::ExitStatus;
 use common::{Sandbox, TempDir};
+use hellovm_core::ExitStatus;
 
 const DATA: &str = "line one\nline two\nline three\n";
 
 fn busybox() -> Option<String> {
-    let path = std::env::var("CANSOL_BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
+    let path = std::env::var("HELLOVM_BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
     if Path::new(&path).exists() {
         Some(path)
     } else {

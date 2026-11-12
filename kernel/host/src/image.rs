@@ -22,7 +22,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use cansol_core::host::{HostFileKind, HostStat, ImagePath};
+use hellovm_core::host::{HostFileKind, HostStat, ImagePath};
 
 /// How many image files are kept open between reads.
 const OPEN_FILES: usize = 16;
@@ -144,7 +144,7 @@ mod tests {
     use super::*;
 
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cansol-image-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hellovm-image-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
