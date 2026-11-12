@@ -15,8 +15,12 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use common::{require_guest, TempDir, Watchdog};
 use hellovm_core::{ExitStatus, Kernel, Sysno};
@@ -392,5 +396,91 @@ fn splice_close_and_exit_deliver_every_queued_byte() {
         let got = reader.join().expect("reader");
         assert_eq!(got, 200_000, "{mode} delivered {got}, port {port}");
         let _ = port;
+    }
+}
+
+fn shrink_rcvbuf(fd: i32) {
+    let n: i32 = 4096;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &n as *const i32 as *const libc::c_void,
+            4,
+        )
+    };
+    assert_eq!(rc, 0, "SO_RCVBUF");
+}
+
+/// One mebibyte into a 4 KiB receive window, read a block at a time.
+/// The tail does not fit in the host socket buffer, so a drain that gives
+/// up on a wall clock drops bytes. `kernel.run` must return while that tail
+/// is still moving.
+fn read_slowly(
+    listener: TcpListener,
+) -> (thread::JoinHandle<usize>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+    let got = Arc::new(AtomicUsize::new(0));
+    let eof = Arc::new(AtomicBool::new(false));
+    let got_c = Arc::clone(&got);
+    let eof_c = Arc::clone(&eof);
+    let handle = thread::spawn(move || {
+        let (sock, _) = listener.accept().expect("accept slow splice");
+        shrink_rcvbuf(sock.as_raw_fd());
+        let mut sock = sock;
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) => {
+                    eof_c.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Ok(n) => {
+                    got_c.fetch_add(n, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(30));
+                }
+                Err(err) => panic!("slow read: {err}"),
+            }
+        }
+        got_c.load(Ordering::SeqCst)
+    });
+    (handle, got, eof)
+}
+
+#[test]
+fn slow_reader_delivers_every_byte_on_close_and_exit() {
+    if !require_guest(guest::NETCHECK, "netcheck") {
+        return;
+    }
+    const BYTES: usize = 1 << 20;
+    let image = image();
+    for mode in ["slowbulk", "slowbulk-exit"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        shrink_rcvbuf(listener.as_raw_fd());
+        let addr = listener.local_addr().unwrap();
+        let (reader, got, eof) = read_slowly(listener);
+        let started = Instant::now();
+        let out = run_guest(
+            image.path(),
+            &[guest::NETCHECK, mode],
+            Some(SocketAddr::from(([127, 0, 0, 1], addr.port()))),
+            true,
+        );
+        let run_took = started.elapsed();
+        let queued = got.load(Ordering::SeqCst);
+        assert!(
+            !eof.load(Ordering::SeqCst),
+            "{mode}: kernel.run waited for the drain ({run_took:?}, delivered {queued})"
+        );
+        assert_eq!(
+            out.status,
+            ExitStatus::Exited(0),
+            "{mode} stdout:\n{}\nstderr:\n{}",
+            out.stdout,
+            out.stderr
+        );
+        assert!(out.stdout.contains("bulk-sent"), "{mode}: {}", out.stdout);
+        let total = reader.join().expect("slow reader");
+        assert_eq!(total, BYTES, "{mode} delivered {total} of {BYTES}");
     }
 }

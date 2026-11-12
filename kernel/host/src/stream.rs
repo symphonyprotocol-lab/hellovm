@@ -23,9 +23,13 @@ use std::time::{Duration, Instant};
 /// 002b can revisit the limit.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a close may spend pushing bytes the guest already queued.
-/// After this, the helper threads exit even if the peer never reads.
-const DRAIN_LIMIT: Duration = Duration::from_millis(250);
+/// Bounds one `write` so the loop can notice close, progress, and errors.
+/// It is not a deadline for the drain.
+const WRITE_POLL: Duration = Duration::from_millis(250);
+
+/// After close, give up only when the peer accepts nothing for this long.
+/// A slow reader that keeps taking bytes resets the timer.
+const NO_PROGRESS: Duration = Duration::from_secs(45);
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -386,18 +390,16 @@ fn read_loop(mut sock: TcpStream, shared: Arc<Shared>) {
 fn write_loop(mut sock: TcpStream, shared: Arc<Shared>) {
     let _guard = helper_guard();
     // Set on this fd. A timeout applied to the control dup does not
-    // interrupt a write that is already blocked here.
-    let _ = sock.set_write_timeout(Some(DRAIN_LIMIT));
+    // interrupt a write that is already blocked here. The timeout only
+    // returns control to this loop; it does not abandon queued bytes.
+    let _ = sock.set_write_timeout(Some(WRITE_POLL));
     let mut pending: Vec<u8> = Vec::new();
-    let mut drain_started: Option<Instant> = None;
+    let mut idle_since: Option<Instant> = None;
     loop {
-        {
+        let closing = {
             let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
             if inner.abort {
                 return;
-            }
-            if inner.closing {
-                drain_started.get_or_insert_with(Instant::now);
             }
             if pending.is_empty() {
                 while inner.outbound.is_empty() && !inner.shut_wr && !inner.closing && !inner.abort
@@ -406,9 +408,6 @@ fn write_loop(mut sock: TcpStream, shared: Arc<Shared>) {
                 }
                 if inner.abort {
                     return;
-                }
-                if inner.closing {
-                    drain_started.get_or_insert_with(Instant::now);
                 }
                 if inner.outbound.is_empty() && inner.closing {
                     drop(inner);
@@ -426,11 +425,8 @@ fn write_loop(mut sock: TcpStream, shared: Arc<Shared>) {
                 let n = inner.outbound.len().min(CHUNK);
                 pending = inner.outbound.drain(..n).collect();
             }
-        }
-        if drain_started.is_some_and(|start| start.elapsed() > DRAIN_LIMIT) {
-            finish_stream(&sock);
-            return;
-        }
+            inner.closing
+        };
         match sock.write(&pending) {
             Ok(0) => {
                 mark_broken(&shared);
@@ -439,6 +435,8 @@ fn write_loop(mut sock: TcpStream, shared: Arc<Shared>) {
             }
             Ok(n) => {
                 pending.drain(..n);
+                // The peer took bytes. A slow reader does not hit the cap.
+                idle_since = None;
                 shared.wake();
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -448,13 +446,15 @@ fn write_loop(mut sock: TcpStream, shared: Arc<Shared>) {
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                 ) =>
             {
-                if drain_started.is_some_and(|start| start.elapsed() > DRAIN_LIMIT) {
-                    finish_stream(&sock);
-                    return;
+                if closing {
+                    let start = *idle_since.get_or_insert_with(Instant::now);
+                    if start.elapsed() >= NO_PROGRESS {
+                        finish_stream(&sock);
+                        return;
+                    }
                 }
-                // Still connected: try again. The timeout only bounds each
-                // attempt, so a slow peer does not drop bytes the guest sent.
             }
+            // EPIPE or reset: the reader is gone.
             Err(_) => {
                 mark_broken(&shared);
                 finish_stream(&sock);
@@ -540,6 +540,9 @@ mod tests {
         assert!(saw_block, "the splice buffer should fill");
         let started = Instant::now();
         table.close(id);
+        // The peer never reads. Dropping it is a reset, so the helper must
+        // stop without waiting out the no-progress limit.
+        let _ = release.send(());
         while LIVE_HELPERS.load(std::sync::atomic::Ordering::Relaxed) > baseline {
             assert!(
                 started.elapsed() < Duration::from_secs(2),

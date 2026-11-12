@@ -371,7 +371,9 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "splice") == 0 && argc > 2) {
         return do_splice(argv[2]);
     }
-    if ((strcmp(cmd, "bulk") == 0 || strcmp(cmd, "bulk-exit") == 0) && argc > 2) {
+    if ((strcmp(cmd, "bulk") == 0 || strcmp(cmd, "bulk-exit") == 0 ||
+         strcmp(cmd, "slowbulk") == 0 || strcmp(cmd, "slowbulk-exit") == 0) &&
+        argc > 2) {
         int c = tcp();
         struct sockaddr_in a = v4(argv[2], 9);
         if (connect(c, (void *)&a, sizeof a) != 0) {
@@ -380,7 +382,9 @@ int main(int argc, char **argv) {
         }
         char block[4096];
         memset(block, 0x5a, sizeof block);
-        size_t left = 200000;
+        size_t left = (strcmp(cmd, "slowbulk") == 0 || strcmp(cmd, "slowbulk-exit") == 0)
+                          ? (size_t)1 << 20
+                          : 200000;
         while (left > 0) {
             size_t n = left < sizeof block ? left : sizeof block;
             ssize_t w = send(c, block, n, 0);
@@ -390,7 +394,7 @@ int main(int argc, char **argv) {
             }
             left -= (size_t)w;
         }
-        if (strcmp(cmd, "bulk") == 0) {
+        if (strcmp(cmd, "bulk") == 0 || strcmp(cmd, "slowbulk") == 0) {
             close(c);
         }
         printf("bulk-sent\n");
