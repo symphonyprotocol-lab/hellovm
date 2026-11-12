@@ -382,11 +382,9 @@ int main(int argc, char **argv) {
         }
         char block[4096];
         memset(block, 0x5a, sizeof block);
-        /* 8 MiB is larger than the host TCP send buffer (tcp_wmem, up to 4 MiB),
-         * so a close cannot hide the tail inside the socket buffer. */
-        size_t left = (strcmp(cmd, "slowbulk") == 0 || strcmp(cmd, "slowbulk-exit") == 0)
-                          ? (size_t)8 << 20
-                          : 200000;
+        int slow = strcmp(cmd, "slowbulk") == 0 || strcmp(cmd, "slowbulk-exit") == 0;
+        size_t left = slow ? (size_t)8 << 20 : 200000;
+        size_t total = 0;
         while (left > 0) {
             size_t n = left < sizeof block ? left : sizeof block;
             ssize_t w = send(c, block, n, 0);
@@ -395,11 +393,46 @@ int main(int argc, char **argv) {
                 return 1;
             }
             left -= (size_t)w;
+            total += (size_t)w;
+        }
+        if (slow) {
+            /* Stop the reader, wait until it is parked, then fill until the
+             * host socket is full too. One EAGAIN only means the in-kernel
+             * queue is full; the host buffer may still be taking bytes. */
+            int ctl = tcp();
+            char go = 0;
+            if (connect(ctl, (void *)&a, sizeof a) != 0 || send(ctl, "D", 1, 0) != 1 ||
+                recv(ctl, &go, 1, 0) != 1) {
+                printf("ctl errno=%d\n", errno);
+                return 1;
+            }
+            close(ctl);
+            int fl = fcntl(c, F_GETFL);
+            if (fl < 0 || fcntl(c, F_SETFL, fl | O_NONBLOCK) < 0) {
+                printf("fcntl errno=%d\n", errno);
+                return 1;
+            }
+            int stalls = 0;
+            while (stalls < 20) {
+                ssize_t w = send(c, block, sizeof block, 0);
+                if (w > 0) {
+                    total += (size_t)w;
+                    stalls = 0;
+                    continue;
+                }
+                if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    stalls++;
+                    usleep(10000);
+                    continue;
+                }
+                printf("fill errno=%d\n", errno);
+                return 1;
+            }
         }
         if (strcmp(cmd, "bulk") == 0 || strcmp(cmd, "slowbulk") == 0) {
             close(c);
         }
-        printf("bulk-sent\n");
+        printf("bulk-sent %zu\n", total);
         return 0;
     }
     if (strcmp(cmd, "epipe") == 0) {

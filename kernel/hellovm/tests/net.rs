@@ -299,18 +299,20 @@ fn busybox_nc_transfers_bytes_over_loopback() {
     };
     let image = TempDir::new("net-busybox");
     image.install(&busybox, "bin/busybox");
-    for applet in ["sh", "nc", "echo", "cat", "sleep"] {
+    for applet in ["sh", "nc", "echo", "cat", "usleep"] {
         image.symlink("busybox", &format!("bin/{applet}"));
     }
     // `wait` on the listener, not `timeout`. If poll misses the peer close,
     // `wait` does not return and the sandbox watchdog fails the test.
-    // `sleep | nc` keeps the listener's stdin open. With stdin at EOF
-    // (`/dev/null`), nc half-closes immediately and the client can exit 0
-    // before it sends. Busybox nc then waits for that sleep to end, so the
-    // hold is 2s: long enough to cover the connect, short of the 5s bound.
-    // The README one-liner uses `sleep 10` for the same reason.
+    // Busybox 1.37 `-w` is only a connect timeout. Once connected, `nc -l`
+    // calls `shutdown(SHUT_WR)` as soon as stdin hits EOF, so a client that
+    // arrives after that sees FIN and exits 0 having sent nothing. `nc` does
+    // not wait for stdin: `sleep 10 | nc -l` makes `nc` exit at once, and
+    // `wait` blocks only because ash waits for the whole pipeline. The loop
+    // below is nc's stdin and exits only after `/got` is non-empty.
     let script = r#"
-sleep 2 | nc -l -p 5000 > /got &
+: > /got
+{ n=0; while [ ! -s /got ] && [ "$n" -lt 300 ]; do usleep 10000; n=$((n + 1)); done; } | nc -l -p 5000 > /got &
 lp=$!
 i=0
 st=1
@@ -403,37 +405,59 @@ fn splice_close_and_exit_deliver_every_queued_byte() {
     }
 }
 
-/// 8 MiB, which is past the host TCP send buffer. The reader takes 4 KiB
-/// every 5 ms until `kernel.run` returns, pauses 1.5 s, then reads the rest.
-/// A drain that gives up on a 250 ms wall clock drops the bytes still queued
-/// during that pause.
+/// 8 MiB through a slow reader. The guest then asks the reader, on a second
+/// connection, to stop, waits for the ack, fills the socket until `EAGAIN`,
+/// and closes or exits. The reader stays paused until 500 ms after
+/// `kernel.run` returns, so a drain that gives up on a wall clock drops bytes.
 fn pause_splice(root: &Path, mode: &'static str) {
-    const BYTES: usize = 8 << 20;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let pause = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
     let returned = Arc::new(AtomicBool::new(false));
     let got = Arc::new(AtomicUsize::new(0));
-    let (flag, count) = (Arc::clone(&returned), Arc::clone(&got));
+    let (p, pd, rt, count) = (
+        Arc::clone(&pause),
+        Arc::clone(&paused),
+        Arc::clone(&returned),
+        Arc::clone(&got),
+    );
     let reader = thread::spawn(move || {
-        let (mut sock, _) = listener.accept().expect("accept pause splice");
+        let (mut sock, _) = listener.accept().expect("accept data");
+        let (p2, pd2) = (Arc::clone(&p), Arc::clone(&pd));
+        let ctl = thread::spawn(move || {
+            let (mut ctl, _) = listener.accept().expect("accept ctl");
+            let mut byte = [0u8; 1];
+            ctl.read_exact(&mut byte).expect("ctl D");
+            p2.store(true, Ordering::SeqCst);
+            while !pd2.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            ctl.write_all(b"G").expect("ctl G");
+        });
         let mut buf = vec![0u8; 4096];
-        let mut paused = false;
+        let mut done_pause = false;
         loop {
-            if !paused && flag.load(Ordering::SeqCst) {
-                paused = true;
-                thread::sleep(Duration::from_millis(1500));
+            if !done_pause && p.load(Ordering::SeqCst) {
+                done_pause = true;
+                pd.store(true, Ordering::SeqCst);
+                while !rt.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                thread::sleep(Duration::from_millis(500));
             }
             match sock.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     count.fetch_add(n, Ordering::SeqCst);
-                    if !paused {
+                    if !done_pause {
                         thread::sleep(Duration::from_millis(5));
                     }
                 }
                 Err(err) => panic!("{mode} read: {err}"),
             }
         }
+        ctl.join().expect("ctl thread");
         count.load(Ordering::SeqCst)
     });
     let out = run_guest(
@@ -444,10 +468,6 @@ fn pause_splice(root: &Path, mode: &'static str) {
     );
     let at_return = got.load(Ordering::SeqCst);
     returned.store(true, Ordering::SeqCst);
-    assert!(
-        at_return < BYTES,
-        "{mode}: kernel.run returned only after all {BYTES} bytes were delivered ({at_return})"
-    );
     assert_eq!(
         out.status,
         ExitStatus::Exited(0),
@@ -455,9 +475,18 @@ fn pause_splice(root: &Path, mode: &'static str) {
         out.stdout,
         out.stderr
     );
-    assert!(out.stdout.contains("bulk-sent"), "{mode}: {}", out.stdout);
+    let sent: usize = out
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("bulk-sent "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{mode}: {}", out.stdout));
+    assert!(
+        at_return < sent,
+        "{mode}: run waited for the drain ({at_return} of {sent})"
+    );
     let total = reader.join().expect("pause reader");
-    assert_eq!(total, BYTES, "{mode} delivered {total} of {BYTES}");
+    assert_eq!(total, sent, "{mode} delivered {total} of {sent}");
 }
 
 #[test]
