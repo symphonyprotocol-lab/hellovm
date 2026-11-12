@@ -10,8 +10,12 @@
 //! * [`host`]: the services of the host OS the kernel itself uses (console,
 //!   the read-only image, random bytes, clocks).
 //!
-//! The core owns the app's state: its memory map ([`mm`]), the executable
-//! loader ([`elf`]), the filesystem ([`vfs`]) and the fd table ([`fd`]).
+//! The core owns the sandbox's state: processes and threads (`task`),
+//! memory maps ([`mm`]), the executable loader ([`elf`]), the filesystem
+//! ([`vfs`]), fd tables and open files ([`fd`]), pipes, signals
+//! ([`signal`]) and the console (`tty`). The kernel serves all of a
+//! sandbox's threads from one event loop (`kernel`), parking syscalls that
+//! have to wait instead of blocking.
 //! Syscalls are always *emulated*, never forwarded to the host kernel: the
 //! host may be macOS, which has no Linux syscalls at all.
 

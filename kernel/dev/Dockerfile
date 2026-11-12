@@ -1,7 +1,8 @@
 # Linux build and test environment for the hellovm kernel, e.g. on a macOS
 # development machine. See the "Building and testing" section of README.md.
 #
-# busybox-static provides /bin/busybox for the end-to-end tests. The x86_64
+# busybox-static provides /bin/busybox for the end-to-end tests; the base
+# image's python3 and ldd serve the CPython and dynamic-linking tests. The x86_64
 # Rust target and cross compiler let an aarch64 machine type-check and lint
 # the x86_64 build (it cannot run it).
 FROM rust:1.99-bookworm
