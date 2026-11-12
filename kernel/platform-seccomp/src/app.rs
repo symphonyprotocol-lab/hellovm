@@ -888,7 +888,21 @@ mod tests {
         .unwrap();
         assert_eq!(p.wait(Some(Duration::from_millis(50))).unwrap(), None);
         p.interrupt(t).unwrap();
-        let event = p.wait(Some(Duration::from_secs(10))).unwrap().unwrap();
+        // `wait` returns `Ok(None)` after any wake, and the wake generation
+        // in `wake.rs` is process-global, so another test in this process
+        // can make a single `wait` return `None` before the stop is
+        // reported. Loop until the event arrives or the deadline has passed.
+        // `None` is not a successful result.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let event = loop {
+            match p.wait(Some(Duration::from_secs(10))).unwrap() {
+                Some(event) => break event,
+                None => assert!(
+                    Instant::now() < deadline,
+                    "interrupt did not stop the spinning task before the deadline"
+                ),
+            }
+        };
         assert_eq!(
             event,
             Event {

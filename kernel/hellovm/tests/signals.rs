@@ -11,8 +11,7 @@ use hellovm_test_guest as guest;
 
 #[test]
 fn signals_reach_handlers_with_correct_frames() {
-    if guest::SIGNALS.is_empty() {
-        eprintln!("skipping: the signals guest is not built when cross-compiling");
+    if !common::require_guest(guest::SIGNALS, "signals") {
         return;
     }
     let image = TempDir::new("signals");

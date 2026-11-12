@@ -1,5 +1,9 @@
 //! Helpers shared by the end-to-end tests: temporary image directories and
 //! running a program from one under the seccomp platform.
+//!
+//! `HELLOVM_REQUIRE_E2E=1` is the only value that turns a missing busybox,
+//! CPython or native test guest into a failure. Any other value keeps the
+//! skip-and-return behaviour.
 
 #![allow(dead_code)]
 
@@ -11,6 +15,51 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use hellovm_core::{ExitStatus, Kernel, KernelError};
 use hellovm_host::{CaptureHost, ImageDir};
 use hellovm_platform_seccomp::{AppKiller, SeccompPlatform};
+
+/// True only when `HELLOVM_REQUIRE_E2E` is exactly `1`.
+pub fn e2e_required() -> bool {
+    std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1")
+}
+
+/// Prints `message` so the caller can return from the test. When
+/// [`e2e_required`] is set, panics with that message instead. `message`
+/// must name what is missing and how to install it, and should start with
+/// `SKIPPING` or `skipping:` so an optional skip is visible in the log.
+pub fn skip_or_fail(message: &str) {
+    if e2e_required() {
+        panic!("{message}");
+    } else {
+        eprintln!("{message}");
+    }
+}
+
+/// Host busybox (`$HELLOVM_BUSYBOX`, default `/bin/busybox`).
+///
+/// `None` means the binary is missing and the caller should return: the
+/// skip was printed. When e2e is required this panics instead of returning
+/// `None`, and the message names Debian/Ubuntu `busybox-static`.
+pub fn require_busybox(what: &str) -> Option<String> {
+    let path = std::env::var("HELLOVM_BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
+    if Path::new(&path).exists() {
+        return Some(path);
+    }
+    skip_or_fail(&format!(
+        "SKIPPING {what}: {path} not found (install Debian/Ubuntu busybox-static, not a musl binary from busybox.net)"
+    ));
+    None
+}
+
+/// Native `hellovm-test-guest` program. An empty path means it was not built
+/// (cross-compiling). Returns false when the caller should return.
+pub fn require_guest(path: &str, name: &str) -> bool {
+    if !path.is_empty() {
+        return true;
+    }
+    skip_or_fail(&format!(
+        "skipping: the {name} guest is not built when cross-compiling (need a native Linux build so hellovm-test-guest guests are not empty; install gcc and libc6-dev)"
+    ));
+    false
+}
 
 /// A directory under the system temp dir, removed on drop.
 pub struct TempDir(pub PathBuf);

@@ -3,6 +3,7 @@ name = "hellovm-test-guest"
 description = "Tiny libc-free Linux programs used to test the hellovm kernel"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 build = "build.rs"

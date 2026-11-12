@@ -3,6 +3,7 @@ name = "hellovm-host"
 description = "hellovm host interface implementations"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 

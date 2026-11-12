@@ -1,8 +1,10 @@
-//! Loading static ELF executables and building the initial stack.
+//! Loading ELF executables and building the initial stack.
 //!
-//! Supported: 64-bit little-endian `ET_EXEC` (non-PIE) and `ET_DYN` without
-//! `PT_INTERP` (static-PIE) for the app's architecture. Executables with a
-//! `PT_INTERP` (dynamically linked) are refused until U2.
+//! Supported: 64-bit little-endian `ET_EXEC` (non-PIE) and `ET_DYN`
+//! (static-PIE and dynamically linked) for the app's architecture. An
+//! executable with `PT_INTERP` is loaded together with its program
+//! interpreter; `AT_BASE` is the address where that interpreter was mapped
+//! (`syscall/proc.rs`, `load_program`).
 //!
 //! The file is parsed from an in-memory copy; nothing in it is trusted.
 //! Every offset and size is bounds-checked, and the image may only land in

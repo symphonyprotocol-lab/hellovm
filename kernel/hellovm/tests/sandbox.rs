@@ -98,8 +98,7 @@ fn missing_and_unsupported_programs_fail_to_start() {
 
 #[test]
 fn static_pie_with_glibc() {
-    if guest::PIE.is_empty() {
-        eprintln!("skipping: the static-PIE guest is not built when cross-compiling");
+    if !common::require_guest(guest::PIE, "static-PIE") {
         return;
     }
     let image = image_with(guest::PIE, "pie");
@@ -120,7 +119,8 @@ fn static_pie_with_glibc() {
             || line.contains("argc=2 argv1=arg tls=42 big=x small pagesz="),
         "{line}"
     );
-    // The big allocation was an mmap, freed with munmap.
+    // The guest maps the big region itself (see test-guest/c/pie.c) and
+    // frees it with munmap. A large malloc is not a reliable mmap.
     let calls: Vec<_> = out.kernel.trace().iter().filter_map(|r| r.sysno).collect();
     assert!(calls.contains(&Sysno::Mmap), "{calls:?}");
     assert!(calls.contains(&Sysno::Munmap), "{calls:?}");

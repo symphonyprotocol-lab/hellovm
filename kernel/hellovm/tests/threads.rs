@@ -10,8 +10,7 @@ use hellovm_test_guest as guest;
 
 #[test]
 fn pthreads_work() {
-    if guest::THREADS.is_empty() {
-        eprintln!("skipping: the threads guest is not built when cross-compiling");
+    if !common::require_guest(guest::THREADS, "threads") {
         return;
     }
     let image = TempDir::new("threads");
