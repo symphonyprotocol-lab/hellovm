@@ -15,8 +15,9 @@ pub const HELLO_STDOUT: &str = "Hello from inside the cansol sandbox!\n";
 pub const HELLO_STDERR: &str = "This line went to stderr.\n";
 pub const HELLO_EXIT_CODE: i32 = 42;
 
-/// Calls `getpid` and exits with the negated return value: 38 (`ENOSYS`)
-/// when the syscall is refused, something else if it reached the host.
+/// Calls `getpid` and exits with the negated return value. The kernel
+/// emulates `getpid` (the sandbox pid is 1, so the exit status is 255); a
+/// call that reached the host would return the app process's host pid.
 #[cfg(target_os = "linux")]
 pub const ENOSYS: &str = env!("CANSOL_GUEST_ENOSYS");
 

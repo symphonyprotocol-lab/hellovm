@@ -59,12 +59,10 @@ fn hello_world_output_goes_through_the_kernel() {
 }
 
 #[test]
-fn other_syscalls_are_refused_not_forwarded() {
+fn syscalls_are_emulated_not_forwarded() {
     let image = image_with(guest::ENOSYS, "enosys");
-    // The guest calls getpid, which is emulated now; use an unknown call
-    // instead via the trace of the hello guest? No: the enosys guest exits
-    // with the negated getpid result, which is the sandbox pid 1, not the
-    // host pid of the app process.
+    // The guest exits with the negated getpid result: the sandbox pid 1, not
+    // the host pid of the app process.
     let out = run(image.path(), &["/enosys"]);
     let trace = out.kernel.trace();
     assert_eq!(trace.len(), 2);

@@ -103,3 +103,75 @@ pub fn try_run(image: &Path, argv: &[&str], stdin: &[u8]) -> Result<Run, KernelE
 pub fn run(image: &Path, argv: &[&str]) -> Run {
     try_run(image, argv, b"").unwrap_or_else(|err| panic!("{argv:?}: {err}"))
 }
+
+/// One sandbox (one kernel, one filesystem) running programs one after
+/// another, like the commands of a session.
+pub struct Sandbox {
+    pub kernel: Kernel<CaptureHost>,
+}
+
+/// What one program in a [`Sandbox`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Output {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Output {
+    pub fn code(&self) -> i32 {
+        match self.status {
+            ExitStatus::Exited(code) => code,
+            ExitStatus::Signaled(sig) => 128 + sig as i32,
+        }
+    }
+}
+
+impl Sandbox {
+    pub fn new(image: &Path) -> Sandbox {
+        let host = CaptureHost::new(Some(ImageDir::open(image).unwrap()));
+        Sandbox {
+            kernel: Kernel::new(host),
+        }
+    }
+
+    /// Runs `argv` with `stdin` as console input.
+    pub fn run_with_input(&mut self, argv: &[&str], stdin: &[u8]) -> Output {
+        let host = self.kernel.host_mut();
+        host.stdout.clear();
+        host.stderr.clear();
+        host.stdin.clear();
+        host.stdin.extend(stdin);
+        let mut app = SeccompApp::new().expect("start the app process");
+        let argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
+        let envp = vec![b"PATH=/bin".to_vec(), b"HOME=/root".to_vec()];
+        self.kernel
+            .exec(&mut app, &argv[0], &argv, &envp)
+            .unwrap_or_else(|err| panic!("exec {argv:?}: {err}"));
+        let status = self.kernel.run(&mut app).expect("run");
+        let host = self.kernel.host();
+        Output {
+            status,
+            stdout: String::from_utf8_lossy(&host.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&host.stderr).into_owned(),
+        }
+    }
+
+    pub fn run(&mut self, argv: &[&str]) -> Output {
+        self.run_with_input(argv, b"")
+    }
+
+    /// Runs a busybox applet: `/bin/busybox <args>`.
+    pub fn bb(&mut self, args: &[&str]) -> Output {
+        let mut argv = vec!["/bin/busybox"];
+        argv.extend_from_slice(args);
+        self.run(&argv)
+    }
+
+    /// Runs a busybox applet that must succeed and returns its stdout.
+    pub fn ok(&mut self, args: &[&str]) -> String {
+        let out = self.bb(args);
+        assert_eq!(out.status, ExitStatus::Exited(0), "{args:?}: {out:?}");
+        out.stdout
+    }
+}

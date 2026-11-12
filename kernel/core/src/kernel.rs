@@ -283,7 +283,35 @@ impl<H: Host> Kernel<H> {
 
     /// Runs the loaded program until it exits or dies, handling all of its
     /// syscalls.
+    ///
+    /// When the program ends, its process state (fds, memory map, signal
+    /// dispositions) is released; the filesystem and the current directory
+    /// stay, so the next [`Kernel::exec`] (into a fresh app) runs another
+    /// program in the same sandbox, as successive commands of a session.
     pub fn run<P: Platform + ?Sized>(&mut self, app: &mut P) -> Result<ExitStatus, KernelError> {
+        let status = self.run_program(app);
+        self.end_process();
+        status
+    }
+
+    /// Releases the process's open files and resets its state, keeping the
+    /// current directory.
+    fn end_process(&mut self) {
+        let cwd = self.proc.cwd;
+        let mut old = std::mem::replace(&mut self.proc, Process::new(cwd));
+        for fd in old.fds.fds() {
+            if let Ok(Some(file)) = old.fds.close(fd) {
+                if let Some(ino) = file.node() {
+                    self.vfs.closed(ino);
+                }
+            }
+        }
+    }
+
+    fn run_program<P: Platform + ?Sized>(
+        &mut self,
+        app: &mut P,
+    ) -> Result<ExitStatus, KernelError> {
         let (entry, stack) = self.proc.start.take().ok_or(KernelError::NoProgram)?;
         let arch = app.arch();
         let mut resume = Resume::Start { entry, stack };

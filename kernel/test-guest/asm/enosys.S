@@ -1,5 +1,6 @@
-// Calls getpid and exits with the negated result: 38 (ENOSYS) when the
-// kernel refuses it; a forwarded getpid would return a positive pid.
+// Calls getpid and exits with the negated result. The kernel emulates
+// getpid (sandbox pid 1, exit status 255); a getpid forwarded to the host
+// would return the app process's host pid instead.
 
 #if defined(__x86_64__)
 
