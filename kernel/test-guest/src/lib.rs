@@ -39,3 +39,11 @@ pub const SIGNALS: &str = env!("HELLOVM_GUEST_SIGNALS");
 /// sqrt2=1.4142 interp=yes exe=<path>`. Empty when cross-compiling.
 #[cfg(target_os = "linux")]
 pub const DYNAMIC: &str = env!("HELLOVM_GUEST_DYNAMIC");
+
+/// A static-PIE glibc program that checks threads: join, TLS, contended
+/// mutexes and condition variables, timed waits, signals to one thread,
+/// robust mutexes, fork from a threaded process and exit from a thread.
+/// Prints one line per check (see `hellovm/tests/threads.rs`) and exits
+/// with 7. Empty when cross-compiling.
+#[cfg(target_os = "linux")]
+pub const THREADS: &str = env!("HELLOVM_GUEST_THREADS");

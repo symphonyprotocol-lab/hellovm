@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ASM_GUESTS: &[&str] = &["hello", "enosys"];
-const C_GUESTS: &[&str] = &["pie", "signals"];
+const C_GUESTS: &[&str] = &["pie", "signals", "threads"];
 /// C guests linked dynamically against the build host's libc.
 const DYNAMIC_GUESTS: &[&str] = &["dynamic"];
 
@@ -69,7 +69,13 @@ fn main() {
         }
         let src = manifest_dir.join("c").join(format!("{guest}.c"));
         let out = out_dir.join(guest);
-        build(&cc, guest, &src, &out, &["-static-pie", "-fPIE", "-O2"]);
+        build(
+            &cc,
+            guest,
+            &src,
+            &out,
+            &["-static-pie", "-fPIE", "-O2", "-pthread"],
+        );
         println!("cargo:rustc-env={var}={}", out.display());
     }
     for guest in DYNAMIC_GUESTS {
