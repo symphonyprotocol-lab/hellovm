@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-x86_64:
+    name: test-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # rust-toolchain.toml at the repository root selects channel 1.99.1
+      # (clippy and rustfmt included). Do not override that pin here.
+      # Do not set rust-src-dir: the action cds there before it looks for
+      # rust-toolchain.toml, misses the root file, installs stable, and
+      # `rustup override set stable` on kernel/ hides the file. cache-workspaces
+      # only points rust-cache at kernel/. override: false keeps a missed
+      # file from writing that directory override.
+      - name: Install the Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-workspaces: kernel
+          override: false
+
+      - name: Install distro e2e dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends busybox-static gcc libc6-dev python3
+
+      - name: Run the x86_64 e2e script
+        run: kernel/dev/run-e2e.sh
+
+      # A4: missing busybox must fail when HELLOVM_REQUIRE_E2E=1, even if
+      # /bin/busybox exists on the runner. A non-zero exit is not enough:
+      # the log must name the missing distro busybox, so a compile error
+      # does not pass this step.
+      - name: Missing busybox fails when e2e is required
+        working-directory: kernel
+        run: |
+          set +e
+          log=$(mktemp)
+          HELLOVM_BUSYBOX=/nonexistent HELLOVM_REQUIRE_E2E=1 \
+            cargo test -p hellovm --test shell >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -eq 0 ]; then
+            echo "expected a non-zero exit when busybox is missing and HELLOVM_REQUIRE_E2E=1" >&2
+            exit 1
+          fi
+          if ! grep -F 'required e2e dependency missing:' "$log" >/dev/null \
+            || ! grep -F 'install Debian/Ubuntu busybox-static' "$log" >/dev/null; then
+            echo "expected the failure to be the missing busybox, naming Debian/Ubuntu busybox-static" >&2
+            exit 1
+          fi
+
+  test-x86_64-dev-image:
+    name: test-x86_64-dev-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Default Docker seccomp profile: ptrace of one's own child is allowed.
+      # Do not pass --privileged or --security-opt seccomp=unconfined.
+      - name: Build the dev image and run e2e
+        run: |
+          docker build -t hellovm-dev kernel/dev
+          docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/tmp/target \
+            hellovm-dev kernel/dev/run-e2e.sh

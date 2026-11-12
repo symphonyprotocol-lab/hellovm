@@ -7,6 +7,10 @@ version = "0.0.1"
 edition = "2021"
 license-file = "../LICENSE"
 publish = false
+# Deliberately stricter than the language MSRV (about 1.88, when
+# `as_chunks`, `is_multiple_of` and `io_error_more` became usable).
+# rustup is pinned to 1.99.1 by `rust-toolchain.toml`.
+rust-version = "1.99"
 
 [workspace.dependencies]
 hellovm-core = { path = "core" }

@@ -10,9 +10,19 @@ The kernel lives in `kernel/`, a Rust workspace:
 |---|---|---|
 | `hellovm-core` | `kernel/core` | Syscall emulation: processes, threads, signals, pipes, ELF loading, memory map, filesystem, terminal, `/proc`; independent of the host OS |
 | `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks |
-| `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Runs apps on Linux: every app thread is a host process; seccomp traps every syscall to the kernel's event-loop thread, which traces them all with ptrace |
+| `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
 | `hellovm` | `kernel/hellovm` | Command-line launcher |
 | `hellovm-test-guest` | `kernel/test-guest` | Small test programs built at build time |
+
+Syscall interception on Linux is ptrace plus `SECCOMP_RET_TRACE`, not
+seccomp user notification. Every app thread is a host process. Its filter
+returns `SECCOMP_RET_TRACE` for every native-ABI syscall, and one
+event-loop thread is the ptrace tracer of those processes: it emulates the
+syscall and skips it, so the host kernel does not run it. Changes to an
+address space, and new tasks, are injected `mmap`, `munmap`, `mprotect` and
+`clone` through a trusted stub page, with arguments the tracer wrote.
+`kernel/platform-seccomp/src/spawn.rs` is the full argument, including why
+an in-app stub plus user notification was rejected.
 
 What runs today (milestone U2): x86_64 and aarch64 Linux programs,
 static or dynamically linked, with any number of processes and threads.
@@ -60,19 +70,38 @@ writable shared *file* mappings (they are private copies), and permission
 checks (the guest is root). Unimplemented syscalls fail with `ENOSYS` and
 are logged.
 
-The aarch64 build is tested end to end. The x86_64 build compiles and
-passes lint, and its syscall table, struct layouts and signal frames are
-unit-tested, but it has not been run end to end yet.
+Both the aarch64 and the x86_64 builds have been tested end to end
+(busybox shell, CPython, pthreads, signals, dynamic linking and the
+terminal). The x86_64 run is `kernel/dev/run-e2e.sh` on a native x86_64
+Linux host.
 
 ## Building and testing
 
 Running sandboxed programs needs a **Linux** host: kernel 5.5 or newer on
-x86_64 or aarch64, a Rust toolchain and a C compiler with a static libc
-(`cc`, used to build the test guests). No root or extra capabilities are
-required, and it works inside a container with the default Docker seccomp
-profile (ptrace of one's own child is allowed there). On other hosts the
-workspace builds, but the end-to-end tests are skipped and `hellovm` cannot
-run programs yet.
+x86_64 or aarch64. Rust **1.99.1** is required; `rust-toolchain.toml` at the
+repository root makes rustup install it (with clippy and rustfmt). The dev
+image is `rust:1.99.1-bookworm`, the same pin. The workspace `rust-version`
+is `1.99`, deliberately stricter than the language MSRV (about 1.88). A C
+compiler with a static libc (`cc`, used to build the test guests) is also
+required. No root or extra capabilities are required, and it works inside a
+container with the default Docker seccomp profile (ptrace of one's own
+child is allowed there). On other hosts the workspace builds, but the
+end-to-end tests are skipped and `hellovm` cannot run programs yet.
+
+`kernel/dev/run-e2e.sh`, run from the repository root, is the one-shot
+path on the machine it runs on (a native host, or the dev container on
+either architecture). It checks that rustc is 1.99.1, that a C compiler
+exists, that busybox is present and statically linked, and that `/usr/bin/python3` has
+its standard library at `/usr/lib/python3.X`. It then runs `cargo check`,
+`cargo test`, clippy and rustfmt. The script exports `HELLOVM_REQUIRE_E2E=1`
+and fails if the test log contains `SKIPPING` or `skipping:`.
+
+Only the value `1` for `HELLOVM_REQUIRE_E2E` requires those end-to-end
+tests to run. Any other value (unset, empty, `0`, `false`, or another
+string) keeps the skip-and-return behaviour, so a machine without busybox
+can still run the unit tests. With `HELLOVM_REQUIRE_E2E=1`, a missing
+busybox, CPython or native test guest fails the test and names what to
+install.
 
 ```sh
 cd kernel
@@ -82,11 +111,13 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-The busybox tests need a statically linked busybox at `/bin/busybox` (Debian:
-`busybox-static`), or at the path in `HELLOVM_BUSYBOX`; without one they are
-skipped with a message. The CPython tests need `/usr/bin/python3` and its
-standard library on the host (the dev image has them); they copy the
-interpreter, its libraries and the standard library into a temporary image.
+The busybox tests need Debian or Ubuntu **`busybox-static`**: a statically
+linked busybox at `/bin/busybox`, or at the path in `HELLOVM_BUSYBOX`. A
+musl binary from busybox.net is not a supported image. Without a distro
+static busybox the tests are skipped, unless `HELLOVM_REQUIRE_E2E=1`. The
+CPython tests need `/usr/bin/python3` and its standard library on the host
+(the dev image has them); they copy the interpreter, its libraries and the
+standard library into a temporary image.
 The dynamic-linking test builds a C program against the host's glibc and
 runs it with the host's libraries the same way.
 
@@ -106,12 +137,20 @@ cargo run -p hellovm -- --root /tmp/image /bin/busybox sh -i
 The container's own root works as an image too, e.g. for CPython:
 `hellovm --root / /usr/bin/python3 -c 'print(42)'`.
 
-On macOS, use a Linux container. `kernel/dev/Dockerfile` adds clippy,
-rustfmt, busybox and an x86_64 cross toolchain to the official Rust image
-(which already has `python3`, its standard library and `ldd`):
+On macOS, use a Linux container. `kernel/dev/Dockerfile` starts from
+`rust:1.99.1-bookworm` (matching `rust-toolchain.toml`) and adds clippy,
+rustfmt, `busybox-static` and an x86_64 cross toolchain. The base image
+already has `python3`, its standard library and `ldd`:
 
 ```sh
 docker build -t hellovm-dev kernel/dev
+docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/tmp/target \
+  hellovm-dev kernel/dev/run-e2e.sh
+```
+
+`cargo test` from `kernel/` still works in that image:
+
+```sh
 docker run --rm -v "$PWD":/src -w /src/kernel -e CARGO_TARGET_DIR=/tmp/target \
   hellovm-dev cargo test
 ```

@@ -4,13 +4,14 @@
 //! Every applet is installed as its own `/bin/<name>` symlink to busybox,
 //! so the shell's external commands go through `fork`/`vfork` and `execve`
 //! of a real file. `$HELLOVM_BUSYBOX` overrides the host busybox (default
-//! `/bin/busybox`); the tests are skipped, loudly, without one.
+//! `/bin/busybox`). Without one the tests are skipped, unless
+//! `HELLOVM_REQUIRE_E2E=1`, which fails them and names Debian/Ubuntu
+//! `busybox-static`.
 
 #![cfg(target_os = "linux")]
 
 mod common;
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::{Output, Sandbox, TempDir};
@@ -22,13 +23,7 @@ const APPLETS: &[&str] = &[
 ];
 
 fn busybox() -> Option<String> {
-    let path = std::env::var("HELLOVM_BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
-    if Path::new(&path).exists() {
-        Some(path)
-    } else {
-        eprintln!("SKIPPING shell test: {path} not found (install busybox-static)");
-        None
-    }
+    common::require_busybox("shell test")
 }
 
 fn image(busybox: &str) -> TempDir {

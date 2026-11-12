@@ -130,11 +130,7 @@ impl Drop for Session {
 }
 
 fn busybox_image() -> Option<TempDir> {
-    let path = std::env::var("HELLOVM_BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
-    if !Path::new(&path).exists() {
-        eprintln!("SKIPPING terminal test: {path} not found (install busybox-static)");
-        return None;
-    }
+    let path = common::require_busybox("terminal test")?;
     let image = TempDir::new("terminal");
     image.install(&path, "bin/busybox");
     for applet in ["sh", "sleep", "tty", "stty", "echo", "cat"] {

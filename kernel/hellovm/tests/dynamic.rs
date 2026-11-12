@@ -17,8 +17,7 @@ use hellovm_test_guest as guest;
 
 #[test]
 fn a_dynamically_linked_program_runs() {
-    if guest::DYNAMIC.is_empty() {
-        eprintln!("skipping: the dynamic guest is not built when cross-compiling");
+    if !common::require_guest(guest::DYNAMIC, "dynamic") {
         return;
     }
     let image = TempDir::new("dynamic");
@@ -41,11 +40,9 @@ fn a_dynamically_linked_program_runs() {
 
 #[test]
 fn proc_shows_the_sandbox_processes() {
-    let path = std::env::var("HELLOVM_BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
-    if !Path::new(&path).exists() {
-        eprintln!("SKIPPING: {path} not found (install busybox-static)");
+    let Some(path) = common::require_busybox("dynamic test") else {
         return;
-    }
+    };
     let image = TempDir::new("proc");
     image.install(&path, "bin/busybox");
     for applet in [

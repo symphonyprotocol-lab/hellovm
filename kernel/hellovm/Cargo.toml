@@ -3,6 +3,7 @@ name = "hellovm"
 description = "Runs a Linux program inside the hellovm kernel"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 

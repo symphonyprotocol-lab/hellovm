@@ -3,12 +3,14 @@
 //! the kernel against a small image directory.
 //!
 //! The busybox binary is copied into each test's image as `/bin/busybox`.
-//! `$HELLOVM_BUSYBOX` overrides its host path (default `/bin/busybox`); the
-//! tests are skipped, loudly, when it does not exist.
+//! `$HELLOVM_BUSYBOX` overrides its host path (default `/bin/busybox`).
+//! Without it the tests are skipped, unless `HELLOVM_REQUIRE_E2E=1`, which
+//! fails them and names the Debian/Ubuntu `busybox-static` package.
 //!
-//! U1 has no `fork`, so each command is one applet. Multi-step scenarios run
-//! applets one after another in the same sandbox (same filesystem), and
-//! `sh -c` scripts use only builtins and redirections.
+//! Each command is one applet. Multi-step scenarios run applets one after
+//! another in the same sandbox (same filesystem), and `sh -c` scripts use
+//! only builtins and redirections. `shell.rs` covers `fork`/`exec` of
+//! external commands.
 
 #![cfg(target_os = "linux")]
 
@@ -24,13 +26,7 @@ use hellovm_core::ExitStatus;
 const DATA: &str = "line one\nline two\nline three\n";
 
 fn busybox() -> Option<String> {
-    let path = std::env::var("HELLOVM_BUSYBOX").unwrap_or_else(|_| "/bin/busybox".into());
-    if Path::new(&path).exists() {
-        Some(path)
-    } else {
-        eprintln!("SKIPPING busybox test: {path} not found (install busybox-static)");
-        None
-    }
+    common::require_busybox("busybox test")
 }
 
 /// A small image: busybox, /bin/sh, user and group files, a data directory.

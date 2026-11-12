@@ -3,6 +3,7 @@ name = "hellovm-platform-seccomp"
 description = "hellovm platform layer for Linux hosts, based on seccomp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
