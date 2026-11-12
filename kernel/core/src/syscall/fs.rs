@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use super::procfs::{self, ProcNode};
 use crate::abi;
 use crate::errno::{
     Errno, SysResult, EACCES, EAGAIN, EBADF, EEXIST, EFAULT, EINVAL, EISDIR, ELOOP, ENOENT, ENOSPC,
@@ -70,12 +71,14 @@ const OVERLAYFS_MAGIC: u64 = 0x794c_7630;
 const IOV_MAX: u64 = 1024;
 
 /// What a path or fd refers to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
     Node(Ino),
     /// An fd of something that is not a node (via `AT_EMPTY_PATH` or
     /// `fstat`).
     Object(FileObject, u64),
+    /// A node of `/proc`, with its inode number.
+    Proc(u64, ProcNode),
 }
 
 /// A `stat` for an open object that is not a filesystem node: the console
@@ -153,10 +156,37 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 }
             });
         }
+        if let Some(comps) = self.proc_path(dirfd, path) {
+            return self.lookup_proc(&comps, follow, 0);
+        }
         let start = self.start_dir(dirfd, path)?;
         Ok(Target::Node(
             self.vfs.resolve(self.host, start, path, follow)?,
         ))
+    }
+
+    /// Resolves a path inside `/proc`; links are followed (when `follow`)
+    /// into `/proc` again or into the VFS.
+    fn lookup_proc(&mut self, comps: &[Vec<u8>], follow: bool, depth: u32) -> SysResult<Target> {
+        let (path, node) = self.proc_lookup(comps)?;
+        if let (ProcNode::Link(target), true) = (&node, follow) {
+            if depth >= 8 {
+                return Err(Errno(ELOOP));
+            }
+            let target = self.proc_follow(&path, target);
+            if let Some(comps) = self.proc_path(AT_FDCWD, &target) {
+                return self.lookup_proc(&comps, true, depth + 1);
+            }
+            if target.first() != Some(&b'/') {
+                // pipe:[n] and the like: not a path.
+                return Ok(Target::Proc(procfs::proc_ino(&path), node));
+            }
+            let root = self.vfs.root();
+            return Ok(Target::Node(
+                self.vfs.resolve(self.host, root, &target, true)?,
+            ));
+        }
+        Ok(Target::Proc(procfs::proc_ino(&path), node))
     }
 
     fn node_at(&mut self, dirfd: i64, path_addr: GuestAddr, follow: bool) -> SysResult<Ino> {
@@ -164,6 +194,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         match self.lookup_at(dirfd, &path, follow, false)? {
             Target::Node(ino) => Ok(ino),
             Target::Object(..) => Err(Errno(EINVAL)),
+            Target::Proc(..) => Err(Errno(EACCES)),
         }
     }
 
@@ -183,6 +214,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             Target::Object(object, size) => {
                 let time = self.now();
                 object_stat(object, size, time)
+            }
+            Target::Proc(ino, node) => {
+                let time = self.now();
+                node.stat(ino, time)
             }
         }
     }
@@ -627,10 +662,113 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         raw_flags: u64,
         mode: u64,
     ) -> SysResult<u64> {
-        let flags = abi::decode_open_flags(self.arch, raw_flags);
         let path = self.read_path(path_addr)?;
+        self.open_path(dirfd, &path, raw_flags, mode, 0)
+    }
+
+    /// Opens a file of `/proc`.
+    fn open_proc(
+        &mut self,
+        comps: &[Vec<u8>],
+        raw_flags: u64,
+        mode: u64,
+        depth: u32,
+    ) -> SysResult<u64> {
+        let flags = abi::decode_open_flags(self.arch, raw_flags);
+        let (path, node) = self.proc_lookup(comps)?;
+        if let ProcNode::Link(target) = &node {
+            if flags.nofollow && !flags.path {
+                return Err(Errno(ELOOP));
+            }
+            if depth >= 8 {
+                return Err(Errno(ELOOP));
+            }
+            // /proc/<pid>/fd/<n> of this process reopens the fd (as a
+            // duplicate, sharing its offset).
+            if let [pid, fd_dir, fd] = path.as_slice() {
+                if fd_dir == b"fd" && *pid == self.pid.to_string().into_bytes() {
+                    let fd = std::str::from_utf8(fd)
+                        .ok()
+                        .and_then(|f| f.parse::<i64>().ok())
+                        .ok_or(Errno(ENOENT))?;
+                    return self
+                        .dup_min(fd, 0, flags.cloexec)
+                        .map(|fd| fd as u64)
+                        .map_err(|e| if e == Errno(EBADF) { Errno(ENOENT) } else { e });
+                }
+            }
+            let target = self.proc_follow(&path, target);
+            if target.first() != Some(&b'/') {
+                return Err(Errno(ENXIO));
+            }
+            return self.open_path(AT_FDCWD, &target, raw_flags, mode, depth + 1);
+        }
+        if flags.creat || flags.accmode != 0 || flags.trunc {
+            return Err(procfs::PROC_WRITE);
+        }
+        if flags.directory && !matches!(node, ProcNode::Dir(_)) {
+            return Err(Errno(ENOTDIR));
+        }
+        let mut file = OpenFile::new(node.object(), Access::Read);
+        let mut abs = b"/proc".to_vec();
+        for c in &path {
+            abs.push(b'/');
+            abs.extend_from_slice(c);
+        }
+        match node {
+            // The listing is generated when it is first read.
+            ProcNode::Dir(_) => {}
+            ProcNode::File(contents) => file.contents = Some(contents),
+            ProcNode::Link(_) => unreachable!("handled above"),
+        }
+        file.path = Some(abs);
+        file.nonblock = flags.nonblock;
+        self.install(file, 0, flags.cloexec).map(|fd| fd as u64)
+    }
+
+    /// The listing of a `/proc` directory, at its absolute path.
+    fn proc_listing(&mut self, abs: Vec<u8>) -> SysResult<Vec<DirEntry>> {
+        let comps = self.proc_path(AT_FDCWD, &abs).ok_or(Errno(ENOENT))?;
+        let (path, node) = self.proc_lookup(&comps)?;
+        let ProcNode::Dir(entries) = node else {
+            return Err(Errno(ENOTDIR));
+        };
+        let mut listing = vec![
+            DirEntry {
+                name: b".".to_vec(),
+                ino: procfs::proc_ino(&path),
+                kind: FileType::Directory,
+            },
+            DirEntry {
+                name: b"..".to_vec(),
+                ino: procfs::proc_ino(&path[..path.len().saturating_sub(1)]),
+                kind: FileType::Directory,
+            },
+        ];
+        for mut e in entries {
+            let mut child = path.clone();
+            child.push(e.name.clone());
+            e.ino = procfs::proc_ino(&child);
+            listing.push(e);
+        }
+        Ok(listing)
+    }
+
+    fn open_path(
+        &mut self,
+        dirfd: i64,
+        path: &[u8],
+        raw_flags: u64,
+        mode: u64,
+        depth: u32,
+    ) -> SysResult<u64> {
+        let flags = abi::decode_open_flags(self.arch, raw_flags);
+        let path = path.to_vec();
         if flags.tmpfile {
             return Err(Errno(EOPNOTSUPP));
+        }
+        if let Some(comps) = self.proc_path(dirfd, &path) {
+            return self.open_proc(&comps, raw_flags, mode, depth);
         }
         let start = self.start_dir(dirfd, &path)?;
         let follow = !flags.nofollow;
@@ -1209,10 +1347,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Err(Errno(EINVAL));
         }
         let path = self.read_path(path)?;
-        let Target::Node(ino) = self.lookup_at(dirfd, &path, false, true)? else {
-            return Err(Errno(EINVAL));
+        let target = match self.lookup_at(dirfd, &path, false, true)? {
+            Target::Node(ino) => self.vfs.read_link(ino)?,
+            Target::Proc(_, ProcNode::Link(target)) => target,
+            _ => return Err(Errno(EINVAL)),
         };
-        let target = self.vfs.read_link(ino)?;
         let n = target.len().min(size as usize);
         self.write_mem(buf, &target[..n])?;
         Ok(n as u64)
@@ -1220,10 +1359,17 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
 
     pub fn sys_getdents64(&mut self, fd: i64, buf: GuestAddr, count: u64) -> SysResult<u64> {
         let (id, file) = self.file(fd)?;
-        let ino = file.node().ok_or(Errno(ENOTDIR))?;
-        if !self.vfs.is_dir(ino) {
-            return Err(Errno(ENOTDIR));
+        let proc_dir = file.object == FileObject::Proc { dir: true };
+        let ino = match file.node() {
+            Some(ino) if self.vfs.is_dir(ino) => ino,
+            _ if proc_dir => 0,
+            _ => return Err(Errno(ENOTDIR)),
+        };
+        if file.listing.is_none() && proc_dir {
+            let listing = self.proc_listing(file.path.clone().unwrap_or_default())?;
+            self.st.files.get_mut(id).listing = Some(listing);
         }
+        let file = self.st.files.get(id);
         if file.listing.is_none() {
             let parent = self.vfs.parent(ino)?;
             let mut listing = vec![

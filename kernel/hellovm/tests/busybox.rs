@@ -113,7 +113,10 @@ fn ls_l_and_stat() {
         full.contains("File: /data/f") && full.contains("Size: 29"),
         "{full}"
     );
-    assert_eq!(sb.ok(&["ls", "/"]), "bin\ndata\ndev\netc\nroot\ntmp\n");
+    assert_eq!(
+        sb.ok(&["ls", "/"]),
+        "bin\ndata\ndev\netc\nproc\nroot\ntmp\n"
+    );
     assert_eq!(sb.ok(&["ls", "/dev/null"]), "/dev/null\n");
 }
 
@@ -309,7 +312,7 @@ fn dot_dot_and_symlinks_cannot_escape_the_root() {
     // `..` at the root is the root.
     assert_eq!(
         sb.ok(&["ls", "/../../.."]),
-        "abs\nbin\ndev\netc\nhostpath\nrel\ntmp\nup\n"
+        "abs\nbin\ndev\netc\nhostpath\nproc\nrel\ntmp\nup\n"
     );
     assert_eq!(sb.ok(&["ls", "/up"]), sb.ok(&["ls", "/"]));
     let out = sb.run(&[

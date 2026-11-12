@@ -54,6 +54,62 @@ impl TempDir {
     pub fn mkdir(&self, rel: &str) {
         fs::create_dir_all(self.0.join(rel)).unwrap();
     }
+
+    /// Copies a host file to the same path in the image (following
+    /// symlinks), unless it is there already.
+    pub fn copy_host_file(&self, host_path: &Path) {
+        let dest = self.0.join(host_path.strip_prefix("/").unwrap());
+        if dest.exists() {
+            return;
+        }
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::copy(host_path, &dest)
+            .unwrap_or_else(|err| panic!("copying {}: {err}", host_path.display()));
+    }
+
+    /// Copies a host executable or library to the same path in the image,
+    /// with the shared libraries and the program interpreter it needs (as
+    /// `ldd` lists them).
+    pub fn install_with_libs(&self, host_path: &Path) {
+        self.copy_host_file(host_path);
+        for lib in shared_libraries(host_path) {
+            self.copy_host_file(&lib);
+        }
+    }
+
+    /// Copies a host directory tree to the same path in the image, keeping
+    /// symlinks as symlinks.
+    pub fn copy_host_tree(&self, host_dir: &Path) {
+        for entry in fs::read_dir(host_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let dest = self.0.join(path.strip_prefix("/").unwrap());
+            if meta.is_dir() {
+                fs::create_dir_all(&dest).unwrap();
+                self.copy_host_tree(&path);
+            } else if meta.file_type().is_symlink() {
+                let target = fs::read_link(&path).unwrap();
+                let _ = std::os::unix::fs::symlink(target, dest);
+            } else if meta.is_file() {
+                self.copy_host_file(&path);
+            }
+        }
+    }
+}
+
+/// The shared libraries (and program interpreter) a host binary needs,
+/// from `ldd`. Empty for static binaries.
+pub fn shared_libraries(binary: &Path) -> Vec<PathBuf> {
+    let output = std::process::Command::new("ldd")
+        .arg(binary)
+        .output()
+        .expect("run ldd");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter(|w| w.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
 }
 
 impl Drop for TempDir {

@@ -2,6 +2,9 @@
 //! libc-free, non-PIE) and the C programs in `c/` (static-PIE against the
 //! system libc).
 //!
+//! `DYNAMIC_GUESTS` are linked dynamically against the build host's libc;
+//! tests run them in an image assembled from the host's own libraries.
+//!
 //! They are built for the target architecture with the C compiler driver
 //! (`cc`, or `$HELLOVM_GUEST_CC` when cross-compiling). C guests need the
 //! target's static libc, so they are only built natively; when
@@ -14,6 +17,8 @@ use std::process::Command;
 
 const ASM_GUESTS: &[&str] = &["hello", "enosys"];
 const C_GUESTS: &[&str] = &["pie", "signals"];
+/// C guests linked dynamically against the build host's libc.
+const DYNAMIC_GUESTS: &[&str] = &["dynamic"];
 
 fn build(cc: &str, name: &str, src: &Path, out: &Path, flags: &[&str]) {
     let output = Command::new(cc)
@@ -65,6 +70,17 @@ fn main() {
         let src = manifest_dir.join("c").join(format!("{guest}.c"));
         let out = out_dir.join(guest);
         build(&cc, guest, &src, &out, &["-static-pie", "-fPIE", "-O2"]);
+        println!("cargo:rustc-env={var}={}", out.display());
+    }
+    for guest in DYNAMIC_GUESTS {
+        let var = format!("HELLOVM_GUEST_{}", guest.to_uppercase());
+        if !native {
+            println!("cargo:rustc-env={var}=");
+            continue;
+        }
+        let src = manifest_dir.join("c").join(format!("{guest}.c"));
+        let out = out_dir.join(guest);
+        build(&cc, guest, &src, &out, &["-O2", "-lm"]);
         println!("cargo:rustc-env={var}={}", out.display());
     }
 }

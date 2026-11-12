@@ -17,6 +17,7 @@ mod futex;
 mod mem;
 mod misc;
 mod proc;
+mod procfs;
 mod signal;
 mod tty;
 
@@ -455,8 +456,9 @@ where
         Some(Setpriority) => Ok(0),
         Some(Membarrier) => Ok(0),
         // Deliberately refused: glibc falls back without restartable
-        // sequences, and without clone3.
-        Some(Rseq) => Err(Errno(ENOSYS)),
+        // sequences, and without clone3. epoll is not implemented yet;
+        // CPython's subprocess and selectors fall back to poll.
+        Some(Rseq | EpollCreate1) => Err(Errno(ENOSYS)),
         _ => unimplemented(trap.nr, sysno, &a),
     };
     if let Some(action) = ctx.action.take() {

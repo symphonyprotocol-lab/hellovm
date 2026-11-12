@@ -1338,4 +1338,55 @@ mod tests {
         assert_eq!(plat.task(3).returns, vec![1, 1]);
         assert!(plat.task(3).started.is_some());
     }
+
+    #[test]
+    fn proc_is_generated_from_the_process_table() {
+        let arch = Arch::Aarch64;
+        let at_fdcwd = (-100i64) as u64;
+        let buf = SCRATCH + 0x1000;
+        let traps = vec![
+            sc(arch, Sysno::Readlinkat, &[at_fdcwd, SCRATCH, buf, 64]),
+            // Relative to /proc/self, through "..".
+            sc(arch, Sysno::Chdir, &[SCRATCH + 0x100]),
+            sc(arch, Sysno::Openat, &[at_fdcwd, SCRATCH + 0x200, 0, 0]),
+            sc(arch, Sysno::Read, &[3, buf + 0x100, 200]),
+            sc(arch, Sysno::Openat, &[at_fdcwd, SCRATCH + 0x300, 0, 0]),
+            sc(arch, Sysno::Getdents64, &[4, buf + 0x400, 0x400]),
+            // Writing is refused.
+            sc(arch, Sysno::Openat, &[at_fdcwd, SCRATCH + 0x200, 1, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (mut kernel, mut plat) = setup(
+            arch,
+            traps,
+            &[
+                (SCRATCH, b"/proc/self/exe\0"),
+                (SCRATCH + 0x100, b"/tmp\0"),
+                (SCRATCH + 0x200, b"../proc/1/stat\0"),
+                (SCRATCH + 0x300, b"/proc/self/fd\0"),
+            ],
+        );
+        kernel.run(&mut plat).unwrap();
+        let r = returns(&plat, INIT);
+        assert_eq!(r[0], 9);
+        let mem = plat.mem(INIT);
+        assert_eq!(mem.peek(buf, 9), b"/bin/prog");
+        assert_eq!(r[1..3], [0, 3]);
+        let stat = mem.peek(buf + 0x100, r[3] as usize);
+        assert!(
+            stat.starts_with(b"1 (prog) R 0 1 1 "),
+            "{}",
+            String::from_utf8_lossy(&stat)
+        );
+        assert_eq!(r[4], 4);
+        // ".", "..", and fds 0..=4.
+        let listing = mem.peek(buf + 0x400, r[5] as usize);
+        let names: Vec<_> = listing
+            .windows(2)
+            .filter(|w| w[1] == 0 && w[0].is_ascii_digit())
+            .map(|w| w[0] - b'0')
+            .collect();
+        assert_eq!(names, [0, 1, 2, 3, 4]);
+        assert_eq!(r[6], -crate::errno::EACCES);
+    }
 }

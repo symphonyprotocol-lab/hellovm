@@ -83,6 +83,16 @@ impl Console {
         self.input.len()
     }
 
+    /// The session the terminal controls, if any.
+    pub fn session(&self) -> Option<u32> {
+        None
+    }
+
+    /// The terminal's foreground process group, if any.
+    pub fn foreground(&self) -> Option<u32> {
+        None
+    }
+
     /// Process `sid` left its session (`setsid`): it no longer controls the
     /// terminal.
     pub fn session_left(&mut self, _sid: u32) {}

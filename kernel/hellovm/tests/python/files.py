@@ -1,0 +1,11 @@
+import os, tempfile, json, shutil
+d = tempfile.mkdtemp()
+p = os.path.join(d, "data.json")
+with open(p, "w") as f: json.dump({"a": [1, 2, 3]}, f)
+with open(p) as f: print("json:", json.load(f))
+os.rename(p, p + ".bak")
+print("listdir:", sorted(os.listdir(d)))
+with open(os.path.join(d, "big"), "wb") as f: f.write(os.urandom(1 << 20))
+print("size:", os.path.getsize(os.path.join(d, "big")))
+shutil.rmtree(d)
+print("removed:", not os.path.exists(d))

@@ -1,7 +1,8 @@
 //! Paths of the test guests built by this crate's build script.
 //!
-//! Each guest is a static, libc-free Linux executable for the target
-//! architecture. Linux targets only.
+//! The assembly guests are static, libc-free Linux executables for the
+//! target architecture; the C guests use the build host's glibc. Linux
+//! targets only.
 
 #![forbid(unsafe_code)]
 
@@ -33,3 +34,8 @@ pub const PIE: &str = env!("HELLOVM_GUEST_PIE");
 /// `hellovm/tests/signals.rs`). Empty when cross-compiling.
 #[cfg(target_os = "linux")]
 pub const SIGNALS: &str = env!("HELLOVM_GUEST_SIGNALS");
+
+/// A dynamically linked glibc program. Prints `dynamic: arg=<arg>
+/// sqrt2=1.4142 interp=yes exe=<path>`. Empty when cross-compiling.
+#[cfg(target_os = "linux")]
+pub const DYNAMIC: &str = env!("HELLOVM_GUEST_DYNAMIC");
