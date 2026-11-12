@@ -938,7 +938,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         self.write_mem(fds, &probe)?;
         let cloexec = flags & abi::O_CLOEXEC != 0;
         let nonblock = flags & abi::O_NONBLOCK != 0;
-        let pipe = self.st.pipes.create();
+        let pipe = self.st.pipes.create().ok_or(Errno(crate::errno::ENFILE))?;
         let mut read = OpenFile::new(FileObject::PipeRead(pipe), Access::Read);
         read.nonblock = nonblock;
         let mut write = OpenFile::new(FileObject::PipeWrite(pipe), Access::Write);

@@ -497,7 +497,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let now = self.host.clock_monotonic();
         let timer = &mut self.proc_mut().itimer;
         timer.interval = Duration::ZERO;
-        timer.deadline = (seconds != 0).then(|| now + Duration::from_secs(seconds.min(1 << 31)));
+        timer.deadline =
+            (seconds != 0).then(|| now.saturating_add(Duration::from_secs(seconds.min(1 << 31))));
         let mut secs = left.as_secs();
         if left.subsec_nanos() >= 500_000_000 || (secs == 0 && !left.is_zero()) {
             secs += 1;
@@ -538,7 +539,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             let now = self.host.clock_monotonic();
             let timer = &mut self.proc_mut().itimer;
             timer.interval = interval;
-            timer.deadline = (!value.is_zero()).then(|| now + value);
+            timer.deadline = (!value.is_zero()).then(|| now.saturating_add(value));
         }
         Ok(0)
     }

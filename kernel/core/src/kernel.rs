@@ -550,7 +550,7 @@ impl<H: Host> Kernel<H> {
             timer.deadline = if timer.interval.is_zero() {
                 None
             } else {
-                Some(now + timer.interval)
+                Some(now.saturating_add(timer.interval))
             };
             self.st.post_signal(
                 pid,
@@ -1445,5 +1445,65 @@ mod tests {
         assert_eq!(last.outcome, Outcome::Returned(3));
         // The echo: the line (CR echoed as CR NL) and ^C.
         assert_eq!(kernel.host().stdout, b"hi\r\n^C");
+    }
+
+    #[test]
+    fn hostile_arguments_fail_cleanly() {
+        let arch = Arch::Aarch64;
+        let mut huge = Vec::new();
+        huge.extend_from_slice(&i64::MAX.to_le_bytes());
+        huge.extend_from_slice(&999_999_999i64.to_le_bytes());
+        let mut itimer = Vec::new();
+        for v in [i64::MAX, 999_999, i64::MAX, 999_999] {
+            itimer.extend_from_slice(&v.to_le_bytes());
+        }
+        let parent = vec![
+            // A timer and a deadline in the far future.
+            sc(arch, Sysno::Setitimer, &[0, SCRATCH + 0x100, 0]),
+            sc(arch, Sysno::Clone, &[SIGCHLD as u64, 0, 0, 0, 0]),
+            sc(arch, Sysno::Ppoll, &[0, 0, SCRATCH, 0, 8]),
+        ];
+        let child = vec![
+            // Unknown clone flags, a bad exit signal, a bad futex address.
+            sc(arch, Sysno::Clone, &[0x4000_0000_0000 | 17, 0, 0, 0, 0]),
+            sc(arch, Sysno::Clone, &[200, 0, 0, 0, 0]),
+            sc(arch, Sysno::Futex, &[SCRATCH + 1, 0, 0, 0, 0, 0]),
+            sc(arch, Sysno::Futex, &[0x10_0000_0000, 0, 0, 0, 0, 0]),
+            // Signal numbers out of range.
+            sc(arch, Sysno::Kill, &[1, 65]),
+            sc(arch, Sysno::RtSigaction, &[0, 0, 0, 8]),
+            // An execve with argv pointing nowhere.
+            sc(arch, Sysno::Execve, &[SCRATCH + 0x200, 0x10_0000_0000, 0]),
+            // A bad rt_sigreturn frame kills the process with SIGSEGV.
+            sc(arch, Sysno::RtSigreturn, &[]),
+        ];
+        let (mut kernel, mut plat) = setup_scripts(
+            arch,
+            vec![parent, child],
+            &[
+                (SCRATCH, &huge),
+                (SCRATCH + 0x100, &itimer),
+                (SCRATCH + 0x200, b"/bin/prog\0"),
+            ],
+        );
+        // The child's sp is 0, so rt_sigreturn's frame is unreadable: it
+        // dies of SIGSEGV. The parent waits until the mock clock reaches
+        // the far deadlines (no overflow), and the timer's SIGALRM ends it.
+        assert_eq!(
+            kernel.run(&mut plat).unwrap(),
+            ExitStatus::Signaled(crate::signal::SIGALRM)
+        );
+        assert_eq!(
+            plat.task(2).returns,
+            vec![
+                -crate::errno::EINVAL,
+                -crate::errno::EINVAL,
+                -crate::errno::EINVAL,
+                -EFAULT,
+                -crate::errno::EINVAL,
+                -crate::errno::EINVAL,
+                -EFAULT,
+            ]
+        );
     }
 }

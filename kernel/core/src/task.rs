@@ -124,7 +124,6 @@ pub(crate) struct Process {
     /// Signal sent to the parent when the process ends (0 for none).
     pub exit_signal: u32,
     /// Monotonic time at creation (`/proc/<pid>/stat`).
-    #[allow(dead_code)]
     pub start_time: Duration,
     /// Set after `execve`, so that `setpgid` from the parent fails.
     pub execed: bool,

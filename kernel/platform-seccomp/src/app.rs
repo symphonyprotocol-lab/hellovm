@@ -617,7 +617,8 @@ impl Platform for SeccompPlatform {
     }
 
     fn wait(&mut self, timeout: Option<Duration>) -> Result<Option<Event>, PlatformError> {
-        let deadline = timeout.map(|t| Instant::now() + t);
+        // A timeout too far away to represent is no timeout.
+        let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         let mut slept = false;
         loop {
             let seen = wake::generation();

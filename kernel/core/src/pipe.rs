@@ -15,6 +15,9 @@ use crate::fd::PipeId;
 pub const PIPE_CAPACITY: usize = 64 * 1024;
 /// Writes up to this size are atomic: all or nothing.
 pub const PIPE_BUF: usize = 4096;
+/// Most pipes in one sandbox, which bounds the memory pipe buffers take
+/// (64 MiB), like Linux's `pipe-user-pages-hard` per user.
+pub const MAX_PIPES: usize = 1024;
 
 #[derive(Debug, Default)]
 pub struct Pipe {
@@ -104,8 +107,12 @@ pub struct Pipes {
 }
 
 impl Pipes {
-    /// A new pipe with one reader and one writer description.
-    pub fn create(&mut self) -> PipeId {
+    /// A new pipe with one reader and one writer description, unless the
+    /// sandbox has [`MAX_PIPES`] already.
+    pub fn create(&mut self) -> Option<PipeId> {
+        if self.slots.len() - self.free.len() >= MAX_PIPES {
+            return None;
+        }
         let pipe = Pipe {
             readers: 1,
             writers: 1,
@@ -113,10 +120,10 @@ impl Pipes {
         };
         if let Some(id) = self.free.pop() {
             self.slots[id] = Some(pipe);
-            return id;
+            return Some(id);
         }
         self.slots.push(Some(pipe));
-        self.slots.len() - 1
+        Some(self.slots.len() - 1)
     }
 
     pub fn get(&self, id: PipeId) -> &Pipe {
@@ -154,7 +161,7 @@ mod tests {
     #[test]
     fn eof_only_without_writers() {
         let mut pipes = Pipes::default();
-        let id = pipes.create();
+        let id = pipes.create().unwrap();
         let p = pipes.get_mut(id);
         let mut buf = [0; 4];
         assert_eq!(p.read(&mut buf), ReadResult::Empty);
@@ -168,12 +175,16 @@ mod tests {
         assert_eq!(pipes.get_mut(id).read(&mut buf), ReadResult::Eof);
         pipes.close_end(id, false);
         assert_eq!(pipes.live(), 0);
+        for _ in 0..MAX_PIPES {
+            pipes.create().unwrap();
+        }
+        assert_eq!(pipes.create(), None);
     }
 
     #[test]
     fn full_pipes_and_atomic_writes() {
         let mut pipes = Pipes::default();
-        let id = pipes.create();
+        let id = pipes.create().unwrap();
         let p = pipes.get_mut(id);
         let big = vec![7u8; PIPE_CAPACITY + 10];
         assert_eq!(p.write(&big), WriteResult::Written(PIPE_CAPACITY));
