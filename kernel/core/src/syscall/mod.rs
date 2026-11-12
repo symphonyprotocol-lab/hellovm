@@ -122,6 +122,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         self.park(WaitKind::Retry, timeout, restart)
     }
 
+    /// Parks the thread until `timeout` passes or a signal handler runs.
+    pub fn park_sleep(&mut self, timeout: Option<Duration>) -> Errno {
+        self.park(WaitKind::Sleep, timeout, Restart::Never)
+    }
+
     /// Whether this is the last attempt of a parked syscall whose timeout
     /// passed.
     pub fn timed_out(&self) -> bool {
@@ -252,10 +257,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 self.st.pipes.close_end(id, true);
                 self.st.changed = true;
             }
-            FileObject::ConsoleIn
-            | FileObject::ConsoleOut(_)
-            | FileObject::Tty
-            | FileObject::Proc { .. } => {}
+            FileObject::Proc { .. } => {
+                let held = file.contents.as_ref().map_or(0, Vec::len);
+                self.st.proc_bytes = self.st.proc_bytes.saturating_sub(held);
+            }
+            FileObject::ConsoleIn | FileObject::ConsoleOut(_) | FileObject::Tty => {}
         }
     }
 

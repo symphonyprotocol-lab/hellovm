@@ -159,6 +159,8 @@ impl StdinReader {
 pub struct StdioHost {
     common: Common,
     stdin: Option<Arc<StdinReader>>,
+    /// Given to the stdin reader when it starts.
+    waker: Option<Waker>,
 }
 
 impl std::fmt::Debug for StdioHost {
@@ -172,13 +174,18 @@ impl StdioHost {
         StdioHost {
             common: Common::new(image),
             stdin: None,
+            waker: None,
         }
     }
 
-    /// The stdin reader, started on first use.
+    /// The stdin reader, started when the sandbox first asks for console
+    /// input: a program that never reads its stdin leaves hellovm's stdin
+    /// untouched for whoever comes next (the rest of a shell script, say).
     fn reader(&mut self) -> &Arc<StdinReader> {
+        let waker = self.waker.clone();
         self.stdin.get_or_insert_with(|| {
             let reader = Arc::new(StdinReader::default());
+            reader.input.lock().unwrap_or_else(|e| e.into_inner()).waker = waker;
             let thread_reader = Arc::clone(&reader);
             // Detached: it may stay blocked in read() until the process
             // exits.
@@ -223,8 +230,11 @@ impl Host for StdioHost {
     }
 
     fn set_console_waker(&mut self, waker: Waker) {
-        let reader = Arc::clone(self.reader());
-        reader.input.lock().unwrap_or_else(|e| e.into_inner()).waker = Some(waker);
+        // Does not start the reader.
+        if let Some(reader) = &self.stdin {
+            reader.input.lock().unwrap_or_else(|e| e.into_inner()).waker = Some(waker.clone());
+        }
+        self.waker = Some(waker);
     }
 
     common_host_methods!();

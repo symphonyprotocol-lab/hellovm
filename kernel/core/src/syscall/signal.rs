@@ -35,12 +35,22 @@ fn timeval(d: Duration) -> [u8; 16] {
 impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     /// Resumes this thread with `next`, delivering a pending signal first if
     /// there is one it must act on.
+    ///
+    /// A parked syscall that is interrupted (`Next::Interrupted`) only ends
+    /// if a handler runs or its process ends. Otherwise (the signal was
+    /// taken by another thread, had no effect, or stopped the process) the
+    /// thread simply stays parked, with its deadline: nothing is restarted,
+    /// so a sleep or a timed wait does not start over.
     pub(crate) fn resume(&mut self, mut next: Next) -> Result<(), KernelError> {
         let tid = self.tid;
         let mut handled = false;
+        let stays_parked =
+            matches!(next, Next::Interrupted(..)) && self.st.thread(tid).parked().is_some();
         loop {
             if self.proc().stopped {
-                self.st.thread_mut(tid).state = ThreadState::Held(next);
+                if !stays_parked {
+                    self.st.thread_mut(tid).state = ThreadState::Held(next);
+                }
                 return Ok(());
             }
             let Some(info) = self.st.take_signal(tid) else {
@@ -68,6 +78,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 }
             }
         }
+        if !handled && stays_parked {
+            return Ok(());
+        }
         if !handled {
             // A syscall that completes on its own puts back the mask that
             // rt_sigsuspend, ppoll or pselect6 replaced.
@@ -83,7 +96,15 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             self.plat.set_context(self.task, &context)?;
         }
         self.plat.resume(self.task, next.resume())?;
-        self.st.thread_mut(tid).state = ThreadState::Running;
+        let thread = self.st.thread_mut(tid);
+        thread.state = ThreadState::Running;
+        // Whatever interrupt was requested before has served its purpose:
+        // the thread was stopped and its signals were looked at. The
+        // platform may have consumed the request without reporting it (it
+        // arrived during a syscall the kernel was already handling), and
+        // after `execve` it concerned another task. A request that is still
+        // on its way only causes one spurious `Trap::Interrupted`.
+        thread.interrupt_sent = false;
         Ok(())
     }
 
@@ -94,9 +115,14 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         match next {
             Next::Return(value) => context.set_ret(value),
             Next::Interrupted(trap, restart) => {
-                if restart == Restart::IfSaRestart && action.flags & SA_RESTART != 0 {
+                let partial = std::mem::take(&mut self.st.thread_mut(self.tid).io_done);
+                if partial > 0 {
+                    // A blocking write that already moved data reports it.
+                    context.set_ret(partial as i64);
+                } else if restart == Restart::IfSaRestart && action.flags & SA_RESTART != 0 {
                     context.restart_syscall(&trap);
                 } else {
+                    self.report_sleep_left();
                     context.set_ret(-EINTR);
                 }
             }
@@ -144,6 +170,28 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             self.proc_mut().actions[sig as usize - 1] = SigAction::default();
         }
         Ok(())
+    }
+
+    /// For a relative `nanosleep`/`clock_nanosleep` that a handler
+    /// interrupts: writes the time left to its `rem` argument, if any.
+    fn report_sleep_left(&mut self) {
+        let Some(parked) = self.st.thread(self.tid).parked().copied() else {
+            return;
+        };
+        const TIMER_ABSTIME: u64 = 1;
+        let args = parked.trap.args;
+        let rem = match parked.sysno {
+            Some(crate::Sysno::Nanosleep) => args[1],
+            Some(crate::Sysno::ClockNanosleep) if args[1] & TIMER_ABSTIME == 0 => args[3],
+            _ => 0,
+        };
+        let (Some(deadline), true) = (parked.deadline, rem != 0) else {
+            return;
+        };
+        let left = deadline.saturating_sub(self.host.clock_monotonic());
+        let raw = abi::encode_pair(left.as_secs() as i64, i64::from(left.subsec_nanos()));
+        // A bad `rem` pointer does not change the outcome (EINTR).
+        let _ = self.write_mem(rem, &raw);
     }
 
     /// Stops this process for job control.
@@ -399,11 +447,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             thread.sigmask = mask & !UNBLOCKABLE;
             self.st.changed = true;
         }
-        Err(self.park_retry(None, Restart::Never))
+        Err(self.park_sleep(None))
     }
 
     pub fn sys_pause(&mut self) -> SysResult<u64> {
-        Err(self.park_retry(None, Restart::Never))
+        Err(self.park_sleep(None))
     }
 
     pub fn sys_rt_sigpending(&mut self, set: GuestAddr, size: u64) -> SysResult<u64> {

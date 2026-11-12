@@ -37,6 +37,11 @@ pub const PID_MAX: Pid = 32768;
 /// Most threads (of all processes, zombies included) in one sandbox.
 pub const MAX_TASKS: usize = 1024;
 
+/// Most bytes of generated `/proc` file contents all open files of a
+/// sandbox hold together (each open keeps a snapshot); opens beyond it fail
+/// with `ENOMEM`.
+pub const MAX_PROC_BYTES: usize = 16 << 20;
+
 /// Default and maximum of a resource limit.
 pub(crate) type Rlimit = (u64, u64);
 
@@ -190,7 +195,12 @@ pub(crate) enum WaitKind {
         addr: GuestAddr,
         bitset: u32,
     },
-    /// The `vfork` child to exec or exit; not interruptible.
+    /// Nothing the sandbox's state can provide: only its deadline or a
+    /// signal handler ends the wait (`nanosleep`, `pause`). Never retried
+    /// on changes.
+    Sleep,
+    /// The `vfork` child to exec or exit; only `SIGKILL` ends the wait
+    /// early.
     Vfork(Pid),
 }
 
@@ -258,8 +268,11 @@ pub(crate) struct Thread {
     pub altstack: AltStack,
     pub clear_child_tid: GuestAddr,
     pub robust_list: (GuestAddr, u64),
-    /// The platform was asked to interrupt it and has not reported back.
+    /// The platform was asked to interrupt it since it was last resumed.
     pub interrupt_sent: bool,
+    /// While parked in a blocking pipe `write`: the bytes its earlier
+    /// attempts already wrote.
+    pub io_done: usize,
 }
 
 impl Thread {
@@ -276,6 +289,7 @@ impl Thread {
             clear_child_tid: 0,
             robust_list: (0, 0),
             interrupt_sent: false,
+            io_done: 0,
         }
     }
 
@@ -351,6 +365,9 @@ pub(crate) struct State {
     pub mms: Mms,
     pub console: Console,
     next_pid: Pid,
+    /// Bytes of generated `/proc` file contents held by open files; see
+    /// [`MAX_PROC_BYTES`].
+    pub proc_bytes: usize,
     /// Something happened that parked syscalls may be waiting for.
     pub changed: bool,
     /// How the first process ended; the sandbox ends with it.
@@ -370,6 +387,7 @@ impl State {
             mms: Mms::default(),
             console,
             next_pid: 1,
+            proc_bytes: 0,
             changed: false,
             init_status: None,
             init_cwd: None,

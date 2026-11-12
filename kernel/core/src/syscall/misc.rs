@@ -7,7 +7,6 @@ use crate::arch::Arch;
 use crate::errno::{Errno, SysResult, EFAULT, EINVAL, ENOSYS, EPERM};
 use crate::host::Host;
 use crate::platform::{GuestAddr, Platform};
-use crate::task::Restart;
 
 use super::{Action, Ctx};
 
@@ -212,8 +211,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if self.timed_out() || request.is_zero() {
             return Ok(0);
         }
+        // `rem` is written when a signal handler interrupts the sleep (see
+        // `Ctx::interrupted_result`), from the trap's arguments.
         let _ = rem;
-        Err(self.park_retry(Some(request), Restart::Never))
+        Err(self.park_sleep(Some(request)))
     }
 
     pub fn sys_nanosleep(&mut self, req: GuestAddr, rem: GuestAddr) -> SysResult<u64> {

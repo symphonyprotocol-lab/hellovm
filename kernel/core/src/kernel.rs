@@ -475,8 +475,16 @@ impl<H: Host> Kernel<H> {
                     }
                 }
                 ThreadState::Parked(parked) => {
-                    let interruptible = !matches!(parked.kind, WaitKind::Vfork(_));
-                    if interruptible && self.st.has_signal_to_act_on(tid) {
+                    if let WaitKind::Vfork(_) = parked.kind {
+                        // The child runs on the parent's memory, so no
+                        // handler may run in the parent; but SIGKILL must
+                        // still end it.
+                        let kill = crate::signal::bit(crate::signal::SIGKILL);
+                        if self.st.deliverable(tid) & kill != 0 {
+                            self.ctx(platform, tid, None)
+                                .exit_process(ExitStatus::Signaled(crate::signal::SIGKILL), false);
+                        }
+                    } else if self.st.has_signal_to_act_on(tid) {
                         let next = Next::Interrupted(parked.trap, parked.restart);
                         self.ctx(platform, tid, None).resume(next)?;
                     } else if parked.kind == WaitKind::Retry && !stopped {
@@ -706,7 +714,7 @@ impl<H: Host> Kernel<H> {
         }
         let pids: Vec<_> = self.st.procs.keys().copied().collect();
         for pid in pids {
-            crate::syscall::reap(&mut self.st, &mut self.vfs, pid);
+            crate::syscall::reap(&mut self.st, pid);
         }
         debug_assert!(self.st.threads.is_empty());
         self.st.tasks.clear();
@@ -1294,7 +1302,8 @@ mod tests {
     fn threads_wait_and_wake_on_futexes() {
         let arch = Arch::Aarch64;
         let word = SCRATCH + 0x40;
-        let flags = 0x100 | 0x800 | 0x1_0000 | 0x20_0000 | 0x100_0000; // VM SIGHAND THREAD CHILD_CLEARTID CHILD_SETTID
+        // VM FS FILES SIGHAND THREAD CHILD_CLEARTID CHILD_SETTID
+        let flags = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x20_0000 | 0x100_0000;
         let main = vec![
             sc(arch, Sysno::Clone, &[flags, SCRATCH + 0x1000, 0, 0, word]),
             // The child set *word = its tid; wait while it is 2.
@@ -1324,7 +1333,7 @@ mod tests {
         let arch = Arch::Aarch64;
         let path = SCRATCH + 0x10;
         let argv = SCRATCH + 0x40;
-        let thread_flags = 0x100 | 0x800 | 0x1_0000; // VM SIGHAND THREAD
+        let thread_flags = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000; // VM FS FILES SIGHAND THREAD
         let main = vec![
             sc(
                 arch,

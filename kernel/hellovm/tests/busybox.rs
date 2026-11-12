@@ -394,3 +394,59 @@ fn timeout_stops_a_program_that_spins() {
     assert!(stderr.contains("timed out"), "{stderr}");
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
+
+#[test]
+fn a_program_that_reads_no_input_leaves_stdin_alone() {
+    use std::io::{Seek, Write};
+    let Some(busybox) = busybox() else { return };
+    let image = image(&busybox);
+    // The child shares this file's offset: whatever hellovm reads moves it.
+    let path = image.path().join("host-stdin");
+    let mut input = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    input.write_all(b"the rest of a script\n").unwrap();
+    input.rewind().unwrap();
+    let run = |args: &[&str], input: &std::fs::File| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_hellovm"))
+            .arg("--root")
+            .arg(image.path())
+            .args(args)
+            .stdin(input.try_clone().unwrap())
+            .output()
+            .expect("run hellovm")
+    };
+    let output = run(&["/bin/busybox", "true"], &input);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(input.stream_position().unwrap(), 0, "stdin was consumed");
+    // A program that does read gets the input.
+    let output = run(&["/bin/busybox", "cat"], &input);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "the rest of a script\n"
+    );
+}
+
+#[test]
+fn proc_cmdline_is_bounded() {
+    let Some(busybox) = busybox() else { return };
+    let image = image(&busybox);
+    let mut sandbox = Sandbox::new(image.path());
+    let long = "x".repeat(100_000);
+    // The program gets the whole argument; /proc keeps a page of whole
+    // arguments.
+    let out = sandbox.ok(&[
+        "sh",
+        "-c",
+        "echo ${#1}; /bin/busybox wc -c < /proc/$$/cmdline",
+        "sh",
+        &long,
+    ]);
+    let numbers: Vec<usize> = out.lines().map(|l| l.trim().parse().unwrap()).collect();
+    assert_eq!(numbers[0], 100_000, "{out}");
+    assert!(numbers[1] > 0 && numbers[1] <= 4096, "{out}");
+}

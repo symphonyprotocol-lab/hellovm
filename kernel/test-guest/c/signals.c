@@ -4,11 +4,13 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <setjmp.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -201,5 +203,76 @@ int main(void) {
     kill(child, SIGCONT);
     waitpid(child, &status, 0);
     printf("continued and exited: %d sigchld=%d\n", WEXITSTATUS(status), got == SIGCHLD);
+    set_handler(SIGCHLD, SIG_DFL, 0);
+
+    // One blocking write to a pipe is complete, even when it is bigger
+    // than the pipe and the reader is slow.
+    int fds[2];
+    if (pipe(fds) != 0) return 1;
+    child = fork();
+    if (child == 0) {
+        close(fds[1]);
+        usleep(100000);
+        char buf[4096];
+        long total = 0;
+        ssize_t n;
+        while ((n = read(fds[0], buf, sizeof buf)) > 0) total += n;
+        _exit(total == 300000 ? 0 : 1);
+    }
+    close(fds[0]);
+    static char big[300000];
+    ssize_t wrote = write(fds[1], big, sizeof big);
+    close(fds[1]);
+    waitpid(child, &status, 0);
+    printf("pipe write: %zd reader=%d\n", wrote, WEXITSTATUS(status));
+
+    // A signal that runs no handler (SIGCONT of a process that is not
+    // stopped) does not make a sleep start over.
+    child = fork();
+    if (child == 0) {
+        double start = now();
+        struct timespec ts = {1, 0};
+        int r = nanosleep(&ts, NULL);
+        double took = now() - start;
+        _exit(r == 0 && took > 0.9 && took < 1.4 ? 0 : 1);
+    }
+    usleep(700000);
+    kill(child, SIGCONT);
+    waitpid(child, &status, 0);
+    printf("sleep keeps its deadline: %d\n", WEXITSTATUS(status) == 0);
+
+    // A handler interrupts a sleep, which reports the time left.
+    set_handler(SIGALRM, on_signal, 0);
+    struct itimerval once = {{0, 0}, {0, 300000}};
+    setitimer(ITIMER_REAL, &once, NULL);
+    struct timespec req = {1, 0}, rem = {9, 9};
+    errno = 0;
+    int slept = nanosleep(&req, &rem);
+    double left = rem.tv_sec + rem.tv_nsec / 1e9;
+    printf("sleep eintr: %d rem-ok=%d\n", slept, errno == EINTR && left > 0.4 && left < 0.75);
+    set_handler(SIGALRM, SIG_DFL, 0);
+
+    // SIGKILL ends a process that waits for its vfork child.
+    child = fork();
+    if (child == 0) {
+        if (vfork() == 0) {
+            struct timespec ts = {5, 0};
+            nanosleep(&ts, NULL);
+            _exit(0);
+        }
+        _exit(0);
+    }
+    usleep(200000);
+    double killed_at = now();
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+    printf("vfork parent killed: %d fast=%d\n",
+           WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, now() - killed_at < 2.0);
+
+    // Sharing the kernel cannot provide is refused, not silently dropped.
+    errno = 0;
+    long cloned = syscall(SYS_clone, CLONE_VM | CLONE_FILES | SIGCHLD, 0, 0, 0, 0);
+    if (cloned == 0) _exit(0);
+    printf("clone sharing refused: %ld %d\n", cloned, errno == EINVAL);
     return 0;
 }

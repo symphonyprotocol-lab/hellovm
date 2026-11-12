@@ -17,7 +17,7 @@ use crate::host::Host;
 use crate::kernel::ExitStatus;
 use crate::mm::{Mm, VmaKind};
 use crate::platform::{GuestAddr, Platform, Prot, TaskKey, TaskMem};
-use crate::signal::{self, SigAction, SIG_DFL, SIG_IGN};
+use crate::signal::{self, SigAction, SIG_IGN};
 use crate::task::{
     Life, Next, Pid, Process, Restart, State, Thread, ThreadState, Tid, WaitKind, RLIM_INFINITY,
 };
@@ -79,6 +79,10 @@ const P_PGID: i64 = 2;
 const MAX_ARGS_BYTES: usize = 2 << 20;
 /// Most argument plus environment strings.
 const MAX_ARGS: usize = 1 << 17;
+/// Most bytes of a command line kept for `/proc/<pid>/cmdline` (one page,
+/// as Linux showed for a long time). The program itself gets all of its
+/// arguments.
+const CMDLINE_MAX: usize = 4096;
 /// Longest `#!` line Linux looks at.
 const SHEBANG_MAX: usize = 256;
 /// Most nested `#!` interpreters.
@@ -277,8 +281,13 @@ pub(crate) fn load_program<H: Host + ?Sized, P: Platform + ?Sized>(
         Ok((entry, stack, trampoline)) => {
             let shown = argv.first().unwrap_or(&path);
             let name = shown.rsplit(|&b| b == b'/').next().unwrap_or(shown);
+            // Every process keeps its command line for /proc, so only its
+            // first CMDLINE_MAX bytes are kept (whole arguments).
             let mut cmdline = Vec::new();
             for arg in &argv {
+                if cmdline.len() + arg.len() + 1 > CMDLINE_MAX {
+                    break;
+                }
                 cmdline.extend_from_slice(arg);
                 cmdline.push(0);
             }
@@ -324,7 +333,7 @@ fn map_trampoline<P: Platform + ?Sized>(
 }
 
 /// Removes a process that has ended (a zombie) from the sandbox.
-pub(crate) fn reap(st: &mut State, _vfs: &mut Vfs, pid: Pid) {
+pub(crate) fn reap(st: &mut State, pid: Pid) {
     if let Some(proc) = st.procs.get(&pid) {
         debug_assert!(!proc.alive() && proc.threads.is_empty());
         st.procs.remove(&pid);
@@ -490,6 +499,20 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if (thread && flags & CLONE_SIGHAND == 0)
             || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
         {
+            return Err(Errno(EINVAL));
+        }
+        // The fd table, the current directory and the signal actions belong
+        // to the process: threads share all three and other clones get
+        // copies. Combinations that ask for anything else cannot be
+        // honoured, so they are refused rather than silently changed.
+        let shared = flags & (CLONE_FILES | CLONE_FS);
+        let consistent = if thread {
+            shared == CLONE_FILES | CLONE_FS
+        } else {
+            shared == 0 && flags & CLONE_SIGHAND == 0
+        };
+        if !consistent {
+            log::warn!("clone: unsupported sharing in flags {flags:#x}");
             return Err(Errno(EINVAL));
         }
         let exit_signal = (flags & 0xff) as u32;
@@ -689,7 +712,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let action = parent.action(signal::SIGCHLD);
         if action.handler == SIG_IGN || action.flags & signal::SA_NOCLDWAIT != 0 {
             // The parent does not want zombies.
-            reap(self.st, self.vfs, pid);
+            reap(self.st, pid);
             return;
         }
         if exit_signal != 0 {
@@ -777,7 +800,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             if self.st.proc(child).alive() {
                 self.st.proc_mut(child).event = None;
             } else {
-                reap(self.st, self.vfs, child);
+                reap(self.st, child);
             }
             return Ok(u64::from(child));
         }
@@ -845,7 +868,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 if self.st.proc(child).alive() {
                     self.st.proc_mut(child).event = None;
                 } else {
-                    reap(self.st, self.vfs, child);
+                    reap(self.st, child);
                 }
             }
             return Ok(0);
@@ -1042,17 +1065,6 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             self.st.proc_mut(pid).rlimits[resource] = (cur, max);
         }
         Ok(0)
-    }
-}
-
-/// Signal dispositions a new process inherits: handlers reset (used by
-/// tests).
-#[allow(dead_code)]
-pub(crate) fn reset_handlers(actions: &mut [SigAction]) {
-    for action in actions {
-        if action.handler != SIG_IGN && action.handler != SIG_DFL {
-            *action = SigAction::default();
-        }
     }
 }
 

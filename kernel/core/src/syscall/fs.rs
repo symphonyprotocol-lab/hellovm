@@ -475,7 +475,43 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let (id, _) = self.file(fd)?;
         let len = (len as usize).min(MAX_IO);
         let data = self.read_mem(buf, len)?;
-        self.write_file(id, offset, &data).map(|n| n as u64)
+        self.write_fully(id, offset, &data).map(|n| n as u64)
+    }
+
+    /// `write`/`writev`: like [`Self::write_file`], except that a blocking
+    /// write to a pipe goes on until all of `data` is in the pipe, as
+    /// POSIX requires: when the pipe fills up, the thread parks and the
+    /// retry continues where it stopped (`Thread::io_done`). Only a signal
+    /// handler or a closed read end make it return a short count.
+    fn write_fully(&mut self, id: FileId, offset: Option<u64>, data: &[u8]) -> SysResult<usize> {
+        let file = self.st.files.get(id);
+        let blocking_pipe = matches!(file.object, FileObject::PipeWrite(_)) && !file.nonblock;
+        if !blocking_pipe || data.is_empty() {
+            return self.write_file(id, offset, data);
+        }
+        let tid = self.tid;
+        let mut done = match self.parked {
+            Some(_) => self.st.thread(tid).io_done.min(data.len()),
+            None => 0,
+        };
+        while done < data.len() {
+            match self.write_file(id, offset, &data[done..]) {
+                Ok(n) => done += n,
+                Err(err) if self.action.is_some() => {
+                    // Parked: remember the progress for the retry.
+                    self.st.thread_mut(tid).io_done = done;
+                    return Err(err);
+                }
+                // The read end closed after some data went through.
+                Err(_) if done > 0 => break,
+                Err(err) => {
+                    self.st.thread_mut(tid).io_done = 0;
+                    return Err(err);
+                }
+            }
+        }
+        self.st.thread_mut(tid).io_done = 0;
+        Ok(done)
     }
 
     fn seekable(&self, fd: i64) -> SysResult<()> {
@@ -584,7 +620,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 break;
             }
         }
-        self.write_file(id, offset, &data).map(|n| n as u64)
+        self.write_fully(id, offset, &data).map(|n| n as u64)
     }
 
     pub fn sys_sendfile(
@@ -731,7 +767,15 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         match node {
             // The listing is generated when it is first read.
             ProcNode::Dir(_) => {}
-            ProcNode::File(contents) => file.contents = Some(contents),
+            ProcNode::File(contents) => {
+                // Each open keeps its snapshot: bound what they hold.
+                let held = self.st.proc_bytes + contents.len();
+                if held > crate::task::MAX_PROC_BYTES {
+                    return Err(Errno(crate::errno::ENOMEM));
+                }
+                self.st.proc_bytes = held;
+                file.contents = Some(contents);
+            }
             ProcNode::Link(_) => unreachable!("handled above"),
         }
         file.path = Some(abs);

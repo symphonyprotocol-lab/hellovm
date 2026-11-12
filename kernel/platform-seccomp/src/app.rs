@@ -66,8 +66,6 @@ struct Task {
     state: State,
     /// While stopped: the registers the app resumes with.
     regs: Regs,
-    /// The registers were changed by the core and must be written back.
-    dirty: bool,
 }
 
 /// The live tasks' pidfds, shared with every [`AppKiller`].
@@ -105,6 +103,8 @@ pub struct SeccompPlatform {
     nr_munmap: u64,
     nr_mprotect: u64,
     nr_clone: u64,
+    /// The waker wake-up count [`Platform::wait`] last reported.
+    wakes_seen: u32,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -119,7 +119,7 @@ impl SeccompPlatform {
         let page_size = sys::page_size();
         let number = |sysno: Sysno| arch.syscall_nr(sysno).expect("generic syscall");
         let stub_range = stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED;
-        let mut platform = SeccompPlatform {
+        let platform = SeccompPlatform {
             arch,
             info: AddressSpaceInfo {
                 page_size,
@@ -134,12 +134,11 @@ impl SeccompPlatform {
             nr_munmap: number(Sysno::Munmap),
             nr_mprotect: number(Sysno::Mprotect),
             nr_clone: number(Sysno::Clone),
+            wakes_seen: wake::wakes(),
             _not_send: PhantomData,
         };
-        // The address space's extent is set by the first spawn, from what
-        // the host gave that process (its stack sits at the top of the user
-        // range).
-        let _ = &mut platform;
+        // `max_addr` is set by the first spawn, from what the host gave
+        // that process (its stack sits at the top of the user range).
         Ok(platform)
     }
 
@@ -208,7 +207,6 @@ impl SeccompPlatform {
                 tracee,
                 state: State::Stopped(kind),
                 regs,
-                dirty: false,
             },
         );
         Ok(key)
@@ -230,7 +228,7 @@ impl SeccompPlatform {
         let key = self.register(spawned.tracee, spawned.regs, StopKind::SyscallExit)?;
         for &(start, len) in &spawned.foreign {
             let ret = self
-                .inject(key, sys_nr(self.nr_munmap), [start, len, 0, 0, 0, 0])
+                .inject(key, self.nr_munmap, [start, len, 0, 0, 0, 0])
                 .map(|(ret, _)| ret);
             match ret {
                 Ok(0) => {}
@@ -304,7 +302,6 @@ impl SeccompPlatform {
         }
         let task = self.task(key)?;
         task.state = State::Stopped(StopKind::SyscallExit);
-        task.dirty = true;
         let mut regs = task.regs;
         regs.prepare_syscall(stub::STUB_SYSCALL, nr, args);
         task.tracee.set_regs(&regs)?;
@@ -419,14 +416,12 @@ impl SeccompPlatform {
                 let regs = task.tracee.regs()?;
                 let (nr, args) = regs.syscall();
                 task.regs = regs;
-                task.dirty = false;
                 task.state = State::Stopped(StopKind::Seccomp);
                 Trap::Syscall(SyscallTrap { nr, args })
             }
             Stop::Signal(sig) => {
                 let regs = task.tracee.regs()?;
                 task.regs = regs;
-                task.dirty = false;
                 task.state = State::Stopped(StopKind::Signal);
                 match task.tracee.siginfo() {
                     Some((code, addr)) if is_fault(sig) && code > 0 => Trap::Fault(Fault {
@@ -449,10 +444,6 @@ fn is_fault(sig: i32) -> bool {
         sig,
         libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGTRAP | libc::SIGSYS
     )
-}
-
-fn sys_nr(nr: u64) -> u64 {
-    nr
 }
 
 fn host_cpu_info() -> CpuInfo {
@@ -555,9 +546,7 @@ impl Platform for SeccompPlatform {
         // of the injected call's). Its FP state and thread pointer are the
         // parent's already: injection never touches them.
         let regs = self.task(parent)?.regs;
-        let key = self.register(tracee, regs, StopKind::Signal)?;
-        self.task(key)?.dirty = true;
-        Ok(key)
+        self.register(tracee, regs, StopKind::Signal)
     }
 
     fn kill(&mut self, key: TaskKey) -> Result<(), PlatformError> {
@@ -586,7 +575,6 @@ impl Platform for SeccompPlatform {
         #[cfg(target_arch = "aarch64")]
         task.tracee.set_tls(_tls)?;
         task.regs = regs;
-        task.dirty = true;
         Ok(())
     }
 
@@ -604,7 +592,6 @@ impl Platform for SeccompPlatform {
         }
         task.tracee.resume(Run::Cont, 0)?;
         task.state = State::Running;
-        task.dirty = false;
         Ok(())
     }
 
@@ -622,6 +609,14 @@ impl Platform for SeccompPlatform {
         let mut slept = false;
         loop {
             let seen = wake::generation();
+            // A waker fired since the last report, possibly while the core
+            // was busy: tell the core now. (Read after `seen`: a wake-up
+            // that comes later changes the generation and ends the sleep.)
+            let wakes = wake::wakes();
+            if wakes != self.wakes_seen {
+                self.wakes_seen = wakes;
+                return Ok(None);
+            }
             loop {
                 match tracer::waitpid(-1, true) {
                     Ok(Some((pid, stop))) => {
@@ -797,6 +792,15 @@ mod tests {
             maps.contains(&format!("{:x}-{:x} rw-p", addr + 2 * page, addr + 4 * page)),
             "{maps}"
         );
+    }
+
+    #[test]
+    fn a_wake_up_that_came_before_the_wait_is_reported() {
+        let mut p = SeccompPlatform::new().unwrap();
+        // The loop is not asleep when the waker fires; without a task or a
+        // timeout, a lost wake-up would block this wait forever.
+        p.waker().wake();
+        assert!(p.wait(None).unwrap().is_none());
     }
 
     #[test]

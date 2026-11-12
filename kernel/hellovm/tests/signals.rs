@@ -34,6 +34,11 @@ fn signals_reach_handlers_with_correct_frames() {
         "child segv: signaled=1 sig=11 core=1",
         "stopped: 1 sig=19",
         "continued and exited: 5 sigchld=1",
+        "pipe write: 300000 reader=0",
+        "sleep keeps its deadline: 1",
+        "sleep eintr: -1 rem-ok=1",
+        "vfork parent killed: 1 fast=1",
+        "clone sharing refused: -1 1",
     ];
     let lines: Vec<_> = out.stdout.lines().collect();
     assert_eq!(lines, expected, "stderr: {}", out.stderr);

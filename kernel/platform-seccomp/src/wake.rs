@@ -12,7 +12,9 @@
 //! The loop reads the counter, drains `waitpid(WNOHANG)`, and only then
 //! sleeps in `FUTEX_WAIT` on the value it read, so a stop that happens in
 //! between changes the counter and the sleep returns at once: no wake-up is
-//! lost. Wake-ups meant for another sandbox in the same host process (the
+//! lost. Waker wake-ups are also counted on their own ([`wakes`]): the loop
+//! reports one whenever the count moved since it last looked, even if the
+//! bump came while it was handling an event. Wake-ups meant for another sandbox in the same host process (the
 //! counter is shared) are harmless: that loop finds nothing and returns
 //! `None`, which the core treats as "check again".
 //!
@@ -27,6 +29,11 @@ use std::time::Duration;
 use hellovm_core::platform::Waker;
 
 static GENERATION: AtomicU32 = AtomicU32::new(0);
+/// Counts the wake-ups of [`Waker`]s alone. A waker's bump may happen while
+/// the event loop is busy rather than asleep; the loop compares this
+/// counter with the value it last acted on, so such a wake-up is still
+/// reported by the next wait instead of being mistaken for old news.
+static WAKES: AtomicU32 = AtomicU32::new(0);
 static INSTALL: Once = Once::new();
 
 fn bump() {
@@ -96,7 +103,18 @@ pub fn sleep(seen: u32, timeout: Option<Duration>) {
     }
 }
 
+/// The number of waker wake-ups so far (wrapping).
+pub fn wakes() -> u32 {
+    WAKES.load(Ordering::SeqCst)
+}
+
+fn wake() {
+    // Count first: a loop that sees the new generation must see the count.
+    WAKES.fetch_add(1, Ordering::SeqCst);
+    bump();
+}
+
 /// A waker for the event loop.
 pub fn waker() -> Waker {
-    Waker::new(bump)
+    Waker::new(wake)
 }
