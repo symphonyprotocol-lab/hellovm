@@ -19,13 +19,16 @@ jobs:
 
       # rust-toolchain.toml at the repository root selects channel 1.99.1
       # (clippy and rustfmt included). Do not override that pin here.
-      # rust-src-dir points the action's rust-cache at kernel/ (the Cargo
-      # workspace). Without it the cache targets the repository root, which
-      # has no Cargo.lock. cache-workspaces falls back to this path.
+      # Do not set rust-src-dir: the action cds there before it looks for
+      # rust-toolchain.toml, misses the root file, installs stable, and
+      # `rustup override set stable` on kernel/ hides the file. cache-workspaces
+      # only points rust-cache at kernel/. override: false keeps a missed
+      # file from writing that directory override.
       - name: Install the Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          rust-src-dir: kernel
+          cache-workspaces: kernel
+          override: false
 
       - name: Install distro e2e dependencies
         run: |
