@@ -98,7 +98,7 @@ macro_rules! sandbox {
         let image = match image() {
             Ok(image) => image,
             Err(err) => {
-                common::skip_or_fail(&format!("SKIPPING python test: {err}"));
+                common::skip_or_fail(&format!("python test: {err}"));
                 return;
             }
         };

@@ -89,8 +89,9 @@ child is allowed there). On other hosts the workspace builds, but the
 end-to-end tests are skipped and `hellovm` cannot run programs yet.
 
 `kernel/dev/run-e2e.sh`, run from the repository root, is the one-shot
-x86_64 path. It checks that rustc is 1.99.1, that a C compiler exists, that
-busybox is present and statically linked, and that `/usr/bin/python3` has
+path on the machine it runs on (a native host, or the dev container on
+either architecture). It checks that rustc is 1.99.1, that a C compiler
+exists, that busybox is present and statically linked, and that `/usr/bin/python3` has
 its standard library at `/usr/lib/python3.X`. It then runs `cargo check`,
 `cargo test`, clippy and rustfmt. The script exports `HELLOVM_REQUIRE_E2E=1`
 and fails if the test log contains `SKIPPING` or `skipping:`.

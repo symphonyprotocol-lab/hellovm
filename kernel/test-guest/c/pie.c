@@ -2,9 +2,11 @@
 // malloc), mmap/munmap, stdio and the auxiliary vector. Keep the output
 // format in sync with the test in hellovm/tests/sandbox.rs.
 //
-// The large region is an explicit mmap. A large malloc is not: GCC at -O2
-// deletes a malloc whose bytes are barely used, and glibc may also serve it
-// from brk. The sandbox test looks for Mmap and Munmap in the trace.
+// The large region is an explicit mmap/munmap so the sandbox trace
+// contains Mmap and Munmap independent of malloc's allocation strategy
+// and of compiler optimisation. A large malloc was deleted at -O2 with
+// GCC 13.2 and glibc 2.39 (no mmap in the trace); that is not assumed
+// for every toolchain.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -21,15 +21,15 @@ pub fn e2e_required() -> bool {
     std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1")
 }
 
-/// Prints `message` so the caller can return from the test. When
-/// [`e2e_required`] is set, panics with that message instead. `message`
-/// must name what is missing and how to install it, and should start with
-/// `SKIPPING` or `skipping:` so an optional skip is visible in the log.
-pub fn skip_or_fail(message: &str) {
+/// `reason` names what is missing and how to install it, with no
+/// `SKIPPING` prefix. An optional run prints `SKIPPING {reason}` so
+/// `run-e2e.sh` can see the skip. When [`e2e_required`] is set, the test
+/// panics with `required e2e dependency missing: {reason}`.
+pub fn skip_or_fail(reason: &str) {
     if e2e_required() {
-        panic!("{message}");
+        panic!("required e2e dependency missing: {reason}");
     } else {
-        eprintln!("{message}");
+        eprintln!("SKIPPING {reason}");
     }
 }
 
@@ -44,7 +44,7 @@ pub fn require_busybox(what: &str) -> Option<String> {
         return Some(path);
     }
     skip_or_fail(&format!(
-        "SKIPPING {what}: {path} not found (install Debian/Ubuntu busybox-static, not a musl binary from busybox.net)"
+        "{what}: {path} not found (install Debian/Ubuntu busybox-static, not a musl binary from busybox.net)"
     ));
     None
 }
@@ -56,7 +56,7 @@ pub fn require_guest(path: &str, name: &str) -> bool {
         return true;
     }
     skip_or_fail(&format!(
-        "skipping: the {name} guest is not built when cross-compiling (need a native Linux build so hellovm-test-guest guests are not empty; install gcc and libc6-dev)"
+        "the {name} guest is not built when cross-compiling (need a native Linux build so hellovm-test-guest guests are not empty; install gcc and libc6-dev)"
     ));
     false
 }

@@ -895,12 +895,12 @@ mod tests {
         // `None` is not a successful result.
         let deadline = Instant::now() + Duration::from_secs(10);
         let event = loop {
-            match p.wait(Some(Duration::from_secs(10))).unwrap() {
-                Some(event) => break event,
-                None => assert!(
-                    Instant::now() < deadline,
-                    "interrupt did not stop the spinning task before the deadline"
-                ),
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                panic!("interrupt did not stop the spinning task before the deadline");
+            }
+            if let Some(event) = p.wait(Some(left)).unwrap() {
+                break event;
             }
         };
         assert_eq!(

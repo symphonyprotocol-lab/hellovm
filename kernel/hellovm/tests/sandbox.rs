@@ -119,8 +119,9 @@ fn static_pie_with_glibc() {
             || line.contains("argc=2 argv1=arg tls=42 big=x small pagesz="),
         "{line}"
     );
-    // The guest maps the big region itself (see test-guest/c/pie.c) and
-    // frees it with munmap. A large malloc is not a reliable mmap.
+    // The guest maps the big region itself and frees it with munmap
+    // (see test-guest/c/pie.c), so this does not depend on malloc or on
+    // compiler optimisation.
     let calls: Vec<_> = out.kernel.trace().iter().filter_map(|r| r.sysno).collect();
     assert!(calls.contains(&Sysno::Mmap), "{calls:?}");
     assert!(calls.contains(&Sysno::Munmap), "{calls:?}");

@@ -3,9 +3,11 @@
 #   kernel/dev/run-e2e.sh
 # This script changes into kernel/ before invoking cargo.
 #
-# One-shot x86_64 check, test, clippy and rustfmt. Requires Rust 1.99.1
-# (rust-toolchain.toml), a C compiler, Debian/Ubuntu busybox-static, and
-# distro python3 with its standard library under /usr/lib/python3.X.
+# One-shot check, test, clippy and rustfmt on the machine it runs on
+# (a native host, or the dev container on either architecture). Requires
+# Rust 1.99.1 (rust-toolchain.toml), a C compiler, Debian/Ubuntu
+# busybox-static, and distro python3 with its standard library under
+# /usr/lib/python3.X.
 # It does not install packages and does not need root or Docker when those
 # dependencies are already on the host.
 set -eu
@@ -28,18 +30,20 @@ fi
 
 bb=${HELLOVM_BUSYBOX:-/bin/busybox}
 if [ ! -f "$bb" ]; then
-  echo "run-e2e: busybox not found at $bb; install Debian/Ubuntu busybox-static (not a musl build from busybox.net)" >&2
+  echo "run-e2e: busybox not found at $bb; install Debian/Ubuntu busybox-static (a busybox.net build is not the supported image)" >&2
   exit 1
 fi
 
 # Statically linked means ldd does not report a dynamic linker or shared
 # libraries. A typical static binary makes ldd exit non-zero and print
-# "not a dynamic executable".
+# "not a dynamic executable". ldd cannot tell a static musl busybox from
+# a static glibc one; the supported image is still Debian/Ubuntu
+# busybox-static.
 ldd_status=0
 ldd_out=$(ldd "$bb" 2>&1) || ldd_status=$?
 case "$ldd_out" in
   *"=>"*|*ld-linux*|*"dynamic linker"*)
-    echo "run-e2e: $bb is dynamically linked; install Debian/Ubuntu busybox-static (not a musl build from busybox.net)" >&2
+    echo "run-e2e: $bb is dynamically linked. Install Debian/Ubuntu busybox-static (a busybox.net build is not the supported image). This check only verifies that the binary is static." >&2
     echo "run-e2e: ldd said: $ldd_out" >&2
     exit 1
     ;;
@@ -48,7 +52,7 @@ case "$ldd_out" in
   *"not a dynamic executable"*|*"statically linked"*) ;;
   *)
     if [ "$ldd_status" -eq 0 ]; then
-      echo "run-e2e: $bb does not look statically linked (ldd: $ldd_out). Install Debian/Ubuntu busybox-static (not a musl build from busybox.net)." >&2
+      echo "run-e2e: $bb does not look statically linked (ldd: $ldd_out). Install Debian/Ubuntu busybox-static (a busybox.net build is not the supported image). This check only verifies that the binary is static." >&2
       exit 1
     fi
     ;;
