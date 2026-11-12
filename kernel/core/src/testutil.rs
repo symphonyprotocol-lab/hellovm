@@ -9,7 +9,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::arch::{Arch, Sysno};
-use crate::host::{ConsoleStream, Host, HostFileKind, HostStat, ImagePath};
+use crate::host::{
+    ConsoleStream, Host, HostFileKind, HostStat, HostStreamId, ImagePath, OutboundFlow,
+    StreamStatus,
+};
 use crate::platform::{
     AddressSpace, AddressSpaceInfo, AppMemory, Context, CpuInfo, Event, GuestAddr, Platform,
     PlatformError, Prot, Resume, Sharing, SyscallTrap, TaskKey, Trap, Waker,
@@ -448,6 +451,23 @@ pub struct MockHost {
     pub image: Option<BTreeMap<String, MockEntry>>,
     pub asked: Vec<String>,
     pub clock: Rc<Cell<Duration>>,
+    /// When set, issued-fake-IP connects splice to an in-memory peer.
+    pub splice: bool,
+    /// Echo guest writes back as peer data.
+    pub splice_echo: bool,
+    /// The peer is already gone: writes fail with `BrokenPipe`.
+    pub splice_break_writes: bool,
+    streams: Vec<MockStream>,
+}
+
+struct MockStream {
+    flow: OutboundFlow,
+    inbound: VecDeque<u8>,
+    outbound: VecDeque<u8>,
+    shut_wr: bool,
+    read_eof: bool,
+    broken: bool,
+    failed: bool,
 }
 
 impl MockHost {
@@ -563,5 +583,125 @@ impl Host for MockHost {
 
     fn clock_monotonic(&mut self) -> Duration {
         self.clock.get()
+    }
+
+    fn egress_configured(&self) -> bool {
+        self.splice
+    }
+
+    fn open_stream(&mut self, flow: OutboundFlow, _waker: Waker) -> io::Result<HostStreamId> {
+        if !self.splice {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no splice endpoint configured",
+            ));
+        }
+        // The guest address is recorded and never dialed: there is no socket.
+        let id = self.streams.len() as u64;
+        self.streams.push(MockStream {
+            flow,
+            inbound: VecDeque::new(),
+            outbound: VecDeque::new(),
+            shut_wr: false,
+            read_eof: false,
+            broken: self.splice_break_writes,
+            failed: false,
+        });
+        Ok(HostStreamId(id))
+    }
+
+    fn stream_connect_result(&mut self, id: HostStreamId) -> io::Result<()> {
+        let stream = self.mock_stream(id)?;
+        if stream.failed {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "mock splice refused",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn stream_status(&mut self, id: HostStreamId) -> io::Result<StreamStatus> {
+        let stream = self.mock_stream(id)?;
+        Ok(StreamStatus {
+            established: true,
+            failed: stream.failed,
+            readable: !stream.inbound.is_empty() || stream.read_eof,
+            writable: !stream.shut_wr && !stream.broken,
+            broken: stream.broken,
+            shut_write: stream.shut_wr,
+        })
+    }
+
+    fn stream_read(&mut self, id: HostStreamId, buf: &mut [u8]) -> io::Result<usize> {
+        let stream = self.mock_stream_mut(id)?;
+        if stream.inbound.is_empty() {
+            return if stream.read_eof {
+                Ok(0)
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            };
+        }
+        let n = buf.len().min(stream.inbound.len());
+        for (dst, src) in buf.iter_mut().zip(stream.inbound.drain(..n)) {
+            *dst = src;
+        }
+        Ok(n)
+    }
+
+    fn stream_write(&mut self, id: HostStreamId, data: &[u8]) -> io::Result<usize> {
+        let echo = self.splice_echo;
+        let stream = self.mock_stream_mut(id)?;
+        if stream.broken || stream.shut_wr {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "mock peer closed",
+            ));
+        }
+        stream.outbound.extend(data);
+        if echo {
+            stream.inbound.extend(data);
+        }
+        Ok(data.len())
+    }
+
+    fn stream_shutdown_write(&mut self, id: HostStreamId) -> io::Result<()> {
+        self.mock_stream_mut(id)?.shut_wr = true;
+        Ok(())
+    }
+
+    fn stream_close(&mut self, id: HostStreamId) {
+        if let Ok(stream) = self.mock_stream_mut(id) {
+            stream.broken = true;
+            stream.read_eof = true;
+        }
+    }
+}
+
+impl MockHost {
+    fn mock_stream(&self, id: HostStreamId) -> io::Result<&MockStream> {
+        self.streams
+            .get(id.0 as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "mock stream is closed"))
+    }
+
+    fn mock_stream_mut(&mut self, id: HostStreamId) -> io::Result<&mut MockStream> {
+        self.streams
+            .get_mut(id.0 as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "mock stream is closed"))
+    }
+
+    /// Guest bytes written to the spliced stream.
+    pub fn splice_outbound(&self, id: HostStreamId) -> Vec<u8> {
+        self.streams[id.0 as usize]
+            .outbound
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub fn splice_flows(&self) -> impl Iterator<Item = &OutboundFlow> {
+        self.streams.iter().map(|s| &s.flow)
     }
 }

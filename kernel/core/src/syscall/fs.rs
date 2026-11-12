@@ -18,7 +18,7 @@ use crate::task::Restart;
 use crate::tty::InputState;
 use crate::vfs::{
     CreateTarget, Device, DirEntry, FileType, Ino, NewNode, Stat, Timespec, S_IFCHR, S_IFDIR,
-    S_IFMT, S_IFREG,
+    S_IFMT, S_IFREG, S_IFSOCK,
 };
 
 /// `S_IFIFO`.
@@ -94,6 +94,7 @@ fn object_stat(object: FileObject, size: u64, time: Timespec) -> Stat {
         }
         FileObject::Proc { dir: true } => (0x16, 0x20, S_IFDIR | 0o555, 0),
         FileObject::Proc { dir: false } => (0x16, 0x21, S_IFREG | 0o444, 0),
+        FileObject::Socket(id) => (0x1d, 0x10_0000 + id as u64, S_IFSOCK | 0o777, 0),
         FileObject::Node(_) => unreachable!("nodes have their own stat"),
     };
     Stat {
@@ -275,6 +276,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             },
             FileObject::Tty => self.tty_read(id, len),
             FileObject::ConsoleOut(_) | FileObject::PipeWrite(_) => Err(Errno(EBADF)),
+            FileObject::Socket(sock) => self.socket_read(sock, len),
             FileObject::PipeRead(pipe) => {
                 let mut buf = vec![0u8; len.min(PIPE_CAPACITY)];
                 match self.st.pipes.get_mut(pipe).read(&mut buf) {
@@ -334,6 +336,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         match self.st.files.get(id).object {
             FileObject::PipeRead(pipe) => self.st.pipes.get_mut(pipe).unread(data),
             FileObject::ConsoleIn | FileObject::Tty => self.st.console.unread(data),
+            FileObject::Socket(sock) => {
+                for &byte in data.iter().rev() {
+                    self.st.net.get_mut(sock).rx.push_front(byte);
+                }
+            }
             _ => {}
         }
     }
@@ -354,6 +361,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             FileObject::ConsoleIn | FileObject::PipeRead(_) | FileObject::Proc { .. } => {
                 Err(Errno(EBADF))
             }
+            FileObject::Socket(sock) => self.socket_write(sock, data),
             FileObject::ConsoleOut(stream) => self.console_write(stream, data),
             FileObject::Tty => self.tty_write(data),
             FileObject::PipeWrite(pipe) => {
@@ -437,7 +445,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     /// Checks that the guest byte at `addr` is writable, leaving it as is.
-    fn probe_writable(&mut self, addr: GuestAddr) -> SysResult<()> {
+    pub(crate) fn probe_writable(&mut self, addr: GuestAddr) -> SysResult<()> {
         let byte: [u8; 1] = self.read_array(addr)?;
         self.write_mem(addr, &byte)
     }
@@ -485,7 +493,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     /// handler or a closed read end make it return a short count.
     fn write_fully(&mut self, id: FileId, offset: Option<u64>, data: &[u8]) -> SysResult<usize> {
         let file = self.st.files.get(id);
-        let blocking_pipe = matches!(file.object, FileObject::PipeWrite(_)) && !file.nonblock;
+        let blocking_pipe = !file.nonblock
+            && matches!(
+                file.object,
+                FileObject::PipeWrite(_) | FileObject::Socket(_)
+            );
         if !blocking_pipe || data.is_empty() {
             return self.write_file(id, offset, data);
         }
@@ -1090,10 +1102,17 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                         self.st.console.buffered() as u64
                     }
                     FileObject::Tty => self.tty_readable() as u64,
+                    FileObject::Socket(sock) => self.socket_readable_len(sock) as u64,
                     _ => return Err(Errno(ENOTTY)),
                 };
                 self.write_u32(arg, n.min(i32::MAX as u64) as u32)?;
                 Ok(0)
+            }
+            request if matches!(object, FileObject::Socket(_)) => {
+                match self.socket_ioctl(request, arg) {
+                    Some(result) => result,
+                    None => Err(Errno(ENOTTY)),
+                }
             }
             request if object == FileObject::Tty => self.tty_ioctl(request, arg),
             // Not a terminal: every tty request (TCGETS, TIOCGWINSZ,
@@ -1130,6 +1149,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             FileObject::PipeWrite(pipe) => {
                 let p = self.st.pipes.get(pipe);
                 (if p.space() > 0 { any_out } else { 0 }) | if p.readers == 0 { POLLERR } else { 0 }
+            }
+            FileObject::Socket(sock) => {
+                let ev = self.socket_poll(sock);
+                (if ev.readable { any_in } else { 0 })
+                    | (if ev.writable { any_out } else { 0 })
+                    | (if ev.err { POLLERR } else { 0 })
+                    | (if ev.hup { POLLHUP } else { 0 })
             }
         }
     }

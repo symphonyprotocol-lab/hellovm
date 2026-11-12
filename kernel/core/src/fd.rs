@@ -34,6 +34,8 @@ pub enum FileObject {
     /// A generated file of `/proc`; its contents are in
     /// [`OpenFile::contents`] (or, for a directory, its listing).
     Proc { dir: bool },
+    /// An emulated socket. The id indexes [`crate::net::Net`].
+    Socket(crate::net::SockId),
 }
 
 /// The access mode an open file allows.

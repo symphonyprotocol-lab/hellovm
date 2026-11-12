@@ -13,6 +13,11 @@
 #![forbid(unsafe_code)]
 
 mod image;
+mod stream;
+
+use hellovm_core::host::{
+    ConsoleStream, Host, HostStat, HostStreamId, ImagePath, OutboundFlow, StreamStatus,
+};
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -20,8 +25,9 @@ use std::io::{self, Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hellovm_core::host::{ConsoleStream, Host, HostStat, ImagePath};
 use hellovm_core::platform::Waker;
+
+use stream::SpliceTable;
 
 pub use image::ImageDir;
 
@@ -101,6 +107,42 @@ macro_rules! common_host_methods {
     };
 }
 
+macro_rules! splice_host_methods {
+    () => {
+        fn egress_configured(&self) -> bool {
+            self.splice.configured()
+        }
+
+        fn open_stream(&mut self, flow: OutboundFlow, waker: Waker) -> io::Result<HostStreamId> {
+            self.splice.open(flow, waker)
+        }
+
+        fn stream_connect_result(&mut self, id: HostStreamId) -> io::Result<()> {
+            self.splice.connect_result(id)
+        }
+
+        fn stream_status(&mut self, id: HostStreamId) -> io::Result<StreamStatus> {
+            self.splice.status(id)
+        }
+
+        fn stream_read(&mut self, id: HostStreamId, buf: &mut [u8]) -> io::Result<usize> {
+            self.splice.read(id, buf)
+        }
+
+        fn stream_write(&mut self, id: HostStreamId, data: &[u8]) -> io::Result<usize> {
+            self.splice.write(id, data)
+        }
+
+        fn stream_shutdown_write(&mut self, id: HostStreamId) -> io::Result<()> {
+            self.splice.shutdown_write(id)
+        }
+
+        fn stream_close(&mut self, id: HostStreamId) {
+            self.splice.close(id);
+        }
+    };
+}
+
 /// Most stdin bytes the reader thread buffers ahead of the kernel.
 const STDIN_AHEAD: usize = 64 * 1024;
 
@@ -161,6 +203,7 @@ pub struct StdioHost {
     stdin: Option<Arc<StdinReader>>,
     /// Given to the stdin reader when it starts.
     waker: Option<Waker>,
+    splice: SpliceTable,
 }
 
 impl std::fmt::Debug for StdioHost {
@@ -175,7 +218,14 @@ impl StdioHost {
             common: Common::new(image),
             stdin: None,
             waker: None,
+            splice: SpliceTable::default(),
         }
+    }
+
+    /// Splice every issued-fake-IP TCP connect to `addr`. The guest's
+    /// destination is not dialed. Orthogonal to 002b's `--egress`.
+    pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) {
+        self.splice.set_endpoint(addr);
     }
 
     /// The stdin reader, started when the sandbox first asks for console
@@ -238,6 +288,7 @@ impl Host for StdioHost {
     }
 
     common_host_methods!();
+    splice_host_methods!();
 }
 
 /// Keeps sandbox console output in memory and serves console input from
@@ -248,6 +299,7 @@ pub struct CaptureHost {
     pub stderr: Vec<u8>,
     pub stdin: VecDeque<u8>,
     common: Common,
+    splice: SpliceTable,
 }
 
 impl CaptureHost {
@@ -257,7 +309,19 @@ impl CaptureHost {
             stderr: Vec::new(),
             stdin: VecDeque::new(),
             common: Common::new(image),
+            splice: SpliceTable::default(),
         }
+    }
+
+    /// Splice every issued-fake-IP TCP connect to `addr`.
+    pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) {
+        self.splice.set_endpoint(addr);
+    }
+
+    /// Flows the kernel asked to splice, in order. `dest_ip` is the guest
+    /// address that was **not** dialed.
+    pub fn splice_flows(&self) -> &[hellovm_core::host::OutboundFlow] {
+        self.splice.flows()
     }
 }
 
@@ -285,6 +349,7 @@ impl Host for CaptureHost {
     }
 
     common_host_methods!();
+    splice_host_methods!();
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 //! `hellovm`: runs a Linux program inside the hellovm kernel.
 //!
 //! ```text
-//! hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] --root DIR
+//! hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty]
+//!         [--splice-to IP:PORT] --root DIR
 //!         [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
 //!
@@ -34,7 +35,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
-     --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+     [--splice-to IP:PORT] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
 
 /// Exit status when the program was killed by `--timeout`.
 const EXIT_TIMEOUT: u8 = 124;
@@ -78,6 +79,9 @@ struct Options {
     tty: Option<bool>,
     timeout: Option<std::time::Duration>,
     root: PathBuf,
+    /// 002a host hook: splice issued-fake-IP TCP to this address. Not
+    /// `--egress` (that flag arrives with the 002b proxy).
+    splice_to: Option<std::net::SocketAddr>,
     env: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
 }
@@ -87,6 +91,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut tty = None;
     let mut timeout = None;
     let mut root = None;
+    let mut splice_to = None;
     let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
     let mut args = args.peekable();
     while let Some(arg) = args.peek() {
@@ -115,6 +120,24 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                         )
                     })?;
                 timeout = Some(seconds);
+                continue;
+            }
+            Some("--splice-to") => {
+                args.next();
+                let value = args.next().ok_or("--splice-to needs IP:PORT")?;
+                let text = value.to_str().ok_or_else(|| {
+                    format!(
+                        "--splice-to {}: expected an IPv4 address and port",
+                        value.to_string_lossy()
+                    )
+                })?;
+                let addr: std::net::SocketAddr = text.parse().map_err(|_| {
+                    format!("--splice-to {text}: expected an IPv4 address and port")
+                })?;
+                if !addr.is_ipv4() {
+                    return Err(format!("--splice-to {text}: expected an IPv4 address"));
+                }
+                splice_to = Some(addr);
                 continue;
             }
             Some("--env") => {
@@ -152,6 +175,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         tty,
         timeout,
         root,
+        splice_to,
         env,
         argv,
     })
@@ -209,7 +233,12 @@ fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
     let mut app = SeccompPlatform::new()?;
-    let mut kernel = Kernel::new(StdioHost::new(Some(image)));
+    let mut host = StdioHost::new(Some(image));
+    if let Some(addr) = options.splice_to {
+        // Every issued fake IP is spliced here. The guest address is not dialed.
+        host.set_splice_endpoint(addr);
+    }
+    let mut kernel = Kernel::new(host);
     if options.trace {
         kernel = kernel.with_trace();
     }

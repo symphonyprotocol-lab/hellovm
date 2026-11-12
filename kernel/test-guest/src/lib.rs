@@ -47,3 +47,9 @@ pub const DYNAMIC: &str = env!("HELLOVM_GUEST_DYNAMIC");
 /// with 7. Empty when cross-compiling.
 #[cfg(target_os = "linux")]
 pub const THREADS: &str = env!("HELLOVM_GUEST_THREADS");
+
+/// Dynamically linked glibc program that exercises emulated IPv4 sockets: loopback,
+/// address classification, half-close, `MSG_NOSIGNAL`, ioctl, `/proc/net`,
+/// virtual DNS, and `getaddrinfo` / `getifaddrs`. Empty when cross-compiling.
+#[cfg(target_os = "linux")]
+pub const NETCHECK: &str = env!("HELLOVM_GUEST_NETCHECK");

@@ -16,6 +16,7 @@ mod fs;
 mod futex;
 mod mem;
 mod misc;
+mod net;
 mod proc;
 mod procfs;
 mod signal;
@@ -257,6 +258,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 self.st.pipes.close_end(id, true);
                 self.st.changed = true;
             }
+            FileObject::Socket(id) => self.finish_drop(id),
             FileObject::Proc { .. } => {
                 let held = file.contents.as_ref().map_or(0, Vec::len);
                 self.st.proc_bytes = self.st.proc_bytes.saturating_sub(held);
@@ -356,6 +358,22 @@ where
         Some(Preadv) => ctx.sys_readv(int(a[0]), a[1], a[2], Some(a[3])),
         Some(Pwritev) => ctx.sys_writev(int(a[0]), a[1], a[2], Some(a[3])),
         Some(Sendfile) => ctx.sys_sendfile(int(a[0]), int(a[1]), a[2], a[3]),
+        Some(Socket) => ctx.sys_socket(int(a[0]), int(a[1]), int(a[2])),
+        Some(Socketpair) => ctx.sys_socketpair(int(a[0]), int(a[1]), int(a[2]), a[3]),
+        Some(Bind) => ctx.sys_bind(int(a[0]), a[1], int(a[2])),
+        Some(Connect) => ctx.sys_connect(int(a[0]), a[1], int(a[2])),
+        Some(Listen) => ctx.sys_listen(int(a[0]), int(a[1])),
+        Some(Accept) => ctx.sys_accept4(int(a[0]), a[1], a[2], 0),
+        Some(Accept4) => ctx.sys_accept4(int(a[0]), a[1], a[2], int(a[3])),
+        Some(Sendto) => ctx.sys_sendto(int(a[0]), a[1], a[2], a[3], a[4], int(a[5])),
+        Some(Recvfrom) => ctx.sys_recvfrom(int(a[0]), a[1], a[2], a[3], a[4], a[5]),
+        Some(Sendmsg) => ctx.sys_sendmsg(int(a[0]), a[1], a[2]),
+        Some(Recvmsg) => ctx.sys_recvmsg(int(a[0]), a[1], a[2]),
+        Some(Shutdown) => ctx.sys_shutdown(int(a[0]), int(a[1])),
+        Some(Getsockname) => ctx.sys_getsockname(int(a[0]), a[1], a[2]),
+        Some(Getpeername) => ctx.sys_getpeername(int(a[0]), a[1], a[2]),
+        Some(Setsockopt) => ctx.sys_setsockopt(int(a[0]), int(a[1]), int(a[2]), a[3], int(a[4])),
+        Some(Getsockopt) => ctx.sys_getsockopt(int(a[0]), int(a[1]), int(a[2]), a[3], a[4]),
         Some(Lseek) => ctx.sys_lseek(int(a[0]), a[1] as i64, int(a[2])),
         Some(Open) => ctx.sys_openat(AT_FDCWD, a[0], a[1], a[2]),
         Some(Creat) => ctx.sys_creat(a[0], a[1]),
@@ -463,8 +481,10 @@ where
         Some(Setpriority) => Ok(0),
         Some(Membarrier) => Ok(0),
         // Deliberately refused: glibc falls back without restartable
-        // sequences, and without clone3. epoll is not implemented yet;
-        // CPython's subprocess and selectors fall back to poll.
+        // sequences, and without clone3. epoll is not implemented.
+        // CPython's DefaultSelector is EpollSelector and errors if
+        // epoll_create1 returns ENOSYS; 002b inventories whether pip or
+        // git need it. subprocess can use poll.
         Some(Rseq | EpollCreate1) => Err(Errno(ENOSYS)),
         _ => unimplemented(trap.nr, sysno, &a),
     };

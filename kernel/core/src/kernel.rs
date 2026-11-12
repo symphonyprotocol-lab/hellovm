@@ -254,6 +254,17 @@ impl<H: Host> Kernel<H> {
         &mut self.host
     }
 
+    /// Issues the next fake IP from `198.51.100.0/24` and records it.
+    ///
+    /// This is the 002a test helper. A later guest `connect` to the address
+    /// is spliced to the configured host endpoint; the address itself is
+    /// never a host dial target. Returns `None` once `.1` through `.254`
+    /// have all been issued. The address is never a NIC, loopback,
+    /// wildcard, or `198.18.0.0/15` address.
+    pub fn issue_fake_ip(&mut self) -> Option<[u8; 4]> {
+        self.st.net.issue_fake_ip()
+    }
+
     pub fn into_host(self) -> H {
         self.host
     }
@@ -728,7 +739,10 @@ impl<H: Host> Kernel<H> {
 mod tests {
     use super::*;
     use crate::elf::tests::sample;
-    use crate::errno::{EBADF, EEXIST, EFAULT, EINTR, ENOENT, ENOSYS, ENOTDIR, EPIPE};
+    use crate::errno::{
+        EADDRNOTAVAIL, EAFNOSUPPORT, EBADF, ECONNREFUSED, EEXIST, EFAULT, EHOSTUNREACH,
+        EINPROGRESS, EINTR, ENETUNREACH, ENOENT, ENOSYS, ENOTDIR, EPIPE,
+    };
     use crate::platform::Context;
     use crate::signal::{SA_RESTORER, SA_SIGINFO, SIGCHLD, SIGPIPE, SIGUSR1};
     use crate::testutil::{MockEntry, MockHost, MockPlatform};
@@ -875,7 +889,7 @@ mod tests {
     fn unknown_syscalls_are_enosys() {
         for arch in Arch::ALL {
             let traps = vec![
-                sc(arch, Sysno::Socket, &[2, 1, 0]),
+                sc(arch, Sysno::Eventfd2, &[0, 0]),
                 sc(arch, Sysno::Clone3, &[SCRATCH, 88]),
                 Trap::Syscall(SyscallTrap {
                     nr: 100_000,
@@ -1202,6 +1216,207 @@ mod tests {
         );
         assert_eq!(plat.mem(INIT).peek(buf, 2), b"hi");
         assert_eq!(kernel.st.pipes.live(), 0, "the pipes are gone");
+    }
+
+    fn sin(ip: [u8; 4], port: u16) -> [u8; 16] {
+        let mut addr = [0u8; 16];
+        addr[..2].copy_from_slice(&2u16.to_le_bytes());
+        addr[2..4].copy_from_slice(&port.to_be_bytes());
+        addr[4..8].copy_from_slice(&ip);
+        addr
+    }
+
+    #[test]
+    fn sockets_loopback_errors_half_close_and_splice() {
+        let arch = Arch::X86_64;
+        let listen = sin([127, 0, 0, 1], 19000);
+        let meta = sin([169, 254, 169, 254], 80);
+        let rfc = sin([10, 1, 2, 3], 80);
+        let off = sin([151, 101, 64, 223], 443);
+        let hostu = sin([192, 0, 2, 99], 80);
+        let gw = sin([192, 0, 2, 1], 80);
+        let gwbind = sin([192, 0, 2, 1], 9);
+        let fakebind = sin([198, 51, 100, 9], 9);
+        let privb = sin([10, 0, 0, 1], 9);
+        let udp_dst = sin([8, 8, 8, 8], 53);
+        let udp_lo = sin([127, 0, 0, 1], 19001);
+        let none = sin([127, 0, 0, 1], 1);
+        let buf = SCRATCH + 0x800;
+        let pollfd = SCRATCH + 0x900;
+        let opt = SCRATCH + 0x920;
+        let optlen = SCRATCH + 0x930;
+        let alen = SCRATCH + 0x940;
+        let outaddr = SCRATCH + 0x960;
+        let ifreq = SCRATCH + 0x980;
+        // Addresses laid out at SCRATCH. The fake-IP sockaddr is poked after
+        // the kernel issues one.
+        let mut data: Vec<(u64, Vec<u8>)> = vec![
+            (SCRATCH, listen.to_vec()),
+            (SCRATCH + 0x20, meta.to_vec()),
+            (SCRATCH + 0x40, rfc.to_vec()),
+            (SCRATCH + 0x60, off.to_vec()),
+            (SCRATCH + 0x80, hostu.to_vec()),
+            (SCRATCH + 0xa0, gw.to_vec()),
+            (SCRATCH + 0xc0, gwbind.to_vec()),
+            (SCRATCH + 0xe0, fakebind.to_vec()),
+            (SCRATCH + 0x100, privb.to_vec()),
+            (SCRATCH + 0x120, udp_dst.to_vec()),
+            (SCRATCH + 0x140, udp_lo.to_vec()),
+            (SCRATCH + 0x160, none.to_vec()),
+            (SCRATCH + 0x180, b"hello-world".to_vec()),
+            (buf, vec![0; 32]),
+            (optlen, 4u32.to_le_bytes().to_vec()),
+            (alen, 16u32.to_le_bytes().to_vec()),
+            (ifreq, b"eth0".to_vec()),
+        ];
+        let _ = &mut data;
+        let owned: Vec<(u64, Vec<u8>)> = data;
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+
+        let nonblock = 1u64 | 0o4000;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 1]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Accept, &[3, outaddr, alen]),
+            sc(arch, Sysno::Sendto, &[4, SCRATCH + 0x180, 5, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, buf, 16, 0, 0, 0]),
+            sc(arch, Sysno::Shutdown, &[4, 1]),
+            sc(arch, Sysno::Recvfrom, &[5, buf + 8, 16, 0, 0, 0]),
+            sc(arch, Sysno::Sendto, &[5, SCRATCH + 0x180 + 6, 5, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[4, buf + 16, 16, 0, 0, 0]),
+            // Queue of 1 is full once another client connects before accept.
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[6, SCRATCH, 16]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[7, SCRATCH, 16]),
+            sc(arch, Sysno::Connect, &[7, SCRATCH + 0x20, 16]),
+            sc(arch, Sysno::Connect, &[7, SCRATCH + 0x40, 16]),
+            sc(arch, Sysno::Connect, &[7, SCRATCH + 0x60, 16]),
+            sc(arch, Sysno::Connect, &[7, SCRATCH + 0x80, 16]),
+            sc(arch, Sysno::Connect, &[7, SCRATCH + 0xa0, 16]),
+            sc(arch, Sysno::Bind, &[7, SCRATCH + 0xc0, 16]),
+            sc(arch, Sysno::Bind, &[7, SCRATCH + 0xe0, 16]),
+            sc(arch, Sysno::Bind, &[7, SCRATCH + 0x100, 16]),
+            sc(arch, Sysno::Socket, &[2, 2, 0]),
+            sc(
+                arch,
+                Sysno::Sendto,
+                &[8, SCRATCH + 0x180, 4, 0, SCRATCH + 0x120, 16],
+            ),
+            sc(arch, Sysno::Socket, &[2, 2, 0]),
+            sc(arch, Sysno::Bind, &[9, SCRATCH + 0x140, 16]),
+            sc(
+                arch,
+                Sysno::Sendto,
+                &[8, SCRATCH + 0x180, 4, 0, SCRATCH + 0x140, 16],
+            ),
+            sc(arch, Sysno::Recvfrom, &[9, buf, 8, 0, 0, 0]),
+            sc(arch, Sysno::Socket, &[2, nonblock, 0]),
+            // Drop the queued connection so the non-blocking connect can proceed.
+            sc(arch, Sysno::Accept, &[3, outaddr, alen]),
+            sc(arch, Sysno::Connect, &[10, SCRATCH, 16]),
+            sc(arch, Sysno::Poll, &[pollfd, 1, 0]),
+            sc(arch, Sysno::Getsockopt, &[10, 1, 4, opt, optlen]),
+            sc(arch, Sysno::Socket, &[2, nonblock, 0]),
+            sc(arch, Sysno::Connect, &[12, SCRATCH + 0x160, 16]),
+            sc(arch, Sysno::Getsockopt, &[12, 1, 4, opt + 8, optlen]),
+            sc(arch, Sysno::Socket, &[10, 1, 0]),
+            sc(arch, Sysno::Socket, &[16, 3, 0]),
+            sc(arch, Sysno::Socket, &[1, 1, 0]),
+            sc(arch, Sysno::Ioctl, &[3, 0x8915, ifreq]),
+            // Peer close, then a write with MSG_NOSIGNAL.
+            sc(arch, Sysno::Close, &[5]),
+            sc(arch, Sysno::Sendto, &[4, buf, 1, 0x4000, 0, 0]),
+            // No endpoint configured: an issued fake IP is still unreachable.
+            sc(arch, Sysno::Connect, &[7, SCRATCH + 0x1a0, 16]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        let fake = kernel.issue_fake_ip().unwrap();
+        assert!(fake[0] == 198 && fake[1] == 51 && fake[2] == 100);
+        plat.mem(INIT).poke(SCRATCH + 0x1a0, &sin(fake, 443));
+        // pollfd for fd 10, POLLOUT.
+        let mut pfd = [0u8; 8];
+        pfd[..4].copy_from_slice(&10i32.to_le_bytes());
+        pfd[4..6].copy_from_slice(&4u16.to_le_bytes());
+        plat.mem(INIT).poke(pollfd, &pfd);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        // The first connection was accepted, so the queue is empty and the
+        // next connect succeeds. A third connect finds the queue full.
+        assert_eq!(plat.mem(INIT).peek(buf, 5), b"hello");
+        assert_eq!(plat.mem(INIT).peek(buf + 16, 5), b"world");
+        assert_eq!(got[0], 3, "socket");
+        assert_eq!(got[6], 5, "send {got:?}");
+        assert_eq!(got[7], 5, "recv {got:?}");
+        assert_eq!(got[9], 0, "half-close eof {got:?}");
+        assert_eq!(got[11], 5, "reply {got:?}");
+        // Index of the full-queue connect: socket 6 connect (success), socket 7 connect (refused).
+        assert_eq!(got[13], 0, "second connect queued {got:?}");
+        assert_eq!(got[15], -ECONNREFUSED, "full backlog {got:?}");
+        assert_eq!(got[16], -ENETUNREACH, "metadata {got:?}");
+        assert_eq!(got[17], -ENETUNREACH, "rfc1918 {got:?}");
+        assert_eq!(got[18], -ENETUNREACH, "off-list {got:?}");
+        assert_eq!(got[19], -EHOSTUNREACH, "nic {got:?}");
+        assert_eq!(got[20], -ECONNREFUSED, "gateway {got:?}");
+        assert_eq!(got[21], -EADDRNOTAVAIL, "bind gateway {got:?}");
+        assert_eq!(got[22], -EADDRNOTAVAIL, "bind fake {got:?}");
+        assert_eq!(got[23], -EADDRNOTAVAIL, "bind rfc1918 {got:?}");
+        assert_eq!(got[25], -ENETUNREACH, "udp {got:?}");
+        assert_eq!(got[29], 4, "udp echo {got:?}");
+        assert_eq!(got[31], 11, "accept drained the queue {got:?}");
+        assert_eq!(got[32], -EINPROGRESS, "nonblock connect {got:?}");
+        assert_eq!(got[33], 1, "poll {got:?}");
+        assert_eq!(plat.mem(INIT).peek(opt, 4), 0u32.to_le_bytes(), "SO_ERROR");
+        assert_eq!(got[36], -EINPROGRESS, "nonblock refuse {got:?}");
+        assert_eq!(
+            i32::from_le_bytes(plat.mem(INIT).peek(opt + 8, 4).try_into().unwrap()),
+            ECONNREFUSED as i32,
+            "SO_ERROR after refuse"
+        );
+        assert_eq!(got[38], -EAFNOSUPPORT, "ipv6 {got:?}");
+        assert_eq!(got[39], -EAFNOSUPPORT, "netlink {got:?}");
+        assert_eq!(got[40], -EAFNOSUPPORT, "unix {got:?}");
+        assert_eq!(got[43], -EPIPE, "nosignal {got:?}");
+        assert_eq!(got[44], -ENETUNREACH, "unconfigured fake ip {got:?}");
+        // SIOCGIFADDR wrote 192.0.2.2 at ifreq+20.
+        assert_eq!(&plat.mem(INIT).peek(ifreq + 20, 4), &[192, 0, 2, 2]);
+    }
+
+    #[test]
+    fn splice_echoes_the_configured_peer_not_the_fake_ip() {
+        let arch = Arch::X86_64;
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        host.splice_echo = true;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Sendto, &[3, SCRATCH + 0x40, 4, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x80, 8, 0, 0, 0]),
+            sc(arch, Sysno::Shutdown, &[3, 1]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host).with_trace();
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x1000]);
+        let ip = kernel.issue_fake_ip().unwrap();
+        plat.mem(INIT).poke(SCRATCH, &sin(ip, 443));
+        plat.mem(INIT).poke(SCRATCH + 0x40, b"ping");
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        assert_eq!(returns(&plat, INIT), vec![3, 0, 4, 4, 0]);
+        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x80, 4), b"ping");
+        let host = kernel.host();
+        let flow = host.splice_flows().next().unwrap();
+        assert_eq!(flow.dest_ip, ip);
+        assert_eq!(flow.dest_port, 443);
+        assert_eq!(host.splice_outbound(crate::host::HostStreamId(0)), b"ping");
     }
 
     fn action(handler: u64, flags: u64, restorer: u64) -> Vec<u8> {
