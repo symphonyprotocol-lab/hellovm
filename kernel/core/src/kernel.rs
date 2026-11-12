@@ -1311,7 +1311,11 @@ mod tests {
         let argv = SCRATCH + 0x40;
         let thread_flags = 0x100 | 0x800 | 0x1_0000; // VM SIGHAND THREAD
         let main = vec![
-            sc(arch, Sysno::Clone, &[thread_flags, SCRATCH + 0x1000, 0, 0, 0]),
+            sc(
+                arch,
+                Sysno::Clone,
+                &[thread_flags, SCRATCH + 0x1000, 0, 0, 0],
+            ),
             // Parks forever; the exec ends this thread.
             sc(arch, Sysno::Futex, &[SCRATCH + 0x80, 0, 0, 0, 0, 0]),
         ];

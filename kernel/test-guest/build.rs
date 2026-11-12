@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ASM_GUESTS: &[&str] = &["hello", "enosys"];
-const C_GUESTS: &[&str] = &["pie"];
+const C_GUESTS: &[&str] = &["pie", "signals"];
 
 fn build(cc: &str, name: &str, src: &Path, out: &Path, flags: &[&str]) {
     let output = Command::new(cc)

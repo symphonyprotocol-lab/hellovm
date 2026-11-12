@@ -26,3 +26,10 @@ pub const ENOSYS: &str = env!("HELLOVM_GUEST_ENOSYS");
 /// random=yes`. Empty when cross-compiling (no target libc).
 #[cfg(target_os = "linux")]
 pub const PIE: &str = env!("HELLOVM_GUEST_PIE");
+
+/// A static-PIE glibc program that checks signal delivery: fault handlers,
+/// masks, timers, the alternate stack, restarts, child statuses and FP
+/// state across asynchronous handlers. Prints one line per check (see
+/// `hellovm/tests/signals.rs`). Empty when cross-compiling.
+#[cfg(target_os = "linux")]
+pub const SIGNALS: &str = env!("HELLOVM_GUEST_SIGNALS");
