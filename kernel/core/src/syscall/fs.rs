@@ -1,17 +1,27 @@
 //! File, path and fd syscalls.
 
+use std::time::Duration;
+
 use crate::abi;
 use crate::errno::{
-    Errno, SysResult, EACCES, EBADF, EEXIST, EFAULT, EINVAL, EISDIR, ELOOP, ENOENT, ENOSPC,
-    ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP, EPERM, ESPIPE,
+    Errno, SysResult, EACCES, EAGAIN, EBADF, EEXIST, EFAULT, EINVAL, EISDIR, ELOOP, ENOENT, ENOSPC,
+    ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP, EPERM, EPIPE, ESPIPE,
 };
 use crate::fd::{Access, FileId, FileObject, OpenFile, MAX_FDS};
-use crate::host::Host;
+use crate::host::{ConsoleStream, Host};
+use crate::mm::{MAP_PRIVATE, MAP_TYPE};
+use crate::pipe::{ReadResult, WriteResult, PIPE_CAPACITY};
 use crate::platform::{GuestAddr, Platform};
+use crate::signal::{self, SigInfo};
+use crate::task::Restart;
+use crate::tty::InputState;
 use crate::vfs::{
-    CreateTarget, Device, DirEntry, FileType, Ino, NewNode, Stat, Timespec, S_IFCHR, S_IFMT,
-    S_IFREG,
+    CreateTarget, Device, DirEntry, FileType, Ino, NewNode, Stat, Timespec, S_IFCHR, S_IFDIR,
+    S_IFMT, S_IFREG,
 };
+
+/// `S_IFIFO`.
+const S_IFIFO: u32 = 0o010_000;
 
 use super::{int, Ctx, AT_FDCWD, MAX_IO};
 
@@ -44,6 +54,8 @@ const FIONREAD: u64 = 0x541b;
 
 const POLLIN: u16 = 0x1;
 const POLLOUT: u16 = 0x4;
+const POLLERR: u16 = 0x8;
+const POLLHUP: u16 = 0x10;
 const POLLNVAL: u16 = 0x20;
 const POLLRDNORM: u16 = 0x40;
 const POLLWRNORM: u16 = 0x100;
@@ -61,22 +73,34 @@ const IOV_MAX: u64 = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
     Node(Ino),
-    /// A console fd (via `AT_EMPTY_PATH` or `fstat`).
-    Console(FileObject),
+    /// An fd of something that is not a node (via `AT_EMPTY_PATH` or
+    /// `fstat`).
+    Object(FileObject, u64),
 }
 
-/// A `stat` for the console: a character device that is not a terminal.
-fn console_stat(object: FileObject, time: Timespec) -> Stat {
+/// A `stat` for an open object that is not a filesystem node: the console
+/// (a character device; the terminal is `/dev/console`, 5:1), a pipe (a
+/// FIFO on its own device, like Linux's pipefs) or a `/proc` file.
+fn object_stat(object: FileObject, size: u64, time: Timespec) -> Stat {
+    let (dev, ino, mode, rdev) = match object {
+        FileObject::ConsoleIn => (0x05, 0x10, S_IFCHR | 0o620, crate::vfs::makedev(136, 0)),
+        FileObject::ConsoleOut(_) => (0x05, 0x11, S_IFCHR | 0o620, crate::vfs::makedev(136, 0)),
+        FileObject::Tty => (0x05, 0x12, S_IFCHR | 0o620, crate::vfs::makedev(5, 1)),
+        FileObject::PipeRead(id) | FileObject::PipeWrite(id) => {
+            (0x0c, 0x1000 + id as u64, S_IFIFO | 0o600, 0)
+        }
+        FileObject::Proc { dir: true } => (0x16, 0x20, S_IFDIR | 0o555, 0),
+        FileObject::Proc { dir: false } => (0x16, 0x21, S_IFREG | 0o444, 0),
+        FileObject::Node(_) => unreachable!("nodes have their own stat"),
+    };
     Stat {
-        dev: 0x05,
-        ino: match object {
-            FileObject::ConsoleIn => 0x10,
-            _ => 0x11,
-        },
-        mode: S_IFCHR | 0o620,
+        dev,
+        ino,
+        mode,
         nlink: 1,
-        rdev: crate::vfs::makedev(5, 1),
-        blksize: 1024,
+        rdev,
+        size,
+        blksize: 4096,
         atime: time,
         mtime: time,
         ctime: time,
@@ -87,25 +111,17 @@ fn console_stat(object: FileObject, time: Timespec) -> Stat {
 impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     // ----- helpers -----
 
-    fn file(&self, fd: i64) -> SysResult<(FileId, &OpenFile)> {
-        let id = self.proc.fds.get(fd)?;
-        Ok((id, self.proc.fds.file(id)))
-    }
-
-    /// Releases a description that lost its last fd.
-    pub(crate) fn release(&mut self, file: Option<OpenFile>) {
-        if let Some(ino) = file.and_then(|f| f.node()) {
-            self.vfs.closed(ino);
-        }
-    }
-
     /// The directory a relative path in an `*at` call starts from.
+    pub(crate) fn start_dir_for(&mut self, dirfd: i64, path: &[u8]) -> SysResult<Ino> {
+        self.start_dir(dirfd, path)
+    }
+
     fn start_dir(&mut self, dirfd: i64, path: &[u8]) -> SysResult<Ino> {
         if path.first() == Some(&b'/') {
             return Ok(self.vfs.root());
         }
         if dirfd == AT_FDCWD {
-            return Ok(self.proc.cwd);
+            return Ok(self.proc().cwd);
         }
         let (_, file) = self.file(dirfd)?;
         match file.node() {
@@ -127,12 +143,14 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 return Err(Errno(ENOENT));
             }
             if dirfd == AT_FDCWD {
-                return Ok(Target::Node(self.proc.cwd));
+                return Ok(Target::Node(self.proc().cwd));
             }
             let (_, file) = self.file(dirfd)?;
             return Ok(match file.object {
                 FileObject::Node(ino) => Target::Node(ino),
-                other => Target::Console(other),
+                other => {
+                    Target::Object(other, file.contents.as_ref().map_or(0, |c| c.len() as u64))
+                }
             });
         }
         let start = self.start_dir(dirfd, path)?;
@@ -145,7 +163,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let path = self.read_path(path_addr)?;
         match self.lookup_at(dirfd, &path, follow, false)? {
             Target::Node(ino) => Ok(ino),
-            Target::Console(_) => Err(Errno(EINVAL)),
+            Target::Object(..) => Err(Errno(EINVAL)),
         }
     }
 
@@ -162,81 +180,151 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     fn stat_of(&mut self, target: Target) -> Stat {
         match target {
             Target::Node(ino) => self.vfs.stat(ino),
-            Target::Console(object) => {
+            Target::Object(object, size) => {
                 let time = self.now();
-                console_stat(object, time)
+                object_stat(object, size, time)
             }
         }
+    }
+
+    /// The absolute path of `path` looked up from `start`, as recorded for
+    /// `/proc/<pid>/fd` (not normalized beyond joining).
+    fn absolute_path(&self, start: Ino, path: &[u8]) -> Option<Vec<u8>> {
+        if path.first() == Some(&b'/') {
+            return Some(path.to_vec());
+        }
+        let mut dir = self.vfs.dir_path(start)?;
+        if dir != b"/" {
+            dir.push(b'/');
+        }
+        dir.extend_from_slice(path);
+        Some(dir)
     }
 
     // ----- data -----
 
     /// Reads up to `len` bytes from a description, at `offset` or at (and
-    /// advancing) its file position.
+    /// advancing) its file position. Parks the thread when a pipe or the
+    /// console has nothing yet.
     fn read_file(&mut self, id: FileId, offset: Option<u64>, len: usize) -> SysResult<Vec<u8>> {
-        let file = self.proc.fds.file(id);
+        let file = self.st.files.get(id);
         if !file.access.readable() {
             return Err(Errno(EBADF));
         }
         let len = len.min(MAX_IO);
-        let mut buf = vec![0u8; len];
-        let n = match file.object {
-            FileObject::ConsoleIn => {
-                if offset.is_some() {
-                    return Err(Errno(ESPIPE));
-                }
-                self.host.console_read(&mut buf).map_err(|err| {
-                    log::warn!("console read failed on the host: {err}");
-                    Errno::from_host(&err)
-                })?
-            }
-            FileObject::ConsoleOut(_) => return Err(Errno(EBADF)),
-            FileObject::Node(ino) => match self.vfs.device(ino) {
-                Some(Device::Null) => 0,
-                Some(Device::Zero | Device::Full) => len,
-                Some(Device::Random | Device::Urandom) => {
-                    self.host
-                        .random(&mut buf)
-                        .map_err(|e| Errno::from_host(&e))?;
-                    len
-                }
-                Some(Device::Fd(_) | Device::Unusable) => return Err(Errno(ENXIO)),
-                None => {
-                    let pos = offset.unwrap_or(file.offset);
-                    let n = self.vfs.read(self.host, ino, pos, &mut buf)?;
-                    if offset.is_none() {
-                        self.proc.fds.file_mut(id).offset = pos + n as u64;
-                    }
-                    n
-                }
+        let nonblock = file.nonblock;
+        let stream = !matches!(file.object, FileObject::Node(_) | FileObject::Proc { .. });
+        if stream && offset.is_some() {
+            return Err(Errno(ESPIPE));
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        match file.object {
+            FileObject::ConsoleIn => match self.st.console.input_state(self.host) {
+                InputState::Ready => Ok(self.st.console.take_input(len)),
+                InputState::Eof => Ok(Vec::new()),
+                InputState::Empty if nonblock => Err(Errno(EAGAIN)),
+                InputState::Empty => Err(self.park_retry(None, Restart::IfSaRestart)),
             },
-        };
-        buf.truncate(n);
-        Ok(buf)
+            FileObject::Tty => self.tty_read(id, len),
+            FileObject::ConsoleOut(_) | FileObject::PipeWrite(_) => Err(Errno(EBADF)),
+            FileObject::PipeRead(pipe) => {
+                let mut buf = vec![0u8; len.min(PIPE_CAPACITY)];
+                match self.st.pipes.get_mut(pipe).read(&mut buf) {
+                    ReadResult::Data(n) => {
+                        buf.truncate(n);
+                        self.st.changed = true;
+                        Ok(buf)
+                    }
+                    ReadResult::Eof => Ok(Vec::new()),
+                    ReadResult::Empty if nonblock => Err(Errno(EAGAIN)),
+                    ReadResult::Empty => Err(self.park_retry(None, Restart::IfSaRestart)),
+                }
+            }
+            FileObject::Proc { .. } => {
+                let file = self.st.files.get(id);
+                let data = file.contents.as_deref().unwrap_or(&[]);
+                let pos = offset.unwrap_or(file.offset).min(data.len() as u64) as usize;
+                let n = len.min(data.len() - pos);
+                let out = data[pos..pos + n].to_vec();
+                if offset.is_none() {
+                    self.st.files.get_mut(id).offset = (pos + n) as u64;
+                }
+                Ok(out)
+            }
+            FileObject::Node(ino) => {
+                let mut buf = vec![0u8; len];
+                let n = match self.vfs.device(ino) {
+                    Some(Device::Null) => 0,
+                    Some(Device::Zero | Device::Full) => len,
+                    Some(Device::Random | Device::Urandom) => {
+                        self.host
+                            .random(&mut buf)
+                            .map_err(|e| Errno::from_host(&e))?;
+                        len
+                    }
+                    Some(Device::Fd(_) | Device::Unusable) => return Err(Errno(ENXIO)),
+                    None => {
+                        let pos = offset.unwrap_or(file.offset);
+                        let n = self.vfs.read(self.host, ino, pos, &mut buf)?;
+                        if offset.is_none() {
+                            self.st.files.get_mut(id).offset = pos + n as u64;
+                        }
+                        n
+                    }
+                };
+                buf.truncate(n);
+                Ok(buf)
+            }
+        }
+    }
+
+    /// Gives back bytes a read took from a stream (pipe, console) but could
+    /// not deliver to the guest.
+    fn unread(&mut self, id: FileId, data: &[u8]) {
+        match self.st.files.get(id).object {
+            FileObject::PipeRead(pipe) => self.st.pipes.get_mut(pipe).unread(data),
+            FileObject::ConsoleIn | FileObject::Tty => self.st.console.unread(data),
+            _ => {}
+        }
     }
 
     /// Writes `data` to a description, at `offset` or at (and advancing) its
-    /// file position.
+    /// file position. Parks the thread when a pipe is full.
     fn write_file(&mut self, id: FileId, offset: Option<u64>, data: &[u8]) -> SysResult<usize> {
-        let file = self.proc.fds.file(id);
+        let file = self.st.files.get(id);
         if !file.access.writable() {
             return Err(Errno(EBADF));
         }
+        let nonblock = file.nonblock;
+        let stream = !matches!(file.object, FileObject::Node(_) | FileObject::Proc { .. });
+        if stream && offset.is_some() {
+            return Err(Errno(ESPIPE));
+        }
         match file.object {
-            FileObject::ConsoleIn => Err(Errno(EBADF)),
-            FileObject::ConsoleOut(stream) => {
-                if offset.is_some() {
-                    return Err(Errno(ESPIPE));
-                }
+            FileObject::ConsoleIn | FileObject::PipeRead(_) | FileObject::Proc { .. } => {
+                Err(Errno(EBADF))
+            }
+            FileObject::ConsoleOut(stream) => self.console_write(stream, data),
+            FileObject::Tty => self.tty_write(data),
+            FileObject::PipeWrite(pipe) => {
                 if data.is_empty() {
                     return Ok(0);
                 }
-                self.host.console_write(stream, data).map_err(|err| {
-                    // Host errno values are not guest errno values; do not
-                    // pass them through.
-                    log::warn!("console write failed on the host: {err}");
-                    Errno(crate::errno::EIO)
-                })
+                match self.st.pipes.get_mut(pipe).write(data) {
+                    WriteResult::Written(n) => {
+                        self.st.changed = true;
+                        Ok(n)
+                    }
+                    WriteResult::Broken => {
+                        let info = SigInfo::kernel(signal::SIGPIPE);
+                        self.st.post_signal(self.pid, Some(self.tid), info);
+                        Err(Errno(EPIPE))
+                    }
+                    WriteResult::Full if nonblock => Err(Errno(EAGAIN)),
+                    WriteResult::Full => Err(self.park_retry(None, Restart::IfSaRestart)),
+                }
             }
             FileObject::Node(ino) => match self.vfs.device(ino) {
                 Some(Device::Full) => Err(Errno(ENOSPC)),
@@ -252,12 +340,24 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                     let now = self.now();
                     let n = self.vfs.write(self.host, ino, pos, data, now)?;
                     if offset.is_none() {
-                        self.proc.fds.file_mut(id).offset = pos + n as u64;
+                        self.st.files.get_mut(id).offset = pos + n as u64;
                     }
                     Ok(n)
                 }
             },
         }
+    }
+
+    pub(crate) fn console_write(&mut self, stream: ConsoleStream, data: &[u8]) -> SysResult<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        self.host.console_write(stream, data).map_err(|err| {
+            // Host errno values are not guest errno values; do not pass
+            // them through.
+            log::warn!("console write failed on the host: {err}");
+            Errno(crate::errno::EIO)
+        })
     }
 
     pub fn sys_read(
@@ -273,15 +373,18 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 return Err(Errno(EISDIR));
             }
         }
-        let console = file.object == FileObject::ConsoleIn;
+        let stream = !matches!(file.object, FileObject::Node(_) | FileObject::Proc { .. });
         let before = file.offset;
-        if console && len > 0 {
-            // Console input cannot be put back: make sure the buffer can
-            // take at least a byte before consuming any.
+        if stream && len > 0 {
+            // Stream input cannot be put back once the guest saw part of
+            // it: make sure the buffer can take at least a byte first.
             self.probe_writable(buf)?;
         }
         let data = self.read_file(id, offset, len as usize)?;
         let done = self.write_mem_prefix(buf, &data);
+        if done < data.len() && stream {
+            self.unread(id, &data[done..]);
+        }
         self.finish_read(id, offset, before, data.len(), done)
     }
 
@@ -303,7 +406,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         done: usize,
     ) -> SysResult<u64> {
         if done < got {
-            let file = self.proc.fds.file_mut(id);
+            let file = self.st.files.get_mut(id);
             if offset.is_none() && file.offset == before + got as u64 {
                 file.offset = before + done as u64;
             }
@@ -330,8 +433,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     fn seekable(&self, fd: i64) -> SysResult<()> {
         let (_, file) = self.file(fd)?;
         match file.object {
-            FileObject::Node(ino) if self.vfs.file_type(ino) == FileType::Regular => Ok(()),
-            FileObject::Node(_) => Ok(()),
+            FileObject::Node(_) | FileObject::Proc { .. } => Ok(()),
             _ => Err(Errno(ESPIPE)),
         }
     }
@@ -377,7 +479,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         count: u64,
         offset: Option<u64>,
     ) -> SysResult<u64> {
-        let (id, _) = self.file(fd)?;
+        let (id, file) = self.file(fd)?;
+        let stream = !matches!(file.object, FileObject::Node(_) | FileObject::Proc { .. });
         if offset.is_some() {
             self.seekable(fd)?;
         }
@@ -387,9 +490,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             .iter()
             .fold(0u64, |sum, v| sum.saturating_add(v.1))
             .min(MAX_IO as u64);
-        let file = self.proc.fds.file(id);
-        let before = file.offset;
-        if file.object == FileObject::ConsoleIn {
+        let before = self.st.files.get(id).offset;
+        if stream {
             if let Some(&(base, _)) = iovecs.iter().find(|v| v.1 > 0) {
                 self.probe_writable(base)?;
             }
@@ -406,6 +508,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             if written < n {
                 break;
             }
+        }
+        if done < data.len() && stream {
+            self.unread(id, &data[done..]);
         }
         self.finish_read(id, offset, before, data.len(), done)
     }
@@ -442,20 +547,35 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         count: u64,
     ) -> SysResult<u64> {
         let (out_id, _) = self.file(out_fd)?;
-        let (in_id, _) = self.file(in_fd)?;
+        let (in_id, in_file) = self.file(in_fd)?;
+        let before = in_file.offset;
         let offset = if offset_ptr != 0 {
             Some(self.read_u64(offset_ptr)?)
         } else {
             None
         };
-        let data = self.read_file(in_id, offset, count as usize)?;
-        let n = self.write_file(out_id, None, &data)?;
+        let count = (count as usize).min(PIPE_CAPACITY);
+        let data = self.read_file(in_id, offset, count)?;
+        let n = match self.write_file(out_id, None, &data) {
+            Ok(n) => n,
+            Err(err) => {
+                // Nothing was transferred: give the input back.
+                self.unread(in_id, &data);
+                if offset.is_none() {
+                    self.st.files.get_mut(in_id).offset = before;
+                }
+                return Err(err);
+            }
+        };
         if let Some(offset) = offset {
             self.write_u64(offset_ptr, offset + n as u64)?;
         } else if n < data.len() {
             // Give back what was read but not written.
-            let file = self.proc.fds.file_mut(in_id);
-            file.offset -= (data.len() - n) as u64;
+            self.unread(in_id, &data[n..]);
+            let file = self.st.files.get_mut(in_id);
+            if matches!(file.object, FileObject::Node(_) | FileObject::Proc { .. }) {
+                file.offset -= (data.len() - n) as u64;
+            }
         }
         Ok(n as u64)
     }
@@ -465,24 +585,31 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         const SEEK_CUR: i64 = 1;
         const SEEK_END: i64 = 2;
         let (id, file) = self.file(fd)?;
-        let Some(ino) = file.node() else {
-            return Err(Errno(ESPIPE));
+        let size = match file.object {
+            FileObject::Node(ino) => {
+                if self.vfs.device(ino).is_some() {
+                    return Ok(0);
+                }
+                self.vfs.size(ino)
+            }
+            FileObject::Proc { .. } => file.contents.as_ref().map_or(0, |c| c.len() as u64),
+            _ => return Err(Errno(ESPIPE)),
         };
-        if self.vfs.device(ino).is_some() {
-            return Ok(0);
-        }
         let base = match whence {
             SEEK_SET => 0,
             SEEK_CUR => file.offset as i64,
-            SEEK_END => self.vfs.size(ino) as i64,
+            SEEK_END => size as i64,
             _ => return Err(Errno(EINVAL)),
         };
         let new = base
             .checked_add(offset)
             .filter(|&n| n >= 0)
             .ok_or(Errno(EINVAL))?;
-        let is_dir = self.vfs.is_dir(ino);
-        let file = self.proc.fds.file_mut(id);
+        let is_dir = match file.object {
+            FileObject::Node(ino) => self.vfs.is_dir(ino),
+            _ => false,
+        };
+        let file = self.st.files.get_mut(id);
         file.offset = new as u64;
         if is_dir && new == 0 {
             // Rewinding a directory lists it afresh.
@@ -520,7 +647,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                     if parent.trailing_slash {
                         return Err(Errno(EISDIR));
                     }
-                    let perm = (mode as u32) & 0o7777 & !self.proc.umask;
+                    let perm = (mode as u32) & 0o7777 & !self.proc().umask;
                     let now = self.now();
                     self.vfs.create(
                         self.host,
@@ -561,9 +688,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 Some(Device::Fd(target)) => {
                     // /dev/stdin and friends reopen the fd they name.
                     return self
-                        .proc
-                        .fds
-                        .dup(i64::from(target), 0, flags.cloexec)
+                        .dup_min(i64::from(target), 0, flags.cloexec)
                         .map(|fd| fd as u64)
                         .map_err(|e| if e == Errno(EBADF) { Errno(ENXIO) } else { e });
                 }
@@ -578,14 +703,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let mut file = OpenFile::new(FileObject::Node(ino), access);
         file.append = flags.append;
         file.nonblock = flags.nonblock;
+        file.path = self.absolute_path(start, &path);
         self.vfs.opened(ino);
-        match self.proc.fds.install(file, 0, flags.cloexec) {
-            Ok(fd) => Ok(fd as u64),
-            Err(err) => {
-                self.vfs.closed(ino);
-                Err(err)
-            }
-        }
+        self.install(file, 0, flags.cloexec).map(|fd| fd as u64)
     }
 
     pub fn sys_creat(&mut self, path: GuestAddr, mode: u64) -> SysResult<u64> {
@@ -594,7 +714,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     pub fn sys_close(&mut self, fd: i64) -> SysResult<u64> {
-        let released = self.proc.fds.close(fd)?;
+        let st = &mut *self.st;
+        let proc = st.procs.get_mut(&self.pid).expect("live process");
+        let released = proc.fds.close(&mut st.files, fd)?;
         self.release(released);
         Ok(0)
     }
@@ -604,10 +726,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if first > last || flags & !CLOSE_RANGE_CLOEXEC != 0 {
             return Err(Errno(EINVAL));
         }
-        for fd in self.proc.fds.fds() {
+        for fd in self.proc().fds.fds() {
             if (first..=last).contains(&(fd as u64)) {
                 if flags & CLOSE_RANGE_CLOEXEC != 0 {
-                    self.proc.fds.set_cloexec(fd, true)?;
+                    self.proc_mut().fds.set_cloexec(fd, true)?;
                 } else {
                     self.sys_close(fd)?;
                 }
@@ -616,13 +738,19 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
+    fn dup_min(&mut self, fd: i64, min: usize, cloexec: bool) -> SysResult<i64> {
+        let st = &mut *self.st;
+        let proc = st.procs.get_mut(&self.pid).expect("live process");
+        proc.fds.dup(&mut st.files, fd, min, cloexec)
+    }
+
     pub fn sys_dup(&mut self, fd: i64) -> SysResult<u64> {
-        self.proc.fds.dup(fd, 0, false).map(|fd| fd as u64)
+        self.dup_min(fd, 0, false).map(|fd| fd as u64)
     }
 
     pub fn sys_dup2(&mut self, old: i64, new: i64) -> SysResult<u64> {
         if old == new {
-            self.proc.fds.get(old)?;
+            self.proc().fds.get(old)?;
             return Ok(new as u64);
         }
         self.sys_dup3(old, new, 0)
@@ -632,27 +760,73 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if old == new || flags & !abi::O_CLOEXEC != 0 {
             return Err(Errno(EINVAL));
         }
-        let released = self.proc.fds.dup_to(old, new, flags != 0)?;
+        let st = &mut *self.st;
+        let proc = st.procs.get_mut(&self.pid).expect("live process");
+        let released = proc.fds.dup_to(&mut st.files, old, new, flags != 0)?;
         self.release(released);
         Ok(new as u64)
     }
 
+    pub fn sys_pipe2(&mut self, fds: GuestAddr, flags: u64) -> SysResult<u64> {
+        const O_DIRECT: u64 = 0o40000;
+        if flags & !(abi::O_CLOEXEC | abi::O_NONBLOCK | O_DIRECT) != 0 {
+            return Err(Errno(EINVAL));
+        }
+        // Check the destination before creating anything.
+        let probe: [u8; 8] = self.read_array(fds)?;
+        self.write_mem(fds, &probe)?;
+        let cloexec = flags & abi::O_CLOEXEC != 0;
+        let nonblock = flags & abi::O_NONBLOCK != 0;
+        let pipe = self.st.pipes.create();
+        let mut read = OpenFile::new(FileObject::PipeRead(pipe), Access::Read);
+        read.nonblock = nonblock;
+        let mut write = OpenFile::new(FileObject::PipeWrite(pipe), Access::Write);
+        write.nonblock = nonblock;
+        let r = match self.install(read, 0, cloexec) {
+            Ok(fd) => fd,
+            Err(err) => {
+                self.st.pipes.close_end(pipe, true);
+                return Err(err);
+            }
+        };
+        let w = match self.install(write, 0, cloexec) {
+            Ok(fd) => fd,
+            Err(err) => {
+                self.sys_close(r)?;
+                return Err(err);
+            }
+        };
+        let mut out = [0u8; 8];
+        out[..4].copy_from_slice(&(r as i32).to_le_bytes());
+        out[4..].copy_from_slice(&(w as i32).to_le_bytes());
+        self.write_mem(fds, &out)?;
+        Ok(0)
+    }
+
     pub fn sys_fcntl(&mut self, fd: i64, cmd: i64, arg: u64) -> SysResult<u64> {
+        const F_SETOWN: i64 = 8;
+        const F_GETOWN: i64 = 9;
+        const F_SETPIPE_SZ: i64 = 1031;
+        const F_GETPIPE_SZ: i64 = 1032;
+        const F_ADD_SEALS: i64 = 1033;
+        const F_GET_SEALS: i64 = 1034;
         let (id, file) = self.file(fd)?;
+        let is_pipe = matches!(
+            file.object,
+            FileObject::PipeRead(_) | FileObject::PipeWrite(_)
+        );
         match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 let min = usize::try_from(int(arg)).map_err(|_| Errno(EINVAL))?;
                 if min >= MAX_FDS {
                     return Err(Errno(EINVAL));
                 }
-                self.proc
-                    .fds
-                    .dup(fd, min, cmd == F_DUPFD_CLOEXEC)
+                self.dup_min(fd, min, cmd == F_DUPFD_CLOEXEC)
                     .map(|fd| fd as u64)
             }
-            F_GETFD => Ok(u64::from(self.proc.fds.cloexec(fd)?)),
+            F_GETFD => Ok(u64::from(self.proc().fds.cloexec(fd)?)),
             F_SETFD => self
-                .proc
+                .proc_mut()
                 .fds
                 .set_cloexec(fd, arg & FD_CLOEXEC != 0)
                 .map(|()| 0),
@@ -663,18 +837,23 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 file.nonblock,
             )),
             F_SETFL => {
-                let file = self.proc.fds.file_mut(id);
+                let file = self.st.files.get_mut(id);
                 file.append = arg & abi::O_APPEND != 0;
                 file.nonblock = arg & abi::O_NONBLOCK != 0;
+                self.st.changed = true;
                 Ok(0)
             }
             F_GETLK | F_OFD_GETLK => {
-                // There is no other process to hold a lock: report l_type
+                // Locks are never held against anyone: report l_type
                 // F_UNLCK (the first field of struct flock).
                 self.write_mem(arg, &F_UNLCK.to_le_bytes())?;
                 Ok(0)
             }
             F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => Ok(0),
+            F_GETOWN | F_SETOWN => Ok(0),
+            F_GETPIPE_SZ | F_SETPIPE_SZ if is_pipe => Ok(PIPE_CAPACITY as u64),
+            F_GETPIPE_SZ | F_SETPIPE_SZ => Err(Errno(EBADF)),
+            F_ADD_SEALS | F_GET_SEALS => Err(Errno(EINVAL)),
             _ => {
                 log::warn!("unimplemented fcntl command {cmd}");
                 Err(Errno(EINVAL))
@@ -683,33 +862,87 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     pub fn sys_ioctl(&mut self, fd: i64, request: u64, arg: u64) -> SysResult<u64> {
+        const FIONBIO: u64 = 0x5421;
         let (id, file) = self.file(fd)?;
+        let object = file.object;
         match request & 0xffff_ffff {
-            FIOCLEX => self.proc.fds.set_cloexec(fd, true).map(|()| 0),
-            FIONCLEX => self.proc.fds.set_cloexec(fd, false).map(|()| 0),
-            FIONREAD => match file.node() {
-                Some(ino) if self.vfs.file_type(ino) == FileType::Regular => {
-                    let left = self
+            FIOCLEX => self.proc_mut().fds.set_cloexec(fd, true).map(|()| 0),
+            FIONCLEX => self.proc_mut().fds.set_cloexec(fd, false).map(|()| 0),
+            FIONBIO => {
+                let on = self.read_u32(arg)? != 0;
+                self.st.files.get_mut(id).nonblock = on;
+                Ok(0)
+            }
+            FIONREAD => {
+                let n = match object {
+                    FileObject::Node(ino) if self.vfs.file_type(ino) == FileType::Regular => self
                         .vfs
                         .size(ino)
-                        .saturating_sub(self.proc.fds.file(id).offset);
-                    self.write_u32(arg, left.min(i32::MAX as u64) as u32)?;
-                    Ok(0)
-                }
-                _ => Err(Errno(ENOTTY)),
-            },
-            // Nothing is a terminal in U1: every tty request (TCGETS,
-            // TIOCGWINSZ, TIOCGPGRP, ...) fails as on a pipe or file.
+                        .saturating_sub(self.st.files.get(id).offset),
+                    FileObject::PipeRead(pipe) => self.st.pipes.get(pipe).len() as u64,
+                    FileObject::ConsoleIn => {
+                        self.st.console.fill(self.host);
+                        self.st.console.buffered() as u64
+                    }
+                    FileObject::Tty => self.tty_readable() as u64,
+                    _ => return Err(Errno(ENOTTY)),
+                };
+                self.write_u32(arg, n.min(i32::MAX as u64) as u32)?;
+                Ok(0)
+            }
+            request if object == FileObject::Tty => self.tty_ioctl(request, arg),
+            // Not a terminal: every tty request (TCGETS, TIOCGWINSZ,
+            // TIOCGPGRP, ...) fails as on a pipe or file.
             _ => Err(Errno(ENOTTY)),
         }
     }
 
-    fn poll_one(&self, fd: i64, events: u16) -> u16 {
-        // Files, devices and the console never block for readiness.
-        match self.proc.fds.get(fd) {
-            Err(_) => POLLNVAL,
-            Ok(_) => events & (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM),
+    /// The `poll` events an fd has now (`POLLNVAL` for a bad fd).
+    fn poll_events(&mut self, fd: i64) -> u16 {
+        let Ok((_, file)) = self.file(fd) else {
+            return POLLNVAL;
+        };
+        let any_in = POLLIN | POLLRDNORM;
+        let any_out = POLLOUT | POLLWRNORM;
+        match file.object {
+            FileObject::Node(_) | FileObject::Proc { .. } => any_in | any_out,
+            FileObject::ConsoleOut(_) => any_out,
+            FileObject::ConsoleIn => match self.st.console.input_state(self.host) {
+                InputState::Empty => 0,
+                _ => any_in,
+            },
+            FileObject::Tty => {
+                if self.tty_readable() > 0 || self.tty_hung_up() {
+                    any_in | any_out
+                } else {
+                    any_out
+                }
+            }
+            FileObject::PipeRead(pipe) => {
+                let p = self.st.pipes.get(pipe);
+                (if p.is_empty() { 0 } else { any_in }) | if p.writers == 0 { POLLHUP } else { 0 }
+            }
+            FileObject::PipeWrite(pipe) => {
+                let p = self.st.pipes.get(pipe);
+                (if p.space() > 0 { any_out } else { 0 }) | if p.readers == 0 { POLLERR } else { 0 }
+            }
         }
+    }
+
+    /// Replaces the signal mask for the duration of a `ppoll`/`pselect6`.
+    fn temporary_mask(&mut self, set: GuestAddr, size: u64) -> SysResult<()> {
+        if set == 0 || self.parked.is_some() {
+            return Ok(());
+        }
+        if size != 8 {
+            return Err(Errno(EINVAL));
+        }
+        let mask = self.read_u64(set)?;
+        let thread = self.st.thread_mut(self.tid);
+        thread.saved_mask = Some(thread.sigmask);
+        thread.sigmask = mask & !signal::UNBLOCKABLE;
+        self.st.changed = true;
+        Ok(())
     }
 
     pub fn sys_poll(
@@ -717,6 +950,19 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         fds: GuestAddr,
         nfds: u64,
         timeout_ms: Option<i64>,
+    ) -> SysResult<u64> {
+        let timeout = match timeout_ms {
+            Some(ms) if ms >= 0 => Some(Duration::from_millis(ms as u64)),
+            _ => None,
+        };
+        self.poll_until(fds, nfds, timeout)
+    }
+
+    fn poll_until(
+        &mut self,
+        fds: GuestAddr,
+        nfds: u64,
+        timeout: Option<Duration>,
     ) -> SysResult<u64> {
         if nfds > MAX_FDS as u64 {
             return Err(Errno(EINVAL));
@@ -729,47 +975,46 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             let revents = if fd < 0 {
                 0
             } else {
-                self.poll_one(i64::from(fd), events)
+                self.poll_events(i64::from(fd)) & (events | POLLERR | POLLHUP | POLLNVAL)
             };
             entry[6..8].copy_from_slice(&revents.to_le_bytes());
             if revents != 0 {
                 ready += 1;
             }
         }
-        self.write_mem(fds, &raw)?;
-        if ready == 0 {
-            match timeout_ms {
-                Some(ms) if ms >= 0 => self.host.sleep(std::time::Duration::from_millis(ms as u64)),
-                _ => {
-                    log::warn!("poll would block forever (nothing can become ready)");
-                    return Err(Errno(crate::errno::EINTR));
-                }
-            }
+        if ready == 0 && !self.timed_out() && timeout != Some(Duration::ZERO) {
+            return Err(self.park_retry(timeout, Restart::Never));
         }
+        self.write_mem(fds, &raw)?;
         Ok(ready)
     }
 
-    pub fn sys_ppoll(&mut self, fds: GuestAddr, nfds: u64, timeout: GuestAddr) -> SysResult<u64> {
-        let timeout_ms = if timeout == 0 {
+    pub fn sys_ppoll(
+        &mut self,
+        fds: GuestAddr,
+        nfds: u64,
+        timeout: GuestAddr,
+        sigmask: GuestAddr,
+        sigsetsize: u64,
+    ) -> SysResult<u64> {
+        let timeout = if timeout == 0 {
             None
         } else {
-            let (sec, nsec) = abi::decode_pair(&self.read_array(timeout)?);
-            Some(sec.saturating_mul(1000).saturating_add(nsec / 1_000_000))
+            Some(self.read_timespec(timeout)?)
         };
-        self.sys_poll(fds, nfds, timeout_ms)
+        self.temporary_mask(sigmask, sigsetsize)?;
+        self.poll_until(fds, nfds, timeout)
     }
 
-    /// `select`/`pselect6`: every valid fd is ready for reading and writing.
-    /// With nothing to report, the call sleeps for its timeout, a `timeval`
-    /// (`select`) or a `timespec` (`pselect6`) at `timeout`.
+    /// `select`/`pselect6`. The timeout is a `timeval` (`select`) or a
+    /// `timespec` (`pselect6`); `sigmask` is pselect6's `{ sigset *, size }`.
     pub fn sys_select(
         &mut self,
         nfds: i64,
-        readfds: GuestAddr,
-        writefds: GuestAddr,
-        exceptfds: GuestAddr,
+        sets: [GuestAddr; 3],
         timeout: GuestAddr,
         timeout_is_timespec: bool,
+        sigmask: GuestAddr,
     ) -> SysResult<u64> {
         let timeout = if timeout == 0 {
             None
@@ -783,45 +1028,62 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             if sec < 0 || !(0..max).contains(&sub) {
                 return Err(Errno(EINVAL));
             }
-            Some(std::time::Duration::new(
-                sec as u64,
-                (sub * to_nanos) as u32,
-            ))
+            Some(Duration::new(sec as u64, (sub * to_nanos) as u32))
         };
         if !(0..=MAX_FDS as i64).contains(&nfds) {
             return Err(Errno(EINVAL));
         }
+        if sigmask != 0 {
+            let pair: [u8; 16] = self.read_array(sigmask)?;
+            let (set, size) = abi::decode_pair(&pair);
+            self.temporary_mask(set as u64, size as u64)?;
+        }
         let bytes = (nfds as usize).div_ceil(64) * 8;
+        let mut inputs = [None, None, None];
+        for (i, &set) in sets.iter().enumerate() {
+            if set != 0 {
+                inputs[i] = Some(self.read_mem(set, bytes)?);
+            }
+        }
+        let wanted = [
+            POLLIN | POLLRDNORM | POLLHUP | POLLERR,
+            POLLOUT | POLLWRNORM | POLLERR,
+            0,
+        ];
+        let mut outputs = vec![vec![0u8; bytes]; 3];
         let mut ready = 0;
-        for set in [readfds, writefds] {
-            if set == 0 {
+        for fd in 0..nfds as usize {
+            let (byte, mask) = (fd / 8, 1u8 << (fd % 8));
+            let asked: Vec<usize> = (0..3)
+                .filter(|&i| inputs[i].as_ref().is_some_and(|b| b[byte] & mask != 0))
+                .collect();
+            if asked.is_empty() {
                 continue;
             }
-            let bits = self.read_mem(set, bytes)?;
-            for fd in 0..nfds as usize {
-                if bits[fd / 8] & (1 << (fd % 8)) != 0 {
-                    self.proc.fds.get(fd as i64)?;
+            let events = self.poll_events(fd as i64);
+            if events & POLLNVAL != 0 {
+                return Err(Errno(EBADF));
+            }
+            for i in asked {
+                if events & wanted[i] != 0 {
+                    outputs[i][byte] |= mask;
                     ready += 1;
                 }
             }
         }
-        if exceptfds != 0 {
-            self.write_mem(exceptfds, &vec![0; bytes])?;
+        if ready == 0 && !self.timed_out() && timeout != Some(Duration::ZERO) {
+            return Err(self.park_retry(timeout, Restart::Never));
         }
-        if ready == 0 {
-            match timeout {
-                Some(duration) => self.host.sleep(duration),
-                None => {
-                    log::warn!("select would block forever (nothing can become ready)");
-                    return Err(Errno(crate::errno::EINTR));
-                }
+        for (i, &set) in sets.iter().enumerate() {
+            if set != 0 {
+                self.write_mem(set, &outputs[i])?;
             }
         }
         Ok(ready)
     }
 
     pub fn sys_fsync(&mut self, fd: i64) -> SysResult<u64> {
-        self.proc.fds.get(fd)?;
+        self.proc().fds.get(fd)?;
         Ok(0)
     }
 
@@ -857,7 +1119,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let (_, file) = self.file(fd)?;
         let target = match file.object {
             FileObject::Node(ino) => Target::Node(ino),
-            other => Target::Console(other),
+            other => Target::Object(other, file.contents.as_ref().map_or(0, |c| c.len() as u64)),
         };
         let st = self.stat_of(target);
         self.write_mem(buf, &abi::encode_stat(self.arch, &st))?;
@@ -977,9 +1239,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 },
             ];
             listing.extend(self.vfs.list(self.host, ino)?);
-            self.proc.fds.file_mut(id).listing = Some(listing);
+            self.st.files.get_mut(id).listing = Some(listing);
         }
-        let file = self.proc.fds.file(id);
+        let file = self.st.files.get(id);
         let listing = file.listing.as_ref().expect("set above");
         let mut out = Vec::new();
         let mut index = file.offset as usize;
@@ -1000,7 +1262,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Err(Errno(EINVAL));
         }
         self.write_mem(buf, &out)?;
-        self.proc.fds.file_mut(id).offset = index as u64;
+        self.st.files.get_mut(id).offset = index as u64;
         Ok(out.len() as u64)
     }
 
@@ -1008,7 +1270,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
 
     pub fn sys_mkdirat(&mut self, dirfd: i64, path: GuestAddr, mode: u64) -> SysResult<u64> {
         let parent = self.parent_at(dirfd, path)?;
-        let perm = (mode as u32) & 0o7777 & !self.proc.umask;
+        let perm = (mode as u32) & 0o7777 & !self.proc().umask;
         let now = self.now();
         self.vfs
             .create(self.host, parent.dir, &parent.name, NewNode::Dir, perm, now)
@@ -1022,7 +1284,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Err(Errno(EPERM));
         }
         let parent = self.parent_at(dirfd, path)?;
-        let perm = (mode as u32) & 0o7777 & !self.proc.umask;
+        let perm = (mode as u32) & 0o7777 & !self.proc().umask;
         let now = self.now();
         self.vfs
             .create(
@@ -1249,7 +1511,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     pub fn sys_getcwd(&mut self, buf: GuestAddr, size: u64) -> SysResult<u64> {
-        let mut path = self.vfs.dir_path(self.proc.cwd).ok_or(Errno(ENOENT))?;
+        let mut path = self.vfs.dir_path(self.proc().cwd).ok_or(Errno(ENOENT))?;
         path.push(0);
         if path.len() as u64 > size {
             return Err(Errno(crate::errno::ERANGE));
@@ -1263,7 +1525,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Err(Errno(ENOTDIR));
         }
         self.vfs.opened(ino);
-        let old = std::mem::replace(&mut self.proc.cwd, ino);
+        let old = std::mem::replace(&mut self.proc_mut().cwd, ino);
         self.vfs.closed(old);
         Ok(0)
     }
@@ -1280,19 +1542,26 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     pub fn sys_umask(&mut self, mask: u64) -> SysResult<u64> {
-        let old = self.proc.umask;
-        self.proc.umask = mask as u32 & 0o777;
+        let old = self.proc().umask;
+        self.proc_mut().umask = mask as u32 & 0o777;
         Ok(u64::from(old))
     }
 
-    /// The contents of a file for a private file mapping.
+    /// The contents of a file for a file mapping (always a private copy;
+    /// see `mm`).
     pub(crate) fn mapping_contents(
         &mut self,
         fd: i64,
         offset: u64,
         len: u64,
+        flags: u64,
     ) -> SysResult<Vec<u8>> {
         let (_, file) = self.file(fd)?;
+        if flags & MAP_TYPE != MAP_PRIVATE && file.access.writable() {
+            log::info!(
+                "a shared writable file mapping is a private copy: writes do not reach the file"
+            );
+        }
         let ino = file.node().ok_or(Errno(crate::errno::EACCES))?;
         if !file.access.readable() {
             return Err(Errno(crate::errno::EACCES));

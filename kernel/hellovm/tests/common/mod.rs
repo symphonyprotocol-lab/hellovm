@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use hellovm_core::{ExitStatus, Kernel, KernelError};
 use hellovm_host::{CaptureHost, ImageDir};
-use hellovm_platform_seccomp::SeccompApp;
+use hellovm_platform_seccomp::{AppKiller, SeccompPlatform};
 
 /// A directory under the system temp dir, removed on drop.
 pub struct TempDir(pub PathBuf);
@@ -62,6 +62,44 @@ impl Drop for TempDir {
     }
 }
 
+/// Kills a sandbox that runs longer than a minute, so that a hanging test
+/// fails instead of blocking the run.
+pub struct Watchdog {
+    done: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl Watchdog {
+    pub const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn start(killer: AppKiller) -> Watchdog {
+        let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let thread_done = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            let (lock, cvar) = &*thread_done;
+            let guard = lock.lock().unwrap();
+            let (guard, timeout) = cvar
+                .wait_timeout_while(guard, Self::LIMIT, |d| !*d)
+                .unwrap();
+            if timeout.timed_out() && !*guard {
+                eprintln!(
+                    "watchdog: the sandbox ran for {:?}; killing it",
+                    Self::LIMIT
+                );
+                let _ = killer.kill();
+            }
+        });
+        Watchdog { done }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.done;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+}
+
 /// The outcome of running a program.
 pub struct Run {
     pub status: ExitStatus,
@@ -86,7 +124,8 @@ pub fn try_run(image: &Path, argv: &[&str], stdin: &[u8]) -> Result<Run, KernelE
     let mut host = CaptureHost::new(Some(ImageDir::open(image).unwrap()));
     host.stdin.extend(stdin);
     let mut kernel = Kernel::new(host).with_trace();
-    let mut app = SeccompApp::new().expect("start the app process");
+    let mut app = SeccompPlatform::new().expect("start the platform");
+    let _watchdog = Watchdog::start(app.killer());
     let argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
     let envp = vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()];
     kernel.exec(&mut app, &argv[0], &argv, &envp)?;
@@ -142,7 +181,8 @@ impl Sandbox {
         host.stderr.clear();
         host.stdin.clear();
         host.stdin.extend(stdin);
-        let mut app = SeccompApp::new().expect("start the app process");
+        let mut app = SeccompPlatform::new().expect("start the platform");
+        let _watchdog = Watchdog::start(app.killer());
         let argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
         let envp = vec![b"PATH=/bin".to_vec(), b"HOME=/root".to_vec()];
         self.kernel

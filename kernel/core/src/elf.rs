@@ -57,8 +57,6 @@ pub enum ElfError {
     Unsupported(String),
     /// For another architecture.
     WrongMachine { found: u16 },
-    /// Dynamically linked: needs this interpreter (U2).
-    Dynamic { interpreter: Vec<u8> },
     /// Inconsistent headers.
     Malformed(&'static str),
     /// The image does not fit the address space.
@@ -85,11 +83,6 @@ impl fmt::Display for ElfError {
                     "ELF file is for another architecture (e_machine {found})"
                 )
             }
-            ElfError::Dynamic { interpreter } => write!(
-                f,
-                "dynamically linked programs are not supported yet (interpreter {})",
-                String::from_utf8_lossy(interpreter)
-            ),
             ElfError::Malformed(what) => write!(f, "malformed ELF file: {what}"),
             ElfError::NoRoom => f.write_str("the program does not fit the address space"),
         }
@@ -112,6 +105,10 @@ struct Segment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Elf {
     pub pie: bool,
+    /// The program interpreter (`PT_INTERP`) of a dynamically linked
+    /// executable: the dynamic loader, which the kernel loads as well and
+    /// starts instead of the program.
+    pub interpreter: Option<Vec<u8>>,
     entry: u64,
     phoff: u64,
     phnum: u64,
@@ -179,6 +176,7 @@ pub fn parse(file: &[u8], arch: Arch) -> Result<Elf, ElfError> {
     let table = &file[phoff as usize..table_end];
 
     let mut segments = Vec::new();
+    let mut interpreter = None;
     let mut phdr_vaddr = None;
     let mut align = 1u64;
     for ph in table.as_chunks::<PHDR_SIZE>().0 {
@@ -195,11 +193,14 @@ pub fn parse(file: &[u8], arch: Arch) -> Result<Elf, ElfError> {
                     .checked_add(filesz)
                     .filter(|&end| end <= file.len() as u64)
                     .ok_or(ElfError::Malformed("PT_INTERP outside the file"))?;
-                let mut interpreter = file[offset as usize..end as usize].to_vec();
-                if interpreter.last() == Some(&0) {
-                    interpreter.pop();
+                let mut path = file[offset as usize..end as usize].to_vec();
+                if path.last() == Some(&0) {
+                    path.pop();
                 }
-                return Err(ElfError::Dynamic { interpreter });
+                if path.is_empty() || path.len() >= crate::vfs::PATH_MAX || path.contains(&0) {
+                    return Err(ElfError::Malformed("bad PT_INTERP"));
+                }
+                interpreter = Some(path);
             }
             PT_PHDR => phdr_vaddr = Some(vaddr),
             PT_LOAD => {
@@ -256,6 +257,7 @@ pub fn parse(file: &[u8], arch: Arch) -> Result<Elf, ElfError> {
     });
     Ok(Elf {
         pie,
+        interpreter,
         entry,
         phoff,
         phnum: phnum as u64,
@@ -278,20 +280,39 @@ pub struct LoadedImage {
     pub end: GuestAddr,
 }
 
+/// Where to put a position-independent image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// The executable: like `ELF_ET_DYN_BASE`, two thirds of the way up, so
+    /// that the heap has room above and the mapping area below the stack.
+    Program,
+    /// The program interpreter: anywhere in the mapping area, like a shared
+    /// library.
+    Interpreter,
+}
+
 /// Maps the segments of `elf` (parsed from `file`) into the address space.
 pub fn load<P: AddressSpace + AppMemory + ?Sized>(
     mm: &mut Mm,
     space: &mut P,
     file: &[u8],
     elf: &Elf,
+    placement: Placement,
 ) -> Result<LoadedImage, ElfError> {
     let page = mm.page_size();
     let align = elf.align.max(page);
     let bias = if elf.pie {
-        // Like ELF_ET_DYN_BASE: two thirds of the way up, so that the heap
-        // has room above and the mapping area below the stack.
         let first = elf.segments[0].vaddr & !(align - 1);
-        ((mm.max_addr() / 3 * 2) & !(align - 1)).wrapping_sub(first)
+        let last = elf.segments.last().expect("at least one segment");
+        let span = (last.vaddr + last.memsz)
+            .checked_sub(first)
+            .and_then(|span| mm.page_up(span))
+            .ok_or(ElfError::NoRoom)?;
+        let base = match placement {
+            Placement::Program => (mm.max_addr() / 3 * 2) & !(align - 1),
+            Placement::Interpreter => mm.free_area(span, align).ok_or(ElfError::NoRoom)?,
+        };
+        base.wrapping_sub(first)
     } else {
         0
     };
@@ -375,6 +396,8 @@ pub struct StackParams<'a> {
     pub execfn: &'a [u8],
     pub image: &'a LoadedImage,
     pub cpu: CpuInfo,
+    /// Where the program interpreter was loaded (`AT_BASE`), 0 without one.
+    pub interp_base: u64,
     /// The 16 bytes `AT_RANDOM` points to.
     pub random: [u8; 16],
 }
@@ -433,7 +456,7 @@ pub fn build_stack<P: AddressSpace + AppMemory + ?Sized>(
         (AT_PHENT, PHDR_SIZE as u64),
         (AT_PHNUM, image.phnum),
         (AT_PAGESZ, mm.page_size()),
-        (AT_BASE, 0),
+        (AT_BASE, params.interp_base),
         (AT_FLAGS, 0),
         (AT_ENTRY, image.entry),
         (AT_UID, 0),
@@ -477,7 +500,6 @@ pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::platform::Platform;
     use crate::testutil::MockApp;
 
     /// A segment for [`build_elf`]: vaddr, file offset, file data, memsz,
@@ -608,7 +630,7 @@ pub(crate) mod tests {
         let file = sample(Arch::Aarch64, ET_EXEC, 0x40_0000);
         let elf = parse(&file, Arch::Aarch64).unwrap();
         assert!(!elf.pie);
-        let image = load(&mut mm, &mut app, &file, &elf).unwrap();
+        let image = load(&mut mm, &mut app, &file, &elf, Placement::Program).unwrap();
         assert_eq!(image.entry, 0x40_1000);
         assert_eq!(image.bias, 0);
         assert_eq!(image.phdr, 0x40_0040, "computed from the first segment");
@@ -653,7 +675,7 @@ pub(crate) mod tests {
             None,
         );
         let elf = parse(&file, Arch::Aarch64).unwrap();
-        load(&mut mm, &mut app, &file, &elf).unwrap();
+        load(&mut mm, &mut app, &file, &elf, Placement::Program).unwrap();
         assert_eq!(app.prot(0x40_0000), Some(Prot(5)));
         assert_eq!(app.prot(0x40_1000), Some(Prot(7)));
         assert_eq!(app.prot(0x40_2000), Some(Prot(3)));
@@ -666,7 +688,7 @@ pub(crate) mod tests {
         let file = sample(Arch::Aarch64, ET_DYN, 0);
         let elf = parse(&file, Arch::Aarch64).unwrap();
         assert!(elf.pie);
-        let image = load(&mut mm, &mut app, &file, &elf).unwrap();
+        let image = load(&mut mm, &mut app, &file, &elf, Placement::Program).unwrap();
         assert_ne!(image.bias, 0);
         assert_eq!(image.bias % 0x1000, 0);
         assert_eq!(image.entry, image.bias + 0x1000);
@@ -707,15 +729,11 @@ pub(crate) mod tests {
             }],
             Some(b"/lib/ld-linux-aarch64.so.1\0"),
         );
-        let err = parse(&dynamic, arch).unwrap_err();
+        let parsed = parse(&dynamic, arch).unwrap();
         assert_eq!(
-            err,
-            ElfError::Dynamic {
-                interpreter: b"/lib/ld-linux-aarch64.so.1".to_vec()
-            }
+            parsed.interpreter.as_deref(),
+            Some(&b"/lib/ld-linux-aarch64.so.1"[..])
         );
-        assert!(err.to_string().contains("not supported yet"));
-        assert_eq!(err.errno(), Errno(ENOEXEC));
         // A segment whose file range lies outside the file.
         let mut bad = file.clone();
         bad.truncate(0x1808);
@@ -727,7 +745,10 @@ pub(crate) mod tests {
         let (mut mm, mut app) = setup();
         let file = sample(Arch::Aarch64, ET_EXEC, app.reserved());
         let elf = parse(&file, Arch::Aarch64).unwrap();
-        assert_eq!(load(&mut mm, &mut app, &file, &elf), Err(ElfError::NoRoom));
+        assert_eq!(
+            load(&mut mm, &mut app, &file, &elf, Placement::Program),
+            Err(ElfError::NoRoom)
+        );
     }
 
     #[test]
@@ -747,7 +768,10 @@ pub(crate) mod tests {
             None,
         );
         let elf = parse(&file, Arch::Aarch64).unwrap();
-        assert_eq!(load(&mut mm, &mut app, &file, &elf), Err(ElfError::NoRoom));
+        assert_eq!(
+            load(&mut mm, &mut app, &file, &elf, Placement::Program),
+            Err(ElfError::NoRoom)
+        );
         assert!(!app.is_mapped(0x40_0000));
     }
 
@@ -789,6 +813,7 @@ pub(crate) mod tests {
                 hwcap: 7,
                 hwcap2: 9,
             },
+            interp_base: 0,
             random: [3; 16],
         };
         let sp = build_stack(&mut mm, &mut app, &params).unwrap();
@@ -846,6 +871,7 @@ pub(crate) mod tests {
             execfn: b"x",
             image: &image,
             cpu: CpuInfo::default(),
+            interp_base: 0,
             random: [0; 16],
         };
         assert_eq!(build_stack(&mut mm, &mut app, &params), Err(Errno(E2BIG)));

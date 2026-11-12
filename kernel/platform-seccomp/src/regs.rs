@@ -1,5 +1,14 @@
-//! The app's general-purpose registers, as `PTRACE_GETREGSET(NT_PRSTATUS)`
-//! returns them, and the per-architecture rules for syscalls.
+//! The app's registers, as `PTRACE_GETREGSET` returns them
+//! (`NT_PRSTATUS`, `NT_PRFPREG`), the per-architecture rules for syscalls,
+//! and the conversion to and from the core's [`Context`].
+//!
+//! A context the core sets comes from guest data (a signal frame), so only
+//! user-controllable state is taken from it: on aarch64 the condition flags
+//! of `pstate` (the exception level, interrupt masks and the rest are kept
+//! from the stopped task), on x86_64 the arithmetic and direction flags of
+//! `eflags` and never the segment registers.
+
+use hellovm_core::platform::Context;
 
 /// aarch64 `struct user_pt_regs`.
 #[cfg(target_arch = "aarch64")]
@@ -57,9 +66,59 @@ impl Regs {
         self.sp = stack;
         self.pc = entry;
     }
+}
 
-    /// aarch64 apps set `tpidr_el0` themselves.
-    pub fn set_thread_pointer(&mut self, _value: u64) {}
+/// aarch64 `struct user_fpsimd_state`.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FpRegs {
+    pub v: [u128; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
+    pub reserved: [u32; 2],
+}
+
+/// The `pstate` bits the app may set: the condition flags N, Z, C and V.
+#[cfg(target_arch = "aarch64")]
+const PSTATE_USER: u64 = 0xf000_0000;
+
+/// The context of a task with these registers.
+#[cfg(target_arch = "aarch64")]
+pub fn to_context(regs: &Regs, fp: &FpRegs, tls: u64) -> Context {
+    use hellovm_core::platform::Aarch64Context;
+    Context::Aarch64(Box::new(Aarch64Context {
+        x: regs.x,
+        sp: regs.sp,
+        pc: regs.pc,
+        pstate: regs.pstate,
+        v: fp.v,
+        fpsr: fp.fpsr,
+        fpcr: fp.fpcr,
+        tpidr: tls,
+    }))
+}
+
+/// The registers for `context`, with what the app may not choose taken
+/// from `current`. `None` if the context is for another architecture.
+#[cfg(target_arch = "aarch64")]
+pub fn from_context(context: &Context, current: &Regs) -> Option<(Regs, FpRegs, u64)> {
+    let Context::Aarch64(c) = context else {
+        return None;
+    };
+    let regs = Regs {
+        x: c.x,
+        sp: c.sp,
+        pc: c.pc,
+        pstate: (current.pstate & !PSTATE_USER) | (c.pstate & PSTATE_USER),
+    };
+    let fp = FpRegs {
+        v: c.v,
+        fpsr: c.fpsr,
+        fpcr: c.fpcr,
+        reserved: [0; 2],
+    };
+    Some((regs, fp, c.tpidr))
 }
 
 /// x86_64 `struct user_regs_struct`.
@@ -160,8 +219,92 @@ impl Regs {
         self.fs_base = 0;
         self.gs_base = 0;
     }
+}
 
-    pub fn set_thread_pointer(&mut self, value: u64) {
-        self.fs_base = value;
+/// x86_64 `struct user_fpregs_struct` (the `fxsave` area).
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpRegs {
+    pub bytes: [u8; 512],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Default for FpRegs {
+    fn default() -> Self {
+        FpRegs { bytes: [0; 512] }
     }
+}
+
+/// The `eflags` bits the app may set: CF, PF, AF, ZF, SF, DF, OF and AC.
+#[cfg(target_arch = "x86_64")]
+const EFLAGS_USER: u64 = 0x4_0cd5;
+
+/// The highest user-space address plus one (47-bit address space): a
+/// thread pointer the app sets must be below it.
+#[cfg(target_arch = "x86_64")]
+const USER_END: u64 = 1 << 47;
+
+#[cfg(target_arch = "x86_64")]
+pub fn to_context(regs: &Regs, fp: &FpRegs, _tls: u64) -> Context {
+    use hellovm_core::platform::X86_64Context;
+    Context::X86_64(Box::new(X86_64Context {
+        r15: regs.r15,
+        r14: regs.r14,
+        r13: regs.r13,
+        r12: regs.r12,
+        rbp: regs.rbp,
+        rbx: regs.rbx,
+        r11: regs.r11,
+        r10: regs.r10,
+        r9: regs.r9,
+        r8: regs.r8,
+        rax: regs.rax,
+        rcx: regs.rcx,
+        rdx: regs.rdx,
+        rsi: regs.rsi,
+        rdi: regs.rdi,
+        rip: regs.rip,
+        rsp: regs.rsp,
+        eflags: regs.eflags,
+        fs_base: regs.fs_base,
+        fxsave: Box::new(fp.bytes),
+    }))
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn from_context(context: &Context, current: &Regs) -> Option<(Regs, FpRegs, u64)> {
+    let Context::X86_64(c) = context else {
+        return None;
+    };
+    let mut regs = *current;
+    regs.r15 = c.r15;
+    regs.r14 = c.r14;
+    regs.r13 = c.r13;
+    regs.r12 = c.r12;
+    regs.rbp = c.rbp;
+    regs.rbx = c.rbx;
+    regs.r11 = c.r11;
+    regs.r10 = c.r10;
+    regs.r9 = c.r9;
+    regs.r8 = c.r8;
+    regs.rax = c.rax;
+    regs.rcx = c.rcx;
+    regs.rdx = c.rdx;
+    regs.rsi = c.rsi;
+    regs.rdi = c.rdi;
+    regs.rip = c.rip;
+    regs.rsp = c.rsp;
+    regs.eflags = (current.eflags & !EFLAGS_USER) | (c.eflags & EFLAGS_USER);
+    regs.orig_rax = u64::MAX;
+    if c.fs_base < USER_END {
+        regs.fs_base = c.fs_base;
+    }
+    let mut fp = FpRegs::default();
+    fp.bytes.copy_from_slice(&c.fxsave[..]);
+    // MXCSR bits the CPU rejects would make ptrace fail: keep the
+    // documented ones (0xffff).
+    let mxcsr = u32::from_le_bytes(fp.bytes[24..28].try_into().unwrap()) & 0xffff;
+    fp.bytes[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    Some((regs, fp, 0))
 }

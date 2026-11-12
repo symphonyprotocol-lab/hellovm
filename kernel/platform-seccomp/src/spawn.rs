@@ -33,11 +33,67 @@
 //!   restores the app's registers.
 //! * Starting the app is setting pc and sp from a syscall-exit stop.
 //!
-//! C has a single thread (`clone` is emulated and refused in U1) and is
-//! stopped whenever K touches its registers, so nothing in C can change a
-//! register between K writing it and the host executing the syscall.
+//! # Processes and threads (U2)
 //!
-//! # Bootstrap
+//! Every app thread is its own host process, and every one of them is a
+//! tracee of the same host thread of K: the sandbox's event-loop thread,
+//! which created the platform. A new task comes from one of two places:
+//!
+//! * [`spawn`] (below): a fresh process with an empty address space, for the
+//!   sandbox's first process and for every `execve`. The core loads the new
+//!   program into it and only then kills the old task, so a failed `execve`
+//!   changes nothing.
+//! * Injecting `clone` into a stopped task C, exactly like `mmap`: K writes
+//!   all registers (pc = the stub instruction, number = `clone`, flags =
+//!   `CLONE_PARENT | SIGCHLD`, plus `CLONE_VM` when the address space is to
+//!   be shared; stack, tid pointers and TLS all 0), checks the seccomp stop
+//!   it gets, and lets it run. The host does the copy-on-write `fork` (or
+//!   shares the address space, for app threads and `vfork`). Because ptrace
+//!   was set up with `PTRACE_O_TRACEFORK`/`TRACECLONE`, the new process is
+//!   traced by K from its creation and starts with a `SIGSTOP` before it
+//!   runs a single instruction; K replaces its registers with C's app
+//!   registers (the core then sets the child's context: return value 0, its
+//!   stack and thread pointer) before resuming it. `CLONE_PARENT` makes K's
+//!   thread the real parent too, so K reaps every app process itself and no
+//!   zombie is left with an app process that cannot make syscalls.
+//!
+//! App threads are deliberately *not* host threads (`CLONE_THREAD`): a
+//! host thread group would bring host-side signal and exit semantics
+//! (group exit, leader zombies, `execve` killing siblings) that the core
+//! emulates itself. Separate host processes sharing one `mm` can each be
+//! stopped, killed and waited for on their own.
+//!
+//! # Why injection stays safe with many threads and processes
+//!
+//! The argument of U1 was "nothing in C can change a register between K
+//! writing it and the host executing the syscall". With several tasks:
+//!
+//! * Registers are per task. K only injects into a task that is in a
+//!   ptrace stop, and only K, its tracer, can change a stopped task's
+//!   registers; other app tasks (even ones sharing its memory and running
+//!   concurrently) cannot. Injected syscalls take no memory arguments, so
+//!   what another thread can write to memory does not matter.
+//! * The stub page is mapped read-execute in every address space (it is
+//!   inherited by `fork` and shared with `CLONE_VM`), lies in a range the
+//!   core never maps, unmaps or re-protects, and app `mmap`/`mprotect` are
+//!   emulated, so no task can change the instruction there.
+//! * A syscall runs only after K saw *that* task's seccomp stop with the
+//!   exact pc, number and arguments it prepared. Any other task executing
+//!   the stub's instruction (they all can jump there) traps like any app
+//!   syscall and is emulated; K never resumes an app-initiated seccomp stop
+//!   with the syscall allowed. While injecting, K waits for the one task's
+//!   pid only; stops of other tasks stay queued for the event loop.
+//! * Every new process inherits the seccomp filter and the ptrace options
+//!   (`PTRACE_O_EXITKILL` included). Should a child ever escape tracing, its
+//!   filter's `SECCOMP_RET_TRACE` without a tracer fails every syscall with
+//!   `ENOSYS`, and its pc points at the trap after the stub's syscall.
+//! * Signals: app processes are in their own host session (`setsid` during
+//!   bootstrap), so the host terminal's signals never reach them. The only
+//!   host signals they receive are faults, K's `SIGKILL`s, and the
+//!   interrupt signal K sends to stop a running task for signal delivery;
+//!   K sees every one of them at a signal-delivery-stop and drops it.
+//!
+//! //! # Bootstrap
 //!
 //! 1. K generates the stub executable into a sealed memfd and prepares the
 //!    filter, the `execveat` arguments and a shared page for error reports,
@@ -59,19 +115,26 @@
 //! # Residual host-syscall surface
 //!
 //! Once the app's own code can run, the host kernel executes exactly these
-//! syscalls in C, and only with numbers and arguments written by K into C's
-//! registers while C is stopped:
+//! syscalls in app processes, and only with numbers and arguments written by
+//! K into a stopped task's registers:
 //!
 //! * `mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0)`
+//! * `mmap(addr, len, prot, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0)`
+//!   (U2: `MAP_SHARED` anonymous memory, shared with `fork`ed processes)
 //! * `munmap(addr, len)`
 //! * `mprotect(addr, len, prot)`
+//! * `clone(CLONE_PARENT | SIGCHLD [| CLONE_VM], 0, 0, 0, 0)` (U2)
 //!
 //! with `prot` limited to `PROT_READ | PROT_WRITE | PROT_EXEC`, `addr` and
 //! `len` page-aligned and inside the app's address range, never touching the
-//! stub's range ([`crate::SeccompApp`] checks this independently of the
-//! core). The values are chosen by the core, in response to app requests it
-//! has validated. Before the app runs, the host also executes the bootstrap
-//! `execveat` of the generated stub. On x86_64 the legacy vsyscall page is
+//! stub's range ([`crate::SeccompPlatform`] checks this independently of
+//! the core). The values are chosen by the core, in response to app requests
+//! it has validated. Before the app runs, the host also executes the
+//! bootstrap `setsid` and `execveat` of the generated stub. On the host side
+//! K uses, per app process, ptrace requests, `waitpid`,
+//! `process_vm_readv`/`writev`, `pidfd_open` (for [`crate::AppKiller`]) and
+//! `tgkill` with `SIGURG` (to interrupt a running task); see `wake` for how
+//! K waits. On x86_64 the legacy vsyscall page is
 //! still present (it cannot be unmapped); its emulation goes through seccomp
 //! like a real syscall, so it is trapped and emulated as well.
 //!
@@ -98,6 +161,18 @@
 //! * **Building the image with `execve` of the real program** (U0). The
 //!   host kernel would parse an untrusted ELF file and build the stack, and
 //!   the core could not own the address space layout.
+//! * **`fork` by spawning a fresh stub and copying memory through K** (U2).
+//!   It needs no injected `clone`, but copies every page of the parent on
+//!   every `fork` (a CPython `subprocess` would copy tens of megabytes) and
+//!   cannot share `MAP_SHARED` memory or an address space between threads.
+//!   The injected `clone` adds one syscall with fixed flags to the surface.
+//! * **App threads as host threads (`CLONE_THREAD`)**: see above. A host
+//!   thread group also makes `waitpid` for one thread and `exit` semantics
+//!   depend on the host's thread-group rules.
+//! * **One tracer thread per app thread**: ptrace binds a tracee to one
+//!   tracer thread, so several tracers would need a cross-thread protocol
+//!   for every injection and every wait; one event-loop thread tracing all
+//!   tasks keeps all of it sequential.
 //!
 //! ptrace of one's own child needs no capabilities and is allowed by
 //! Docker's default seccomp profile on Linux 4.8 and newer (strace works in a
@@ -125,6 +200,7 @@ const STAGE_TRACEME: i32 = 2;
 const STAGE_NO_NEW_PRIVS: i32 = 3;
 const STAGE_SECCOMP: i32 = 4;
 const STAGE_EXEC: i32 = 5;
+const STAGE_SETSID: i32 = 6;
 
 fn stage_name(stage: i32) -> &'static str {
     match stage {
@@ -133,6 +209,7 @@ fn stage_name(stage: i32) -> &'static str {
         STAGE_NO_NEW_PRIVS => "prctl(PR_SET_NO_NEW_PRIVS)",
         STAGE_SECCOMP => "installing the seccomp filter",
         STAGE_EXEC => "execveat of the stub",
+        STAGE_SETSID => "setsid",
         _ => "an unknown step",
     }
 }
@@ -406,6 +483,11 @@ unsafe fn child_bootstrap(
         libc::_exit(127);
     }
     close_all_fds_except(stub_fd);
+    // Its own session: signals the host terminal sends to the kernel's
+    // process group (Ctrl-C, window changes) never reach app processes.
+    if libc::setsid() < 0 {
+        fail(STAGE_SETSID);
+    }
 
     if sys::ptrace(sys::PTRACE_TRACEME, 0, 0, 0) != 0 {
         fail(STAGE_TRACEME);

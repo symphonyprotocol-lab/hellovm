@@ -1,24 +1,63 @@
-//! The kernel: one sandbox's filesystem and process, and the run loop.
+//! The kernel: one sandbox's filesystem, processes and threads, and the
+//! event loop that runs them.
+//!
+//! # The event loop
+//!
+//! [`Kernel::run`] serves every thread of the sandbox from the calling host
+//! thread. Each iteration:
+//!
+//! 1. resumes the threads that are ready (their syscall completed, a signal
+//!    handler was set up, a program was loaded);
+//! 2. if the sandbox's state changed (data in a pipe, a child exited, a
+//!    signal was posted, console input arrived), revisits the parked
+//!    threads: a deliverable signal interrupts a parked syscall, the others
+//!    retry it; and running threads with a signal to act on are interrupted
+//!    through the platform;
+//! 3. expires deadlines (sleeps, timeouts, interval timers);
+//! 4. waits in [`Platform::wait`] for the next trap, bounded by the nearest
+//!    deadline, and handles it: a syscall is dispatched and either completes
+//!    at once or parks its thread; a fault becomes a signal.
+//!
+//! A parked syscall leaves no trace until it completes: a handler that
+//! decides to wait has not changed anything yet, so it can simply be run
+//! again later. Waits that are woken explicitly rather than retried
+//! (`futex`, `vfork`) say so in [`WaitKind`].
+//!
+//! The sandbox lives as long as its first process, which plays the role of
+//! init: orphans are reparented to it, and when it ends every other process
+//! is killed and [`Kernel::run`] returns its status.
 
 use std::fmt;
+use std::time::Duration;
 
 use crate::arch::{Arch, Sysno};
-use crate::elf::{self, ElfError, StackParams};
 use crate::errno::{Errno, MAX_ERRNO};
-use crate::fd::FdTable;
-use crate::host::Host;
-use crate::mm::Mm;
-use crate::platform::{GuestAddr, Platform, PlatformError, Resume, SyscallTrap, Trap};
-use crate::syscall::{self, Action};
-use crate::vfs::{FileType, Ino, Timespec, Vfs};
+use crate::fd::{Access, FileObject, OpenFile};
+use crate::host::{ConsoleStream, Host};
+use crate::platform::{Event, Platform, PlatformError, SyscallTrap, Trap};
+use crate::syscall::{self, Action, Ctx};
+use crate::task::{Next, Parked, Process, State, Thread, ThreadState, Tid, WaitKind};
+use crate::tty::Console;
+use crate::vfs::{Ino, Timespec, Vfs};
 
-/// How an app ended.
+/// How a process ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitStatus {
-    /// The app called `exit` or `exit_group` with this status (0..=255).
+    /// It called `exit` or `exit_group` with this status (0..=255).
     Exited(i32),
-    /// The app was killed by this Linux signal.
+    /// It was killed by this Linux signal.
     Signaled(u32),
+}
+
+impl ExitStatus {
+    /// The `wait4` status word. `core` marks a signal whose default action
+    /// dumps core (no core file is ever written).
+    pub(crate) fn wait_status(self, core: bool) -> i32 {
+        match self {
+            ExitStatus::Exited(code) => (code & 0xff) << 8,
+            ExitStatus::Signaled(sig) => sig as i32 | if core { 0x80 } else { 0 },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -63,13 +102,17 @@ impl From<PlatformError> for KernelError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Returned(i64),
-    Exited(i32),
-    Signaled(u32),
+    /// The thread continued with a new context (`rt_sigreturn`, `execve`).
+    Continued,
+    /// The thread or process ended.
+    Ended,
 }
 
 /// One entry of the syscall trace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SyscallRecord {
+    /// The guest thread that made the syscall.
+    pub tid: u32,
     pub arch: Arch,
     pub nr: u64,
     pub sysno: Option<Sysno>,
@@ -107,55 +150,22 @@ impl fmt::Display for SyscallRecord {
             }
             Outcome::Returned(ret) if !(-4096..=4096).contains(&ret) => write!(f, " = {ret:#x}"),
             Outcome::Returned(ret) => write!(f, " = {ret}"),
-            Outcome::Exited(_) | Outcome::Signaled(_) => f.write_str(" = ?"),
+            Outcome::Continued | Outcome::Ended => f.write_str(" = ?"),
         }
     }
 }
 
-/// Default and maximum of a resource limit.
-pub(crate) type Rlimit = (u64, u64);
-
-pub(crate) const RLIM_INFINITY: u64 = u64::MAX;
-
-/// The state of the app's (single) process.
-#[derive(Clone, Debug)]
-pub(crate) struct Process {
-    pub mm: Option<Mm>,
-    pub fds: FdTable,
-    /// Current directory; held open in the VFS so it stays alive.
-    pub cwd: Ino,
-    pub umask: u32,
-    /// `struct sigaction` of each signal (1..=64): handler, flags,
-    /// restorer, mask.
-    pub sigactions: [[u64; 4]; 64],
-    pub sigmask: u64,
-    /// `comm`, at most 15 bytes.
-    pub name: Vec<u8>,
-    pub start: Option<(GuestAddr, GuestAddr)>,
-    pub rlimits: [Rlimit; 16],
-    pub thread_pointer: u64,
-}
-
-impl Process {
-    fn new(cwd: Ino) -> Process {
-        let mut rlimits = [(RLIM_INFINITY, RLIM_INFINITY); 16];
-        rlimits[3] = (crate::mm::STACK_SIZE, RLIM_INFINITY); // RLIMIT_STACK
-        rlimits[4] = (0, RLIM_INFINITY); // RLIMIT_CORE
-        rlimits[7] = (crate::fd::MAX_FDS as u64, crate::fd::MAX_FDS as u64); // RLIMIT_NOFILE
-        rlimits[8] = (8 << 20, 8 << 20); // RLIMIT_MEMLOCK
-        Process {
-            mm: None,
-            fds: FdTable::with_console(),
-            cwd,
-            umask: 0o022,
-            sigactions: [[0; 4]; 64],
-            sigmask: 0,
-            name: Vec::new(),
-            start: None,
-            rlimits,
-            thread_pointer: 0,
-        }
-    }
+/// How the sandbox console appears to the guest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConsoleMode {
+    /// fd 0 reads the host's console input, fds 1 and 2 write its output
+    /// and error streams; none of them is a terminal.
+    #[default]
+    Streams,
+    /// fds 0, 1 and 2 are one terminal (`/dev/console`) with a line
+    /// discipline, job control and window size; its output goes to the
+    /// host's output stream.
+    Terminal,
 }
 
 /// The current wall-clock time from the host, as a VFS timestamp.
@@ -167,12 +177,18 @@ pub(crate) fn now<H: Host + ?Sized>(host: &mut H) -> Timespec {
     }
 }
 
-/// A kernel instance serving one app: its filesystem and its process.
+/// A kernel instance serving one sandbox: its filesystem and its processes.
 pub struct Kernel<H> {
     host: H,
     trace: Option<Vec<SyscallRecord>>,
     vfs: Vfs,
-    proc: Process,
+    st: State,
+    /// The directory the next program starts in (the last one's current
+    /// directory, as for the commands of a session).
+    cwd: Ino,
+    console_mode: ConsoleMode,
+    /// The platform's architecture, once a program was loaded.
+    arch: Option<Arch>,
 }
 
 impl<H: Host> Kernel<H> {
@@ -187,7 +203,10 @@ impl<H: Host> Kernel<H> {
             host,
             trace: None,
             vfs,
-            proc: Process::new(root),
+            st: State::new(Console::new()),
+            cwd: root,
+            console_mode: ConsoleMode::Streams,
+            arch: None,
         }
     }
 
@@ -210,6 +229,12 @@ impl<H: Host> Kernel<H> {
         self
     }
 
+    /// Sets how the console appears to the next program.
+    pub fn with_console(mut self, mode: ConsoleMode) -> Self {
+        self.console_mode = mode;
+        self
+    }
+
     /// The syscalls handled so far, if tracing is on.
     pub fn trace(&self) -> &[SyscallRecord] {
         self.trace.as_deref().unwrap_or(&[])
@@ -227,167 +252,452 @@ impl<H: Host> Kernel<H> {
         self.host
     }
 
-    /// Loads the program at `path` (in the sandbox filesystem) into `app`,
-    /// which must have a fresh address space, and prepares it to start with
-    /// `argv` and `envp`.
+    /// Loads the program at `path` (in the sandbox filesystem) into a new
+    /// task of `platform`, as the sandbox's first process, and prepares it
+    /// to start with `argv` and `envp`.
     pub fn exec<P: Platform + ?Sized>(
         &mut self,
-        app: &mut P,
+        platform: &mut P,
         path: &[u8],
         argv: &[Vec<u8>],
         envp: &[Vec<u8>],
     ) -> Result<(), KernelError> {
-        let display = String::from_utf8_lossy(path).into_owned();
-        let fail = |errno: Errno, reason: String| KernelError::Exec {
-            path: display.clone(),
-            errno,
-            reason,
-        };
-        let errno_fail = |errno: Errno| {
-            let reason = match errno.0 {
-                crate::errno::ENOENT => "no such file or directory".to_string(),
-                crate::errno::EACCES => "permission denied".to_string(),
-                crate::errno::ENOTDIR => "not a directory".to_string(),
-                crate::errno::ELOOP => "too many levels of symbolic links".to_string(),
-                _ => format!("cannot load ({errno})"),
-            };
-            fail(errno, reason)
-        };
-        let ino = self
-            .vfs
-            .resolve(&mut self.host, self.proc.cwd, path, true)
-            .map_err(errno_fail)?;
-        if self.vfs.file_type(ino) != FileType::Regular || self.vfs.perm(ino) & 0o111 == 0 {
-            return Err(errno_fail(Errno(crate::errno::EACCES)));
+        if !self.st.procs.is_empty() {
+            self.end_all(platform);
         }
-        let file = self.vfs.read_all(&mut self.host, ino).map_err(errno_fail)?;
-        let arch = app.arch();
-        let elf_fail = |err: ElfError| fail(err.errno(), err.to_string());
-        let parsed = elf::parse(&file, arch).map_err(elf_fail)?;
-        let mut mm = Mm::new(&app.address_space());
-        let image = elf::load(&mut mm, app, &file, &parsed).map_err(elf_fail)?;
-        mm.set_brk_start(image.end);
-        let mut random = [0u8; 16];
-        self.host
-            .random(&mut random)
-            .map_err(|err| fail(Errno::from_host(&err), format!("no random bytes: {err}")))?;
-        let params = StackParams {
-            arch,
+        self.arch = Some(platform.arch());
+        let display = String::from_utf8_lossy(path).into_owned();
+        let loaded = syscall::load_program(
+            &mut self.host,
+            platform,
+            &mut self.vfs,
+            self.cwd,
+            path,
             argv,
             envp,
-            execfn: path,
-            image: &image,
-            cpu: app.cpu_info(),
-            random,
+        )
+        .map_err(|err| KernelError::Exec {
+            path: display.clone(),
+            errno: err.errno,
+            reason: err.reason,
+        })?;
+        let start = self.host.clock_monotonic();
+        // Each program gets a fresh view of console input.
+        self.st.console = Console::new();
+        let pid = self.st.alloc_pid().expect("an empty sandbox has room");
+        let mut proc = Process::new(pid, self.cwd, start);
+        self.vfs.opened(self.cwd);
+        self.install_console(&mut proc);
+        let task = loaded.task;
+        let mm = self.st.mms.add(loaded.mm, loaded.trampoline);
+        proc.mm = Some(mm);
+        proc.threads.push(pid);
+        proc.name = loaded.name;
+        proc.exe = loaded.exe;
+        proc.cmdline = loaded.cmdline;
+        self.st.procs.insert(pid, proc);
+        let next = Next::Start {
+            entry: loaded.entry,
+            stack: loaded.stack,
         };
-        let sp = elf::build_stack(&mut mm, app, &params).map_err(errno_fail)?;
-        let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
-        self.proc.name = name[..name.len().min(15)].to_vec();
-        self.proc.mm = Some(mm);
-        self.proc.start = Some((image.entry, sp));
-        log::debug!(
-            "loaded {display}: entry {:#x}, stack {sp:#x}, brk {:#x}, bias {:#x}",
-            image.entry,
-            image.end,
-            image.bias
-        );
+        self.st
+            .threads
+            .insert(pid, Thread::new(pid, pid, task, ThreadState::Ready(next)));
+        self.st.tasks.insert(task, pid);
+        self.st.init_status = None;
         Ok(())
     }
 
-    /// Runs the loaded program until it exits or dies, handling all of its
-    /// syscalls.
+    fn install_console(&mut self, proc: &mut Process) {
+        let files = &mut self.st.files;
+        let objects: [(FileObject, Access); 3] = match self.console_mode {
+            ConsoleMode::Streams => [
+                (FileObject::ConsoleIn, Access::Read),
+                (FileObject::ConsoleOut(ConsoleStream::Stdout), Access::Write),
+                (FileObject::ConsoleOut(ConsoleStream::Stderr), Access::Write),
+            ],
+            ConsoleMode::Terminal => [(FileObject::Tty, Access::ReadWrite); 3],
+        };
+        for (object, access) in objects {
+            proc.fds
+                .install(files, OpenFile::new(object, access), 0, false)
+                .expect("a new fd table has room");
+        }
+    }
+
+    /// Runs the sandbox until its first process ends, handling all syscalls
+    /// of all of its processes, and returns how that process ended. Every
+    /// process still alive then is killed.
     ///
-    /// When the program ends, its process state (fds, memory map, signal
-    /// dispositions) is released; the filesystem and the current directory
-    /// stay, so the next [`Kernel::exec`] (into a fresh app) runs another
-    /// program in the same sandbox, as successive commands of a session.
-    pub fn run<P: Platform + ?Sized>(&mut self, app: &mut P) -> Result<ExitStatus, KernelError> {
-        let status = self.run_program(app);
-        self.end_process();
-        status
-    }
-
-    /// Releases the process's open files and resets its state, keeping the
-    /// current directory.
-    fn end_process(&mut self) {
-        let cwd = self.proc.cwd;
-        let mut old = std::mem::replace(&mut self.proc, Process::new(cwd));
-        for fd in old.fds.fds() {
-            if let Ok(Some(file)) = old.fds.close(fd) {
-                if let Some(ino) = file.node() {
-                    self.vfs.closed(ino);
-                }
-            }
-        }
-    }
-
-    fn run_program<P: Platform + ?Sized>(
+    /// The filesystem and the first process's current directory stay, so
+    /// the next [`Kernel::exec`] runs another program in the same sandbox,
+    /// as successive commands of a session.
+    pub fn run<P: Platform + ?Sized>(
         &mut self,
-        app: &mut P,
+        platform: &mut P,
     ) -> Result<ExitStatus, KernelError> {
-        let (entry, stack) = self.proc.start.take().ok_or(KernelError::NoProgram)?;
-        let arch = app.arch();
-        let mut resume = Resume::Start { entry, stack };
+        if self.st.procs.is_empty() {
+            return Err(KernelError::NoProgram);
+        }
+        self.host.set_console_waker(platform.waker());
+        let result = self.event_loop(platform);
+        self.end_all(platform);
+        if let Some(cwd) = self.st.init_cwd.take() {
+            self.vfs.closed(self.cwd);
+            self.cwd = cwd;
+        }
+        result
+    }
+
+    fn ctx<'a, P: Platform + ?Sized>(
+        &'a mut self,
+        platform: &'a mut P,
+        tid: Tid,
+        parked: Option<Parked>,
+    ) -> Ctx<'a, H, P> {
+        let arch = platform.arch();
+        let thread = self.st.thread(tid);
+        let (pid, task) = (thread.pid, thread.task);
+        Ctx {
+            host: &mut self.host,
+            plat: platform,
+            vfs: &mut self.vfs,
+            st: &mut self.st,
+            arch,
+            tid,
+            pid,
+            task,
+            parked,
+            action: None,
+        }
+    }
+
+    fn event_loop<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+    ) -> Result<ExitStatus, KernelError> {
+        self.st.changed = true;
         loop {
-            let trap = match app.run(resume)? {
-                Trap::Syscall(trap) => trap,
-                Trap::Fault(fault) => {
-                    log::info!(
-                        "app stopped by signal {} (address {:x?})",
-                        fault.signal,
-                        fault.addr
-                    );
-                    if !fault.fatal {
-                        // No signal delivery yet: a fault ends the app, as an
-                        // unhandled fault does on Linux.
-                        app.terminate()?;
-                    }
-                    return Ok(ExitStatus::Signaled(fault.signal));
+            if let Some(status) = self.st.init_status {
+                return Ok(status);
+            }
+            self.resume_ready(platform)?;
+            if self.st.init_status.is_some() {
+                continue;
+            }
+            if std::mem::take(&mut self.st.changed) {
+                self.revisit(platform)?;
+                continue;
+            }
+            let now = self.host.clock_monotonic();
+            let deadline = self.next_deadline();
+            if let Some(deadline) = deadline {
+                if deadline <= now {
+                    self.expire(platform, now)?;
+                    continue;
                 }
-            };
-            let sysno = arch.sysno(trap.nr);
-            let action = syscall::dispatch(
-                &mut syscall::Ctx {
-                    host: &mut self.host,
-                    app: &mut *app,
-                    vfs: &mut self.vfs,
-                    proc: &mut self.proc,
-                    arch,
-                },
-                sysno,
-                &trap,
-            );
-            self.record(arch, sysno, &trap, action);
-            match action {
-                Action::Return(ret) => resume = Resume::Return(ret),
-                Action::Exit(status) => {
-                    app.terminate()?;
-                    return Ok(ExitStatus::Exited(status));
-                }
-                Action::Signal(signal) => {
-                    app.terminate()?;
-                    return Ok(ExitStatus::Signaled(signal));
-                }
+            }
+            let timeout = deadline.map(|d| d - now);
+            match platform.wait(timeout)? {
+                Some(event) => self.handle_event(platform, event)?,
+                // A timeout (handled at the top) or a wake-up: console
+                // input may have arrived.
+                None => self.st.changed = true,
             }
         }
     }
 
-    fn record(&mut self, arch: Arch, sysno: Option<Sysno>, trap: &SyscallTrap, action: Action) {
+    /// Resumes every thread that is ready.
+    fn resume_ready<P: Platform + ?Sized>(&mut self, platform: &mut P) -> Result<(), KernelError> {
+        loop {
+            let ready: Vec<(Tid, Next)> = self
+                .st
+                .threads
+                .values()
+                .filter_map(|t| match t.state {
+                    ThreadState::Ready(next) => Some((t.tid, next)),
+                    _ => None,
+                })
+                .collect();
+            if ready.is_empty() {
+                return Ok(());
+            }
+            for (tid, next) in ready {
+                if !self.st.threads.contains_key(&tid) {
+                    continue;
+                }
+                self.ctx(platform, tid, None).resume(next)?;
+            }
+        }
+    }
+
+    /// Something changed: interrupt or retry parked syscalls, interrupt
+    /// running threads that have a signal to act on, and let held threads
+    /// go when their process was continued.
+    fn revisit<P: Platform + ?Sized>(&mut self, platform: &mut P) -> Result<(), KernelError> {
+        let tids: Vec<Tid> = self.st.threads.keys().copied().collect();
+        for tid in tids {
+            let Some(thread) = self.st.threads.get(&tid) else {
+                continue;
+            };
+            let stopped = self.st.proc(thread.pid).stopped;
+            match thread.state {
+                ThreadState::Running => {
+                    if !thread.interrupt_sent && self.st.has_signal_to_act_on(tid) {
+                        let task = thread.task;
+                        self.st.thread_mut(tid).interrupt_sent = true;
+                        platform.interrupt(task)?;
+                    } else if stopped && !thread.interrupt_sent {
+                        // Stop it so that it can be held.
+                        let task = thread.task;
+                        self.st.thread_mut(tid).interrupt_sent = true;
+                        platform.interrupt(task)?;
+                    }
+                }
+                ThreadState::Held(next) => {
+                    if !stopped {
+                        self.st.thread_mut(tid).state = ThreadState::Ready(next);
+                    }
+                }
+                ThreadState::Parked(parked) => {
+                    let interruptible = !matches!(parked.kind, WaitKind::Vfork(_));
+                    if interruptible && self.st.has_signal_to_act_on(tid) {
+                        let next = Next::Interrupted(parked.trap, parked.restart);
+                        self.ctx(platform, tid, None).resume(next)?;
+                    } else if parked.kind == WaitKind::Retry && !stopped {
+                        self.retry(platform, tid, parked)?;
+                    }
+                }
+                ThreadState::Ready(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn retry<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+        tid: Tid,
+        parked: Parked,
+    ) -> Result<(), KernelError> {
+        let (tid, action) = self.dispatch(platform, tid, Some(parked), parked.sysno, &parked.trap);
+        self.complete(
+            platform,
+            tid,
+            parked.sysno,
+            &parked.trap,
+            action,
+            Some(parked),
+        )
+    }
+
+    /// Runs a syscall handler for `tid`. Returns the thread's tid afterwards
+    /// (`execve` in a non-leader thread gives it the process's pid).
+    fn dispatch<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+        tid: Tid,
+        parked: Option<Parked>,
+        sysno: Option<Sysno>,
+        trap: &SyscallTrap,
+    ) -> (Tid, Action) {
+        let mut ctx = self.ctx(platform, tid, parked);
+        let action = syscall::dispatch(&mut ctx, sysno, trap);
+        (ctx.tid, action)
+    }
+
+    /// The nearest deadline of a parked syscall or an interval timer.
+    fn next_deadline(&self) -> Option<Duration> {
+        let parked = self
+            .st
+            .threads
+            .values()
+            .filter_map(|t| t.parked().and_then(|p| p.deadline));
+        let timers = self.st.procs.values().filter_map(|p| p.itimer.deadline);
+        parked.chain(timers).min()
+    }
+
+    fn expire<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+        now: Duration,
+    ) -> Result<(), KernelError> {
+        let pids: Vec<_> = self
+            .st
+            .procs
+            .values()
+            .filter(|p| p.itimer.deadline.is_some_and(|d| d <= now))
+            .map(|p| p.pid)
+            .collect();
+        for pid in pids {
+            let proc = self.st.proc_mut(pid);
+            let timer = &mut proc.itimer;
+            timer.deadline = if timer.interval.is_zero() {
+                None
+            } else {
+                Some(now + timer.interval)
+            };
+            self.st.post_signal(
+                pid,
+                None,
+                crate::signal::SigInfo::kernel(crate::signal::SIGALRM),
+            );
+        }
+        let expired: Vec<(Tid, Parked)> = self
+            .st
+            .threads
+            .values()
+            .filter_map(|t| {
+                t.parked()
+                    .filter(|p| p.deadline.is_some_and(|d| d <= now))
+                    .map(|p| (t.tid, *p))
+            })
+            .collect();
+        for (tid, mut parked) in expired {
+            parked.timed_out = true;
+            parked.deadline = None;
+            match parked.kind {
+                WaitKind::Futex { .. } => {
+                    self.st.thread_mut(tid).state =
+                        ThreadState::Ready(Next::Return(-crate::errno::ETIMEDOUT));
+                    self.record(
+                        tid,
+                        parked.sysno,
+                        &parked.trap,
+                        Outcome::Returned(-crate::errno::ETIMEDOUT),
+                    );
+                }
+                _ => self.retry(platform, tid, parked)?,
+            }
+        }
+        self.st.changed = true;
+        Ok(())
+    }
+
+    fn handle_event<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+        event: Event,
+    ) -> Result<(), KernelError> {
+        let Some(&tid) = self.st.tasks.get(&event.task) else {
+            log::debug!("event {event:?} of a task the kernel no longer has");
+            return Ok(());
+        };
+        match event.trap {
+            Trap::Syscall(trap) => {
+                self.st.thread_mut(tid).state = ThreadState::Ready(Next::Continue);
+                let sysno = platform.arch().sysno(trap.nr);
+                let (tid, action) = self.dispatch(platform, tid, None, sysno, &trap);
+                self.complete(platform, tid, sysno, &trap, action, None)
+            }
+            Trap::Fault(fault) => {
+                self.st.thread_mut(tid).state = ThreadState::Ready(Next::Continue);
+                log::debug!("thread {tid}: fault {fault:?}");
+                let mut ctx = self.ctx(platform, tid, None);
+                ctx.force_signal(fault);
+                ctx.resume(Next::Continue)
+            }
+            Trap::Interrupted => {
+                let thread = self.st.thread_mut(tid);
+                thread.interrupt_sent = false;
+                thread.state = ThreadState::Ready(Next::Continue);
+                self.ctx(platform, tid, None).resume(Next::Continue)
+            }
+            Trap::Gone => {
+                log::info!("thread {tid} was killed from outside the sandbox");
+                self.st.tasks.remove(&event.task);
+                self.st.init_status = Some(ExitStatus::Signaled(crate::signal::SIGKILL));
+                Ok(())
+            }
+        }
+    }
+
+    /// Acts on what a syscall handler decided.
+    fn complete<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+        tid: Tid,
+        sysno: Option<Sysno>,
+        trap: &SyscallTrap,
+        action: Action,
+        parked: Option<Parked>,
+    ) -> Result<(), KernelError> {
+        match action {
+            Action::Return(ret) => {
+                self.record(tid, sysno, trap, Outcome::Returned(ret));
+                self.ctx(platform, tid, None).resume(Next::Return(ret))
+            }
+            Action::Continue => {
+                self.record(tid, sysno, trap, Outcome::Continued);
+                self.ctx(platform, tid, None).resume(Next::Continue)
+            }
+            Action::Start { entry, stack } => {
+                self.record(tid, sysno, trap, Outcome::Continued);
+                self.ctx(platform, tid, None)
+                    .resume(Next::Start { entry, stack })
+            }
+            Action::Park(wait) => {
+                let now = self.host.clock_monotonic();
+                let deadline = match parked {
+                    Some(p) => p.deadline,
+                    None => wait.timeout.map(|t| now.saturating_add(t)),
+                };
+                if let Some(thread) = self.st.threads.get_mut(&tid) {
+                    thread.state = ThreadState::Parked(Parked {
+                        trap: *trap,
+                        sysno,
+                        kind: wait.kind,
+                        deadline,
+                        restart: wait.restart,
+                        timed_out: false,
+                    });
+                }
+                Ok(())
+            }
+            Action::Done => {
+                self.record(tid, sysno, trap, Outcome::Ended);
+                Ok(())
+            }
+        }
+    }
+
+    fn record(&mut self, tid: Tid, sysno: Option<Sysno>, trap: &SyscallTrap, outcome: Outcome) {
+        let Some(arch) = self.arch else {
+            return;
+        };
         let record = SyscallRecord {
+            tid,
             arch,
             nr: trap.nr,
             sysno,
             args: trap.args,
-            outcome: match action {
-                Action::Return(ret) => Outcome::Returned(ret),
-                Action::Exit(status) => Outcome::Exited(status),
-                Action::Signal(signal) => Outcome::Signaled(signal),
-            },
+            outcome,
         };
-        log::debug!("{record}");
+        log::debug!("[{tid}] {record}");
         if let Some(trace) = &mut self.trace {
             trace.push(record);
         }
+    }
+
+    /// Kills every process and forgets them all.
+    fn end_all<P: Platform + ?Sized>(&mut self, platform: &mut P) {
+        let pids: Vec<_> = self.st.procs.keys().copied().collect();
+        for pid in pids {
+            let Some(&tid) = self.st.proc(pid).threads.first() else {
+                continue;
+            };
+            self.ctx(platform, tid, None)
+                .exit_process(ExitStatus::Signaled(crate::signal::SIGKILL), false);
+        }
+        let pids: Vec<_> = self.st.procs.keys().copied().collect();
+        for pid in pids {
+            crate::syscall::reap(&mut self.st, &mut self.vfs, pid);
+        }
+        debug_assert!(self.st.threads.is_empty());
+        self.st.tasks.clear();
+        self.st.changed = false;
+        self.st.init_status = None;
+        self.st.reset_pids();
     }
 }
 
@@ -395,10 +705,13 @@ impl<H: Host> Kernel<H> {
 mod tests {
     use super::*;
     use crate::elf::tests::sample;
-    use crate::errno::{EBADF, EEXIST, EFAULT, ENOENT, ENOEXEC, ENOSYS, ENOTDIR};
-    use crate::testutil::{MockApp, MockEntry, MockHost};
+    use crate::errno::{EBADF, EEXIST, EFAULT, EINTR, ENOENT, ENOSYS, ENOTDIR, EPIPE};
+    use crate::platform::Context;
+    use crate::signal::{SA_RESTORER, SA_SIGINFO, SIGCHLD, SIGPIPE, SIGUSR1};
+    use crate::testutil::{MockEntry, MockHost, MockPlatform};
 
     const SCRATCH: u64 = 0x7000_0000;
+    const INIT: u64 = 1;
 
     fn host_with_prog(arch: Arch) -> MockHost {
         MockHost::with_image(&[
@@ -410,41 +723,60 @@ mod tests {
         ])
     }
 
-    /// A kernel with /bin/prog loaded into a mock app that will make
-    /// `traps`, and scratch memory holding `data`.
-    fn setup(arch: Arch, traps: Vec<Trap>, data: &[(u64, &[u8])]) -> (Kernel<MockHost>, MockApp) {
-        let mut kernel = Kernel::new(host_with_prog(arch)).with_trace();
-        let mut app = MockApp::with_traps(arch, traps);
+    /// A kernel with /bin/prog loaded as init, whose task follows the first
+    /// script (later tasks take the next ones), with scratch memory holding
+    /// `data`.
+    fn setup_scripts(
+        arch: Arch,
+        scripts: Vec<Vec<Trap>>,
+        data: &[(u64, &[u8])],
+    ) -> (Kernel<MockHost>, MockPlatform) {
+        let host = host_with_prog(arch);
+        let mut plat = MockPlatform::with_scripts(arch, &host, scripts);
+        let mut kernel = Kernel::new(host).with_trace();
         kernel
-            .exec(&mut app, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
             .unwrap();
-        app.poke(SCRATCH, &[0; 0x4000]);
+        let mem = plat.mem(INIT);
+        mem.poke(SCRATCH, &[0; 0x4000]);
         for (addr, bytes) in data {
-            app.poke(*addr, bytes);
+            mem.poke(*addr, bytes);
         }
-        (kernel, app)
+        (kernel, plat)
+    }
+
+    fn setup(
+        arch: Arch,
+        traps: Vec<Trap>,
+        data: &[(u64, &[u8])],
+    ) -> (Kernel<MockHost>, MockPlatform) {
+        setup_scripts(arch, vec![traps], data)
     }
 
     fn sc(arch: Arch, sysno: Sysno, args: &[u64]) -> Trap {
-        MockApp::syscall(arch, sysno, args)
+        MockPlatform::syscall(arch, sysno, args)
+    }
+
+    fn returns(plat: &MockPlatform, task: u64) -> Vec<i64> {
+        plat.task(task).returns.clone()
     }
 
     #[test]
     fn exec_loads_and_starts_the_program() {
         let arch = Arch::Aarch64;
-        let (mut kernel, mut app) = setup(arch, vec![sc(arch, Sysno::ExitGroup, &[3])], &[]);
-        assert_eq!(kernel.run(&mut app).unwrap(), ExitStatus::Exited(3));
-        let (entry, sp) = app.started.unwrap();
+        let (mut kernel, mut plat) = setup(arch, vec![sc(arch, Sysno::ExitGroup, &[3])], &[]);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(3));
+        let (entry, sp) = plat.task(INIT).started.unwrap();
         assert_eq!(entry, 0x40_1000);
-        assert_eq!(app.peek(sp, 8), 1u64.to_le_bytes());
-        assert!(app.terminated);
+        assert_eq!(plat.mem(INIT).peek(sp, 8), 1u64.to_le_bytes());
+        assert!(plat.task(INIT).killed);
         // run again without exec
-        assert!(matches!(kernel.run(&mut app), Err(KernelError::NoProgram)));
+        assert!(matches!(kernel.run(&mut plat), Err(KernelError::NoProgram)));
     }
 
     #[test]
     fn exec_errors() {
-        let mut kernel = Kernel::new(MockHost::with_image(&[
+        let host = MockHost::with_image(&[
             (
                 "dyn",
                 MockEntry::File({
@@ -456,21 +788,23 @@ mod tests {
                 }),
             ),
             ("script", MockEntry::File(b"#!/bin/sh\n".to_vec())),
-        ]));
-        let mut app = MockApp::new(Arch::Aarch64);
-        let err = |r: Result<(), KernelError>| match r {
+            ("bad", MockEntry::File(b"\x7fELF".to_vec())),
+        ]);
+        let mut plat = MockPlatform::new(Arch::Aarch64, &host);
+        let mut kernel = Kernel::new(host);
+        let mut err = |path: &[u8]| match kernel.exec(&mut plat, path, &[], &[]) {
             Err(KernelError::Exec { errno, reason, .. }) => (errno, reason),
             other => panic!("{other:?}"),
         };
-        let (errno, _) = err(kernel.exec(&mut app, b"/missing", &[], &[]));
-        assert_eq!(errno, Errno(ENOENT));
-        let (errno, reason) = err(kernel.exec(&mut app, b"/dyn", &[], &[]));
-        assert_eq!(errno, Errno(ENOEXEC));
-        assert!(reason.contains("dynamically linked"), "{reason}");
-        let (errno, _) = err(kernel.exec(&mut app, b"/script", &[], &[]));
-        assert_eq!(errno, Errno(ENOEXEC));
-        let (errno, _) = err(kernel.exec(&mut app, b"/dev", &[], &[]));
-        assert_eq!(errno, Errno(crate::errno::EACCES));
+        assert_eq!(err(b"/missing").0, Errno(ENOENT));
+        // The interpreter named by PT_INTERP does not exist.
+        assert_eq!(err(b"/dyn").0, Errno(ENOENT));
+        // A script whose interpreter does not exist.
+        assert_eq!(err(b"/script").0, Errno(ENOENT));
+        assert_eq!(err(b"/bad").0, Errno(crate::errno::ENOEXEC));
+        assert_eq!(err(b"/dev").0, Errno(crate::errno::EACCES));
+        // Every task created along the way was discarded.
+        assert!(plat.tasks.values().all(|t| t.killed));
     }
 
     #[test]
@@ -481,9 +815,9 @@ mod tests {
                 sc(arch, Sysno::Write, &[2, SCRATCH + 6, 5]),
                 sc(arch, Sysno::ExitGroup, &[0x1_07]),
             ];
-            let (mut kernel, mut app) = setup(arch, traps, &[(SCRATCH, b"hello world")]);
-            assert_eq!(kernel.run(&mut app).unwrap(), ExitStatus::Exited(7));
-            assert_eq!(app.returns, vec![5, 5]);
+            let (mut kernel, mut plat) = setup(arch, traps, &[(SCRATCH, b"hello world")]);
+            assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(7));
+            assert_eq!(returns(&plat, INIT), vec![5, 5]);
             assert_eq!(kernel.host().stdout, b"hello");
             assert_eq!(kernel.host().stderr, b"world");
             let names: Vec<_> = kernel.trace().iter().map(|r| r.sysno).collect();
@@ -508,9 +842,9 @@ mod tests {
             sc(arch, Sysno::Write, &[0, SCRATCH, 1]),
             sc(arch, Sysno::Exit, &[0]),
         ];
-        let (mut kernel, mut app) = setup(arch, traps, &[]);
-        assert_eq!(kernel.run(&mut app).unwrap(), ExitStatus::Exited(0));
-        assert_eq!(app.returns, vec![-EBADF, -EFAULT, 0, -EBADF]);
+        let (mut kernel, mut plat) = setup(arch, traps, &[]);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        assert_eq!(returns(&plat, INIT), vec![-EBADF, -EFAULT, 0, -EBADF]);
         assert!(kernel.host().stdout.is_empty());
     }
 
@@ -518,17 +852,17 @@ mod tests {
     fn unknown_syscalls_are_enosys() {
         for arch in Arch::ALL {
             let traps = vec![
-                sc(arch, Sysno::Execve, &[SCRATCH, 0, 0]),
                 sc(arch, Sysno::Socket, &[2, 1, 0]),
+                sc(arch, Sysno::Clone3, &[SCRATCH, 88]),
                 Trap::Syscall(SyscallTrap {
                     nr: 100_000,
                     args: [0; 6],
                 }),
                 sc(arch, Sysno::ExitGroup, &[38]),
             ];
-            let (mut kernel, mut app) = setup(arch, traps, &[]);
-            assert_eq!(kernel.run(&mut app).unwrap(), ExitStatus::Exited(38));
-            assert_eq!(app.returns, vec![-ENOSYS; 3]);
+            let (mut kernel, mut plat) = setup(arch, traps, &[]);
+            assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(38));
+            assert_eq!(returns(&plat, INIT), vec![-ENOSYS; 3]);
             assert_eq!(kernel.trace()[2].sysno, None);
         }
     }
@@ -598,21 +932,22 @@ mod tests {
             (path(0x600), b"/etc/motd/x\0"),
             (path(0x700), b".\0"),
         ];
-        let (mut kernel, mut app) = setup(arch, traps, &data);
-        assert_eq!(kernel.run(&mut app).unwrap(), ExitStatus::Exited(0));
-        let r = app.returns.clone();
+        let (mut kernel, mut plat) = setup(arch, traps, &data);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let r = returns(&plat, INIT);
         assert_eq!(&r[..4], &[3, 12, 12, 0]);
         assert_eq!(kernel.host().stdout, b"hello image\n");
         // pread on the write-only fd fails; the second, read-write open works.
         assert_eq!(&r[4..11], &[0, -EEXIST, 3, 4, -EBADF, 4, 3]);
         assert_eq!(&r[11..15], &[0, 7, 0, 0]);
-        assert_eq!(app.peek(buf, 7), b"/tmp/d\0");
+        let mem = plat.mem(INIT);
+        assert_eq!(mem.peek(buf, 7), b"/tmp/d\0");
         // newfstatat of "f": regular, 4 bytes (aarch64 layout).
-        let st = app.peek(buf + 0x100, 128);
+        let st = mem.peek(buf + 0x100, 128);
         assert_eq!(u32::from_le_bytes(st[16..20].try_into().unwrap()), 0o100644);
         assert_eq!(u64::from_le_bytes(st[48..56].try_into().unwrap()), 4);
         // fstat of the console: a character device.
-        let st = app.peek(buf + 0x200, 128);
+        let st = mem.peek(buf + 0x200, 128);
         assert_eq!(
             u32::from_le_bytes(st[16..20].try_into().unwrap()) & 0o170000,
             0o020000
@@ -621,7 +956,7 @@ mod tests {
         assert_eq!(r[18], 5);
         // ".", "..", "f": three 24-byte records.
         assert_eq!(&r[19..21], &[72, 0]);
-        assert_eq!(&app.peek(buf + 0x400 + 48 + 19, 2), b"f\0");
+        assert_eq!(&mem.peek(buf + 0x400 + 48 + 19, 2), b"f\0");
         assert_eq!(&r[21..24], &[1, 4, 4]);
         assert_eq!(
             kernel.host().stdout,
@@ -630,14 +965,15 @@ mod tests {
         );
         assert_eq!(r[24], 0x40_6000, "brk starts after the image");
         assert!(r[25] > 0x40_0000);
-        // The image is unchanged; the file lives in the upper layer.
+        // The image is unchanged; the file lives in the upper layer, and
+        // the next program starts in /tmp/d, where this one ended.
         let f = kernel
             .vfs
             .resolve(&mut kernel.host, 2, b"/tmp/d/f", true)
             .unwrap();
-        // fd 4 was at offset 0 (pread does not move it), so the write through
-        // fd 1 overwrote the data.
         assert_eq!(kernel.vfs.read_all(&mut kernel.host, f).unwrap(), b"data");
+        assert_eq!(kernel.vfs.dir_path(kernel.cwd).unwrap(), b"/tmp/d");
+        assert_eq!(kernel.st.files.len(), 0, "every description was released");
     }
 
     #[test]
@@ -662,17 +998,18 @@ mod tests {
             iovecs.extend_from_slice(&(SCRATCH + 0x2000).to_le_bytes());
             iovecs.extend_from_slice(&u64::MAX.to_le_bytes());
         }
-        let (mut kernel, mut app) =
+        let (mut kernel, mut plat) =
             setup(arch, traps, &[(SCRATCH, b"/etc/motd\0"), (iov, &iovecs)]);
-        kernel.run(&mut app).unwrap();
-        assert_eq!(app.returns, vec![3, -EFAULT, 4, 8, 0, 12]);
-        assert_eq!(app.peek(SCRATCH + 0x3ffc, 4), b"hell");
-        assert_eq!(app.peek(SCRATCH + 0x1000, 8), b"o image\n");
-        assert_eq!(app.peek(SCRATCH + 0x2000, 12), b"hello image\n");
+        kernel.run(&mut plat).unwrap();
+        assert_eq!(returns(&plat, INIT), vec![3, -EFAULT, 4, 8, 0, 12]);
+        let mem = plat.mem(INIT);
+        assert_eq!(mem.peek(SCRATCH + 0x3ffc, 4), b"hell");
+        assert_eq!(mem.peek(SCRATCH + 0x1000, 8), b"o image\n");
+        assert_eq!(mem.peek(SCRATCH + 0x2000, 12), b"hello image\n");
     }
 
     #[test]
-    fn select_waits_for_its_timeout() {
+    fn sleeps_and_timeouts_wait_without_blocking_the_kernel() {
         let arch = Arch::Aarch64;
         let mut timeout = Vec::new();
         timeout.extend_from_slice(&0i64.to_le_bytes());
@@ -680,20 +1017,40 @@ mod tests {
         let mut bad = Vec::new();
         bad.extend_from_slice(&0i64.to_le_bytes());
         bad.extend_from_slice(&2_000_000_000i64.to_le_bytes());
+        let mut two_secs = Vec::new();
+        two_secs.extend_from_slice(&2i64.to_le_bytes());
+        two_secs.extend_from_slice(&0i64.to_le_bytes());
         let traps = vec![
             sc(arch, Sysno::Pselect6, &[0, 0, 0, 0, SCRATCH, 0]),
             sc(arch, Sysno::Pselect6, &[0, 0, 0, 0, SCRATCH + 0x100, 0]),
-            sc(arch, Sysno::Pselect6, &[0, 0, 0, 0, 0, 0]),
+            sc(arch, Sysno::Nanosleep, &[SCRATCH + 0x200, 0]),
+            // Console input: EOF, so poll reports it readable at once.
+            sc(arch, Sysno::Ppoll, &[SCRATCH + 0x300, 1, 0, 0, 8]),
             sc(arch, Sysno::ExitGroup, &[0]),
         ];
-        let (mut kernel, mut app) =
-            setup(arch, traps, &[(SCRATCH, &timeout), (SCRATCH + 0x100, &bad)]);
-        kernel.run(&mut app).unwrap();
-        assert_eq!(
-            app.returns,
-            vec![0, -crate::errno::EINVAL, -crate::errno::EINTR]
+        let mut pollfd = Vec::new();
+        pollfd.extend_from_slice(&0i32.to_le_bytes());
+        pollfd.extend_from_slice(&1u16.to_le_bytes());
+        pollfd.extend_from_slice(&0u16.to_le_bytes());
+        let (mut kernel, mut plat) = setup(
+            arch,
+            traps,
+            &[
+                (SCRATCH, &timeout),
+                (SCRATCH + 0x100, &bad),
+                (SCRATCH + 0x200, &two_secs),
+                (SCRATCH + 0x300, &pollfd),
+            ],
         );
-        assert_eq!(kernel.host().slept, std::time::Duration::from_nanos(1000));
+        let start = kernel.host().clock.get();
+        kernel.run(&mut plat).unwrap();
+        assert_eq!(returns(&plat, INIT), vec![0, -crate::errno::EINVAL, 0, 1]);
+        let slept = kernel.host().clock.get() - start;
+        assert_eq!(slept, Duration::from_nanos(2_000_001_000));
+        assert_eq!(
+            &plat.mem(INIT).peek(SCRATCH + 0x306, 2),
+            &1u16.to_le_bytes()
+        );
     }
 
     #[test]
@@ -706,15 +1063,15 @@ mod tests {
             sc(arch, Sysno::ArchPrctl, &[0x1002, 0x1234_5000]),
             sc(arch, Sysno::ExitGroup, &[0]),
         ];
-        let (mut kernel, mut app) = setup(
+        let (mut kernel, mut plat) = setup(
             arch,
             traps,
             &[(SCRATCH, b"/etc/motd\0"), (SCRATCH + 0x40, b"/etc\0")],
         );
-        kernel.run(&mut app).unwrap();
+        kernel.run(&mut plat).unwrap();
         // O_DIRECTORY (x86_64 value) on a file fails; on a directory works.
-        assert_eq!(app.returns, vec![0, -ENOTDIR, 3, 0]);
-        let st = app.peek(SCRATCH + 0x100, 144);
+        assert_eq!(returns(&plat, INIT), vec![0, -ENOTDIR, 3]);
+        let st = plat.mem(INIT).peek(SCRATCH + 0x100, 144);
         assert_eq!(
             u64::from_le_bytes(st[16..24].try_into().unwrap()),
             1,
@@ -722,23 +1079,28 @@ mod tests {
         );
         assert_eq!(u32::from_le_bytes(st[24..28].try_into().unwrap()), 0o100755);
         assert_eq!(u64::from_le_bytes(st[48..56].try_into().unwrap()), 12);
-        assert_eq!(app.thread_pointer, Some(0x1234_5000));
+        // arch_prctl continues with a new context: thread pointer set,
+        // return value 0.
+        let Context::X86_64(c) = &plat.task(INIT).context else {
+            panic!()
+        };
+        assert_eq!((c.fs_base, c.rax), (0x1234_5000, 0));
     }
 
     #[test]
     fn fault_ends_the_app() {
         let traps = vec![Trap::Fault(crate::platform::Fault {
             signal: 11,
+            code: 1,
             addr: Some(0),
-            fatal: false,
         })];
-        let (mut kernel, mut app) = setup(Arch::X86_64, traps, &[]);
-        assert_eq!(kernel.run(&mut app).unwrap(), ExitStatus::Signaled(11));
-        assert!(app.terminated);
+        let (mut kernel, mut plat) = setup(Arch::X86_64, traps, &[]);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Signaled(11));
+        assert!(plat.task(INIT).killed);
     }
 
     #[test]
-    fn self_kill_ends_the_app() {
+    fn signals_to_self() {
         let arch = Arch::Aarch64;
         let traps = vec![
             sc(arch, Sysno::Kill, &[1, 0]),
@@ -746,27 +1108,230 @@ mod tests {
             sc(arch, Sysno::Kill, &[99, 15]),
             sc(arch, Sysno::Tgkill, &[1, 1, 6]),
         ];
-        let (mut kernel, mut app) = setup(arch, traps, &[]);
-        assert_eq!(kernel.run(&mut app).unwrap(), ExitStatus::Signaled(6));
-        assert_eq!(app.returns, vec![0, 0, -crate::errno::ESRCH]);
+        let (mut kernel, mut plat) = setup(arch, traps, &[]);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Signaled(6));
+        assert_eq!(returns(&plat, INIT), vec![0, 0, -crate::errno::ESRCH]);
     }
 
     #[test]
-    fn trace_format() {
-        let record = SyscallRecord {
-            arch: Arch::X86_64,
-            nr: 1,
-            sysno: Some(Sysno::Write),
-            args: [1, 0x400100, 13, 0, 0, 0],
-            outcome: Outcome::Returned(13),
+    fn fork_and_wait() {
+        let arch = Arch::Aarch64;
+        let parent = vec![
+            sc(arch, Sysno::Clone, &[SIGCHLD as u64, 0, 0, 0, 0]),
+            sc(arch, Sysno::Wait4, &[u64::MAX, SCRATCH, 0, 0]),
+            sc(arch, Sysno::Wait4, &[u64::MAX, SCRATCH, 0, 0]),
+            sc(arch, Sysno::Getppid, &[]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let child = vec![
+            sc(arch, Sysno::Getpid, &[]),
+            sc(arch, Sysno::Getppid, &[]),
+            sc(arch, Sysno::ExitGroup, &[3]),
+        ];
+        let (mut kernel, mut plat) = setup_scripts(arch, vec![parent, child], &[]);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        // The parent got pid 2, waited until the child exited (status
+        // 3 << 8), then had no children left.
+        assert_eq!(returns(&plat, INIT), vec![2, 2, -crate::errno::ECHILD, 0]);
+        assert_eq!(plat.mem(INIT).peek(SCRATCH, 4), (3u32 << 8).to_le_bytes());
+        // The child's clone returned 0 (through its context), then it saw
+        // its own pid and its parent.
+        let child = plat.task(2);
+        assert_eq!(child.returns, vec![2, 1]);
+        assert!(kernel.st.procs.is_empty(), "everything was reaped");
+    }
+
+    #[test]
+    fn pipes_carry_data_to_eof_and_break_with_sigpipe() {
+        let arch = Arch::Aarch64;
+        let buf = SCRATCH + 0x100;
+        let parent = vec![
+            sc(arch, Sysno::Pipe2, &[SCRATCH, 0]),
+            sc(arch, Sysno::Clone, &[SIGCHLD as u64, 0, 0, 0, 0]),
+            sc(arch, Sysno::Close, &[4]),
+            // Parks until the child wrote, then reads it, then EOF.
+            sc(arch, Sysno::Read, &[3, buf, 100]),
+            sc(arch, Sysno::Read, &[3, buf + 2, 100]),
+            sc(arch, Sysno::Wait4, &[u64::MAX, 0, 0, 0]),
+            // A pipe without readers: EPIPE, then SIGPIPE ends the process.
+            sc(arch, Sysno::Pipe2, &[SCRATCH, 0]),
+            sc(arch, Sysno::Close, &[4]),
+            sc(arch, Sysno::Write, &[5, buf, 1]),
+        ];
+        let child = vec![
+            sc(arch, Sysno::Close, &[3]),
+            sc(arch, Sysno::Write, &[4, SCRATCH + 0x200, 2]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (mut kernel, mut plat) =
+            setup_scripts(arch, vec![parent, child], &[(SCRATCH + 0x200, b"hi")]);
+        assert_eq!(
+            kernel.run(&mut plat).unwrap(),
+            ExitStatus::Signaled(SIGPIPE)
+        );
+        // The write failed with EPIPE, but SIGPIPE ended the process before
+        // it returned.
+        assert_eq!(returns(&plat, INIT), vec![0, 2, 0, 2, 0, 2, 0, 0]);
+        let last = kernel.trace().last().unwrap();
+        assert_eq!(
+            (last.sysno, last.outcome),
+            (Some(Sysno::Write), Outcome::Returned(-EPIPE))
+        );
+        assert_eq!(plat.mem(INIT).peek(buf, 2), b"hi");
+        assert_eq!(kernel.st.pipes.live(), 0, "the pipes are gone");
+    }
+
+    fn action(handler: u64, flags: u64, restorer: u64) -> Vec<u8> {
+        let mut action = Vec::new();
+        for v in [handler, flags, restorer, 0] {
+            action.extend_from_slice(&v.to_le_bytes());
+        }
+        action
+    }
+
+    #[test]
+    fn handlers_run_on_a_frame_and_return_through_sigreturn() {
+        let arch = Arch::Aarch64;
+        let act = SCRATCH + 0x100;
+        let handler = 0x40_1100u64;
+        let traps = vec![
+            sc(arch, Sysno::RtSigaction, &[SIGUSR1 as u64, act, 0, 8]),
+            // The signal is posted by kill and handled before kill returns.
+            sc(arch, Sysno::Kill, &[1, SIGUSR1 as u64]),
+            // In the handler: SIGUSR1 is blocked.
+            sc(arch, Sysno::RtSigprocmask, &[0, 0, SCRATCH, 8]),
+            sc(arch, Sysno::RtSigreturn, &[]),
+            // Back: the mask is restored.
+            sc(arch, Sysno::RtSigprocmask, &[0, 0, SCRATCH + 8, 8]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (mut kernel, mut plat) = setup(
+            arch,
+            traps,
+            &[(act, &action(handler, SA_SIGINFO | SA_RESTORER, 0x40_1200))],
+        );
+        if let Context::Aarch64(c) = &mut plat.tasks.get_mut(&INIT).unwrap().context {
+            c.x[19] = 0x1919;
+        }
+        kernel.run(&mut plat).unwrap();
+        assert_eq!(returns(&plat, INIT), vec![0, 0, 0]);
+        let mem = plat.mem(INIT);
+        assert_eq!(mem.peek(SCRATCH, 8), (1u64 << (SIGUSR1 - 1)).to_le_bytes());
+        assert_eq!(mem.peek(SCRATCH + 8, 8), 0u64.to_le_bytes());
+        let task = plat.task(INIT);
+        // Resumed twice with a new context: into the handler, then back.
+        let [Context::Aarch64(into), Context::Aarch64(back)] = &task.continued[..] else {
+            panic!("{:?}", task.continued)
         };
-        assert_eq!(record.to_string(), "write(1, 0x400100, 13) = 13");
-        let record = SyscallRecord {
-            sysno: Some(Sysno::Getpid),
-            nr: 39,
-            outcome: Outcome::Returned(-ENOSYS),
-            ..record
+        assert_eq!(into.pc, handler);
+        assert_eq!(into.x[0], SIGUSR1 as u64);
+        assert_eq!(into.x[30], 0x40_1200, "SA_RESTORER is the return address");
+        assert_eq!(into.sp % 16, 0);
+        assert_eq!(back.pc, 0x40_1000, "back where kill was made");
+        assert_eq!(back.x[0], 0, "with kill's return value");
+        assert_eq!(back.x[19], 0x1919, "registers survive the handler");
+    }
+
+    #[test]
+    fn interrupted_syscalls_fail_with_eintr_or_restart() {
+        let arch = Arch::Aarch64;
+        for (flags, restarted) in [
+            (SA_RESTORER, false),
+            (SA_RESTORER | crate::signal::SA_RESTART, true),
+        ] {
+            let act = SCRATCH + 0x100;
+            let parent = vec![
+                sc(arch, Sysno::RtSigaction, &[SIGUSR1 as u64, act, 0, 8]),
+                sc(arch, Sysno::Pipe2, &[SCRATCH, 0]),
+                sc(arch, Sysno::Clone, &[SIGCHLD as u64, 0, 0, 0, 0]),
+                // Parks: nothing is written to the pipe. The child's signal
+                // interrupts it.
+                sc(arch, Sysno::Read, &[3, SCRATCH + 0x200, 10]),
+                sc(arch, Sysno::RtSigreturn, &[]),
+                sc(arch, Sysno::ExitGroup, &[0]),
+            ];
+            let child = vec![
+                sc(arch, Sysno::Kill, &[1, SIGUSR1 as u64]),
+                sc(arch, Sysno::ExitGroup, &[0]),
+            ];
+            let (mut kernel, mut plat) = setup_scripts(
+                arch,
+                vec![parent, child],
+                &[(act, &action(0x40_1100, flags, 0x40_1200))],
+            );
+            kernel.run(&mut plat).unwrap();
+            let task = plat.task(INIT);
+            let Context::Aarch64(back) = task.continued.last().unwrap() else {
+                panic!()
+            };
+            if restarted {
+                // Back at the svc instruction with read's arguments.
+                assert_eq!(back.pc, 0x40_1000 - 4);
+                assert_eq!((back.x[0], back.x[8]), (3, 63));
+            } else {
+                assert_eq!(back.pc, 0x40_1000);
+                assert_eq!(back.x[0] as i64, -EINTR);
+            }
+        }
+    }
+
+    #[test]
+    fn threads_wait_and_wake_on_futexes() {
+        let arch = Arch::Aarch64;
+        let word = SCRATCH + 0x40;
+        let flags = 0x100 | 0x800 | 0x1_0000 | 0x20_0000 | 0x100_0000; // VM SIGHAND THREAD CHILD_CLEARTID CHILD_SETTID
+        let main = vec![
+            sc(arch, Sysno::Clone, &[flags, SCRATCH + 0x1000, 0, 0, word]),
+            // The child set *word = its tid; wait while it is 2.
+            sc(arch, Sysno::Futex, &[word, 0, 2, 0, 0, 0]),
+            sc(arch, Sysno::Gettid, &[]),
+            sc(arch, Sysno::ExitGroup, &[5]),
+        ];
+        let thread = vec![
+            sc(arch, Sysno::Getpid, &[]),
+            sc(arch, Sysno::Gettid, &[]),
+            // Thread exit clears *word and wakes the futex.
+            sc(arch, Sysno::Exit, &[0]),
+        ];
+        let (mut kernel, mut plat) = setup_scripts(arch, vec![main, thread], &[]);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(5));
+        assert_eq!(returns(&plat, INIT), vec![2, 0, 1]);
+        assert_eq!(plat.task(2).returns, vec![1, 2]);
+        assert_eq!(plat.mem(INIT).peek(word, 4), 0u32.to_le_bytes());
+        let Context::Aarch64(c) = &plat.task(2).continued[0] else {
+            panic!()
         };
-        assert_eq!(record.to_string(), "getpid() = -1 (errno 38)");
+        assert_eq!(c.sp, SCRATCH + 0x1000, "the thread runs on its own stack");
+    }
+
+    #[test]
+    fn a_thread_that_execs_becomes_the_process() {
+        let arch = Arch::Aarch64;
+        let path = SCRATCH + 0x10;
+        let argv = SCRATCH + 0x40;
+        let thread_flags = 0x100 | 0x800 | 0x1_0000; // VM SIGHAND THREAD
+        let main = vec![
+            sc(arch, Sysno::Clone, &[thread_flags, SCRATCH + 0x1000, 0, 0, 0]),
+            // Parks forever; the exec ends this thread.
+            sc(arch, Sysno::Futex, &[SCRATCH + 0x80, 0, 0, 0, 0, 0]),
+        ];
+        let thread = vec![sc(arch, Sysno::Execve, &[path, argv, 0])];
+        let program = vec![
+            sc(arch, Sysno::Getpid, &[]),
+            sc(arch, Sysno::Gettid, &[]),
+            sc(arch, Sysno::ExitGroup, &[9]),
+        ];
+        let mut argv_bytes = Vec::new();
+        argv_bytes.extend_from_slice(&path.to_le_bytes());
+        argv_bytes.extend_from_slice(&0u64.to_le_bytes());
+        let (mut kernel, mut plat) = setup_scripts(
+            arch,
+            vec![main, thread, program],
+            &[(path, b"/bin/prog\0"), (argv, &argv_bytes)],
+        );
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(9));
+        assert!(plat.task(INIT).killed && plat.task(2).killed);
+        assert_eq!(plat.task(3).returns, vec![1, 1]);
+        assert!(plat.task(3).started.is_some());
     }
 }

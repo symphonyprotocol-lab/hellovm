@@ -189,18 +189,19 @@ fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
 
     use hellovm_core::Kernel;
     use hellovm_host::{ImageDir, StdioHost};
-    use hellovm_platform_seccomp::SeccompApp;
+    use hellovm_platform_seccomp::SeccompPlatform;
 
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
-    let mut app = SeccompApp::new()?;
+    let mut app = SeccompPlatform::new()?;
     let mut kernel = Kernel::new(StdioHost::new(Some(image)));
     if options.trace {
         kernel = kernel.with_trace();
     }
     kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
-    // The watchdog thread is detached: it holds no more than a pidfd, and
-    // killing through it after the program has ended does nothing.
+    // The watchdog thread is detached: it holds no more than the sandbox's
+    // pidfds, and killing through it after the sandbox has ended does
+    // nothing.
     let timed_out = Arc::new(AtomicBool::new(false));
     if let Some(timeout) = options.timeout {
         let killer = app.killer();

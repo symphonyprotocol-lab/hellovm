@@ -1,61 +1,48 @@
-//! Test doubles: a scripted platform with page-granular memory and an
-//! in-memory host with an image tree.
+//! Test doubles: a scripted multi-task platform with page-granular memory,
+//! a standalone memory ([`MockApp`]) for address-space tests, and an
+//! in-memory host with an image tree and a clock the platform advances.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
+use std::rc::Rc;
+use std::time::Duration;
 
 use crate::arch::{Arch, Sysno};
 use crate::host::{ConsoleStream, Host, HostFileKind, HostStat, ImagePath};
 use crate::platform::{
-    AddressSpace, AddressSpaceInfo, AppMemory, CpuInfo, GuestAddr, Platform, PlatformError, Prot,
-    Resume, SyscallTrap, Trap,
+    AddressSpace, AddressSpaceInfo, AppMemory, Context, CpuInfo, Event, GuestAddr, Platform,
+    PlatformError, Prot, Resume, Sharing, SyscallTrap, TaskKey, Trap, Waker,
 };
 
 const PAGE: u64 = 0x1000;
 const RESERVED: u64 = 0xf_fff0_0000;
 
-/// A scripted app: a fixed list of traps, and memory that honours page
-/// protections like `process_vm_readv`/`writev` do.
+type Pages = HashMap<u64, (Prot, Box<[u8; PAGE as usize]>)>;
+
+/// An address space with memory that honours page protections like
+/// `process_vm_readv`/`writev` do.
+#[derive(Clone, Default)]
 pub struct MockApp {
-    pub arch: Arch,
-    pub traps: VecDeque<Trap>,
-    pub returns: Vec<i64>,
-    pub started: Option<(GuestAddr, GuestAddr)>,
-    pub terminated: bool,
-    pub thread_pointer: Option<u64>,
-    pages: HashMap<u64, (Prot, Box<[u8; PAGE as usize]>)>,
+    pages: Pages,
 }
 
 impl MockApp {
-    pub fn new(arch: Arch) -> Self {
-        MockApp {
-            arch,
-            traps: VecDeque::new(),
-            returns: Vec::new(),
-            started: None,
-            terminated: false,
-            thread_pointer: None,
-            pages: HashMap::new(),
-        }
-    }
-
-    pub fn with_traps(arch: Arch, traps: Vec<Trap>) -> Self {
-        let mut app = MockApp::new(arch);
-        app.traps = traps.into();
-        app
-    }
-
-    pub fn syscall(arch: Arch, sysno: Sysno, args: &[u64]) -> Trap {
-        let mut all = [0; 6];
-        all[..args.len()].copy_from_slice(args);
-        Trap::Syscall(SyscallTrap {
-            nr: arch.syscall_nr(sysno).unwrap(),
-            args: all,
-        })
+    pub fn new(_arch: Arch) -> Self {
+        MockApp::default()
     }
 
     pub fn reserved(&self) -> GuestAddr {
         RESERVED
+    }
+
+    pub fn address_space(&self) -> AddressSpaceInfo {
+        AddressSpaceInfo {
+            page_size: PAGE,
+            min_addr: 0x1_0000,
+            max_addr: 1 << 39,
+            reserved: std::iter::once(RESERVED..RESERVED + 0x1_0000).collect(),
+        }
     }
 
     pub fn is_mapped(&self, addr: GuestAddr) -> bool {
@@ -146,7 +133,13 @@ impl AppMemory for MockApp {
 }
 
 impl AddressSpace for MockApp {
-    fn map(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), PlatformError> {
+    fn map(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+        _sharing: Sharing,
+    ) -> Result<(), PlatformError> {
         self.check(addr, len);
         for page in Self::pages_of(addr, len) {
             self.pages
@@ -175,19 +168,108 @@ impl AddressSpace for MockApp {
     }
 }
 
-impl Platform for MockApp {
+/// One scripted task of a [`MockPlatform`].
+pub struct MockTask {
+    /// The traps it will make, in order.
+    pub traps: VecDeque<Trap>,
+    /// The syscall results it received.
+    pub returns: Vec<i64>,
+    pub started: Option<(GuestAddr, GuestAddr)>,
+    /// The contexts it was resumed with by `Resume::Continue`.
+    pub continued: Vec<Context>,
+    pub context: Context,
+    pub running: bool,
+    pub killed: bool,
+    /// Index into the platform's address spaces.
+    pub space: usize,
+}
+
+/// A platform whose tasks follow scripts. Each task created by `spawn` or
+/// `clone_task` takes the next script from [`MockPlatform::scripts`]; tasks
+/// run one trap at a time in FIFO order of resumption.
+pub struct MockPlatform {
+    pub arch: Arch,
+    pub tasks: BTreeMap<TaskKey, MockTask>,
+    pub scripts: VecDeque<Vec<Trap>>,
+    pub spaces: Vec<MockApp>,
+    next_key: TaskKey,
+    queue: VecDeque<TaskKey>,
+    clock: Rc<Cell<Duration>>,
+}
+
+impl MockPlatform {
+    pub fn new(arch: Arch, host: &MockHost) -> Self {
+        MockPlatform {
+            arch,
+            tasks: BTreeMap::new(),
+            scripts: VecDeque::new(),
+            spaces: Vec::new(),
+            next_key: 1,
+            queue: VecDeque::new(),
+            clock: Rc::clone(&host.clock),
+        }
+    }
+
+    pub fn with_scripts(arch: Arch, host: &MockHost, scripts: Vec<Vec<Trap>>) -> Self {
+        let mut p = MockPlatform::new(arch, host);
+        p.scripts = scripts.into();
+        p
+    }
+
+    pub fn syscall(arch: Arch, sysno: Sysno, args: &[u64]) -> Trap {
+        let mut all = [0; 6];
+        all[..args.len()].copy_from_slice(args);
+        Trap::Syscall(SyscallTrap {
+            nr: arch.syscall_nr(sysno).unwrap(),
+            args: all,
+        })
+    }
+
+    pub fn task(&self, key: TaskKey) -> &MockTask {
+        &self.tasks[&key]
+    }
+
+    /// The memory of a task's address space.
+    pub fn mem(&mut self, key: TaskKey) -> &mut MockApp {
+        let space = self.tasks[&key].space;
+        &mut self.spaces[space]
+    }
+
+    fn add_task(&mut self, space: usize, context: Context) -> TaskKey {
+        let key = self.next_key;
+        self.next_key += 1;
+        let traps = self.scripts.pop_front().unwrap_or_default();
+        self.tasks.insert(
+            key,
+            MockTask {
+                traps: traps.into(),
+                returns: Vec::new(),
+                started: None,
+                continued: Vec::new(),
+                context,
+                running: false,
+                killed: false,
+                space,
+            },
+        );
+        key
+    }
+
+    fn live(&mut self, key: TaskKey) -> Result<&mut MockTask, PlatformError> {
+        match self.tasks.get_mut(&key) {
+            Some(task) if !task.killed => Ok(task),
+            _ => Err(PlatformError::AppGone(format!("no task {key}"))),
+        }
+    }
+}
+
+impl Platform for MockPlatform {
     fn arch(&self) -> Arch {
         self.arch
     }
 
     fn address_space(&self) -> AddressSpaceInfo {
-        let reserved = RESERVED..RESERVED + 0x1_0000;
-        AddressSpaceInfo {
-            page_size: PAGE,
-            min_addr: 0x1_0000,
-            max_addr: 1 << 39,
-            reserved: vec![reserved],
-        }
+        MockApp::default().address_space()
     }
 
     fn cpu_info(&self) -> CpuInfo {
@@ -197,28 +279,150 @@ impl Platform for MockApp {
         }
     }
 
-    fn set_thread_pointer(&mut self, value: u64) -> Result<(), PlatformError> {
-        self.thread_pointer = Some(value);
+    fn spawn(&mut self) -> Result<TaskKey, PlatformError> {
+        self.spaces.push(MockApp::default());
+        let space = self.spaces.len() - 1;
+        Ok(self.add_task(space, Context::zeroed(self.arch)))
+    }
+
+    fn clone_task(
+        &mut self,
+        parent: TaskKey,
+        share_memory: bool,
+    ) -> Result<TaskKey, PlatformError> {
+        let task = self.live(parent)?;
+        assert!(!task.running);
+        let context = task.context.clone();
+        let mut space = task.space;
+        if !share_memory {
+            let copy = self.spaces[space].clone();
+            self.spaces.push(copy);
+            space = self.spaces.len() - 1;
+        }
+        Ok(self.add_task(space, context))
+    }
+
+    fn kill(&mut self, task: TaskKey) -> Result<(), PlatformError> {
+        let task = self.live(task)?;
+        task.killed = true;
+        task.running = false;
         Ok(())
     }
 
-    fn run(&mut self, resume: Resume) -> Result<Trap, PlatformError> {
-        assert!(!self.terminated);
+    fn context(&mut self, task: TaskKey) -> Result<Context, PlatformError> {
+        Ok(self.live(task)?.context.clone())
+    }
+
+    fn set_context(&mut self, task: TaskKey, context: &Context) -> Result<(), PlatformError> {
+        self.live(task)?.context = context.clone();
+        Ok(())
+    }
+
+    fn resume(&mut self, key: TaskKey, resume: Resume) -> Result<(), PlatformError> {
+        let task = self.live(key)?;
+        assert!(!task.running, "task {key} resumed twice");
         match resume {
             Resume::Start { entry, stack } => {
-                assert!(self.started.is_none());
-                self.started = Some((entry, stack));
+                assert!(task.started.is_none());
+                task.started = Some((entry, stack));
+                task.context.set_pc(entry);
+                task.context.set_sp(stack);
             }
-            Resume::Return(ret) => self.returns.push(ret),
+            Resume::Return(ret) => {
+                task.returns.push(ret);
+                task.context.set_ret(ret);
+            }
+            Resume::Continue => task.continued.push(task.context.clone()),
         }
-        self.traps
-            .pop_front()
-            .ok_or_else(|| PlatformError::AppGone("script ended".into()))
+        task.running = true;
+        self.queue.push_back(key);
+        Ok(())
     }
 
-    fn terminate(&mut self) -> Result<(), PlatformError> {
-        self.terminated = true;
+    fn interrupt(&mut self, key: TaskKey) -> Result<(), PlatformError> {
+        let task = self.live(key)?;
+        if task.running {
+            task.traps.push_front(Trap::Interrupted);
+        }
         Ok(())
+    }
+
+    fn wait(&mut self, timeout: Option<Duration>) -> Result<Option<Event>, PlatformError> {
+        while let Some(key) = self.queue.pop_front() {
+            let task = self.tasks.get_mut(&key).expect("queued task");
+            if task.killed || !task.running {
+                continue;
+            }
+            task.running = false;
+            let trap = task
+                .traps
+                .pop_front()
+                .ok_or_else(|| PlatformError::AppGone(format!("task {key}: script ended")))?;
+            if let Trap::Syscall(s) = trap {
+                // Like a real syscall stop: the arguments are in registers.
+                if let Context::Aarch64(c) = &mut task.context {
+                    c.x[..6].copy_from_slice(&s.args);
+                    c.x[8] = s.nr;
+                }
+            }
+            return Ok(Some(Event { task: key, trap }));
+        }
+        match timeout {
+            Some(t) => {
+                self.clock.set(self.clock.get() + t);
+                Ok(None)
+            }
+            None => Err(PlatformError::AppGone(
+                "deadlock: no task is running and there is no timeout".into(),
+            )),
+        }
+    }
+
+    fn waker(&self) -> Waker {
+        Waker::noop()
+    }
+
+    fn read(
+        &mut self,
+        task: TaskKey,
+        addr: GuestAddr,
+        buf: &mut [u8],
+    ) -> Result<(), PlatformError> {
+        self.live(task)?;
+        self.mem(task).read(addr, buf)
+    }
+
+    fn write(&mut self, task: TaskKey, addr: GuestAddr, data: &[u8]) -> Result<(), PlatformError> {
+        self.live(task)?;
+        self.mem(task).write(addr, data)
+    }
+
+    fn map(
+        &mut self,
+        task: TaskKey,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+        sharing: Sharing,
+    ) -> Result<(), PlatformError> {
+        self.live(task)?;
+        self.mem(task).map(addr, len, prot, sharing)
+    }
+
+    fn unmap(&mut self, task: TaskKey, addr: GuestAddr, len: u64) -> Result<(), PlatformError> {
+        self.live(task)?;
+        self.mem(task).unmap(addr, len)
+    }
+
+    fn protect(
+        &mut self,
+        task: TaskKey,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+    ) -> Result<(), PlatformError> {
+        self.live(task)?;
+        self.mem(task).protect(addr, len, prot)
     }
 }
 
@@ -230,17 +434,20 @@ pub enum MockEntry {
     Symlink(Vec<u8>),
 }
 
-/// A host with console capture, deterministic random bytes and clock, and
-/// an in-memory image tree. It records every image path it is asked about.
+/// A host with console capture, deterministic random bytes, a clock that
+/// only the [`MockPlatform`] advances (when it waits), and an in-memory
+/// image tree. It records every image path it is asked about.
 #[derive(Default)]
 pub struct MockHost {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stdin: VecDeque<u8>,
+    /// When set, console input reports `WouldBlock` instead of EOF once
+    /// `stdin` is empty.
+    pub stdin_open: bool,
     pub image: Option<BTreeMap<String, MockEntry>>,
     pub asked: Vec<String>,
-    /// Total time the kernel asked to sleep.
-    pub slept: std::time::Duration,
+    pub clock: Rc<Cell<Duration>>,
 }
 
 impl MockHost {
@@ -252,6 +459,7 @@ impl MockHost {
         }
         MockHost {
             image: Some(image),
+            clock: Rc::new(Cell::new(Duration::from_secs(100))),
             ..Default::default()
         }
     }
@@ -268,10 +476,6 @@ impl MockHost {
 }
 
 impl Host for MockHost {
-    fn sleep(&mut self, duration: std::time::Duration) {
-        self.slept += duration;
-    }
-
     fn console_write(&mut self, stream: ConsoleStream, data: &[u8]) -> io::Result<usize> {
         match stream {
             ConsoleStream::Stdout => self.stdout.extend_from_slice(data),
@@ -281,6 +485,9 @@ impl Host for MockHost {
     }
 
     fn console_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.stdin.is_empty() && self.stdin_open {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         let n = buf.len().min(self.stdin.len());
         for (dst, src) in buf.iter_mut().zip(self.stdin.drain(..n)) {
             *dst = src;
@@ -350,11 +557,11 @@ impl Host for MockHost {
         Ok(())
     }
 
-    fn clock_realtime(&mut self) -> std::time::Duration {
-        std::time::Duration::new(1_700_000_000, 500)
+    fn clock_realtime(&mut self) -> Duration {
+        Duration::new(1_699_999_900, 500) + self.clock.get()
     }
 
-    fn clock_monotonic(&mut self) -> std::time::Duration {
-        std::time::Duration::new(100, 0)
+    fn clock_monotonic(&mut self) -> Duration {
+        self.clock.get()
     }
 }

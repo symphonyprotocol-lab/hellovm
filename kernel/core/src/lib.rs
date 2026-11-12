@@ -25,11 +25,15 @@ pub mod fd;
 pub mod host;
 mod kernel;
 pub mod mm;
+mod pipe;
 pub mod platform;
+pub mod signal;
 mod syscall;
+mod task;
 #[cfg(test)]
 mod testutil;
+mod tty;
 pub mod vfs;
 
 pub use arch::{Arch, Sysno};
-pub use kernel::{ExitStatus, Kernel, KernelError, Outcome, SyscallRecord};
+pub use kernel::{ConsoleMode, ExitStatus, Kernel, KernelError, Outcome, SyscallRecord};

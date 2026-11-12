@@ -9,3 +9,4 @@ publish.workspace = true
 [dependencies]
 hellovm-core.workspace = true
 libc.workspace = true
+log.workspace = true

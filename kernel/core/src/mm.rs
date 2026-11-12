@@ -6,13 +6,19 @@
 //! memory, unmap, change protection. File-backed private mappings are
 //! anonymous memory filled with the file's contents (there is no host file
 //! to map: the file may live in the in-memory layer, and on KVM there is no
-//! host `mmap` at all). Shared mappings are treated as private, which is
-//! exact while an app is a single process (U1); `fork` (U2) changes that.
+//! host `mmap` at all).
+//!
+//! Shared anonymous mappings (`MAP_SHARED | MAP_ANONYMOUS`) are shared with
+//! the processes that inherit them through `fork`, as on Linux. Shared
+//! *file* mappings are private copies of the file: writes to them do not
+//! reach the file, and writes to the file do not show up in them. Moving a
+//! shared mapping with `mremap` copies it, so the moved mapping is no longer
+//! shared with other processes.
 
 use std::collections::BTreeMap;
 
 use crate::errno::{Errno, SysResult, EEXIST, EFAULT, EINVAL, ENOMEM};
-use crate::platform::{AddressSpace, AddressSpaceInfo, AppMemory, GuestAddr, Prot};
+use crate::platform::{AddressSpace, AddressSpaceInfo, AppMemory, GuestAddr, Prot, Sharing};
 
 /// `mmap` flags (identical on x86_64 and aarch64).
 pub const MAP_SHARED: u64 = 0x01;
@@ -45,10 +51,15 @@ pub enum VmaKind {
     /// The main thread's stack.
     Stack,
     Anonymous,
+    /// Shared anonymous memory (`MAP_SHARED | MAP_ANONYMOUS`).
+    Shared,
     /// A private copy of a file.
     File,
     /// Used by the platform; never touched by the core.
     Reserved,
+    /// Code the kernel maps for the app (the sigreturn trampoline),
+    /// shown as `[vdso]`.
+    Vdso,
 }
 
 /// A virtual memory area: `start..end` with one protection.
@@ -254,7 +265,14 @@ impl Mm {
         if !self.in_bounds(addr, end) || self.vmas.touches_reserved(addr, end) {
             return Err(Errno(ENOMEM));
         }
-        space.map(addr, len, prot).map_err(platform_failed("map"))?;
+        let sharing = if kind == VmaKind::Shared {
+            Sharing::Shared
+        } else {
+            Sharing::Private
+        };
+        space
+            .map(addr, len, prot, sharing)
+            .map_err(platform_failed("map"))?;
         self.vmas.insert(Vma {
             start: addr,
             end,
@@ -285,6 +303,17 @@ impl Mm {
             .find_free(len, low, self.mmap_top)
             .or_else(|| self.vmas.find_free(len, self.min_addr, self.mmap_top))
             .ok_or(Errno(ENOMEM))
+    }
+
+    /// The highest free, `align`-aligned range of `len` bytes in the
+    /// mapping area, for images placed like shared libraries.
+    pub fn free_area(&self, len: u64, align: u64) -> Option<GuestAddr> {
+        let align = align.max(self.page_size);
+        let padded = len.checked_add(align - self.page_size)?;
+        let low = self.min_addr.max(self.brk_start);
+        let start = self.vmas.find_free(padded, low, self.mmap_top)?;
+        let aligned = start.checked_add(align - 1)? & !(align - 1);
+        (aligned + len <= start + padded).then_some(aligned)
     }
 
     /// Places the program break right after the loaded image.
@@ -359,7 +388,14 @@ impl Mm {
             self.pick_address(addr, len)?
         };
         match contents {
-            None => self.map_fixed(space, addr, len, prot, VmaKind::Anonymous)?,
+            None => {
+                let kind = if flags & MAP_TYPE == MAP_PRIVATE {
+                    VmaKind::Anonymous
+                } else {
+                    VmaKind::Shared
+                };
+                self.map_fixed(space, addr, len, prot, kind)?
+            }
             Some(data) => {
                 self.map_fixed(space, addr, len, Prot::RW, VmaKind::File)?;
                 let data = &data[..data.len().min(len as usize)];
@@ -587,7 +623,7 @@ mod tests {
 
     fn setup() -> (Mm, MockApp) {
         let app = MockApp::new(crate::Arch::Aarch64);
-        let mm = Mm::new(&crate::platform::Platform::address_space(&app));
+        let mm = Mm::new(&app.address_space());
         (mm, app)
     }
 

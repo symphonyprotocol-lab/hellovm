@@ -4,14 +4,20 @@
 //! that the same core runs on a Linux or a macOS host. The operations are
 //! deliberately narrow:
 //!
-//! * console output and input for the app's standard streams;
+//! * console output and input for the app's standard streams. Input never
+//!   blocks the kernel: [`Host::console_read`] returns what has arrived and
+//!   reports `WouldBlock` otherwise, and the host calls the [`Waker`] it was
+//!   given when more arrives (the kernel serves every process of the
+//!   sandbox from one thread and must not stall on one of them);
 //! * read-only access to the image, the sandbox's lower filesystem layer,
 //!   by [`ImagePath`]: a path the core has already resolved itself, made of
 //!   plain names only (no `.`, `..`, empty components or `/`). The host
 //!   never sees a path the guest supplied, never follows a symlink on the
 //!   core's behalf (symlinks are reported, the core interprets them), and
 //!   never writes to the image;
-//! * random bytes, clocks and sleeping.
+//! * random bytes and clocks. The kernel never sleeps itself: timeouts are
+//!   deadlines on [`Host::clock_monotonic`] that bound its wait for app
+//!   events.
 //!
 //! Host errors are `std::io::Error`s; the core translates them by kind
 //! ([`crate::errno::Errno::from_host`]), never by host errno number.
@@ -19,6 +25,8 @@
 use std::fmt;
 use std::io;
 use std::time::Duration;
+
+use crate::platform::Waker;
 
 /// The sandbox console stream a guest write goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,10 +121,17 @@ pub trait Host {
     /// `data` were accepted, like a host `write`.
     fn console_write(&mut self, stream: ConsoleStream, data: &[u8]) -> io::Result<usize>;
 
-    /// Reads console input (the app's standard input). 0 is end of input.
+    /// Reads console input (the app's standard input) that has already
+    /// arrived. 0 is end of input; an error of kind `WouldBlock` means that
+    /// nothing has arrived yet, and the waker set with
+    /// [`Host::set_console_waker`] will be called when something does.
     fn console_read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
         Ok(0)
     }
+
+    /// Sets the waker to call when console input arrives after
+    /// [`Host::console_read`] reported `WouldBlock`.
+    fn set_console_waker(&mut self, _waker: Waker) {}
 
     /// Whether there is an image at all. Without one, the sandbox
     /// filesystem starts empty.
@@ -157,9 +172,6 @@ pub trait Host {
 
     /// A monotonic clock, starting at some arbitrary point.
     fn clock_monotonic(&mut self) -> Duration;
-
-    /// Blocks the kernel for `duration` (the app is single-threaded).
-    fn sleep(&mut self, _duration: Duration) {}
 }
 
 impl<H: Host + ?Sized> Host for &mut H {
@@ -168,6 +180,9 @@ impl<H: Host + ?Sized> Host for &mut H {
     }
     fn console_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         (**self).console_read(buf)
+    }
+    fn set_console_waker(&mut self, waker: Waker) {
+        (**self).set_console_waker(waker)
     }
     fn has_image(&self) -> bool {
         (**self).has_image()
@@ -192,9 +207,6 @@ impl<H: Host + ?Sized> Host for &mut H {
     }
     fn clock_monotonic(&mut self) -> Duration {
         (**self).clock_monotonic()
-    }
-    fn sleep(&mut self, duration: Duration) {
-        (**self).sleep(duration)
     }
 }
 

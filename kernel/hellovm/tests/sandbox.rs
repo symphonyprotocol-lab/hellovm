@@ -52,7 +52,7 @@ fn hello_world_output_goes_through_the_kernel() {
             (
                 Some(Sysno::ExitGroup),
                 guest::HELLO_EXIT_CODE as u64,
-                Outcome::Exited(guest::HELLO_EXIT_CODE)
+                Outcome::Ended
             ),
         ]
     );
@@ -81,7 +81,14 @@ fn missing_and_unsupported_programs_fail_to_start() {
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )
     .unwrap();
-    for (path, errno) in [("/nonexistent", 2), ("/script", 8), ("/", 13)] {
+    image.write("data", b"not a program");
+    std::fs::set_permissions(
+        image.path().join("data"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    // The script's interpreter, /bin/sh, does not exist in this image.
+    for (path, errno) in [("/nonexistent", 2), ("/script", 2), ("/data", 8), ("/", 13)] {
         match try_run(image.path(), &[path], b"") {
             Err(KernelError::Exec { errno: e, .. }) => assert_eq!(e.0, errno, "{path}"),
             other => panic!("{path}: {other:?}"),
