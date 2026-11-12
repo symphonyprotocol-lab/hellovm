@@ -94,6 +94,9 @@ pub(crate) enum Link {
     Host(HostStreamId),
     /// Virtual DNS on `192.0.2.1:53`.
     Dns,
+    /// The peer's slot has been freed. This is not a [`SockId`]: the next
+    /// socket may reuse that slot, and a survivor must not write into it.
+    Gone,
 }
 
 #[derive(Clone, Debug)]
@@ -143,8 +146,9 @@ pub(crate) struct Socket {
     /// The one write Linux accepts after a clean peer close has been done.
     /// The next write is `EPIPE`.
     pub post_fin_write: bool,
-    /// A non-blocking connect already failed. A later `connect` returns the
-    /// pending `SO_ERROR` once, then `ECONNABORTED`.
+    /// The last connect failed and that error was consumed by `SO_ERROR`
+    /// (or returned directly by a blocking host connect). The next `connect`
+    /// is `ECONNABORTED` once, then this flag clears and the call retries.
     pub connect_failed: bool,
     pub so_error: i64,
     pub reuseaddr: bool,
@@ -562,6 +566,12 @@ impl Net {
             peer_sock.peer_fin = true;
             if reset {
                 peer_sock.peer_reset = true;
+            }
+            // Drop the raw slot id. The survivor stays connected (`Gone`)
+            // so poll and the one accepted write still work, but a later
+            // socket that reuses this slot is a different connection.
+            if peer_sock.link() == Some(Link::Socket(id)) {
+                peer_sock.phase = Phase::Connected(Link::Gone);
             }
         }
         dropped

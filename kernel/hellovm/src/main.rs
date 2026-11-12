@@ -136,9 +136,9 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 let addr: std::net::SocketAddr = text.parse().map_err(|_| {
                     format!("--splice-to {text}: expected an IPv4 address and port")
                 })?;
-                if !addr.ip().is_loopback() {
+                if !addr.ip().is_ipv4() || !addr.ip().is_loopback() {
                     return Err(format!(
-                        "--splice-to {text}: dev-only hook, and the address must be loopback"
+                        "--splice-to {text}: dev-only hook, and the address must be IPv4 loopback"
                     ));
                 }
                 splice_to = Some(addr);

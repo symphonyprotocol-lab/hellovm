@@ -286,8 +286,9 @@ print(conn.recv(16).decode())
 }
 
 /// `echo hi | nc -w2 127.0.0.1 5000` against `nc -l -p 5000`. The listener
-/// must observe the peer close (`POLLIN|POLLRDHUP`) or this hangs. Retries
-/// cover the listener not being in `accept` yet; `timeout` bounds a regression.
+/// must exit because it saw the peer close. `wait` on that pid blocks if
+/// poll never reports the close, so a timeout wrapped around `nc -l` is not
+/// used. The test also checks `nc`'s exit status and that the run is short.
 #[test]
 fn busybox_nc_transfers_bytes_over_loopback() {
     let Some(busybox) = common::require_busybox("net busybox") else {
@@ -295,33 +296,53 @@ fn busybox_nc_transfers_bytes_over_loopback() {
     };
     let image = TempDir::new("net-busybox");
     image.install(&busybox, "bin/busybox");
-    for applet in ["sh", "nc", "echo", "cat", "timeout"] {
+    for applet in ["sh", "nc", "echo", "cat"] {
         image.symlink("busybox", &format!("bin/{applet}"));
     }
+    // `wait` on the listener, not `timeout`. If poll misses the peer close,
+    // `wait` does not return and the sandbox watchdog fails the test.
     let script = r#"
-timeout 3 nc -l -p 5000 > /got &
+nc -l -p 5000 > /got &
+lp=$!
 i=0
+st=1
 while [ "$i" -lt 50 ]; do
-  echo hi | nc -w 2 127.0.0.1 5000 && break
+  echo hi | nc -w 2 127.0.0.1 5000
+  st=$?
+  if [ "$st" -eq 0 ]; then
+    break
+  fi
   i=$((i + 1))
 done
-wait
+wait "$lp"
+echo client:$st
 cat /got
 "#;
     for n in 0..10 {
+        let started = std::time::Instant::now();
         let out = run_guest(image.path(), &["/bin/sh", "-c", script], None, false);
+        let elapsed = started.elapsed();
         assert_eq!(
             out.status,
             ExitStatus::Exited(0),
-            "loop {n} stdout:\n{}\nstderr:\n{}",
+            "loop {n} after {elapsed:?} stdout:\n{}\nstderr:\n{}",
             out.stdout,
             out.stderr
+        );
+        assert!(
+            out.stdout.contains("client:0"),
+            "loop {n} client status stdout:\n{}",
+            out.stdout
         );
         assert!(
             out.stdout.contains("hi"),
             "loop {n} stdout:\n{}\nstderr:\n{}",
             out.stdout,
             out.stderr
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "loop {n} took {elapsed:?}"
         );
     }
 }

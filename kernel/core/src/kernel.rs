@@ -1535,7 +1535,7 @@ mod tests {
             got[12], -ECONNREFUSED,
             "second connect returns SO_ERROR {got:?}"
         );
-        assert_eq!(got[13], -ECONNABORTED, "third connect {got:?}");
+        assert_eq!(got[13], -EINPROGRESS, "third connect retries {got:?}");
         assert_eq!(got[15], -ECONNREFUSED, "blocking refuse {got:?}");
         assert_eq!(got[16], 0, "getsockopt {got:?}");
         assert_eq!(plat.mem(INIT).peek(opt, 4), 0u32.to_le_bytes());
@@ -1767,6 +1767,159 @@ mod tests {
         assert_eq!(got[2], 1, "{got:?}");
         assert_ne!(revents_of(&plat.mem(INIT).peek(SCRATCH + 0x100, 8)) & 4, 0);
         assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x120, 4), 0u32.to_le_bytes());
+    }
+
+    /// Closing the accepted socket must not leave its slot id on the peer.
+    /// The next socket reuses that slot and must not see the old connection's bytes.
+    #[test]
+    fn clean_close_does_not_leak_into_a_reused_slot() {
+        let arch = Arch::X86_64;
+        let listen = sin([127, 0, 0, 1], 19030);
+        let buf = SCRATCH + 0x180;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 4]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Accept, &[3, 0, 0]),
+            sc(arch, Sysno::Close, &[5]),
+            // fd 5 and the accepted socket's slot are both free.
+            sc(arch, Sysno::Socket, &[2, 1 | 0o4000, 0]),
+            sc(arch, Sysno::Connect, &[5, SCRATCH, 16]),
+            sc(arch, Sysno::Accept, &[3, 0, 0]),
+            sc(arch, Sysno::Sendto, &[4, SCRATCH + 0x100, 5, 0, 0, 0]),
+            sc(arch, Sysno::Sendto, &[4, SCRATCH + 0x100, 5, 0x4000, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, buf, 8, 0x40, 0, 0]),
+            sc(arch, Sysno::Close, &[4]),
+            sc(arch, Sysno::Recvfrom, &[5, buf, 8, 0x40, 0, 0]),
+            sc(arch, Sysno::Sendto, &[5, SCRATCH + 0x120, 2, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[6, buf + 8, 8, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let owned = [
+            (SCRATCH, listen.to_vec()),
+            (SCRATCH + 0x100, b"LEAK1".to_vec()),
+            (SCRATCH + 0x120, b"hi".to_vec()),
+            (buf, b"ZZZZZZZZ".to_vec()),
+        ];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[10], 5, "first write after clean close {got:?}");
+        assert_eq!(got[11], -EPIPE, "second write {got:?}");
+        assert_eq!(got[12], -EAGAIN, "reused socket must not see LEAK {got:?}");
+        assert_eq!(plat.mem(INIT).peek(buf, 5), b"ZZZZZ");
+        assert_eq!(got[14], -EAGAIN, "close of the old peer is not EOF {got:?}");
+        assert_eq!(got[15], 2, "new connection send {got:?}");
+        assert_eq!(got[16], 2, "new connection recv {got:?}");
+        assert_eq!(plat.mem(INIT).peek(buf + 8, 2), b"hi");
+    }
+
+    /// After `SO_ERROR` is read, one `connect` is `ECONNABORTED` and the next retries.
+    #[test]
+    fn connect_retries_against_a_listener_started_after_the_failure() {
+        let arch = Arch::X86_64;
+        let dead = sin([127, 0, 0, 1], 1);
+        let live = sin([127, 0, 0, 1], 19031);
+        let opt = SCRATCH + 0x200;
+        let optlen = SCRATCH + 0x210;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1 | 0o4000, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Getsockopt, &[3, 1, 4, opt, optlen]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[4, SCRATCH + 0x20, 16]),
+            sc(arch, Sysno::Listen, &[4, 4]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH + 0x20, 16]),
+            sc(arch, Sysno::Getsockopt, &[3, 1, 4, opt + 4, optlen]),
+            sc(arch, Sysno::Accept, &[4, 0, 0]),
+            sc(arch, Sysno::Sendto, &[3, SCRATCH + 0x80, 2, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, SCRATCH + 0x90, 8, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let owned = [
+            (SCRATCH, dead.to_vec()),
+            (SCRATCH + 0x20, live.to_vec()),
+            (SCRATCH + 0x80, b"ok".to_vec()),
+            (optlen, 4u32.to_le_bytes().to_vec()),
+        ];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[1], -EINPROGRESS, "first refuse {got:?}");
+        assert_eq!(got[2], 0, "getsockopt {got:?}");
+        assert_eq!(
+            i32::from_le_bytes(plat.mem(INIT).peek(opt, 4).try_into().unwrap()),
+            ECONNREFUSED as i32
+        );
+        assert_eq!(got[3], -ECONNABORTED, "one-shot abort {got:?}");
+        assert_eq!(got[7], -EINPROGRESS, "retry reaches the listener {got:?}");
+        assert_eq!(plat.mem(INIT).peek(opt + 4, 4), 0u32.to_le_bytes());
+        assert_eq!(got[10], 2, "send on the retried socket {got:?}");
+        assert_eq!(got[11], 2, "accept side {got:?}");
+        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x90, 2), b"ok");
+    }
+
+    #[test]
+    fn blocking_host_connect_failure_is_one_shot() {
+        let arch = Arch::X86_64;
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        host.splice_fail_connect = true;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x40]);
+        let ip = kernel.issue_fake_ip().unwrap();
+        plat.mem(INIT).poke(SCRATCH, &sin(ip, 443));
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[1], -ECONNREFUSED, "blocking failure {got:?}");
+        assert_eq!(got[2], -ECONNABORTED, "one-shot {got:?}");
+        assert_eq!(got[3], -ECONNREFUSED, "the next call retries {got:?}");
+    }
+
+    #[test]
+    fn dns_tcp_poll_stops_when_the_buffer_is_full() {
+        let arch = Arch::X86_64;
+        let dns = sin([192, 0, 2, 1], 53);
+        let poll_at = SCRATCH + 0x40;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(
+                arch,
+                Sysno::Sendto,
+                &[3, SCRATCH + 0x80, 16 * 1024, 0, 0, 0],
+            ),
+            sc(arch, Sysno::Poll, &[poll_at, 1, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut payload = vec![0xffu8; 16 * 1024];
+        payload[0] = 0xff;
+        payload[1] = 0xff;
+        let owned = [(SCRATCH, dns.to_vec()), (SCRATCH + 0x80, payload)];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        plat.mem(INIT).poke(poll_at, &poll_memory(3, 4));
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[2], 16 * 1024, "dns send {got:?}");
+        assert_eq!(got[3], 0, "poll {got:?}");
+        assert_eq!(revents_of(&plat.mem(INIT).peek(poll_at, 8)) & 4, 0);
     }
 
     fn action(handler: u64, flags: u64, restorer: u64) -> Vec<u8> {

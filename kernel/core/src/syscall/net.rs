@@ -205,17 +205,20 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if self.st.net.get(id).domain != Domain::Inet {
             return Err(Errno(EAFNOSUPPORT));
         }
-        // A failed non-blocking connect leaves `SO_ERROR`. The next `connect`
-        // returns that error and clears it; a further one is `ECONNABORTED`.
+        // A failed non-blocking connect leaves `SO_ERROR`. Calling `connect`
+        // again returns that error and then retries. If `SO_ERROR` was read
+        // first (or a blocking host connect already returned the error), the
+        // next call is `ECONNABORTED` once and the one after that retries.
         if !self.st.net.get(id).tcp_connected() {
             let pending = self.st.net.get(id).so_error;
             if pending != 0 {
                 let sock = self.st.net.get_mut(id);
                 sock.so_error = 0;
-                sock.connect_failed = true;
+                sock.connect_failed = false;
                 return Err(Errno(pending));
             }
             if self.st.net.get(id).connect_failed {
+                self.st.net.get_mut(id).connect_failed = false;
                 return Err(Errno(ECONNABORTED));
             }
         }
@@ -652,14 +655,16 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 Some(Link::Socket(peer)) if self.st.net.contains(peer) => {
                     self.st.net.get(peer).rx_space() > 0
                 }
+                Some(Link::Socket(_)) => true,
                 Some(Link::Host(stream)) => self
                     .host
                     .stream_status(stream)
                     .map(|status| status.writable && !status.broken)
                     .unwrap_or(true),
-                // Peer is already gone, or this is DNS: Linux still reports
-                // `POLLOUT` until `SHUT_WR`.
-                _ => true,
+                Some(Link::Dns) => self.st.net.get(id).dns_in.len() < 16 * 1024,
+                // Peer is already gone: Linux still reports `POLLOUT` until
+                // `SHUT_WR`.
+                Some(Link::Gone) | None => true,
             };
         let sock = self.st.net.get(id);
         SockPoll {
@@ -979,6 +984,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     fn arm_reset_after_clean_close(&mut self, id: SockId) {
         let sock = self.st.net.get(id);
         let dead = match sock.link() {
+            Some(Link::Gone) => true,
             Some(Link::Socket(peer)) => !self.st.net.contains(peer),
             _ => false,
         };
@@ -1091,6 +1097,14 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return self.epipe(nosignal);
         }
         match sock.link() {
+            Some(Link::Gone) => {
+                let sock = self.st.net.get(id);
+                if sock.peer_fin && !sock.peer_reset && !sock.post_fin_write {
+                    return Ok(data.len());
+                }
+                self.st.net.get_mut(id).peer_reset = true;
+                self.epipe(nosignal)
+            }
             Some(Link::Socket(peer)) => {
                 if !self.st.net.contains(peer) {
                     let sock = self.st.net.get(id);
@@ -1315,7 +1329,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                     }
                 })?;
             }
-            Some(Link::Dns) | None => {}
+            Some(Link::Dns) | Some(Link::Gone) | None => {}
         }
         Ok(())
     }
