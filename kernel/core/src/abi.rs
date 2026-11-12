@@ -218,7 +218,14 @@ pub fn push_dirent64(out: &mut Vec<u8>, ino: u64, next_off: i64, kind: u8, name:
 
 /// `struct statfs` (all-long fields; the same layout on both
 /// architectures, 120 bytes).
-pub fn encode_statfs(fs_type: u64, bsize: u64, blocks: u64, free: u64, files: u64, ffree: u64) -> Vec<u8> {
+pub fn encode_statfs(
+    fs_type: u64,
+    bsize: u64,
+    blocks: u64,
+    free: u64,
+    files: u64,
+    ffree: u64,
+) -> Vec<u8> {
     let mut b = vec![0u8; 120];
     let words = [fs_type, bsize, blocks, free, free, files, ffree];
     for (i, w) in words.iter().enumerate() {
@@ -373,7 +380,7 @@ mod tests {
         let u = encode_utsname(["Linux", "cansol", "6.1.0", "#1", "aarch64", "(none)"]);
         assert_eq!(u.len(), 390);
         assert_eq!(&u[65..71], b"cansol");
-        assert_eq!(u[70], 0);
+        assert_eq!(u[71], 0);
         let s = encode_statfs(0x794c_7630, 4096, 100, 50, 10, 5);
         assert_eq!(s.len(), 120);
         assert_eq!(u64_at(&s, 0), 0x794c_7630);

@@ -81,7 +81,10 @@ impl fmt::Display for ElfError {
             ElfError::NotElf => f.write_str("not an ELF executable"),
             ElfError::Unsupported(what) => write!(f, "unsupported ELF file: {what}"),
             ElfError::WrongMachine { found } => {
-                write!(f, "ELF file is for another architecture (e_machine {found})")
+                write!(
+                    f,
+                    "ELF file is for another architecture (e_machine {found})"
+                )
             }
             ElfError::Dynamic { interpreter } => write!(
                 f,
@@ -179,7 +182,7 @@ pub fn parse(file: &[u8], arch: Arch) -> Result<Elf, ElfError> {
     let mut segments = Vec::new();
     let mut phdr_vaddr = None;
     let mut align = 1u64;
-    for ph in table.chunks_exact(PHDR_SIZE) {
+    for ph in table.as_chunks::<PHDR_SIZE>().0 {
         let p_type = u32_at(ph, 0);
         let p_flags = u32_at(ph, 4);
         let offset = u64_at(ph, 8);
@@ -201,7 +204,10 @@ pub fn parse(file: &[u8], arch: Arch) -> Result<Elf, ElfError> {
             }
             PT_PHDR => phdr_vaddr = Some(vaddr),
             PT_LOAD => {
-                if offset.checked_add(filesz).is_none_or(|end| end > file.len() as u64) {
+                if offset
+                    .checked_add(filesz)
+                    .is_none_or(|end| end > file.len() as u64)
+                {
                     return Err(ElfError::Malformed("segment outside the file"));
                 }
                 if filesz > memsz || vaddr.checked_add(memsz).is_none() {
@@ -389,7 +395,7 @@ pub fn build_stack<P: AddressSpace + AppMemory + ?Sized>(
     let platform_off = blob.len();
     blob.extend_from_slice(params.arch.name().as_bytes());
     blob.push(0);
-    let mut offsets = |strings: &[Vec<u8>], blob: &mut Vec<u8>| -> Vec<usize> {
+    let offsets = |strings: &[Vec<u8>], blob: &mut Vec<u8>| -> Vec<usize> {
         strings
             .iter()
             .map(|s| {
@@ -473,7 +479,13 @@ pub(crate) mod tests {
     /// A minimal ELF file with the given segments; program headers follow
     /// the ELF header at offset 64 and are covered by the first segment if
     /// it starts at offset 0.
-    pub fn build_elf(arch: Arch, e_type: u16, entry: u64, segs: &[Seg], interp: Option<&[u8]>) -> Vec<u8> {
+    pub fn build_elf(
+        arch: Arch,
+        e_type: u16,
+        entry: u64,
+        segs: &[Seg],
+        interp: Option<&[u8]>,
+    ) -> Vec<u8> {
         let phnum = segs.len() + usize::from(interp.is_some());
         let mut out = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
         out.resize(16, 0);
@@ -489,7 +501,13 @@ pub(crate) mod tests {
         out.extend_from_slice(&(phnum as u16).to_le_bytes());
         out.extend_from_slice(&[0; 6]);
         let interp_off = 64 + phnum * 56;
-        let ph = |out: &mut Vec<u8>, ty: u32, flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64| {
+        let ph = |out: &mut Vec<u8>,
+                  ty: u32,
+                  flags: u32,
+                  off: u64,
+                  vaddr: u64,
+                  filesz: u64,
+                  memsz: u64| {
             out.extend_from_slice(&ty.to_le_bytes());
             out.extend_from_slice(&flags.to_le_bytes());
             out.extend_from_slice(&off.to_le_bytes());
@@ -500,21 +518,38 @@ pub(crate) mod tests {
             out.extend_from_slice(&0x1000u64.to_le_bytes());
         };
         if let Some(interp) = interp {
-            ph(&mut out, PT_INTERP, PF_R, interp_off as u64, 0, interp.len() as u64, interp.len() as u64);
+            ph(
+                &mut out,
+                PT_INTERP,
+                PF_R,
+                interp_off as u64,
+                0,
+                interp.len() as u64,
+                interp.len() as u64,
+            );
         }
         for s in segs {
-            ph(&mut out, PT_LOAD, s.flags, s.offset, s.vaddr, s.data.len() as u64, s.memsz);
+            ph(
+                &mut out,
+                PT_LOAD,
+                s.flags,
+                s.offset,
+                s.vaddr,
+                s.data.len() as u64,
+                s.memsz,
+            );
         }
         if let Some(interp) = interp {
             out.extend_from_slice(interp);
         }
+        let header_len = out.len();
         for s in segs {
             let end = s.offset as usize + s.data.len();
             if out.len() < end {
                 out.resize(end, 0);
             }
             // The first segment at offset 0 covers the headers; keep them.
-            let start = (s.offset as usize).max(if s.offset == 0 { out.len().min(end) } else { 0 });
+            let start = (s.offset as usize).max(if s.offset == 0 { header_len } else { 0 });
             let skip = start - s.offset as usize;
             out[start..end].copy_from_slice(&s.data[skip..]);
         }
@@ -586,8 +621,20 @@ pub(crate) mod tests {
             ET_EXEC,
             0x40_0000,
             &[
-                Seg { vaddr: 0x40_0000, offset: 0, data: &[1; 0x1100], memsz: 0x1100, flags: PF_R | PF_X },
-                Seg { vaddr: 0x40_1100, offset: 0x1100, data: &[2; 0x10], memsz: 0x2000, flags: PF_R | PF_W },
+                Seg {
+                    vaddr: 0x40_0000,
+                    offset: 0,
+                    data: &[1; 0x1100],
+                    memsz: 0x1100,
+                    flags: PF_R | PF_X,
+                },
+                Seg {
+                    vaddr: 0x40_1100,
+                    offset: 0x1100,
+                    data: &[2; 0x10],
+                    memsz: 0x2000,
+                    flags: PF_R | PF_W,
+                },
             ],
             None,
         );
@@ -619,7 +666,10 @@ pub(crate) mod tests {
         let arch = Arch::Aarch64;
         assert_eq!(parse(b"#!/bin/sh\n", arch), Err(ElfError::NotElf));
         let file = sample(arch, ET_EXEC, 0x40_0000);
-        assert_eq!(parse(&file[..40], arch), Err(ElfError::Malformed("truncated header")));
+        assert_eq!(
+            parse(&file[..40], arch),
+            Err(ElfError::Malformed("truncated header"))
+        );
         assert_eq!(
             parse(&file, Arch::X86_64),
             Err(ElfError::WrongMachine { found: 183 })
@@ -634,7 +684,13 @@ pub(crate) mod tests {
             arch,
             ET_DYN,
             0x1000,
-            &[Seg { vaddr: 0, offset: 0, data: &[0; 0x200], memsz: 0x200, flags: PF_R }],
+            &[Seg {
+                vaddr: 0,
+                offset: 0,
+                data: &[0; 0x200],
+                memsz: 0x200,
+                flags: PF_R,
+            }],
             Some(b"/lib/ld-linux-aarch64.so.1\0"),
         );
         let err = parse(&dynamic, arch).unwrap_err();
@@ -648,7 +704,7 @@ pub(crate) mod tests {
         assert_eq!(err.errno(), Errno(ENOEXEC));
         // A segment whose file range lies outside the file.
         let mut bad = file.clone();
-        bad.truncate(0x1810);
+        bad.truncate(0x1808);
         assert!(matches!(parse(&bad, arch), Err(ElfError::Malformed(_))));
     }
 
@@ -694,7 +750,10 @@ pub(crate) mod tests {
             envp: &envp,
             execfn: b"/bin/busybox",
             image: &image,
-            cpu: CpuInfo { hwcap: 7, hwcap2: 9 },
+            cpu: CpuInfo {
+                hwcap: 7,
+                hwcap2: 9,
+            },
             random: [3; 16],
         };
         let sp = build_stack(&mut mm, &mut app, &params).unwrap();
@@ -737,7 +796,13 @@ pub(crate) mod tests {
     #[test]
     fn huge_arguments_are_refused() {
         let (mut mm, mut app) = setup();
-        let image = LoadedImage { entry: 0, phdr: 0, phnum: 0, bias: 0, end: 0 };
+        let image = LoadedImage {
+            entry: 0,
+            phdr: 0,
+            phnum: 0,
+            bias: 0,
+            end: 0,
+        };
         let argv = vec![vec![b'a'; (STACK_SIZE / 4) as usize]];
         let params = StackParams {
             arch: Arch::X86_64,

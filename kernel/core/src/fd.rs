@@ -169,10 +169,13 @@ impl FdTable {
         let slot = self.slot(fd)?;
         let new = self.lowest_free(min)?;
         self.file_mut(slot.file).refs += 1;
-        self.set(new, Slot {
-            file: slot.file,
-            cloexec,
-        });
+        self.set(
+            new,
+            Slot {
+                file: slot.file,
+                cloexec,
+            },
+        );
         Ok(new as i64)
     }
 
@@ -189,10 +192,13 @@ impl FdTable {
             None => None,
         };
         self.file_mut(slot.file).refs += 1;
-        self.set(new, Slot {
-            file: slot.file,
-            cloexec,
-        });
+        self.set(
+            new,
+            Slot {
+                file: slot.file,
+                cloexec,
+            },
+        );
         Ok(released)
     }
 
@@ -261,9 +267,15 @@ mod tests {
         // fd 1 (console out) is replaced; its description is still shared
         // with nobody, so it is released.
         let released = t.dup_to(fd, 1, false).unwrap().unwrap();
-        assert_eq!(released.object, FileObject::ConsoleOut(ConsoleStream::Stdout));
+        assert_eq!(
+            released.object,
+            FileObject::ConsoleOut(ConsoleStream::Stdout)
+        );
         assert_eq!(t.get(1).unwrap(), t.get(fd).unwrap());
-        assert_eq!(t.dup_to(fd, MAX_FDS as i64, false).unwrap_err(), Errno(EBADF));
+        assert_eq!(
+            t.dup_to(fd, MAX_FDS as i64, false).unwrap_err(),
+            Errno(EBADF)
+        );
         assert_eq!(t.dup_to(50, 4, false).unwrap_err(), Errno(EBADF));
         // Lowest free fd after a close.
         t.close(0).unwrap();

@@ -75,7 +75,12 @@ macro_rules! common_host_methods {
             self.common.image()?.read_dir(path)
         }
 
-        fn image_read(&mut self, path: &ImagePath, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        fn image_read(
+            &mut self,
+            path: &ImagePath,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> io::Result<usize> {
             self.common.image()?.read(path, offset, buf)
         }
 

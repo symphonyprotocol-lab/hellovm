@@ -404,13 +404,16 @@ mod tests {
     #[test]
     fn exec_errors() {
         let mut kernel = Kernel::new(MockHost::with_image(&[
-            ("dyn", MockEntry::File({
-                let mut f = sample(Arch::Aarch64, 2, 0x40_0000);
-                // Turn the second PT_LOAD into PT_INTERP pointing at text.
-                let ph = 64 + 56;
-                f[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes());
-                f
-            })),
+            (
+                "dyn",
+                MockEntry::File({
+                    let mut f = sample(Arch::Aarch64, 2, 0x40_0000);
+                    // Turn the second PT_LOAD into PT_INTERP pointing at text.
+                    let ph = 64 + 56;
+                    f[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes());
+                    f
+                }),
+            ),
             ("script", MockEntry::File(b"#!/bin/sh\n".to_vec())),
         ]));
         let mut app = MockApp::new(Arch::Aarch64);
@@ -445,7 +448,11 @@ mod tests {
             let names: Vec<_> = kernel.trace().iter().map(|r| r.sysno).collect();
             assert_eq!(
                 names,
-                vec![Some(Sysno::Write), Some(Sysno::Write), Some(Sysno::ExitGroup)]
+                vec![
+                    Some(Sysno::Write),
+                    Some(Sysno::Write),
+                    Some(Sysno::ExitGroup)
+                ]
             );
         }
     }
@@ -501,7 +508,11 @@ mod tests {
             // 4: mkdir, create, write, pread back.
             sc(arch, Sysno::Mkdirat, &[at_fdcwd, path(0x100), 0o755]),
             sc(arch, Sysno::Mkdirat, &[at_fdcwd, path(0x100), 0o755]),
-            sc(arch, Sysno::Openat, &[at_fdcwd, path(0x200), o_creat_wr, 0o644]),
+            sc(
+                arch,
+                Sysno::Openat,
+                &[at_fdcwd, path(0x200), o_creat_wr, 0o644],
+            ),
             sc(arch, Sysno::Write, &[3, path(0x300), 4]),
             sc(arch, Sysno::Pread64, &[3, buf, 4, 0]),
             sc(arch, Sysno::Openat, &[at_fdcwd, path(0x200), 2, 0]),
@@ -509,12 +520,20 @@ mod tests {
             // 11: chdir + getcwd, relative open, fstat.
             sc(arch, Sysno::Chdir, &[path(0x100)]),
             sc(arch, Sysno::Getcwd, &[buf, 100]),
-            sc(arch, Sysno::Newfstatat, &[at_fdcwd, path(0x400), buf + 0x100, 0]),
+            sc(
+                arch,
+                Sysno::Newfstatat,
+                &[at_fdcwd, path(0x400), buf + 0x100, 0],
+            ),
             sc(arch, Sysno::Fstat, &[1, buf + 0x200]),
             // 15: errors.
             sc(arch, Sysno::Openat, &[at_fdcwd, path(0x500), 0, 0]),
             sc(arch, Sysno::Openat, &[at_fdcwd, path(0x600), 0, 0]),
-            sc(arch, Sysno::Openat, &[at_fdcwd, path(0x200), o_creat_wr | 0o200, 0]),
+            sc(
+                arch,
+                Sysno::Openat,
+                &[at_fdcwd, path(0x200), o_creat_wr | 0o200, 0],
+            ),
             // 18: getdents64 of the new directory.
             sc(arch, Sysno::Openat, &[at_fdcwd, path(0x700), 0, 0]),
             sc(arch, Sysno::Getdents64, &[5, buf + 0x400, 0x400]),
@@ -540,10 +559,11 @@ mod tests {
         ];
         let (mut kernel, mut app) = setup(arch, traps, &data);
         assert_eq!(kernel.run(&mut app).unwrap(), ExitStatus::Exited(0));
-        let r = &app.returns;
+        let r = app.returns.clone();
         assert_eq!(&r[..4], &[3, 12, 12, 0]);
         assert_eq!(kernel.host().stdout, b"hello image\n");
-        assert_eq!(&r[4..11], &[0, -EEXIST, 3, 4, 4, 4, 3]);
+        // pread on the write-only fd fails; the second, read-write open works.
+        assert_eq!(&r[4..11], &[0, -EEXIST, 3, 4, -EBADF, 4, 3]);
         assert_eq!(&r[11..15], &[0, 7, 0, 0]);
         assert_eq!(app.peek(buf, 7), b"/tmp/d\0");
         // newfstatat of "f": regular, 4 bytes (aarch64 layout).
@@ -552,19 +572,31 @@ mod tests {
         assert_eq!(u64::from_le_bytes(st[48..56].try_into().unwrap()), 4);
         // fstat of the console: a character device.
         let st = app.peek(buf + 0x200, 128);
-        assert_eq!(u32::from_le_bytes(st[16..20].try_into().unwrap()) & 0o170000, 0o020000);
+        assert_eq!(
+            u32::from_le_bytes(st[16..20].try_into().unwrap()) & 0o170000,
+            0o020000
+        );
         assert_eq!(&r[15..18], &[-ENOENT, -ENOTDIR, -EEXIST]);
         assert_eq!(r[18], 5);
         // ".", "..", "f": three 24-byte records.
         assert_eq!(&r[19..21], &[72, 0]);
         assert_eq!(&app.peek(buf + 0x400 + 48 + 19, 2), b"f\0");
         assert_eq!(&r[21..24], &[1, 4, 4]);
-        assert_eq!(kernel.host().stdout, b"hello image\n", "fd 1 is the file now");
+        assert_eq!(
+            kernel.host().stdout,
+            b"hello image\n",
+            "fd 1 is the file now"
+        );
         assert_eq!(r[24], 0x40_6000, "brk starts after the image");
         assert!(r[25] > 0x40_0000);
         // The image is unchanged; the file lives in the upper layer.
-        let f = kernel.vfs.resolve(&mut kernel.host, 2, b"/tmp/d/f", true).unwrap();
-        assert_eq!(kernel.vfs.read_all(&mut kernel.host, f).unwrap(), b"datadata");
+        let f = kernel
+            .vfs
+            .resolve(&mut kernel.host, 2, b"/tmp/d/f", true)
+            .unwrap();
+        // fd 4 was at offset 0 (pread does not move it), so the write through
+        // fd 1 overwrote the data.
+        assert_eq!(kernel.vfs.read_all(&mut kernel.host, f).unwrap(), b"data");
     }
 
     #[test]
@@ -577,12 +609,20 @@ mod tests {
             sc(arch, Sysno::ArchPrctl, &[0x1002, 0x1234_5000]),
             sc(arch, Sysno::ExitGroup, &[0]),
         ];
-        let (mut kernel, mut app) = setup(arch, traps, &[(SCRATCH, b"/etc/motd\0"), (SCRATCH + 0x40, b"/etc\0")]);
+        let (mut kernel, mut app) = setup(
+            arch,
+            traps,
+            &[(SCRATCH, b"/etc/motd\0"), (SCRATCH + 0x40, b"/etc\0")],
+        );
         kernel.run(&mut app).unwrap();
         // O_DIRECTORY (x86_64 value) on a file fails; on a directory works.
         assert_eq!(app.returns, vec![0, -ENOTDIR, 3, 0]);
         let st = app.peek(SCRATCH + 0x100, 144);
-        assert_eq!(u64::from_le_bytes(st[16..24].try_into().unwrap()), 1, "nlink");
+        assert_eq!(
+            u64::from_le_bytes(st[16..24].try_into().unwrap()),
+            1,
+            "nlink"
+        );
         assert_eq!(u32::from_le_bytes(st[24..28].try_into().unwrap()), 0o100755);
         assert_eq!(u64::from_le_bytes(st[48..56].try_into().unwrap()), 12);
         assert_eq!(app.thread_pointer, Some(0x1234_5000));

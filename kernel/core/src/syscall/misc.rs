@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::abi;
 use crate::arch::{Arch, Sysno};
-use crate::errno::{Errno, SysResult, EFAULT, EINVAL, EPERM, ESRCH, ETIMEDOUT, EAGAIN, ENOSYS};
+use crate::errno::{Errno, SysResult, EAGAIN, EFAULT, EINVAL, ENOSYS, EPERM, ESRCH, ETIMEDOUT};
 use crate::host::Host;
 use crate::kernel::RLIM_INFINITY;
 use crate::platform::{GuestAddr, Platform};
@@ -192,7 +192,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
 
     pub fn sys_clock_gettime(&mut self, clock: i64, tp: GuestAddr) -> SysResult<u64> {
         let t = self.clock(clock)?;
-        self.write_mem(tp, &abi::encode_pair(t.as_secs() as i64, i64::from(t.subsec_nanos())))?;
+        self.write_mem(
+            tp,
+            &abi::encode_pair(t.as_secs() as i64, i64::from(t.subsec_nanos())),
+        )?;
         Ok(0)
     }
 
@@ -207,7 +210,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     pub fn sys_gettimeofday(&mut self, tv: GuestAddr, tz: GuestAddr) -> SysResult<u64> {
         let t = self.host.clock_realtime();
         if tv != 0 {
-            self.write_mem(tv, &abi::encode_pair(t.as_secs() as i64, i64::from(t.subsec_micros())))?;
+            self.write_mem(
+                tv,
+                &abi::encode_pair(t.as_secs() as i64, i64::from(t.subsec_micros())),
+            )?;
         }
         if tz != 0 {
             self.write_mem(tz, &[0; 8])?;
@@ -250,7 +256,12 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
-    pub fn sys_clock_nanosleep(&mut self, clock: i64, flags: u64, req: GuestAddr) -> SysResult<u64> {
+    pub fn sys_clock_nanosleep(
+        &mut self,
+        clock: i64,
+        flags: u64,
+        req: GuestAddr,
+    ) -> SysResult<u64> {
         const TIMER_ABSTIME: u64 = 1;
         let mut d = self.read_timespec(req)?;
         if flags & TIMER_ABSTIME != 0 {
@@ -263,7 +274,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     pub fn sys_sched_getaffinity(&mut self, len: u64, mask: GuestAddr) -> SysResult<u64> {
-        if len < 8 || len % 8 != 0 {
+        if len < 8 || !len.is_multiple_of(8) {
             return Err(Errno(EINVAL));
         }
         self.write_u64(mask, 1)?;
@@ -279,7 +290,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
-    pub fn sys_prlimit64(&mut self, pid: i64, resource: u64, new: GuestAddr, old: GuestAddr) -> SysResult<u64> {
+    pub fn sys_prlimit64(
+        &mut self,
+        pid: i64,
+        resource: u64,
+        new: GuestAddr,
+        old: GuestAddr,
+    ) -> SysResult<u64> {
         if pid != 0 && pid != PID as i64 {
             return Err(Errno(ESRCH));
         }
@@ -314,7 +331,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
-    pub fn sys_rt_sigaction(&mut self, sig: i64, act: GuestAddr, old: GuestAddr, size: u64) -> SysResult<u64> {
+    pub fn sys_rt_sigaction(
+        &mut self,
+        sig: i64,
+        act: GuestAddr,
+        old: GuestAddr,
+        size: u64,
+    ) -> SysResult<u64> {
         if size != 8 || !(1..=64).contains(&sig) {
             return Err(Errno(EINVAL));
         }
@@ -346,7 +369,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
-    pub fn sys_rt_sigprocmask(&mut self, how: i64, set: GuestAddr, old: GuestAddr, size: u64) -> SysResult<u64> {
+    pub fn sys_rt_sigprocmask(
+        &mut self,
+        how: i64,
+        set: GuestAddr,
+        old: GuestAddr,
+        size: u64,
+    ) -> SysResult<u64> {
         const SIG_BLOCK: i64 = 0;
         const SIG_UNBLOCK: i64 = 1;
         const SIG_SETMASK: i64 = 2;

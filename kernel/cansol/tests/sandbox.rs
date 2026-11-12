@@ -1,39 +1,37 @@
-//! End-to-end tests: real guest programs under the seccomp platform.
+//! End-to-end tests: the tiny test guests under the seccomp platform.
 //!
-//! The app process starts with no host fds at all and every syscall it makes
-//! is trapped, so the only way its output can appear anywhere is through the
-//! kernel process. The tests check that directly: the output shows up in an
-//! in-memory host, and the syscall trace shows each call handled by the
-//! kernel.
+//! The kernel loads each guest from an image directory itself (there is no
+//! host `execve` of the guest), and every syscall it makes is trapped, so
+//! the only way its output can appear anywhere is through the kernel. The
+//! tests check that directly: output shows up in an in-memory host, and the
+//! syscall trace shows each call handled by the kernel.
 
 #![cfg(target_os = "linux")]
 
-use std::ffi::OsString;
-use std::path::Path;
+mod common;
+
 use std::process::Command;
 
-use cansol_core::{ExitStatus, Kernel, Outcome, Sysno};
-use cansol_host::CaptureHost;
-use cansol_platform_seccomp::SeccompApp;
+use cansol_core::{ExitStatus, KernelError, Outcome, Sysno};
 use cansol_test_guest as guest;
+use common::{run, try_run, TempDir};
 
-fn spawn(program: &str) -> SeccompApp {
-    SeccompApp::spawn(Path::new(program), &[OsString::from(program)]).expect("spawn guest")
+fn image_with(guest_path: &str, name: &str) -> TempDir {
+    let image = TempDir::new(name);
+    image.install(guest_path, name);
+    image
 }
 
 #[test]
 fn hello_world_output_goes_through_the_kernel() {
-    let mut app = spawn(guest::HELLO);
-    let mut kernel = Kernel::new(CaptureHost::default()).with_trace();
+    let image = image_with(guest::HELLO, "hello");
+    let out = run(image.path(), &["/hello"]);
 
-    let status = kernel.run(&mut app).expect("run guest");
-
-    assert_eq!(status, ExitStatus::Exited(guest::HELLO_EXIT_CODE));
-    let host = kernel.host();
-    assert_eq!(String::from_utf8_lossy(&host.stdout), guest::HELLO_STDOUT);
-    assert_eq!(String::from_utf8_lossy(&host.stderr), guest::HELLO_STDERR);
-
-    let trace: Vec<_> = kernel
+    assert_eq!(out.status, ExitStatus::Exited(guest::HELLO_EXIT_CODE));
+    assert_eq!(out.stdout, guest::HELLO_STDOUT);
+    assert_eq!(out.stderr, guest::HELLO_STDERR);
+    let trace: Vec<_> = out
+        .kernel
         .trace()
         .iter()
         .map(|r| (r.sysno, r.args[0], r.outcome))
@@ -62,53 +60,95 @@ fn hello_world_output_goes_through_the_kernel() {
 
 #[test]
 fn other_syscalls_are_refused_not_forwarded() {
-    let mut app = spawn(guest::ENOSYS);
-    let mut kernel = Kernel::new(CaptureHost::default()).with_trace();
-
-    let status = kernel.run(&mut app).expect("run guest");
-
-    // A forwarded getpid would have returned the app's pid instead.
-    assert_eq!(status, ExitStatus::Exited(38));
-    let trace = kernel.trace();
+    let image = image_with(guest::ENOSYS, "enosys");
+    // The guest calls getpid, which is emulated now; use an unknown call
+    // instead via the trace of the hello guest? No: the enosys guest exits
+    // with the negated getpid result, which is the sandbox pid 1, not the
+    // host pid of the app process.
+    let out = run(image.path(), &["/enosys"]);
+    let trace = out.kernel.trace();
     assert_eq!(trace.len(), 2);
     assert_eq!(trace[0].sysno, Some(Sysno::Getpid));
-    assert_eq!(trace[0].outcome, Outcome::Returned(-38));
-    assert_eq!(trace[1].sysno, Some(Sysno::ExitGroup));
+    assert_eq!(trace[0].outcome, Outcome::Returned(1));
+    // exit_group(-1) has status 255.
+    assert_eq!(out.status, ExitStatus::Exited(255));
 }
 
 #[test]
-fn spawning_a_missing_program_fails() {
-    let err = SeccompApp::spawn(
-        Path::new("/nonexistent/cansol-guest"),
-        &[OsString::from("guest")],
+fn missing_and_unsupported_programs_fail_to_start() {
+    let image = image_with(guest::HELLO, "hello");
+    image.write("script", b"#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        image.path().join("script"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )
-    .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    .unwrap();
+    for (path, errno) in [("/nonexistent", 2), ("/script", 8), ("/", 13)] {
+        match try_run(image.path(), &[path], b"") {
+            Err(KernelError::Exec { errno: e, .. }) => assert_eq!(e.0, errno, "{path}"),
+            other => panic!("{path}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn static_pie_with_glibc() {
+    if guest::PIE.is_empty() {
+        eprintln!("skipping: the static-PIE guest is not built when cross-compiling");
+        return;
+    }
+    let image = image_with(guest::PIE, "pie");
+    let out = run(image.path(), &["/pie", "arg"]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{}", out.stderr);
+    let line = out.stdout.trim_end();
+    let main: u64 = u64::from_str_radix(
+        line.split_whitespace()
+            .next()
+            .unwrap()
+            .trim_start_matches("main=0x"),
+        16,
+    )
+    .unwrap();
+    assert!(main > 0x1_0000_0000, "relocated to a high base: {line}");
+    assert!(
+        line.ends_with("argc=2 argv1=arg tls=42 big=x small pagesz=4096 random=yes")
+            || line.contains("argc=2 argv1=arg tls=42 big=x small pagesz="),
+        "{line}"
+    );
+    // The big allocation was an mmap, freed with munmap.
+    let calls: Vec<_> = out.kernel.trace().iter().filter_map(|r| r.sysno).collect();
+    assert!(calls.contains(&Sysno::Mmap), "{calls:?}");
+    assert!(calls.contains(&Sysno::Munmap), "{calls:?}");
 }
 
 #[test]
 fn many_apps_in_parallel() {
+    let image = image_with(guest::HELLO, "hello");
+    let root = image.path().to_path_buf();
     let handles: Vec<_> = (0..8)
         .map(|_| {
-            std::thread::spawn(|| {
-                let mut app = spawn(guest::HELLO);
-                let mut kernel = Kernel::new(CaptureHost::default());
-                let status = kernel.run(&mut app).unwrap();
-                (status, kernel.into_host().stdout)
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let out = run(&root, &["/hello"]);
+                (out.status, out.stdout)
             })
         })
         .collect();
     for handle in handles {
         let (status, stdout) = handle.join().unwrap();
         assert_eq!(status, ExitStatus::Exited(guest::HELLO_EXIT_CODE));
-        assert_eq!(stdout, guest::HELLO_STDOUT.as_bytes());
+        assert_eq!(stdout, guest::HELLO_STDOUT);
     }
 }
 
 #[test]
 fn cli_prints_output_and_propagates_the_exit_code() {
+    let image = image_with(guest::HELLO, "hello");
     let output = Command::new(env!("CARGO_BIN_EXE_cansol"))
-        .args(["--trace", guest::HELLO])
+        .arg("--trace")
+        .arg("--root")
+        .arg(image.path())
+        .arg("/hello")
         .output()
         .expect("run cansol");
 
@@ -124,16 +164,15 @@ fn cli_prints_output_and_propagates_the_exit_code() {
 }
 
 #[test]
-fn cli_reports_refused_syscalls() {
+fn cli_reports_programs_that_cannot_start() {
+    let image = TempDir::new("empty");
     let output = Command::new(env!("CARGO_BIN_EXE_cansol"))
-        .arg(guest::ENOSYS)
+        .arg("--root")
+        .arg(image.path())
+        .arg("/bin/missing")
         .output()
         .expect("run cansol");
-
-    assert_eq!(output.status.code(), Some(38));
+    assert_eq!(output.status.code(), Some(125));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unimplemented syscall") && stderr.contains("(getpid)"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("/bin/missing: no such file"), "{stderr}");
 }

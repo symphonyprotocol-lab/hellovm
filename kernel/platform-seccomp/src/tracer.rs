@@ -52,10 +52,6 @@ impl Tracee {
         Tracee { pid, reaped: false }
     }
 
-    pub fn is_reaped(&self) -> bool {
-        self.reaped
-    }
-
     /// Blocks until the tracee stops or ends.
     pub fn wait(&mut self) -> io::Result<Stop> {
         if self.reaped {

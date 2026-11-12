@@ -149,7 +149,8 @@ impl AddressSpace for MockApp {
     fn map(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), PlatformError> {
         self.check(addr, len);
         for page in Self::pages_of(addr, len) {
-            self.pages.insert(page, (prot, Box::new([0; PAGE as usize])));
+            self.pages
+                .insert(page, (prot, Box::new([0; PAGE as usize])));
         }
         Ok(())
     }
@@ -180,11 +181,12 @@ impl Platform for MockApp {
     }
 
     fn address_space(&self) -> AddressSpaceInfo {
+        let reserved = RESERVED..RESERVED + 0x1_0000;
         AddressSpaceInfo {
             page_size: PAGE,
             min_addr: 0x1_0000,
             max_addr: 1 << 39,
-            reserved: vec![RESERVED..RESERVED + 0x1_0000],
+            reserved: vec![reserved],
         }
     }
 

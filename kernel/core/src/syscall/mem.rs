@@ -17,10 +17,18 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(mm.brk(self.app, addr))
     }
 
-    pub fn sys_mmap(&mut self, addr: GuestAddr, len: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> SysResult<u64> {
+    pub fn sys_mmap(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        prot: u64,
+        flags: u64,
+        fd: i64,
+        offset: u64,
+    ) -> SysResult<u64> {
         let contents = if flags & MAP_ANONYMOUS == 0 {
             let page = self.mm()?.page_size();
-            if offset % page != 0 {
+            if !offset.is_multiple_of(page) {
                 return Err(Errno(EINVAL));
             }
             Some(self.mapping_contents(fd, offset, len)?)
@@ -41,7 +49,14 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         mm.mprotect(self.app, addr, len, prot).map(|()| 0)
     }
 
-    pub fn sys_mremap(&mut self, old: GuestAddr, old_len: u64, new_len: u64, flags: u64, new_addr: GuestAddr) -> SysResult<u64> {
+    pub fn sys_mremap(
+        &mut self,
+        old: GuestAddr,
+        old_len: u64,
+        new_len: u64,
+        flags: u64,
+        new_addr: GuestAddr,
+    ) -> SysResult<u64> {
         let mm = self.proc.mm.as_mut().ok_or(Errno(ENOMEM))?;
         mm.mremap(self.app, old, old_len, new_len, flags, new_addr)
     }

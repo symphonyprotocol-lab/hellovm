@@ -25,6 +25,7 @@ name = "cansol-host"
 version = "0.0.1"
 dependencies = [
  "cansol-core",
+ "libc",
 ]
 
 [[package]]

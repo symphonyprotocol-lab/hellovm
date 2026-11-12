@@ -22,7 +22,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: cansol [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+const USAGE: &str =
+    "usage: cansol [--trace] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
 
 const DEFAULT_ENV: [&str; 2] = [
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -73,14 +74,19 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
             Some("--trace") => trace = true,
             Some("--root") => {
                 args.next();
-                root = Some(PathBuf::from(args.next().ok_or("--root needs a directory")?));
+                root = Some(PathBuf::from(
+                    args.next().ok_or("--root needs a directory")?,
+                ));
                 continue;
             }
             Some("--env") => {
                 args.next();
                 let var = args.next().ok_or("--env needs NAME=VALUE")?.into_vec();
                 let Some(eq) = var.iter().position(|&b| b == b'=') else {
-                    return Err(format!("--env {}: expected NAME=VALUE", String::from_utf8_lossy(&var)));
+                    return Err(format!(
+                        "--env {}: expected NAME=VALUE",
+                        String::from_utf8_lossy(&var)
+                    ));
                 };
                 env.retain(|e| !e.starts_with(&var[..=eq]));
                 env.push(var);

@@ -13,7 +13,7 @@ use crate::arch::{Arch, Sysno};
 use crate::errno::{Errno, SysResult, EFAULT, ENAMETOOLONG, ENOSYS};
 use crate::host::Host;
 use crate::kernel::{now, Process};
-use crate::platform::{AppMemory, GuestAddr, Platform, SyscallTrap};
+use crate::platform::{GuestAddr, Platform, SyscallTrap};
 use crate::vfs::{Timespec, Vfs, PATH_MAX};
 
 /// What the kernel does after handling a syscall.
@@ -117,7 +117,11 @@ fn unimplemented(nr: u64, sysno: Option<Sysno>, args: &[u64; 6]) -> SysResult<u6
     Err(Errno(ENOSYS))
 }
 
-pub(crate) fn dispatch<H, P>(ctx: &mut Ctx<'_, H, P>, sysno: Option<Sysno>, trap: &SyscallTrap) -> Action
+pub(crate) fn dispatch<H, P>(
+    ctx: &mut Ctx<'_, H, P>,
+    sysno: Option<Sysno>,
+    trap: &SyscallTrap,
+) -> Action
 where
     H: Host + ?Sized,
     P: Platform + ?Sized,

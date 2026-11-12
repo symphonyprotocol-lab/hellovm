@@ -285,7 +285,9 @@ pub fn spawn(arch: Arch) -> io::Result<Spawned> {
         Stop::Signal(libc::SIGSTOP) => {}
         stop => return Err(unexpected(stop, hs, "waiting for the app to stop")),
     }
-    tracee.set_options().map_err(|e| context(e, "PTRACE_SETOPTIONS"))?;
+    tracee
+        .set_options()
+        .map_err(|e| context(e, "PTRACE_SETOPTIONS"))?;
     tracee.resume(Run::Cont, 0)?;
 
     // Step 3: the only syscall the app process makes on its own is the
@@ -418,7 +420,8 @@ unsafe fn child_bootstrap(
         sys::SECCOMP_SET_MODE_FILTER,
         0 as libc::c_ulong,
         prog,
-    ) != 0 {
+    ) != 0
+    {
         fail(STAGE_SECCOMP);
     }
 
@@ -441,7 +444,13 @@ unsafe fn child_bootstrap(
 /// Closes every fd except `keep`. Async-signal-safe.
 unsafe fn close_all_fds_except(keep: libc::c_int) {
     let keep = keep as libc::c_uint;
-    let ok = (keep == 0 || libc::syscall(sys::SYS_CLOSE_RANGE, 0 as libc::c_long, (keep - 1) as libc::c_long, 0 as libc::c_long) == 0)
+    let ok = (keep == 0
+        || libc::syscall(
+            sys::SYS_CLOSE_RANGE,
+            0 as libc::c_long,
+            (keep - 1) as libc::c_long,
+            0 as libc::c_long,
+        ) == 0)
         && libc::syscall(
             sys::SYS_CLOSE_RANGE,
             (keep + 1) as libc::c_long,

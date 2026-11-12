@@ -2,13 +2,15 @@
 
 use crate::abi;
 use crate::errno::{
-    Errno, SysResult, EBADF, EEXIST, EFAULT, EINVAL, EISDIR, ELOOP, ENOENT, ENOSPC, ENOTDIR,
-    ENOTTY, ENXIO, EOPNOTSUPP, EPERM, ESPIPE, EACCES,
+    Errno, SysResult, EACCES, EBADF, EEXIST, EFAULT, EINVAL, EISDIR, ELOOP, ENOENT, ENOSPC,
+    ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP, EPERM, ESPIPE,
 };
 use crate::fd::{Access, FileId, FileObject, OpenFile, MAX_FDS};
-use crate::host::{ConsoleStream, Host};
+use crate::host::Host;
 use crate::platform::{GuestAddr, Platform};
-use crate::vfs::{Device, DirEntry, FileType, Ino, NewNode, Stat, Timespec, S_IFCHR, S_IFMT, S_IFREG};
+use crate::vfs::{
+    Device, DirEntry, FileType, Ino, NewNode, Stat, Timespec, S_IFCHR, S_IFMT, S_IFREG,
+};
 
 use super::{int, Ctx, AT_FDCWD, MAX_IO};
 
@@ -112,7 +114,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     /// Resolves `dirfd` + `path` (an `*at` call's target).
-    fn lookup_at(&mut self, dirfd: i64, path: &[u8], follow: bool, empty_path: bool) -> SysResult<Target> {
+    fn lookup_at(
+        &mut self,
+        dirfd: i64,
+        path: &[u8],
+        follow: bool,
+        empty_path: bool,
+    ) -> SysResult<Target> {
         if path.is_empty() {
             if !empty_path {
                 return Err(Errno(ENOENT));
@@ -127,7 +135,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             });
         }
         let start = self.start_dir(dirfd, path)?;
-        Ok(Target::Node(self.vfs.resolve(self.host, start, path, follow)?))
+        Ok(Target::Node(
+            self.vfs.resolve(self.host, start, path, follow)?,
+        ))
     }
 
     fn node_at(&mut self, dirfd: i64, path_addr: GuestAddr, follow: bool) -> SysResult<Ino> {
@@ -138,7 +148,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
     }
 
-    fn parent_at(&mut self, dirfd: i64, path_addr: GuestAddr) -> SysResult<crate::vfs::ParentAndName> {
+    fn parent_at(
+        &mut self,
+        dirfd: i64,
+        path_addr: GuestAddr,
+    ) -> SysResult<crate::vfs::ParentAndName> {
         let path = self.read_path(path_addr)?;
         let start = self.start_dir(dirfd, &path)?;
         self.vfs.resolve_parent(self.host, start, &path)
@@ -180,7 +194,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 Some(Device::Null) => 0,
                 Some(Device::Zero | Device::Full) => len,
                 Some(Device::Random | Device::Urandom) => {
-                    self.host.random(&mut buf).map_err(|e| Errno::from_host(&e))?;
+                    self.host
+                        .random(&mut buf)
+                        .map_err(|e| Errno::from_host(&e))?;
                     len
                 }
                 Some(Device::Fd(_) | Device::Unusable) => return Err(Errno(ENXIO)),
@@ -243,7 +259,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
     }
 
-    pub fn sys_read(&mut self, fd: i64, buf: GuestAddr, len: u64, offset: Option<u64>) -> SysResult<u64> {
+    pub fn sys_read(
+        &mut self,
+        fd: i64,
+        buf: GuestAddr,
+        len: u64,
+        offset: Option<u64>,
+    ) -> SysResult<u64> {
         let (id, file) = self.file(fd)?;
         if let FileObject::Node(ino) = file.object {
             if self.vfs.is_dir(ino) {
@@ -255,7 +277,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(data.len() as u64)
     }
 
-    pub fn sys_write(&mut self, fd: i64, buf: GuestAddr, len: u64, offset: Option<u64>) -> SysResult<u64> {
+    pub fn sys_write(
+        &mut self,
+        fd: i64,
+        buf: GuestAddr,
+        len: u64,
+        offset: Option<u64>,
+    ) -> SysResult<u64> {
         let (id, _) = self.file(fd)?;
         let len = (len as usize).min(MAX_IO);
         let data = self.read_mem(buf, len)?;
@@ -293,7 +321,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
         let raw = self.read_mem(iov, count as usize * 16)?;
         Ok(raw
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|c| {
                 (
                     u64::from_le_bytes(c[..8].try_into().unwrap()),
@@ -303,7 +333,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             .collect())
     }
 
-    pub fn sys_readv(&mut self, fd: i64, iov: GuestAddr, count: u64, offset: Option<u64>) -> SysResult<u64> {
+    pub fn sys_readv(
+        &mut self,
+        fd: i64,
+        iov: GuestAddr,
+        count: u64,
+        offset: Option<u64>,
+    ) -> SysResult<u64> {
         let (id, _) = self.file(fd)?;
         if offset.is_some() {
             self.seekable(fd)?;
@@ -323,7 +359,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(data.len() as u64)
     }
 
-    pub fn sys_writev(&mut self, fd: i64, iov: GuestAddr, count: u64, offset: Option<u64>) -> SysResult<u64> {
+    pub fn sys_writev(
+        &mut self,
+        fd: i64,
+        iov: GuestAddr,
+        count: u64,
+        offset: Option<u64>,
+    ) -> SysResult<u64> {
         let (id, _) = self.file(fd)?;
         if offset.is_some() {
             self.seekable(fd)?;
@@ -341,7 +383,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         self.write_file(id, offset, &data).map(|n| n as u64)
     }
 
-    pub fn sys_sendfile(&mut self, out_fd: i64, in_fd: i64, offset_ptr: GuestAddr, count: u64) -> SysResult<u64> {
+    pub fn sys_sendfile(
+        &mut self,
+        out_fd: i64,
+        in_fd: i64,
+        offset_ptr: GuestAddr,
+        count: u64,
+    ) -> SysResult<u64> {
         let (out_id, _) = self.file(out_fd)?;
         let (in_id, _) = self.file(in_fd)?;
         let offset = if offset_ptr != 0 {
@@ -378,7 +426,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             SEEK_END => self.vfs.size(ino) as i64,
             _ => return Err(Errno(EINVAL)),
         };
-        let new = base.checked_add(offset).filter(|&n| n >= 0).ok_or(Errno(EINVAL))?;
+        let new = base
+            .checked_add(offset)
+            .filter(|&n| n >= 0)
+            .ok_or(Errno(EINVAL))?;
         let is_dir = self.vfs.is_dir(ino);
         let file = self.proc.fds.file_mut(id);
         file.offset = new as u64;
@@ -391,7 +442,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
 
     // ----- open, close, dup -----
 
-    pub fn sys_openat(&mut self, dirfd: i64, path_addr: GuestAddr, raw_flags: u64, mode: u64) -> SysResult<u64> {
+    pub fn sys_openat(
+        &mut self,
+        dirfd: i64,
+        path_addr: GuestAddr,
+        raw_flags: u64,
+        mode: u64,
+    ) -> SysResult<u64> {
         let flags = abi::decode_open_flags(self.arch, raw_flags);
         let path = self.read_path(path_addr)?;
         if flags.tmpfile {
@@ -404,7 +461,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             if parent.trailing_slash {
                 return Err(Errno(EISDIR));
             }
-            let existing = match self.vfs.resolve(self.host, start, &path, follow && !flags.excl) {
+            let existing = match self
+                .vfs
+                .resolve(self.host, start, &path, follow && !flags.excl)
+            {
                 Ok(ino) => Some(ino),
                 Err(Errno(ENOENT)) => None,
                 Err(err) => return Err(err),
@@ -415,8 +475,14 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 None => {
                     let perm = (mode as u32) & 0o7777 & !self.proc.umask;
                     let now = self.now();
-                    self.vfs
-                        .create(self.host, parent.dir, &parent.name, NewNode::File, perm, now)?
+                    self.vfs.create(
+                        self.host,
+                        parent.dir,
+                        &parent.name,
+                        NewNode::File,
+                        perm,
+                        now,
+                    )?
                 }
             }
         } else {
@@ -576,7 +642,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             FIONCLEX => self.proc.fds.set_cloexec(fd, false).map(|()| 0),
             FIONREAD => match file.node() {
                 Some(ino) if self.vfs.file_type(ino) == FileType::Regular => {
-                    let left = self.vfs.size(ino).saturating_sub(self.proc.fds.file(id).offset);
+                    let left = self
+                        .vfs
+                        .size(ino)
+                        .saturating_sub(self.proc.fds.file(id).offset);
                     self.write_u32(arg, left.min(i32::MAX as u64) as u32)?;
                     Ok(0)
                 }
@@ -596,16 +665,25 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
     }
 
-    pub fn sys_poll(&mut self, fds: GuestAddr, nfds: u64, timeout_ms: Option<i64>) -> SysResult<u64> {
+    pub fn sys_poll(
+        &mut self,
+        fds: GuestAddr,
+        nfds: u64,
+        timeout_ms: Option<i64>,
+    ) -> SysResult<u64> {
         if nfds > MAX_FDS as u64 {
             return Err(Errno(EINVAL));
         }
         let mut raw = self.read_mem(fds, nfds as usize * 8)?;
         let mut ready = 0;
-        for entry in raw.chunks_exact_mut(8) {
+        for entry in raw.as_chunks_mut::<8>().0 {
             let fd = i32::from_le_bytes(entry[..4].try_into().unwrap());
             let events = u16::from_le_bytes([entry[4], entry[5]]);
-            let revents = if fd < 0 { 0 } else { self.poll_one(i64::from(fd), events) };
+            let revents = if fd < 0 {
+                0
+            } else {
+                self.poll_one(i64::from(fd), events)
+            };
             entry[6..8].copy_from_slice(&revents.to_le_bytes());
             if revents != 0 {
                 ready += 1;
@@ -635,7 +713,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     /// `select`/`pselect6`: every valid fd is ready for reading and writing.
-    pub fn sys_select(&mut self, nfds: i64, readfds: GuestAddr, writefds: GuestAddr, exceptfds: GuestAddr) -> SysResult<u64> {
+    pub fn sys_select(
+        &mut self,
+        nfds: i64,
+        readfds: GuestAddr,
+        writefds: GuestAddr,
+        exceptfds: GuestAddr,
+    ) -> SysResult<u64> {
         if !(0..=MAX_FDS as i64).contains(&nfds) {
             return Err(Errno(EINVAL));
         }
@@ -674,7 +758,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Err(Errno(EINVAL));
         }
         let now = self.now();
-        self.vfs.truncate(self.host, ino, len as u64, now).map(|()| 0)
+        self.vfs
+            .truncate(self.host, ino, len as u64, now)
+            .map(|()| 0)
     }
 
     pub fn sys_truncate(&mut self, path: GuestAddr, len: i64) -> SysResult<u64> {
@@ -683,7 +769,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
         let ino = self.node_at(AT_FDCWD, path, true)?;
         let now = self.now();
-        self.vfs.truncate(self.host, ino, len as u64, now).map(|()| 0)
+        self.vfs
+            .truncate(self.host, ino, len as u64, now)
+            .map(|()| 0)
     }
 
     // ----- metadata -----
@@ -699,7 +787,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
-    pub fn sys_newfstatat(&mut self, dirfd: i64, path: GuestAddr, buf: GuestAddr, flags: u64) -> SysResult<u64> {
+    pub fn sys_newfstatat(
+        &mut self,
+        dirfd: i64,
+        path: GuestAddr,
+        buf: GuestAddr,
+        flags: u64,
+    ) -> SysResult<u64> {
         let path = self.read_path(path)?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         let target = self.lookup_at(dirfd, &path, follow, flags & AT_EMPTY_PATH != 0)?;
@@ -708,7 +802,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
-    pub fn sys_statx(&mut self, dirfd: i64, path: GuestAddr, flags: u64, buf: GuestAddr) -> SysResult<u64> {
+    pub fn sys_statx(
+        &mut self,
+        dirfd: i64,
+        path: GuestAddr,
+        flags: u64,
+        buf: GuestAddr,
+    ) -> SysResult<u64> {
         let path = self.read_path(path)?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
         let target = self.lookup_at(dirfd, &path, follow, flags & AT_EMPTY_PATH != 0)?;
@@ -733,7 +833,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         self.write_statfs(buf)
     }
 
-    pub fn sys_faccessat(&mut self, dirfd: i64, path: GuestAddr, mode: u64, flags: u64) -> SysResult<u64> {
+    pub fn sys_faccessat(
+        &mut self,
+        dirfd: i64,
+        path: GuestAddr,
+        mode: u64,
+        flags: u64,
+    ) -> SysResult<u64> {
         const X_OK: u64 = 1;
         if mode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
             return Err(Errno(EINVAL));
@@ -753,7 +859,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
-    pub fn sys_readlinkat(&mut self, dirfd: i64, path: GuestAddr, buf: GuestAddr, size: u64) -> SysResult<u64> {
+    pub fn sys_readlinkat(
+        &mut self,
+        dirfd: i64,
+        path: GuestAddr,
+        buf: GuestAddr,
+        size: u64,
+    ) -> SysResult<u64> {
         if (size as i64) <= 0 {
             return Err(Errno(EINVAL));
         }
@@ -798,7 +910,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             if out.len() + abi::dirent64_len(&entry.name) > count as usize {
                 break;
             }
-            abi::push_dirent64(&mut out, entry.ino, index as i64 + 1, entry.kind.dirent_type(), &entry.name);
+            abi::push_dirent64(
+                &mut out,
+                entry.ino,
+                index as i64 + 1,
+                entry.kind.dirent_type(),
+                &entry.name,
+            );
             index += 1;
         }
         if out.is_empty() && index < listing.len() {
@@ -830,7 +948,14 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let perm = (mode as u32) & 0o7777 & !self.proc.umask;
         let now = self.now();
         self.vfs
-            .create(self.host, parent.dir, &parent.name, NewNode::File, perm, now)
+            .create(
+                self.host,
+                parent.dir,
+                &parent.name,
+                NewNode::File,
+                perm,
+                now,
+            )
             .map(|_| 0)
     }
 
@@ -845,14 +970,25 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         } else {
             if parent.trailing_slash {
                 let ino = self.vfs.lookup(self.host, parent.dir, &parent.name)?;
-                return Err(Errno(if self.vfs.is_dir(ino) { EISDIR } else { ENOTDIR }));
+                return Err(Errno(if self.vfs.is_dir(ino) {
+                    EISDIR
+                } else {
+                    ENOTDIR
+                }));
             }
             self.vfs.unlink(self.host, parent.dir, &parent.name, now)?;
         }
         Ok(0)
     }
 
-    pub fn sys_renameat(&mut self, old_dirfd: i64, old: GuestAddr, new_dirfd: i64, new: GuestAddr, flags: u64) -> SysResult<u64> {
+    pub fn sys_renameat(
+        &mut self,
+        old_dirfd: i64,
+        old: GuestAddr,
+        new_dirfd: i64,
+        new: GuestAddr,
+        flags: u64,
+    ) -> SysResult<u64> {
         if flags & !RENAME_NOREPLACE != 0 {
             // RENAME_EXCHANGE and RENAME_WHITEOUT.
             return Err(Errno(EINVAL));
@@ -879,7 +1015,12 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             .map(|()| 0)
     }
 
-    pub fn sys_symlinkat(&mut self, target: GuestAddr, dirfd: i64, path: GuestAddr) -> SysResult<u64> {
+    pub fn sys_symlinkat(
+        &mut self,
+        target: GuestAddr,
+        dirfd: i64,
+        path: GuestAddr,
+    ) -> SysResult<u64> {
         let target = self.read_path(target)?;
         if target.is_empty() {
             return Err(Errno(ENOENT));
@@ -890,11 +1031,25 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
         let now = self.now();
         self.vfs
-            .create(self.host, parent.dir, &parent.name, NewNode::Symlink(target), 0o777, now)
+            .create(
+                self.host,
+                parent.dir,
+                &parent.name,
+                NewNode::Symlink(target),
+                0o777,
+                now,
+            )
             .map(|_| 0)
     }
 
-    pub fn sys_linkat(&mut self, old_dirfd: i64, old: GuestAddr, new_dirfd: i64, new: GuestAddr, flags: u64) -> SysResult<u64> {
+    pub fn sys_linkat(
+        &mut self,
+        old_dirfd: i64,
+        old: GuestAddr,
+        new_dirfd: i64,
+        new: GuestAddr,
+        flags: u64,
+    ) -> SysResult<u64> {
         if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
             return Err(Errno(EINVAL));
         }
@@ -915,7 +1070,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             .map(|()| 0)
     }
 
-    pub fn sys_fchmodat(&mut self, dirfd: i64, path: GuestAddr, mode: u64, flags: u64) -> SysResult<u64> {
+    pub fn sys_fchmodat(
+        &mut self,
+        dirfd: i64,
+        path: GuestAddr,
+        mode: u64,
+        flags: u64,
+    ) -> SysResult<u64> {
         let ino = self.node_at(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         if self.vfs.file_type(ino) == FileType::Symlink {
             return Err(Errno(EOPNOTSUPP));
@@ -939,10 +1100,19 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         self.vfs.set_owner(ino, id(uid), id(gid), now);
     }
 
-    pub fn sys_fchownat(&mut self, dirfd: i64, path: GuestAddr, uid: u64, gid: u64, flags: u64) -> SysResult<u64> {
+    pub fn sys_fchownat(
+        &mut self,
+        dirfd: i64,
+        path: GuestAddr,
+        uid: u64,
+        gid: u64,
+        flags: u64,
+    ) -> SysResult<u64> {
         let path = self.read_path(path)?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        if let Target::Node(ino) = self.lookup_at(dirfd, &path, follow, flags & AT_EMPTY_PATH != 0)? {
+        if let Target::Node(ino) =
+            self.lookup_at(dirfd, &path, follow, flags & AT_EMPTY_PATH != 0)?
+        {
             self.chown(ino, uid, gid);
         }
         Ok(0)
@@ -956,13 +1126,24 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(0)
     }
 
-    pub fn sys_utimensat(&mut self, dirfd: i64, path: GuestAddr, times: GuestAddr, flags: u64) -> SysResult<u64> {
+    pub fn sys_utimensat(
+        &mut self,
+        dirfd: i64,
+        path: GuestAddr,
+        times: GuestAddr,
+        flags: u64,
+    ) -> SysResult<u64> {
         let target = if path == 0 {
             // futimens(fd, times).
             self.lookup_at(dirfd, b"", true, true)?
         } else {
             let path = self.read_path(path)?;
-            self.lookup_at(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0, flags & AT_EMPTY_PATH != 0)?
+            self.lookup_at(
+                dirfd,
+                &path,
+                flags & AT_SYMLINK_NOFOLLOW == 0,
+                flags & AT_EMPTY_PATH != 0,
+            )?
         };
         let now = self.now();
         let (atime, mtime) = if times == 0 {
@@ -975,7 +1156,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 *slot = match nsec {
                     UTIME_NOW => Some(now),
                     UTIME_OMIT => None,
-                    0..=999_999_999 => Some(Timespec { sec, nsec: nsec as u32 }),
+                    0..=999_999_999 => Some(Timespec {
+                        sec,
+                        nsec: nsec as u32,
+                    }),
                     _ => return Err(Errno(EINVAL)),
                 };
             }
@@ -1025,7 +1209,12 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     }
 
     /// The contents of a file for a private file mapping.
-    pub(crate) fn mapping_contents(&mut self, fd: i64, offset: u64, len: u64) -> SysResult<Vec<u8>> {
+    pub(crate) fn mapping_contents(
+        &mut self,
+        fd: i64,
+        offset: u64,
+        len: u64,
+    ) -> SysResult<Vec<u8>> {
         let (_, file) = self.file(fd)?;
         let ino = file.node().ok_or(Errno(crate::errno::EACCES))?;
         if !file.access.readable() {

@@ -36,8 +36,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::errno::{
-    Errno, SysResult, EBUSY, EEXIST, EFBIG, EINVAL, EISDIR, ELOOP, ENAMETOOLONG, ENOENT,
-    ENOTDIR, ENOTEMPTY, EPERM,
+    Errno, SysResult, EBUSY, EEXIST, EFBIG, EINVAL, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR,
+    ENOTEMPTY, EPERM,
 };
 use crate::host::{Host, HostFileKind, HostStat, ImagePath};
 
@@ -163,7 +163,6 @@ enum Content {
 
 #[derive(Clone, Debug)]
 pub struct Node {
-    ino: Ino,
     /// Permission bits (`0o7777`).
     perm: u32,
     uid: u32,
@@ -315,11 +314,14 @@ impl Vfs {
     fn add_node(&mut self, content: Content, perm: u32, time: Timespec) -> Ino {
         let ino = self.next_ino;
         self.next_ino += 1;
-        let nlink = if matches!(content, Content::Dir(_)) { 2 } else { 1 };
+        let nlink = if matches!(content, Content::Dir(_)) {
+            2
+        } else {
+            1
+        };
         self.nodes.insert(
             ino,
             Node {
-                ino,
                 perm: perm & 0o7777,
                 uid: 0,
                 gid: 0,
@@ -380,7 +382,13 @@ impl Vfs {
         self.node(ino).perm
     }
 
-    fn node_from_image(&mut self, path: ImagePath, stat: HostStat, parent: Ino, host_link: Option<Vec<u8>>) -> Ino {
+    fn node_from_image(
+        &mut self,
+        path: ImagePath,
+        stat: HostStat,
+        parent: Ino,
+        host_link: Option<Vec<u8>>,
+    ) -> Ino {
         let content = match stat.kind {
             HostFileKind::Directory => Content::Dir(Dir {
                 parent,
@@ -403,7 +411,12 @@ impl Vfs {
     }
 
     /// Looks up one name in a directory.
-    pub fn lookup<H: Host + ?Sized>(&mut self, host: &mut H, dir: Ino, name: &[u8]) -> SysResult<Ino> {
+    pub fn lookup<H: Host + ?Sized>(
+        &mut self,
+        host: &mut H,
+        dir: Ino,
+        name: &[u8],
+    ) -> SysResult<Ino> {
         let d = self.dir(dir)?;
         if name == b"." {
             return Ok(dir);
@@ -467,7 +480,10 @@ impl Vfs {
         }
         let trailing_slash = path.ends_with(b"/");
         let mut cur = if path[0] == b'/' { self.root } else { start };
-        let comps: Vec<&[u8]> = path.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        let comps: Vec<&[u8]> = path
+            .split(|&b| b == b'/')
+            .filter(|c| !c.is_empty())
+            .collect();
         for (i, comp) in comps.iter().enumerate() {
             if comp.len() > NAME_MAX {
                 return Err(Errno(ENAMETOOLONG));
@@ -615,7 +631,13 @@ impl Vfs {
     }
 
     /// `unlink`: removes a non-directory name.
-    pub fn unlink<H: Host + ?Sized>(&mut self, host: &mut H, dir: Ino, name: &[u8], now: Timespec) -> SysResult<()> {
+    pub fn unlink<H: Host + ?Sized>(
+        &mut self,
+        host: &mut H,
+        dir: Ino,
+        name: &[u8],
+        now: Timespec,
+    ) -> SysResult<()> {
         if name == b"." || name == b".." {
             return Err(Errno(EISDIR));
         }
@@ -633,7 +655,13 @@ impl Vfs {
     }
 
     /// `rmdir`: removes an empty directory.
-    pub fn rmdir<H: Host + ?Sized>(&mut self, host: &mut H, dir: Ino, name: &[u8], now: Timespec) -> SysResult<()> {
+    pub fn rmdir<H: Host + ?Sized>(
+        &mut self,
+        host: &mut H,
+        dir: Ino,
+        name: &[u8],
+        now: Timespec,
+    ) -> SysResult<()> {
         if name == b"." {
             return Err(Errno(EINVAL));
         }
@@ -883,7 +911,13 @@ impl Vfs {
     }
 
     /// Reads file data at `offset`. Returns the number of bytes read.
-    pub fn read<H: Host + ?Sized>(&mut self, host: &mut H, ino: Ino, offset: u64, buf: &mut [u8]) -> SysResult<usize> {
+    pub fn read<H: Host + ?Sized>(
+        &mut self,
+        host: &mut H,
+        ino: Ino,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> SysResult<usize> {
         match &self.node(ino).content {
             Content::File(FileData::Upper(data)) => {
                 let start = offset.min(data.len() as u64) as usize;
@@ -960,7 +994,13 @@ impl Vfs {
     }
 
     /// Sets the size of a regular file.
-    pub fn truncate<H: Host + ?Sized>(&mut self, host: &mut H, ino: Ino, len: u64, now: Timespec) -> SysResult<()> {
+    pub fn truncate<H: Host + ?Sized>(
+        &mut self,
+        host: &mut H,
+        ino: Ino,
+        len: u64,
+        now: Timespec,
+    ) -> SysResult<()> {
         if len > MAX_FILE_SIZE {
             return Err(Errno(EFBIG));
         }
@@ -998,7 +1038,13 @@ impl Vfs {
         node.ctime = now;
     }
 
-    pub fn set_times(&mut self, ino: Ino, atime: Option<Timespec>, mtime: Option<Timespec>, now: Timespec) {
+    pub fn set_times(
+        &mut self,
+        ino: Ino,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+        now: Timespec,
+    ) {
         let node = self.node_mut(ino);
         if let Some(atime) = atime {
             node.atime = atime;
@@ -1043,7 +1089,10 @@ mod tests {
         MockHost::with_image(&[
             ("etc", MockEntry::Dir),
             ("etc/passwd", MockEntry::File(b"root:x:0:0\n".to_vec())),
-            ("etc/hosts", MockEntry::File(b"127.0.0.1 localhost\n".to_vec())),
+            (
+                "etc/hosts",
+                MockEntry::File(b"127.0.0.1 localhost\n".to_vec()),
+            ),
             ("bin", MockEntry::Dir),
             ("bin/sh", MockEntry::Symlink(b"busybox".to_vec())),
             ("bin/busybox", MockEntry::File(b"\x7fELF".to_vec())),
@@ -1078,7 +1127,10 @@ mod tests {
         let passwd = resolve(&mut vfs, &mut host, "/etc/passwd").unwrap();
         assert_eq!(resolve(&mut vfs, &mut host, "/etc/./passwd"), Ok(passwd));
         assert_eq!(resolve(&mut vfs, &mut host, "//etc//passwd"), Ok(passwd));
-        assert_eq!(resolve(&mut vfs, &mut host, "/bin/../etc/passwd"), Ok(passwd));
+        assert_eq!(
+            resolve(&mut vfs, &mut host, "/bin/../etc/passwd"),
+            Ok(passwd)
+        );
         let busybox = resolve(&mut vfs, &mut host, "/bin/busybox").unwrap();
         assert_eq!(resolve(&mut vfs, &mut host, "/bin/sh"), Ok(busybox));
         let root = vfs.root();
@@ -1092,11 +1144,17 @@ mod tests {
             resolve(&mut vfs, &mut host, "/etc/passwd/x"),
             Err(Errno(ENOTDIR))
         );
-        assert_eq!(resolve(&mut vfs, &mut host, "/etc/passwd/"), Err(Errno(ENOTDIR)));
+        assert_eq!(
+            resolve(&mut vfs, &mut host, "/etc/passwd/"),
+            Err(Errno(ENOTDIR))
+        );
         assert_eq!(resolve(&mut vfs, &mut host, "/loop"), Err(Errno(ELOOP)));
         assert_eq!(resolve(&mut vfs, &mut host, ""), Err(Errno(ENOENT)));
         let long = format!("/{}", "a".repeat(256));
-        assert_eq!(resolve(&mut vfs, &mut host, &long), Err(Errno(ENAMETOOLONG)));
+        assert_eq!(
+            resolve(&mut vfs, &mut host, &long),
+            Err(Errno(ENAMETOOLONG))
+        );
         // Relative to a start directory.
         let etc = resolve(&mut vfs, &mut host, "/etc").unwrap();
         assert_eq!(vfs.resolve(&mut host, etc, b"passwd", true), Ok(passwd));
@@ -1117,7 +1175,13 @@ mod tests {
         assert_eq!(vfs.resolve(&mut host, etc, b"../../../etc", true), Ok(etc));
         // The host was only ever asked about plain image paths.
         for path in &host.asked {
-            assert!(!path.split('/').any(|c| c == ".." || c == "." || c.is_empty()) || path.is_empty(), "{path}");
+            assert!(
+                !path
+                    .split('/')
+                    .any(|c| c == ".." || c == "." || c.is_empty())
+                    || path.is_empty(),
+                "{path}"
+            );
         }
     }
 
@@ -1149,7 +1213,10 @@ mod tests {
         assert_eq!(names(&mut vfs, &mut host, "/etc"), ["hosts", "passwd"]);
         vfs.unlink(&mut host, etc, b"passwd", NOW).unwrap();
         assert_eq!(names(&mut vfs, &mut host, "/etc"), ["hosts"]);
-        assert_eq!(resolve(&mut vfs, &mut host, "/etc/passwd"), Err(Errno(ENOENT)));
+        assert_eq!(
+            resolve(&mut vfs, &mut host, "/etc/passwd"),
+            Err(Errno(ENOENT))
+        );
         // Re-creating the name gives a new, empty file.
         let new = vfs
             .create(&mut host, etc, b"passwd", NewNode::File, 0o600, NOW)
@@ -1166,8 +1233,14 @@ mod tests {
         vfs.create(&mut host, usr, b"lib", NewNode::Dir, 0o755, NOW)
             .unwrap();
         assert_eq!(names(&mut vfs, &mut host, "/usr/lib"), Vec::<String>::new());
-        assert_eq!(vfs.rmdir(&mut host, root, b"etc", NOW), Err(Errno(ENOTEMPTY)));
-        assert_eq!(vfs.rmdir(&mut host, root, b"bin/sh", NOW), Err(Errno(ENOENT)));
+        assert_eq!(
+            vfs.rmdir(&mut host, root, b"etc", NOW),
+            Err(Errno(ENOTEMPTY))
+        );
+        assert_eq!(
+            vfs.rmdir(&mut host, root, b"bin/sh", NOW),
+            Err(Errno(ENOENT))
+        );
         assert_eq!(vfs.unlink(&mut host, root, b"etc", NOW), Err(Errno(EISDIR)));
     }
 
@@ -1182,14 +1255,18 @@ mod tests {
         vfs.rename(&mut host, etc, b"passwd", tmp, b"pw", false, NOW)
             .unwrap();
         assert_eq!(resolve(&mut vfs, &mut host, "/tmp/pw"), Ok(passwd));
-        assert_eq!(resolve(&mut vfs, &mut host, "/etc/passwd"), Err(Errno(ENOENT)));
+        assert_eq!(
+            resolve(&mut vfs, &mut host, "/etc/passwd"),
+            Err(Errno(ENOENT))
+        );
         assert_eq!(vfs.read_all(&mut host, passwd).unwrap(), b"root:x:0:0\n");
         // Renaming an image directory keeps its contents.
         vfs.rename(&mut host, root, b"usr", tmp, b"u", false, NOW)
             .unwrap();
         let libc = resolve(&mut vfs, &mut host, "/tmp/u/lib/libc.so").unwrap();
         assert_eq!(vfs.read_all(&mut host, libc).unwrap(), b"libc");
-        assert_eq!(vfs.dir_path(resolve(&mut vfs, &mut host, "/tmp/u/lib").unwrap()), Some(b"/tmp/u/lib".to_vec()));
+        let u_lib = resolve(&mut vfs, &mut host, "/tmp/u/lib").unwrap();
+        assert_eq!(vfs.dir_path(u_lib), Some(b"/tmp/u/lib".to_vec()));
         // Into its own subtree.
         let u = resolve(&mut vfs, &mut host, "/tmp/u").unwrap();
         assert_eq!(
@@ -1221,7 +1298,10 @@ mod tests {
         vfs.write(&mut host, passwd, 0, b"R", NOW).unwrap();
         let again = resolve(&mut vfs, &mut host, "/tmp/again").unwrap();
         assert_eq!(vfs.read_all(&mut host, again).unwrap()[0], b'R');
-        assert_eq!(vfs.link(&mut host, tmp, root, b"t2", NOW), Err(Errno(EPERM)));
+        assert_eq!(
+            vfs.link(&mut host, tmp, root, b"t2", NOW),
+            Err(Errno(EPERM))
+        );
     }
 
     #[test]
@@ -1260,7 +1340,8 @@ mod tests {
         let p = vfs.resolve_parent(&mut host, p.dir, b"x").unwrap();
         assert_eq!((p.dir, p.name), (root, b"x".to_vec()));
         assert_eq!(
-            vfs.resolve_parent(&mut host, root, b"/dev/null/x").map(|p| p.dir),
+            vfs.resolve_parent(&mut host, root, b"/dev/null/x")
+                .map(|p| p.dir),
             Err(Errno(ENOTDIR))
         );
         assert_eq!(vfs.dir_path(root), Some(b"/".to_vec()));

@@ -99,7 +99,9 @@ impl ImageDir {
     }
 
     pub fn read_link(&mut self, path: &ImagePath) -> io::Result<Vec<u8>> {
-        Ok(fs::read_link(self.host_path(path)?)?.into_os_string().into_vec())
+        Ok(fs::read_link(self.host_path(path)?)?
+            .into_os_string()
+            .into_vec())
     }
 
     pub fn read_dir(&mut self, path: &ImagePath) -> io::Result<Vec<Vec<u8>>> {
@@ -175,7 +177,10 @@ mod tests {
         assert_eq!(image.read_link(&p("abs")).unwrap(), b"/etc");
         let mut names = image.read_dir(&p("")).unwrap();
         names.sort();
-        assert_eq!(names, vec![b"abs".to_vec(), b"etc".to_vec(), b"out".to_vec()]);
+        assert_eq!(
+            names,
+            vec![b"abs".to_vec(), b"etc".to_vec(), b"out".to_vec()]
+        );
 
         // Host symlinks are never followed, not even by a stray request.
         assert!(image.read(&p("out/secret"), 0, &mut buf).is_err());

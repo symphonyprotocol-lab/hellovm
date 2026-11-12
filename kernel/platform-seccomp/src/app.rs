@@ -70,6 +70,7 @@ impl SeccompApp {
         let page_size = sys::page_size();
         let number = |sysno: Sysno| arch.syscall_nr(sysno).expect("generic syscall");
         let max_addr = spawned.top & !(page_size - 1);
+        let stub_range = stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED;
         let mut app = SeccompApp {
             tracee: spawned.tracee,
             arch,
@@ -81,7 +82,7 @@ impl SeccompApp {
                 page_size,
                 min_addr: MIN_ADDR.max(page_size),
                 max_addr,
-                reserved: vec![stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED],
+                reserved: vec![stub_range],
             },
             hwcap: host_cpu_info(),
             thread_pointer: None,
@@ -91,7 +92,11 @@ impl SeccompApp {
             _not_send: PhantomData,
         };
         for &(start, len) in &spawned.foreign {
-            let ret = app.inject(app.nr_munmap, [start, len, 0, 0, 0, 0])?;
+            let ret = app
+                .inject(app.nr_munmap, [start, len, 0, 0, 0, 0])
+                .map_err(|err| {
+                    io::Error::other(format!("clearing the app address space: {err}"))
+                })?;
             if ret != 0 {
                 return Err(io::Error::other(format!(
                     "clearing the app address space: munmap({start:#x}, {len:#x}) = {ret}"
@@ -124,7 +129,7 @@ impl SeccompApp {
 
     /// Moves from a seccomp stop to a syscall-exit stop by skipping the app
     /// syscall, so that syscalls can be injected.
-    fn to_exit_stop(&mut self) -> Result<(), PlatformError> {
+    fn enter_exit_stop(&mut self) -> Result<(), PlatformError> {
         match self.state {
             State::AtExit { .. } => Ok(()),
             State::AtEntry { regs } => {
@@ -172,9 +177,9 @@ impl SeccompApp {
     /// returns the raw result. The app's own registers are restored when it
     /// resumes.
     fn inject(&mut self, nr: u64, args: [u64; 6]) -> Result<i64, PlatformError> {
-        self.to_exit_stop()?;
+        self.enter_exit_stop()?;
         let State::AtExit { saved } = self.state else {
-            unreachable!("to_exit_stop leaves the app at an exit stop");
+            unreachable!("enter_exit_stop leaves the app at an exit stop");
         };
         let mut regs = saved;
         regs.prepare_syscall(stub::STUB_SYSCALL, nr, args);
@@ -211,8 +216,8 @@ impl SeccompApp {
             len: len as usize,
         };
         let end = addr.checked_add(len).ok_or_else(bad)?;
-        if addr % page != 0
-            || len % page != 0
+        if !addr.is_multiple_of(page)
+            || !len.is_multiple_of(page)
             || len == 0
             || addr < self.info.min_addr
             || end > self.info.max_addr
@@ -227,13 +232,21 @@ impl SeccompApp {
         Ok(())
     }
 
-    fn checked_inject(&mut self, what: &str, nr: u64, args: [u64; 6]) -> Result<i64, PlatformError> {
+    fn checked_inject(
+        &mut self,
+        what: &str,
+        nr: u64,
+        args: [u64; 6],
+    ) -> Result<i64, PlatformError> {
         let ret = self.inject(nr, args)?;
         if (-4095..0).contains(&ret) {
             // A host errno: for the kernel process's log only.
             return Err(PlatformError::Host(io::Error::new(
                 io::Error::from_raw_os_error((-ret) as i32).kind(),
-                format!("{what} in the app process failed: {}", io::Error::from_raw_os_error((-ret) as i32)),
+                format!(
+                    "{what} in the app process failed: {}",
+                    io::Error::from_raw_os_error((-ret) as i32)
+                ),
             )));
         }
         Ok(ret)
@@ -438,9 +451,15 @@ mod tests {
     fn starts_with_only_the_stub() {
         let app = SeccompApp::new().unwrap();
         let maps = maps(&app);
-        let lines: Vec<_> = maps.lines().filter(|l| !l.ends_with("[vsyscall]")).collect();
+        let lines: Vec<_> = maps
+            .lines()
+            .filter(|l| !l.ends_with("[vsyscall]"))
+            .collect();
         assert_eq!(lines.len(), 1, "{maps}");
-        assert!(lines[0].starts_with(&format!("{:x}-", stub::STUB_BASE)), "{maps}");
+        assert!(
+            lines[0].starts_with(&format!("{:x}-", stub::STUB_BASE)),
+            "{maps}"
+        );
         let info = app.address_space();
         assert!(info.max_addr > stub::STUB_BASE + stub::STUB_RESERVED);
     }
@@ -460,7 +479,10 @@ mod tests {
         app.unmap(addr + page, page).unwrap();
         assert!(app.read(addr + page, &mut buf).is_err());
         let maps = maps(&app);
-        assert!(maps.contains(&format!("{:x}-{:x} r--p", addr, addr + page)), "{maps}");
+        assert!(
+            maps.contains(&format!("{:x}-{:x} r--p", addr, addr + page)),
+            "{maps}"
+        );
         assert!(
             maps.contains(&format!("{:x}-{:x} rw-p", addr + 2 * page, addr + 4 * page)),
             "{maps}"

@@ -65,7 +65,14 @@ pub fn elf(arch: Arch) -> Vec<u8> {
     out.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
     out.extend_from_slice(&2u16.to_le_bytes()); // e_phnum
     out.extend_from_slice(&[0; 6]); // e_shentsize, e_shnum, e_shstrndx
-    phdr(&mut out, PT_LOAD, PF_R | PF_X, STUB_BASE, file_len, STUB_RESERVED);
+    phdr(
+        &mut out,
+        PT_LOAD,
+        PF_R | PF_X,
+        STUB_BASE,
+        file_len,
+        STUB_RESERVED,
+    );
     // A non-executable stack, so that the host never applies
     // READ_IMPLIES_EXEC to the process.
     phdr(&mut out, PT_GNU_STACK, PF_R | PF_W, 0, 0, 16);

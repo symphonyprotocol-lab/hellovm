@@ -50,7 +50,11 @@ fn main() {
         let src = manifest_dir.join("asm").join(format!("{guest}.S"));
         let out = out_dir.join(guest);
         build(&cc, guest, &src, &out, &["-nostdlib", "-static", "-no-pie"]);
-        println!("cargo:rustc-env=CANSOL_GUEST_{}={}", guest.to_uppercase(), out.display());
+        println!(
+            "cargo:rustc-env=CANSOL_GUEST_{}={}",
+            guest.to_uppercase(),
+            out.display()
+        );
     }
     for guest in C_GUESTS {
         let var = format!("CANSOL_GUEST_{}", guest.to_uppercase());

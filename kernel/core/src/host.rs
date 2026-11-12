@@ -41,7 +41,11 @@ impl ImagePath {
 
     /// Whether `name` may be a component of an image path.
     pub fn valid_name(name: &[u8]) -> bool {
-        !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+        !name.is_empty()
+            && name != b"."
+            && name != b".."
+            && !name.contains(&b'/')
+            && !name.contains(&0)
     }
 
     /// This path with `name` appended, if `name` is a valid component.
@@ -136,7 +140,12 @@ pub trait Host {
     }
 
     /// Reads from an image file at `offset`; 0 is end of file.
-    fn image_read(&mut self, _path: &ImagePath, _offset: u64, _buf: &mut [u8]) -> io::Result<usize> {
+    fn image_read(
+        &mut self,
+        _path: &ImagePath,
+        _offset: u64,
+        _buf: &mut [u8],
+    ) -> io::Result<usize> {
         Err(no_image())
     }
 
@@ -199,7 +208,10 @@ mod tests {
         assert!(root.is_root());
         let p = root.join(b"etc").unwrap().join(b"passwd").unwrap();
         assert_eq!(p.as_bytes(), b"etc/passwd");
-        assert_eq!(p.components().collect::<Vec<_>>(), vec![&b"etc"[..], b"passwd"]);
+        assert_eq!(
+            p.components().collect::<Vec<_>>(),
+            vec![&b"etc"[..], b"passwd"]
+        );
         for bad in [&b""[..], b".", b"..", b"a/b", b"a\0"] {
             assert!(root.join(bad).is_none(), "{bad:?}");
         }

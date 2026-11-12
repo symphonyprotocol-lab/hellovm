@@ -254,9 +254,7 @@ impl Mm {
         if !self.in_bounds(addr, end) || self.vmas.touches_reserved(addr, end) {
             return Err(Errno(ENOMEM));
         }
-        space
-            .map(addr, len, prot)
-            .map_err(platform_failed("map"))?;
+        space.map(addr, len, prot).map_err(platform_failed("map"))?;
         self.vmas.insert(Vma {
             start: addr,
             end,
@@ -275,7 +273,7 @@ impl Mm {
 
     /// A free range of `len` bytes for a mapping without a fixed address.
     fn pick_address(&self, hint: GuestAddr, len: u64) -> SysResult<GuestAddr> {
-        if hint != 0 && hint % self.page_size == 0 {
+        if hint != 0 && hint.is_multiple_of(self.page_size) {
             if let Some(end) = hint.checked_add(len) {
                 if self.in_bounds(hint, end) && self.vmas.is_free(hint, end) {
                     return Ok(hint);
@@ -314,10 +312,8 @@ impl Mm {
             {
                 return self.brk;
             }
-        } else if new_end < old_end {
-            if self.unmap_range(space, new_end, old_end).is_err() {
-                return self.brk;
-            }
+        } else if new_end < old_end && self.unmap_range(space, new_end, old_end).is_err() {
+            return self.brk;
         }
         self.brk = new;
         self.brk
@@ -338,14 +334,17 @@ impl Mm {
         if len == 0 || prot & !(Prot::ALL.0 as u64) != 0 {
             return Err(Errno(EINVAL));
         }
-        if !matches!(flags & MAP_TYPE, MAP_SHARED | MAP_PRIVATE | MAP_SHARED_VALIDATE) {
+        if !matches!(
+            flags & MAP_TYPE,
+            MAP_SHARED | MAP_PRIVATE | MAP_SHARED_VALIDATE
+        ) {
             return Err(Errno(EINVAL));
         }
         let prot = Prot(prot as u32);
         let len = self.page_up(len).ok_or(Errno(ENOMEM))?;
         let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
         let addr = if fixed {
-            if addr % self.page_size != 0 {
+            if !addr.is_multiple_of(self.page_size) {
                 return Err(Errno(EINVAL));
             }
             let end = addr.checked_add(len).ok_or(Errno(ENOMEM))?;
@@ -394,9 +393,7 @@ impl Mm {
                 continue;
             }
             let (s, e) = (vma.start.max(start), vma.end.min(end));
-            space
-                .unmap(s, e - s)
-                .map_err(platform_failed("unmap"))?;
+            space.unmap(s, e - s).map_err(platform_failed("unmap"))?;
             self.vmas.remove(s, e);
         }
         Ok(())
@@ -409,7 +406,7 @@ impl Mm {
         addr: GuestAddr,
         len: u64,
     ) -> SysResult<()> {
-        if addr % self.page_size != 0 || len == 0 {
+        if !addr.is_multiple_of(self.page_size) || len == 0 {
             return Err(Errno(EINVAL));
         }
         let len = self.page_up(len).ok_or(Errno(EINVAL))?;
@@ -425,7 +422,7 @@ impl Mm {
         len: u64,
         prot: u64,
     ) -> SysResult<()> {
-        if addr % self.page_size != 0 || prot & !(Prot::ALL.0 as u64 | PROT_GROWS) != 0 {
+        if !addr.is_multiple_of(self.page_size) || prot & !(Prot::ALL.0 as u64 | PROT_GROWS) != 0 {
             return Err(Errno(EINVAL));
         }
         let prot = Prot((prot & Prot::ALL.0 as u64) as u32);
@@ -454,7 +451,7 @@ impl Mm {
         flags: u64,
         new_addr: GuestAddr,
     ) -> SysResult<GuestAddr> {
-        if old % self.page_size != 0
+        if !old.is_multiple_of(self.page_size)
             || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0
             || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0)
         {
@@ -489,7 +486,7 @@ impl Mm {
         // Move: new mapping, copy, drop the old one.
         let target = if fixed {
             let end = new_addr.checked_add(new_len).ok_or(Errno(EINVAL))?;
-            if new_addr % self.page_size != 0 || (new_addr < old_end && end > old) {
+            if !new_addr.is_multiple_of(self.page_size) || (new_addr < old_end && end > old) {
                 return Err(Errno(EINVAL));
             }
             if !self.in_bounds(new_addr, end) || self.vmas.touches_reserved(new_addr, end) {
@@ -612,7 +609,13 @@ mod tests {
         );
         mm.munmap(&mut app, a + 0x1000, 0x1000).unwrap();
         assert!(app.read(a + 0x1000, &mut [0]).is_err());
-        assert_eq!(mm.vmas().iter().filter(|v| v.kind == VmaKind::Anonymous).count(), 2);
+        assert_eq!(
+            mm.vmas()
+                .iter()
+                .filter(|v| v.kind == VmaKind::Anonymous)
+                .count(),
+            2
+        );
         // Unmapping holes is fine.
         mm.munmap(&mut app, a, 0x10_0000).unwrap();
         assert_eq!(mm.munmap(&mut app, a + 1, 0x1000), Err(Errno(EINVAL)));
@@ -651,8 +654,18 @@ mod tests {
             Err(Errno(ENOMEM))
         );
         // munmap silently skips the reserved range; mprotect refuses it.
-        mm.munmap(&mut app, reserved - 0x1000, 0x3000).unwrap();
-        assert!(app.is_mapped(reserved));
+        // (The mock panics if the core touches the reserved range.)
+        mm.mmap(
+            &mut app,
+            reserved - 0x1000,
+            0x1000,
+            3,
+            flags | MAP_FIXED,
+            None,
+        )
+        .unwrap();
+        mm.munmap(&mut app, reserved - 0x1000, 0x3_0000).unwrap();
+        assert!(!app.is_mapped(reserved - 0x1000));
         assert_eq!(
             mm.mprotect(&mut app, reserved, 0x1000, 3),
             Err(Errno(ENOMEM))
