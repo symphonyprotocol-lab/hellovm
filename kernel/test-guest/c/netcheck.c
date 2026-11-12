@@ -382,8 +382,10 @@ int main(int argc, char **argv) {
         }
         char block[4096];
         memset(block, 0x5a, sizeof block);
+        /* 8 MiB is larger than the host TCP send buffer (tcp_wmem, up to 4 MiB),
+         * so a close cannot hide the tail inside the socket buffer. */
         size_t left = (strcmp(cmd, "slowbulk") == 0 || strcmp(cmd, "slowbulk-exit") == 0)
-                          ? (size_t)1 << 20
+                          ? (size_t)8 << 20
                           : 200000;
         while (left > 0) {
             size_t n = left < sizeof block ? left : sizeof block;

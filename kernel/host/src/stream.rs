@@ -490,8 +490,10 @@ mod tests {
 
     use super::{SpliceTable, LIVE_HELPERS};
 
+    /// Peer reset, not a peer that stays open without reading. The 45s
+    /// no-progress bound for that case is not exercised here.
     #[test]
-    fn close_ends_helpers_when_the_peer_never_reads() {
+    fn close_ends_helpers_when_the_peer_resets() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (release, wait) = mpsc::channel();
@@ -540,8 +542,9 @@ mod tests {
         assert!(saw_block, "the splice buffer should fill");
         let started = Instant::now();
         table.close(id);
-        // The peer never reads. Dropping it is a reset, so the helper must
-        // stop without waiting out the no-progress limit.
+        // Dropping the accepted socket without reading is a reset. The
+        // helper must stop on that error. A peer that never reads and never
+        // closes is bounded by `NO_PROGRESS` (45s); this test does not cover it.
         let _ = release.send(());
         while LIVE_HELPERS.load(std::sync::atomic::Ordering::Relaxed) > baseline {
             assert!(
