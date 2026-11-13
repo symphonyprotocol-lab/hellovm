@@ -1892,34 +1892,461 @@ mod tests {
         assert_eq!(got[3], -ECONNREFUSED, "the next call retries {got:?}");
     }
 
+    /// A TCP DNS client that writes queries and never reads the replies is
+    /// pushed back (`EAGAIN`, no `POLLOUT`) instead of growing kernel
+    /// memory. Reading replies lets it write again.
     #[test]
-    fn dns_tcp_poll_stops_when_the_buffer_is_full() {
+    fn dns_tcp_applies_backpressure_when_replies_are_unread() {
         let arch = Arch::X86_64;
         let dns = sin([192, 0, 2, 1], 53);
         let poll_at = SCRATCH + 0x40;
-        let traps = vec![
-            sc(arch, Sysno::Socket, &[2, 1, 0]),
+        let data = SCRATCH + 0x1000;
+        let chunk = 16 * 1024u64;
+        let sends = 12;
+        let mut traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1 | 0o4000, 0]),
             sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
-            sc(
-                arch,
-                Sysno::Sendto,
-                &[3, SCRATCH + 0x80, 16 * 1024, 0, 0, 0],
-            ),
-            sc(arch, Sysno::Poll, &[poll_at, 1, 0]),
-            sc(arch, Sysno::ExitGroup, &[0]),
         ];
-        let mut payload = vec![0xffu8; 16 * 1024];
-        payload[0] = 0xff;
-        payload[1] = 0xff;
-        let owned = [(SCRATCH, dns.to_vec()), (SCRATCH + 0x80, payload)];
+        for _ in 0..sends {
+            traps.push(sc(arch, Sysno::Sendto, &[3, data, chunk, 0, 0, 0]));
+        }
+        traps.push(sc(arch, Sysno::Poll, &[poll_at, 1, 0]));
+        traps.push(sc(
+            arch,
+            Sysno::Recvfrom,
+            &[3, SCRATCH + 0x8000, chunk, 0, 0, 0],
+        ));
+        traps.push(sc(arch, Sysno::Sendto, &[3, data, chunk, 0, 0, 0]));
+        traps.push(sc(arch, Sysno::ExitGroup, &[0]));
+        // Back-to-back 14-byte frames: a 2-byte length and a 12-byte header.
+        let frame = [0, 12, 0x12, 0x34, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let payload: Vec<u8> = frame.iter().copied().cycle().take(chunk as usize).collect();
+        let owned = [
+            (SCRATCH, dns.to_vec()),
+            (data, payload),
+            (SCRATCH + 0x8000, vec![0; chunk as usize]),
+        ];
         let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
         let (mut kernel, mut plat) = setup(arch, traps, &refs);
         plat.mem(INIT).poke(poll_at, &poll_memory(3, 4));
         assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
         let got = returns(&plat, INIT);
-        assert_eq!(got[2], 16 * 1024, "dns send {got:?}");
-        assert_eq!(got[3], 0, "poll {got:?}");
-        assert_eq!(revents_of(&plat.mem(INIT).peek(poll_at, 8)) & 4, 0);
+        let sent = &got[2..2 + sends];
+        let accepted: i64 = sent.iter().filter(|&&n| n > 0).sum();
+        assert_eq!(
+            sent[sends - 1],
+            -EAGAIN,
+            "a reader that never reads is pushed back {got:?}"
+        );
+        // Unanswered requests plus unread replies stay within two caps.
+        let bound = (crate::net::DNS_IN_CAP + 2 * crate::net::STREAM_CAP) as i64;
+        assert!(accepted <= bound, "accepted {accepted} bytes {got:?}");
+        assert_eq!(got[2 + sends], 0, "poll: nothing ready {got:?}");
+        assert_eq!(
+            revents_of(&plat.mem(INIT).peek(poll_at, 8)) & 4,
+            0,
+            "no POLLOUT"
+        );
+        assert_eq!(got[3 + sends], chunk as i64, "replies are readable {got:?}");
+        assert!(got[4 + sends] > 0, "reading made room {got:?}");
+    }
+
+    /// A length prefix above the old 16 KiB request buffer still completes.
+    #[test]
+    fn dns_tcp_accepts_the_largest_frame() {
+        let arch = Arch::X86_64;
+        let dns = sin([192, 0, 2, 1], 53);
+        let data = SCRATCH + 0x1000;
+        let len = 2 + 65535u64;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Sendto, &[3, data, len, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x40, 2, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut payload = vec![0u8; len as usize];
+        payload[0] = 0xff;
+        payload[1] = 0xff;
+        payload[2..6].copy_from_slice(&[0x12, 0x34, 1, 0]);
+        let owned = [(SCRATCH, dns.to_vec()), (data, payload)];
+        let refs: Vec<(u64, &[u8])> = owned.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &refs);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[2], len as i64, "send {got:?}");
+        assert_eq!(got[3], 2, "reply length prefix {got:?}");
+        // The reply echoes the header and the (empty-name) question: 17 bytes.
+        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x40, 2), [0, 17]);
+    }
+
+    /// Loopback listener on `port`, a connected client on fd 4 and the
+    /// accepted socket on fd 5, with the listener on fd 3.
+    fn tcp_pair_traps(arch: Arch) -> Vec<Trap> {
+        vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 4]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Accept, &[3, 0, 0]),
+        ]
+    }
+
+    /// A blocking `write` larger than the peer's buffer parks and resumes
+    /// where it stopped: every byte arrives once, in order.
+    #[test]
+    fn blocking_socket_write_larger_than_the_buffer_is_sent_once() {
+        let arch = Arch::Aarch64;
+        let data = SCRATCH + 0x1_0000;
+        let len = 100_000u64;
+        let r = SCRATCH + 0x4_0000;
+        let mut parent = tcp_pair_traps(arch);
+        parent.extend([
+            sc(arch, Sysno::Clone, &[SIGCHLD as u64, 0, 0, 0, 0]),
+            sc(arch, Sysno::Close, &[5]),
+            sc(arch, Sysno::Write, &[4, data, len]),
+            sc(arch, Sysno::Close, &[4]),
+            sc(arch, Sysno::Wait4, &[u64::MAX, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ]);
+        let child = vec![
+            sc(arch, Sysno::Close, &[4]),
+            sc(arch, Sysno::Read, &[5, r, 65536]),
+            sc(arch, Sysno::Read, &[5, r + 0x1_0000, 65536]),
+            sc(arch, Sysno::Read, &[5, r + 0x2_0000, 65536]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let pattern: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let listen = sin([127, 0, 0, 1], 19200);
+        let reads = vec![0u8; 0x3_0000];
+        let (mut kernel, mut plat) = setup_scripts(
+            arch,
+            vec![parent, child],
+            &[
+                (SCRATCH, &listen[..]),
+                (data, &pattern[..]),
+                (r, &reads[..]),
+            ],
+        );
+        let status = kernel.run(&mut plat).unwrap();
+        let got = returns(&plat, INIT);
+        let child = plat.task(2).returns.clone();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(0),
+            "parent {got:?} child {child:?}"
+        );
+        assert_eq!(got[8], len as i64, "write {got:?}");
+        assert_eq!(
+            child[1..],
+            [65536, (len - 65536) as i64, 0],
+            "reads {child:?}"
+        );
+        let second = plat.mem(2).peek(r + 0x1_0000, 4);
+        assert_eq!(
+            second,
+            pattern[65536..65540],
+            "the second read continues, not byte 0"
+        );
+    }
+
+    /// A client that sends and closes before the server calls `accept`:
+    /// `accept` still returns the connection, with its data and then EOF.
+    #[test]
+    fn data_sent_before_accept_survives_the_client_close() {
+        let arch = Arch::X86_64;
+        let buf = SCRATCH + 0x200;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 4]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Sendto, &[4, SCRATCH + 0x100, 5, 0, 0, 0]),
+            sc(arch, Sysno::Close, &[4]),
+            sc(arch, Sysno::Accept, &[3, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[4, buf, 16, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[4, buf + 16, 16, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let listen = sin([127, 0, 0, 1], 19201);
+        let (mut kernel, mut plat) = setup(
+            arch,
+            traps,
+            &[(SCRATCH, &listen[..]), (SCRATCH + 0x100, &b"hello"[..])],
+        );
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[7], 4, "accept {got:?}");
+        assert_eq!(got[8], 5, "data sent before the close {got:?}");
+        assert_eq!(plat.mem(INIT).peek(buf, 5), b"hello");
+        assert_eq!(got[9], 0, "then EOF {got:?}");
+    }
+
+    /// `accept` with a bad address buffer fails without consuming the
+    /// connection; the next `accept` gets it.
+    #[test]
+    fn accept_efault_leaves_the_connection_queued() {
+        let arch = Arch::X86_64;
+        let unmapped = 0x2_0000u64;
+        let alen = SCRATCH + 0x40;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 4]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::Accept, &[3, unmapped, alen]),
+            sc(arch, Sysno::Accept, &[3, 0, 0]),
+            sc(arch, Sysno::Sendto, &[4, SCRATCH + 0x100, 2, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, SCRATCH + 0x200, 8, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let listen = sin([127, 0, 0, 1], 19202);
+        let (mut kernel, mut plat) = setup(
+            arch,
+            traps,
+            &[
+                (SCRATCH, &listen[..]),
+                (alen, &16u32.to_le_bytes()[..]),
+                (SCRATCH + 0x100, &b"ok"[..]),
+            ],
+        );
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[5], -EFAULT, "bad address {got:?}");
+        assert_eq!(got[6], 5, "still queued {got:?}");
+        assert_eq!(got[8], 2, "the connection works {got:?}");
+    }
+
+    /// UDP as on Linux: `sendto` never narrows a wildcard bind, a full
+    /// queue drops instead of blocking, a socket may send to itself, and a
+    /// connected socket may reconnect, send to an explicit address, or
+    /// dissolve with `AF_UNSPEC`.
+    #[test]
+    fn udp_sendto_connect_and_full_queues_follow_linux() {
+        let arch = Arch::X86_64;
+        let wild = SCRATCH; // 0.0.0.0:19100
+        let lo = SCRATCH + 0x20; // 127.0.0.1:19100
+        let nic = SCRATCH + 0x40; // 192.0.2.2:19100
+        let me = SCRATCH + 0x60; // 127.0.0.1:19101
+        let unspec = SCRATCH + 0x80;
+        let from = SCRATCH + 0xa0;
+        let fromlen = SCRATCH + 0xc0;
+        let name = SCRATCH + 0xe0;
+        let namelen = SCRATCH + 0x100;
+        let msg = SCRATCH + 0x120;
+        let buf = SCRATCH + 0x200;
+        let dontwait = 0x40u64;
+        let mut traps = vec![
+            sc(arch, Sysno::Socket, &[2, 2, 0]),              // 0: fd 3
+            sc(arch, Sysno::Bind, &[3, wild, 16]),            // 1
+            sc(arch, Sysno::Socket, &[2, 2, 0]),              // 2: fd 4
+            sc(arch, Sysno::Sendto, &[4, msg, 1, 0, lo, 16]), // 3
+            sc(arch, Sysno::Recvfrom, &[3, buf, 8, 0, from, fromlen]), // 4
+            sc(arch, Sysno::Sendto, &[3, msg, 1, 0, from, 16]), // 5: reply
+            sc(arch, Sysno::Getsockname, &[3, name, namelen]), // 6
+            sc(arch, Sysno::Sendto, &[4, msg, 1, 0, nic, 16]), // 7
+            sc(arch, Sysno::Recvfrom, &[3, buf, 8, dontwait, 0, 0]), // 8
+            sc(arch, Sysno::Recvfrom, &[4, buf, 8, dontwait, 0, 0]), // 9
+            sc(arch, Sysno::Connect, &[4, lo, 16]),           // 10
+            sc(arch, Sysno::Connect, &[4, lo, 16]),           // 11
+            sc(arch, Sysno::Sendto, &[4, msg, 1, 0, lo, 16]), // 12
+            sc(arch, Sysno::Connect, &[4, unspec, 16]),       // 13
+            sc(arch, Sysno::Sendto, &[4, msg, 1, 0, 0, 0]),   // 14: no peer now
+            sc(arch, Sysno::Socket, &[2, 2, 0]),              // 15: fd 5
+            sc(arch, Sysno::Bind, &[5, me, 16]),              // 16
+            sc(arch, Sysno::Sendto, &[5, msg, 1, 0, me, 16]), // 17: to itself
+            sc(arch, Sysno::Recvfrom, &[5, buf, 8, dontwait, 0, 0]), // 18
+            sc(arch, Sysno::Socket, &[2, 2, 0]),              // 19: fd 6, blocking
+        ];
+        let floods = 70;
+        for _ in 0..floods {
+            traps.push(sc(arch, Sysno::Sendto, &[6, msg, 1, 0, me, 16]));
+        }
+        traps.push(sc(arch, Sysno::ExitGroup, &[0]));
+        let (mut kernel, mut plat) = setup(
+            arch,
+            traps,
+            &[
+                (wild, &sin([0, 0, 0, 0], 19100)[..]),
+                (lo, &sin([127, 0, 0, 1], 19100)[..]),
+                (nic, &sin([192, 0, 2, 2], 19100)[..]),
+                (me, &sin([127, 0, 0, 1], 19101)[..]),
+                (unspec, &[0u8; 16][..]),
+                (fromlen, &16u32.to_le_bytes()[..]),
+                (namelen, &16u32.to_le_bytes()[..]),
+                (msg, &b"x"[..]),
+            ],
+        );
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[4], 1, "recv {got:?}");
+        assert_eq!(got[5], 1, "reply {got:?}");
+        assert_eq!(got[6], 0, "getsockname {got:?}");
+        assert_eq!(
+            plat.mem(INIT).peek(name + 4, 4),
+            [0, 0, 0, 0],
+            "still a wildcard bind"
+        );
+        assert_eq!(
+            got[8], 1,
+            "the NIC address still reaches the wildcard socket {got:?}"
+        );
+        assert_eq!(got[9], 1, "the reply arrived {got:?}");
+        assert_eq!(got[11], 0, "UDP reconnect {got:?}");
+        assert_eq!(got[12], 1, "explicit address on a connected socket {got:?}");
+        assert_eq!(got[13], 0, "AF_UNSPEC dissolves {got:?}");
+        assert_eq!(
+            got[14],
+            -crate::errno::EDESTADDRREQ,
+            "no peer after AF_UNSPEC {got:?}"
+        );
+        assert_eq!(got[17], 1, "send to itself {got:?}");
+        assert_eq!(got[18], 1, "delivered to itself {got:?}");
+        assert!(
+            got[20..20 + floods].iter().all(|&n| n == 1),
+            "full queue drops {got:?}"
+        );
+    }
+
+    /// Bytes waiting on a spliced stream are visible to `poll` and
+    /// `FIONREAD` before any `recv`, and a zero-length `recv` is not EOF.
+    #[test]
+    fn spliced_socket_is_readable_before_recv() {
+        let arch = Arch::X86_64;
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        host.splice_echo = true;
+        let pfd = SCRATCH + 0x100;
+        let count = SCRATCH + 0x120;
+        let buf = SCRATCH + 0x180;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Sendto, &[3, SCRATCH + 0x40, 4, 0, 0, 0]),
+            sc(arch, Sysno::Poll, &[pfd, 1, 0]),
+            sc(arch, Sysno::Ioctl, &[3, 0x541B, count]),
+            sc(arch, Sysno::Recvfrom, &[3, buf, 0, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[3, buf, 8, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x200]);
+        let ip = kernel.issue_fake_ip().unwrap();
+        plat.mem(INIT).poke(SCRATCH, &sin(ip, 443));
+        plat.mem(INIT).poke(SCRATCH + 0x40, b"ping");
+        plat.mem(INIT).poke(pfd, &poll_memory(3, 1));
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[3], 1, "poll {got:?}");
+        assert_eq!(revents_of(&plat.mem(INIT).peek(pfd, 8)) & 1, 1, "POLLIN");
+        assert_eq!(got[4], 0, "FIONREAD {got:?}");
+        assert_eq!(plat.mem(INIT).peek(count, 4), 4u32.to_le_bytes());
+        assert_eq!(got[5], 0, "zero-length recv {got:?}");
+        assert_eq!(got[6], 4, "the data is still there {got:?}");
+        assert_eq!(plat.mem(INIT).peek(buf, 4), b"ping");
+    }
+
+    /// `recvmsg` rejects iovec lengths whose sum overflows, and reports an
+    /// unwritable buffer as `EFAULT` without consuming the data.
+    #[test]
+    fn recvmsg_rejects_overflowing_iovecs_and_faults() {
+        let arch = Arch::X86_64;
+        let msg = SCRATCH + 0x200;
+        let msg2 = SCRATCH + 0x240;
+        let iov = SCRATCH + 0x280;
+        let iov2 = SCRATCH + 0x2c0;
+        let mut hdr = [0u8; 56];
+        hdr[16..24].copy_from_slice(&iov.to_le_bytes());
+        hdr[24..32].copy_from_slice(&2u64.to_le_bytes());
+        let mut hdr2 = [0u8; 56];
+        hdr2[16..24].copy_from_slice(&iov2.to_le_bytes());
+        hdr2[24..32].copy_from_slice(&1u64.to_le_bytes());
+        let mut vecs = [0u8; 32];
+        for i in 0..2 {
+            vecs[i * 16..i * 16 + 8].copy_from_slice(&(SCRATCH + 0x300).to_le_bytes());
+            vecs[i * 16 + 8..i * 16 + 16].copy_from_slice(&(1u64 << 63).to_le_bytes());
+        }
+        let mut bad = [0u8; 16];
+        bad[..8].copy_from_slice(&0x2_0000u64.to_le_bytes());
+        bad[8..].copy_from_slice(&8u64.to_le_bytes());
+        let mut traps = tcp_pair_traps(arch);
+        traps.extend([
+            sc(arch, Sysno::Sendto, &[4, SCRATCH + 0x100, 2, 0, 0, 0]),
+            sc(arch, Sysno::Recvmsg, &[5, msg, 0]),
+            sc(arch, Sysno::Recvmsg, &[5, msg2, 0]),
+            sc(arch, Sysno::Recvfrom, &[5, SCRATCH + 0x300, 8, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ]);
+        let listen = sin([127, 0, 0, 1], 19203);
+        let (mut kernel, mut plat) = setup(
+            arch,
+            traps,
+            &[
+                (SCRATCH, &listen[..]),
+                (SCRATCH + 0x100, &b"xy"[..]),
+                (msg, &hdr[..]),
+                (msg2, &hdr2[..]),
+                (iov, &vecs[..]),
+                (iov2, &bad[..]),
+            ],
+        );
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[7], -crate::errno::EINVAL, "overflowing iovecs {got:?}");
+        assert_eq!(got[8], -EFAULT, "unwritable buffer {got:?}");
+        assert_eq!(got[9], 2, "nothing was consumed {got:?}");
+        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x300, 2), b"xy");
+    }
+
+    /// `getsockopt` answers `SO_DOMAIN`/`SO_PROTOCOL`, and struct-valued
+    /// options come back at their real size.
+    #[test]
+    fn getsockopt_reports_domain_protocol_and_struct_sizes() {
+        let arch = Arch::X86_64;
+        let val = |i: u64| SCRATCH + 0x100 + i * 0x20;
+        let len = |i: u64| SCRATCH + 0x300 + i * 8;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Getsockopt, &[3, 1, 39, val(0), len(0)]),
+            sc(arch, Sysno::Getsockopt, &[3, 1, 38, val(1), len(1)]),
+            sc(arch, Sysno::Getsockopt, &[3, 1, 20, val(2), len(2)]),
+            sc(arch, Sysno::Getsockopt, &[3, 1, 13, val(3), len(3)]),
+            sc(arch, Sysno::Getsockopt, &[3, 1, 17, val(4), len(4)]),
+            sc(arch, Sysno::Getsockopt, &[3, 1, 39, val(5), len(5)]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let lens: Vec<(u64, u32)> = vec![
+            (len(0), 4),
+            (len(1), 4),
+            (len(2), 16),
+            (len(3), 8),
+            (len(4), 12),
+            (len(5), 2),
+        ];
+        let raw: Vec<(u64, [u8; 4])> = lens.iter().map(|&(a, n)| (a, n.to_le_bytes())).collect();
+        let data: Vec<(u64, &[u8])> = raw.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        let (mut kernel, mut plat) = setup(arch, traps, &data);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert!(got[1..7].iter().all(|&r| r == 0), "{got:?}");
+        let mem = plat.mem(INIT);
+        let word = |m: &mut crate::testutil::MockApp, a: u64| {
+            u32::from_le_bytes(m.peek(a, 4).try_into().unwrap())
+        };
+        assert_eq!(word(mem, val(0)), 2, "SO_DOMAIN is AF_INET");
+        assert_eq!(word(mem, val(1)), 6, "SO_PROTOCOL is IPPROTO_TCP");
+        assert_eq!(word(mem, len(2)), 16, "SO_RCVTIMEO is a timeval");
+        assert_eq!(word(mem, len(3)), 8, "SO_LINGER is a struct linger");
+        assert_eq!(word(mem, len(4)), 12, "SO_PEERCRED is a struct ucred");
+        assert_eq!(word(mem, val(4) + 4), u32::MAX, "inet peer has no uid");
+        assert_eq!(word(mem, len(5)), 2, "optlen is the copied size");
     }
 
     fn action(handler: u64, flags: u64, restorer: u64) -> Vec<u8> {

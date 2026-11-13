@@ -6,15 +6,21 @@
 //!
 //! `setsockopt` / `getsockopt` that are stored: `SO_ERROR`, `SO_REUSEADDR`,
 //! `SO_TYPE`, `SO_KEEPALIVE`, `SO_SNDBUF`, `SO_RCVBUF`, `SO_ACCEPTCONN`,
-//! `TCP_NODELAY`. The following are accepted and ignored so glibc and
+//! `TCP_NODELAY`. `getsockopt` also reports `SO_DOMAIN`, `SO_PROTOCOL` and
+//! `SO_PEERCRED`. The following are accepted and ignored so glibc and
 //! CPython do not fail during socket setup: `SO_LINGER`, `SO_BROADCAST`,
 //! `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_OOBINLINE`, `SO_DONTROUTE`,
 //! `SO_PRIORITY`, `SO_TIMESTAMP`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
 //! `TCP_KEEPCNT`, `TCP_MAXSEG`, `TCP_QUICKACK`, `IP_TTL`, `IP_TOS`,
-//! `IP_PKTINFO`, `IP_RECVERR`, `IP_MTU_DISCOVER`, `IP_RECVTOS`. Any other
-//! option at `SOL_SOCKET`, `IPPROTO_IP` or `IPPROTO_TCP` is a silent
-//! success on `setsockopt` and returns 0 from `getsockopt`. Any other level
-//! is `ENOPROTOOPT`.
+//! `IP_PKTINFO`, `IP_RECVERR`, `IP_MTU_DISCOVER`, `IP_RECVTOS`;
+//! `getsockopt` reads `SO_LINGER` and the timeouts back as zeroed structs of
+//! their real size. Any other option at `SOL_SOCKET`, `IPPROTO_IP` or
+//! `IPPROTO_TCP` is a silent success on `setsockopt` and returns 0 from
+//! `getsockopt`. Any other level is `ENOPROTOOPT`.
+//!
+//! UDP follows Linux: a full receive queue drops the datagram and `sendto`
+//! succeeds, an unconnected `sendto` never changes the bound address, and
+//! a connected socket may `connect` again or dissolve with `AF_UNSPEC`.
 //!
 //! Unnamed `AF_UNIX` `socketpair` (`SOCK_STREAM` and `SOCK_DGRAM`) is
 //! implemented. `socket(AF_UNIX)`, and `bind`/`connect` of a path, are
@@ -32,13 +38,14 @@ use crate::errno::{
 use crate::fd::{Access, FileObject, OpenFile};
 use crate::host::{Host, OutboundFlow};
 use crate::net::{
-    dns_nxdomain, source_ip, Class, Domain, Link, Net, Phase, Proto, SockId, DGRAM_CAP, DGRAM_MAX,
-    DNS_PORT, GATEWAY_IP, STREAM_CAP,
+    dns_nxdomain, source_ip, Class, Domain, Link, Net, Phase, Proto, SockId, DGRAM_BYTES_CAP,
+    DGRAM_CAP, DGRAM_MAX, DNS_IN_CAP, DNS_PORT, GATEWAY_IP, STREAM_CAP,
 };
 use crate::platform::{GuestAddr, Platform};
 use crate::signal::{self, SigInfo};
 use crate::task::Restart;
 
+const AF_UNSPEC: u16 = 0;
 const AF_UNIX: i64 = 1;
 const AF_INET: i64 = 2;
 const AF_INET6: i64 = 10;
@@ -59,7 +66,13 @@ const SO_ERROR: i64 = 4;
 const SO_SNDBUF: i64 = 7;
 const SO_RCVBUF: i64 = 8;
 const SO_KEEPALIVE: i64 = 9;
+const SO_LINGER: i64 = 13;
+const SO_PEERCRED: i64 = 17;
+const SO_RCVTIMEO: i64 = 20;
+const SO_SNDTIMEO: i64 = 21;
 const SO_ACCEPTCONN: i64 = 30;
+const SO_PROTOCOL: i64 = 38;
+const SO_DOMAIN: i64 = 39;
 
 const TCP_NODELAY: i64 = 1;
 
@@ -228,11 +241,24 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             }
             return Err(Errno(EALREADY));
         }
-        if self.st.net.get(id).tcp_connected() || self.st.net.get(id).udp_remote.is_some() {
+        // A connected UDP socket may `connect` again to re-target, or with
+        // `AF_UNSPEC` to dissolve the association (glibc's `getaddrinfo`
+        // address sorting does both). Only TCP is `EISCONN`.
+        if self.st.net.get(id).tcp_connected() {
             return Err(Errno(EISCONN));
         }
         if self.st.net.get(id).listening() {
             return Err(Errno(EINVAL));
+        }
+        if self.st.net.get(id).proto == Proto::Udp && addrlen >= 2 {
+            let family: [u8; 2] = self.read_array(addr)?;
+            if u16::from_le_bytes(family) == AF_UNSPEC {
+                let sock = self.st.net.get_mut(id);
+                sock.udp_remote = None;
+                sock.remote_ip = 0;
+                sock.remote_port = 0;
+                return Ok(0);
+            }
         }
         let InetAddr { mut ip, port } = self.read_inet(addr, addrlen)?;
         if port == 0 && self.st.net.get(id).proto == Proto::Tcp {
@@ -303,17 +329,23 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             }
             return Err(self.park_retry(None, Restart::IfSaRestart));
         }
-        let child = self.st.net.get_mut(id).queue.pop_front().expect("queued");
+        // The connection leaves the queue only once nothing can fail: a bad
+        // address buffer (`EFAULT`) or no free fd (`EMFILE`) leaves it
+        // queued for the next `accept`.
+        let child = *self.st.net.get(id).queue.front().expect("queued");
         let (ip, port) = {
             let child = self.st.net.get(child);
             (child.remote_ip, child.remote_port)
         };
+        self.write_inet_out(addr, addrlen, ip, port)?;
+        self.st.net.add_owner(child);
         let newfd = self.install_sock(
             child,
             flags & abi::O_NONBLOCK as i64 != 0,
             flags & abi::O_CLOEXEC as i64 != 0,
         )?;
-        self.write_inet_out(addr, addrlen, ip, port)?;
+        self.st.net.get_mut(id).queue.pop_front();
+        self.st.net.drop_queue_owner(child);
         self.st.changed = true;
         Ok(newfd as u64)
     }
@@ -405,25 +437,52 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Err(Errno(crate::errno::ENOPROTOOPT));
         }
         let sock = self.st.net.get(id);
+        let int = |v: i32| v.to_le_bytes().to_vec();
         let value = match (level, opt) {
             (SOL_SOCKET, SO_ERROR) => {
                 let err = sock.so_error;
                 self.st.net.get_mut(id).so_error = 0;
-                err as i32
+                int(err as i32)
             }
-            (SOL_SOCKET, SO_TYPE) => match sock.proto {
+            (SOL_SOCKET, SO_TYPE) => int(match sock.proto {
                 Proto::Tcp => SOCK_STREAM as i32,
                 Proto::Udp => SOCK_DGRAM as i32,
-            },
-            (SOL_SOCKET, SO_REUSEADDR) => i32::from(sock.reuseaddr),
-            (SOL_SOCKET, SO_KEEPALIVE) => i32::from(sock.keepalive),
-            (SOL_SOCKET, SO_SNDBUF) => sock.sndbuf as i32,
-            (SOL_SOCKET, SO_RCVBUF) => sock.rcvbuf as i32,
-            (SOL_SOCKET, SO_ACCEPTCONN) => i32::from(sock.listening()),
-            (IPPROTO_TCP, TCP_NODELAY) => i32::from(sock.nodelay),
-            _ => 0,
+            }),
+            (SOL_SOCKET, SO_DOMAIN) => int(match sock.domain {
+                Domain::Inet => AF_INET as i32,
+                Domain::Unix => AF_UNIX as i32,
+            }),
+            (SOL_SOCKET, SO_PROTOCOL) => int(match (sock.domain, sock.proto) {
+                (Domain::Unix, _) => 0,
+                (Domain::Inet, Proto::Tcp) => IPPROTO_TCP as i32,
+                (Domain::Inet, Proto::Udp) => IPPROTO_UDP as i32,
+            }),
+            (SOL_SOCKET, SO_REUSEADDR) => int(i32::from(sock.reuseaddr)),
+            (SOL_SOCKET, SO_KEEPALIVE) => int(i32::from(sock.keepalive)),
+            (SOL_SOCKET, SO_SNDBUF) => int(sock.sndbuf as i32),
+            (SOL_SOCKET, SO_RCVBUF) => int(sock.rcvbuf as i32),
+            (SOL_SOCKET, SO_ACCEPTCONN) => int(i32::from(sock.listening())),
+            (IPPROTO_TCP, TCP_NODELAY) => int(i32::from(sock.nodelay)),
+            // Not stored: report "no timeout" / "linger off" in the
+            // option's own struct size, not a bare int.
+            (SOL_SOCKET, SO_RCVTIMEO | SO_SNDTIMEO) => vec![0; 16],
+            (SOL_SOCKET, SO_LINGER) => vec![0; 8],
+            // `struct ucred`. A socketpair peer is this sandbox's own
+            // process (uid and gid are 0 here). An inet socket has no peer
+            // credentials: pid 0, uid and gid -1, as on Linux.
+            (SOL_SOCKET, SO_PEERCRED) => {
+                let (pid, uid, gid) = match sock.domain {
+                    Domain::Unix => (self.pid, 0u32, 0u32),
+                    Domain::Inet => (0, u32::MAX, u32::MAX),
+                };
+                let mut raw = pid.to_le_bytes().to_vec();
+                raw.extend(uid.to_le_bytes());
+                raw.extend(gid.to_le_bytes());
+                raw
+            }
+            _ => int(0),
         };
-        self.write_opt_int(val, len, value)
+        self.write_opt(val, len, &value)
     }
 
     pub fn sys_setsockopt(
@@ -550,8 +609,16 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             namelen,
             controllen,
         } = self.read_msg_in(msg)?;
-        let total: usize = iov.iter().map(|(_, len)| *len).sum();
+        // `read_iov` bounded the sum, so this cannot overflow.
+        let total = iov
+            .iter()
+            .fold(0usize, |sum, (_, len)| sum.saturating_add(*len));
         let id = self.sock_id(fd)?;
+        // As `recvfrom` does: fail with `EFAULT` before consuming anything
+        // when the first buffer is not writable.
+        if let Some(&(base, _)) = iov.iter().find(|(_, len)| *len > 0) {
+            self.probe_writable(base)?;
+        }
         let (data, src) = self.socket_recv(id, total.min(MAX_IO), flags)?;
         let mut off = 0;
         for (base, len) in iov {
@@ -570,6 +637,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             for &byte in rest.iter().rev() {
                 self.st.net.get_mut(id).rx.push_front(byte);
             }
+        }
+        if off == 0 && !data.is_empty() {
+            return Err(Errno(EFAULT));
         }
         if let Some((ip, port)) = src {
             self.write_inet_out(name, namelen, ip, port)?;
@@ -599,6 +669,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
 
     pub(crate) fn socket_readable_len(&mut self, id: SockId) -> usize {
         self.refresh_connect(id);
+        self.pump_host(id);
         let sock = self.st.net.get(id);
         if sock.proto == Proto::Udp {
             sock.dgrams.front().map(|d| d.data.len()).unwrap_or(0)
@@ -609,6 +680,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
 
     pub(crate) fn socket_poll(&mut self, id: SockId) -> SockPoll {
         self.refresh_connect(id);
+        self.pump_host(id);
         let sock = self.st.net.get(id);
         if sock.proto == Proto::Udp {
             return SockPoll {
@@ -661,7 +733,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                     .stream_status(stream)
                     .map(|status| status.writable && !status.broken)
                     .unwrap_or(true),
-                Some(Link::Dns) => self.st.net.get(id).dns_in.len() < 16 * 1024,
+                Some(Link::Dns) => self.st.net.get(id).dns_in.len() < DNS_IN_CAP,
                 // Peer is already gone: Linux still reports `POLLOUT` until
                 // `SHUT_WR`.
                 Some(Link::Gone) | None => true,
@@ -696,14 +768,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if let Some(stream) = dropped.host {
             self.host.stream_close(stream);
         }
-        let resets = dropped.reset;
-        let children = dropped.children;
-        for peer in resets {
-            if self.st.net.detach_queued(peer) {
-                self.finish_drop(peer);
-            }
-        }
-        for child in children {
+        // Peers in `dropped.reset` were already marked with the FIN or reset
+        // and stay alive. That includes a server-side socket still in an
+        // accept queue: `accept` returns it, the server reads what the
+        // client sent, then EOF (or `ECONNRESET`), as on Linux.
+        for child in dropped.children {
             self.finish_drop(child);
         }
         self.st.changed = true;
@@ -795,6 +864,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let waker = self.plat.waker();
         let stream = match self.host.open_stream(flow, waker) {
             Ok(id) => id,
+            // The host is at its stream limit: a resource error, as Linux
+            // `connect` reports when it cannot get a local port.
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Err(Errno(EAGAIN)),
             Err(_) => return Err(Errno(crate::errno::ENETUNREACH)),
         };
         let sock = self.st.net.get_mut(id);
@@ -865,6 +937,48 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
     }
 
+    /// Moves bytes the host has buffered for a spliced socket into `rx` (up
+    /// to `STREAM_CAP`, so the host's own cap still applies backpressure),
+    /// and records a peer EOF or reset. `recv`, `poll` and `FIONREAD` all
+    /// call this, so they agree on what is readable.
+    fn pump_host(&mut self, id: SockId) {
+        let sock = self.st.net.get(id);
+        let Some(Link::Host(stream)) = sock.link() else {
+            return;
+        };
+        if !sock.tcp_connected() || sock.shut_rd || sock.peer_fin || sock.peer_reset {
+            return;
+        }
+        loop {
+            let space = self.st.net.get(id).rx_space();
+            if space == 0 {
+                return;
+            }
+            let mut buf = vec![0u8; space.min(16 * 1024)];
+            match self.host.stream_read(stream, &mut buf) {
+                Ok(0) => {
+                    self.st.net.get_mut(id).peer_fin = true;
+                    self.st.changed = true;
+                    return;
+                }
+                Ok(n) => {
+                    self.st.net.get_mut(id).rx.extend(&buf[..n]);
+                    self.st.changed = true;
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    // A reset, or the stream is gone: queued bytes are still
+                    // readable, then `recv` returns `ECONNRESET`.
+                    let sock = self.st.net.get_mut(id);
+                    sock.peer_fin = true;
+                    sock.peer_reset = true;
+                    self.st.changed = true;
+                    return;
+                }
+            }
+        }
+    }
+
     fn ensure_local(&mut self, id: SockId, ip: u32) -> SysResult<()> {
         let sock = self.st.net.get(id);
         let proto = sock.proto;
@@ -911,18 +1025,18 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if broken {
             return self.epipe(nosignal);
         }
-        if sock.domain == Domain::Unix {
-            if sock.proto == Proto::Udp {
-                let Some(Link::Socket(peer)) = sock.link() else {
-                    return Err(Errno(ENOTCONN));
-                };
-                if data.len() > DGRAM_MAX {
-                    return Err(Errno(EMSGSIZE));
-                }
-                self.enqueue_dgram(peer, 0, 0, data.to_vec(), nonblock)?;
-                return Ok(data.len());
+        // An AF_UNIX stream pair falls through to the blocking loop below.
+        if sock.domain == Domain::Unix && sock.proto == Proto::Udp {
+            let Some(Link::Socket(peer)) = sock.link() else {
+                return Err(Errno(ENOTCONN));
+            };
+            if data.len() > DGRAM_MAX {
+                return Err(Errno(EMSGSIZE));
             }
-            return self.send_stream(id, data, nonblock, nosignal);
+            // An AF_UNIX datagram sender blocks while the receiver's queue
+            // is full, as on Linux.
+            self.enqueue_dgram(peer, 0, 0, data.to_vec(), nonblock, false)?;
+            return Ok(data.len());
         }
         if sock.proto == Proto::Udp {
             return self.send_udp(id, data, dest, nonblock, nosignal);
@@ -1010,10 +1124,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if sock.shut_wr || sock.peer_reset {
             return self.epipe(nosignal);
         }
+        // An explicit destination wins over a connected one, as on Linux.
         let (ip, port) = if let Some(InetAddr { ip, port }) = dest {
-            if sock.udp_remote.is_some() {
-                return Err(Errno(EISCONN));
-            }
             (ip, port)
         } else if let Some(remote) = sock.udp_remote {
             remote
@@ -1028,28 +1140,39 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if let Some(err) = class.errno() {
             return Err(Errno(err));
         }
-        let source_ip = if self.st.net.get(id).bound && self.st.net.get(id).local_ip != 0 {
-            self.st.net.get(id).local_ip
-        } else {
-            source_ip(ip)
-        };
-        self.ensure_local(id, source_ip)?;
+        // An unconnected `sendto` never changes the bound address. An unbound
+        // socket is auto-bound to `0.0.0.0:ephemeral`, as Linux does; the
+        // datagram's source address is then chosen per destination.
+        if !self.st.net.get(id).bound {
+            let port = self.st.net.alloc_ephemeral(0, Proto::Udp)?;
+            let sock = self.st.net.get_mut(id);
+            sock.local_ip = 0;
+            sock.local_port = port;
+            sock.bound = true;
+            sock.holds_port = true;
+            self.st.net.claim_port(0, port, Proto::Udp);
+        }
         let (src_ip, src_port) = {
             let sock = self.st.net.get(id);
-            (sock.local_ip, sock.local_port)
+            let src = if sock.local_ip != 0 {
+                sock.local_ip
+            } else {
+                source_ip(ip)
+            };
+            (src, sock.local_port)
         };
+        // UDP never blocks the sender on a full receive queue: Linux drops
+        // the datagram and `sendto` succeeds.
         match class {
             Class::Dns => {
                 if let Some(reply) = dns_nxdomain(data) {
-                    self.enqueue_dgram(id, GATEWAY_IP, DNS_PORT, reply, nonblock)?;
+                    self.enqueue_dgram(id, GATEWAY_IP, DNS_PORT, reply, nonblock, true)?;
                 }
                 Ok(data.len())
             }
             Class::Local(_) => {
                 if let Some(dst) = self.st.net.find_udp(ip, port) {
-                    if dst != id {
-                        self.enqueue_dgram(dst, src_ip, src_port, data.to_vec(), nonblock)?;
-                    }
+                    self.enqueue_dgram(dst, src_ip, src_port, data.to_vec(), nonblock, true)?;
                 }
                 Ok(data.len())
             }
@@ -1057,6 +1180,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
     }
 
+    /// Queues a datagram on `id`. A full queue (by count or by bytes) drops
+    /// it when `drop_when_full` (UDP); otherwise the sender waits (AF_UNIX).
     fn enqueue_dgram(
         &mut self,
         id: SockId,
@@ -1064,9 +1189,20 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         src_port: u16,
         data: Vec<u8>,
         nonblock: bool,
+        drop_when_full: bool,
     ) -> SysResult<()> {
         let sock = self.st.net.get(id);
-        if sock.dgrams.len() >= DGRAM_CAP {
+        if sock.shut_rd {
+            return Ok(());
+        }
+        let queued: usize = sock.dgrams.iter().map(|d| d.data.len()).sum();
+        // One datagram of any size fits in an empty queue.
+        let full = sock.dgrams.len() >= DGRAM_CAP
+            || (!sock.dgrams.is_empty() && queued + data.len() > DGRAM_BYTES_CAP);
+        if full {
+            if drop_when_full {
+                return Ok(());
+            }
             return if nonblock || self.timed_out() {
                 Err(Errno(EAGAIN))
             } else {
@@ -1159,19 +1295,34 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 Err(err) => Err(io_errno(&err)),
             },
             Some(Link::Dns) => {
-                if self.st.net.get(id).dns_in.len() + data.len() > 16 * 1024 {
-                    return Err(Errno(EMSGSIZE));
+                // Bounded both ways: requests wait in `dns_in` while the
+                // replies in `rx` are unread, so a guest that never reads
+                // blocks (or gets `EAGAIN`) instead of growing memory.
+                let room = DNS_IN_CAP.saturating_sub(self.st.net.get(id).dns_in.len());
+                if room == 0 {
+                    return if nonblock || self.timed_out() {
+                        Err(Errno(EAGAIN))
+                    } else {
+                        Err(self.park_retry(None, Restart::IfSaRestart))
+                    };
                 }
-                self.st.net.get_mut(id).dns_in.extend(data);
+                let n = data.len().min(room);
+                self.st.net.get_mut(id).dns_in.extend(&data[..n]);
                 self.drain_dns(id);
-                Ok(data.len())
+                Ok(n)
             }
             None => Err(Errno(ENOTCONN)),
         }
     }
 
+    /// Answers every complete TCP DNS frame in `dns_in`, as long as the
+    /// reply buffer has room. `socket_recv` calls it again after the guest
+    /// reads replies.
     fn drain_dns(&mut self, id: SockId) {
         loop {
+            if self.st.net.get(id).rx.len() >= STREAM_CAP {
+                return;
+            }
             let buf = &self.st.net.get(id).dns_in;
             if buf.len() < 2 {
                 return;
@@ -1206,6 +1357,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if sock.shut_rd {
             return Ok((Vec::new(), None));
         }
+        self.pump_host(id);
+        let sock = self.st.net.get(id);
         if !sock.rx.is_empty() {
             let n = len.min(sock.rx.len());
             let data: Vec<u8> = if peek {
@@ -1215,6 +1368,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             };
             if !peek {
                 self.st.changed = true;
+                if self.st.net.get(id).link() == Some(Link::Dns) {
+                    // Room for more replies: answer requests that waited.
+                    self.drain_dns(id);
+                }
             }
             return Ok((data, None));
         }
@@ -1235,40 +1392,14 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             }
             return Err(Errno(ENOTCONN));
         }
-        // Host streams: pull anything the reader thread has buffered.
-        if let Some(Link::Host(stream)) = sock.link() {
-            let mut buf = vec![0u8; len.min(STREAM_CAP)];
-            match self.host.stream_read(stream, &mut buf) {
-                Ok(0) => {
-                    self.st.net.get_mut(id).peer_fin = true;
-                    return Ok((Vec::new(), None));
-                }
-                Ok(n) => {
-                    buf.truncate(n);
-                    if peek {
-                        // Put it back into the guest-side buffer and also
-                        // return it. A later non-peek read consumes `rx`.
-                        for &byte in buf.iter().rev() {
-                            self.st.net.get_mut(id).rx.push_front(byte);
-                        }
-                    }
-                    return Ok((buf, None));
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-                    ) =>
-                {
-                    let sock = self.st.net.get_mut(id);
-                    sock.peer_fin = true;
-                    sock.peer_reset = true;
-                    return Err(Errno(ECONNRESET));
-                }
-                Err(err) => return Err(io_errno(&err)),
-            }
+        // "The value 0 may also be returned if the requested number of bytes
+        // to receive from a stream socket was 0" (recv(2)): no wait, and
+        // nothing is consumed.
+        if len == 0 {
+            return Ok((Vec::new(), None));
         }
+        // Host bytes, EOF and resets were already pulled into `rx` and the
+        // flags above by `pump_host`.
         if nonblock || self.timed_out() {
             Err(Errno(EAGAIN))
         } else {
@@ -1435,7 +1566,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(())
     }
 
-    fn write_opt_int(&mut self, val: GuestAddr, len_ptr: GuestAddr, value: i32) -> SysResult<u64> {
+    /// Copies an option value out, truncated to the caller's `optlen`, and
+    /// stores the number of bytes copied back in `optlen`, as Linux does.
+    fn write_opt(&mut self, val: GuestAddr, len_ptr: GuestAddr, value: &[u8]) -> SysResult<u64> {
         if val == 0 || len_ptr == 0 {
             return Err(Errno(EFAULT));
         }
@@ -1443,9 +1576,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         if len == 0 {
             return Err(Errno(EINVAL));
         }
-        let bytes = value.to_le_bytes();
-        self.write_mem(val, &bytes[..len.min(4)])?;
-        self.write_u32(len_ptr, 4)?;
+        let n = len.min(value.len());
+        self.write_mem(val, &value[..n])?;
+        self.write_u32(len_ptr, n as u32)?;
         Ok(0)
     }
 
@@ -1514,10 +1647,16 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         }
         let raw = self.read_mem(iov, iovlen as usize * 16)?;
         let mut out = Vec::with_capacity(iovlen as usize);
+        // Linux rejects a total that does not fit in `ssize_t` with `EINVAL`.
+        let mut total: u64 = 0;
         for chunk in raw.chunks(16) {
             let base = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-            let len = u64::from_le_bytes(chunk[8..16].try_into().unwrap()) as usize;
-            out.push((base, len));
+            let len = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+            total = total
+                .checked_add(len)
+                .filter(|&t| t <= i64::MAX as u64)
+                .ok_or(Errno(EINVAL))?;
+            out.push((base, len as usize));
         }
         Ok(out)
     }

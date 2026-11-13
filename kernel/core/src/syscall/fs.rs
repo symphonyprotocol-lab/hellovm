@@ -493,13 +493,13 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     /// POSIX requires: when the pipe fills up, the thread parks and the
     /// retry continues where it stopped (`Thread::io_done`). Only a signal
     /// handler or a closed read end make it return a short count.
+    ///
+    /// Sockets are not looped here: `socket_send` already writes every
+    /// byte of a blocking stream send and keeps its own `io_done`. A second
+    /// loop on top would overwrite that progress and resend from byte 0.
     fn write_fully(&mut self, id: FileId, offset: Option<u64>, data: &[u8]) -> SysResult<usize> {
         let file = self.st.files.get(id);
-        let blocking_pipe = !file.nonblock
-            && matches!(
-                file.object,
-                FileObject::PipeWrite(_) | FileObject::Socket(_)
-            );
+        let blocking_pipe = !file.nonblock && matches!(file.object, FileObject::PipeWrite(_));
         if !blocking_pipe || data.is_empty() {
             return self.write_file(id, offset, data);
         }

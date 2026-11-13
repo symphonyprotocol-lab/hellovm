@@ -31,7 +31,6 @@ const WRITE_POLL: Duration = Duration::from_millis(250);
 /// A slow reader that keeps taking bytes resets the timer.
 const NO_PROGRESS: Duration = Duration::from_secs(45);
 
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
@@ -87,6 +86,16 @@ struct Shared {
     inner: Mutex<Inner>,
     cv: Condvar,
     waker: Mutex<Waker>,
+    /// The table's count of streams whose helpers are still alive, including
+    /// ones the guest closed that are still draining.
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for Shared {
+    /// The last of the table entry, the reader and the writer has let go.
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Shared {
@@ -95,13 +104,23 @@ impl Shared {
     }
 }
 
+/// Streams whose helper threads may be alive at once (two threads each),
+/// counting closed streams that are still draining. Past this, a guest
+/// `connect` fails with `EAGAIN` instead of exhausting host threads.
+const MAX_LIVE_STREAMS: usize = 512;
+
+/// Most recent flows kept for [`SpliceTable::flows`].
+const FLOW_LOG: usize = 1024;
+
 /// Configured splice endpoint and the streams currently open to it.
 #[derive(Default)]
 pub struct SpliceTable {
     endpoint: Option<SocketAddr>,
     streams: HashMap<u64, Arc<Shared>>,
     next: u64,
+    /// The last [`FLOW_LOG`] flows, oldest first.
     flows: Vec<OutboundFlow>,
+    live: Arc<AtomicUsize>,
 }
 
 impl SpliceTable {
@@ -124,9 +143,19 @@ impl SpliceTable {
                 "no splice endpoint configured",
             ));
         };
+        if self.live.load(Ordering::Relaxed) >= MAX_LIVE_STREAMS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many splice streams are open or draining",
+            ));
+        }
         // `flow.dest_ip` is stored for the test (and, later, the egress
         // audit record). The dial below uses `addr` only.
+        if self.flows.len() >= FLOW_LOG {
+            self.flows.remove(0);
+        }
         self.flows.push(flow);
+        self.live.fetch_add(1, Ordering::Relaxed);
         let id = self.next;
         self.next += 1;
         let shared = Arc::new(Shared {
@@ -144,12 +173,16 @@ impl SpliceTable {
             }),
             cv: Condvar::new(),
             waker: Mutex::new(waker),
+            live: Arc::clone(&self.live),
         });
-        self.streams.insert(id, Arc::clone(&shared));
+        let helper = Arc::clone(&shared);
+        // Register only once the helper runs: a failed spawn must not leave
+        // an entry the kernel will never close.
         thread::Builder::new()
             .name(format!("hellovm-splice-{id}"))
-            .spawn(move || drive(addr, shared))
+            .spawn(move || drive(addr, helper))
             .map_err(io::Error::other)?;
+        self.streams.insert(id, shared);
         Ok(HostStreamId(id))
     }
 
@@ -257,6 +290,14 @@ impl SpliceTable {
             if !matches!(inner.phase, Phase::Up) {
                 // Still connecting. The helper must not block past the timeout.
                 inner.abort = true;
+            }
+            // The guest will not read again, so the reader can stop now. It
+            // may be blocked in `read` on a peer that never sends or closes;
+            // when the guest had half-closed earlier, the writer has already
+            // exited and nothing else would wake it. Shutting the read side
+            // sends nothing to the peer and does not affect the write drain.
+            if let Some(control) = &inner.control {
+                let _ = control.shutdown(Shutdown::Read);
             }
         }
         shared.cv.notify_all();
@@ -550,6 +591,53 @@ mod tests {
             assert!(
                 started.elapsed() < Duration::from_secs(2),
                 "helpers still live after close"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = release.send(());
+        server.join().unwrap();
+    }
+
+    /// The guest half-closes, then closes, while the peer neither sends nor
+    /// closes. The writer exited at the half-close; the reader must not be
+    /// left blocked in `read` holding the connection.
+    #[test]
+    fn close_after_half_close_ends_the_reader_when_the_peer_is_silent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, wait) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            // Hold the connection open, silently, until the test ends.
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+            drop(sock);
+        });
+        let mut table = SpliceTable::default();
+        table.set_endpoint(addr);
+        let id = table
+            .open(
+                OutboundFlow {
+                    sandbox_id: 0,
+                    guest_pid: 1,
+                    dest_ip: [198, 51, 100, 1],
+                    dest_port: 9,
+                },
+                Waker::new(|| {}),
+            )
+            .unwrap();
+        let start = Instant::now();
+        while table.connect_result(id).is_err() {
+            assert!(start.elapsed() < Duration::from_secs(2), "connect");
+            thread::sleep(Duration::from_millis(5));
+        }
+        table.shutdown_write(id).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        table.close(id);
+        let closed = Instant::now();
+        while table.live.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            assert!(
+                closed.elapsed() < Duration::from_secs(2),
+                "the reader is still blocked after close"
             );
             thread::sleep(Duration::from_millis(10));
         }

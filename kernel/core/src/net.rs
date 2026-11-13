@@ -61,6 +61,13 @@ pub const DNS_PORT: u16 = 53;
 pub(crate) const STREAM_CAP: usize = 64 * 1024;
 /// Datagrams one UDP socket queues.
 pub(crate) const DGRAM_CAP: usize = 64;
+/// Payload bytes one datagram socket queues, so 4096 sockets cannot hold
+/// gigabytes. One datagram of any size is still accepted into an empty
+/// queue.
+pub(crate) const DGRAM_BYTES_CAP: usize = STREAM_CAP;
+/// TCP DNS request bytes buffered: one largest frame (2-byte length plus
+/// 65535 bytes), so any well-formed frame can complete.
+pub(crate) const DNS_IN_CAP: usize = 2 + 65535;
 /// Largest UDP payload (`65535 - 8 - 20`).
 pub(crate) const DGRAM_MAX: usize = 65507;
 /// Most sockets in one sandbox.
@@ -320,20 +327,19 @@ impl Net {
         self.sockets.get(id)
     }
 
-    /// Removes `id` from every accept queue. `true` when it was queued.
-    pub(crate) fn detach_queued(&mut self, id: SockId) -> bool {
-        let mut found = false;
-        for slot in &mut self.sockets.slots {
-            let Some(sock) = slot else {
-                continue;
-            };
-            let before = sock.queue.len();
-            sock.queue.retain(|&q| q != id);
-            if sock.queue.len() != before {
-                found = true;
-            }
-        }
-        found
+    /// `accept` is about to install `id` in an fd: the fd becomes a second
+    /// owner while the accept queue still holds the first, so a failed
+    /// install leaves the connection queued.
+    pub(crate) fn add_owner(&mut self, id: SockId) {
+        self.sockets.get_mut(id).owners += 1;
+    }
+
+    /// `accept` removed `id` from its queue after the fd was installed: the
+    /// queue's ownership ends without freeing the socket.
+    pub(crate) fn drop_queue_owner(&mut self, id: SockId) {
+        let sock = self.sockets.get_mut(id);
+        debug_assert!(sock.owners > 1);
+        sock.owners = sock.owners.saturating_sub(1).max(1);
     }
 
     pub(crate) fn get_mut(&mut self, id: SockId) -> &mut Socket {
@@ -437,7 +443,9 @@ impl Net {
         self.held.remove(&(ip, port, proto_key(proto)));
     }
 
-    /// Next free ephemeral port for `(ip, proto)`, or `EADDRINUSE`.
+    /// Next free ephemeral port for `(ip, proto)`, or `EADDRINUSE`. "Free"
+    /// uses the same rule as an explicit `bind`, so a wildcard socket never
+    /// shares a port with a specific-address socket.
     pub(crate) fn alloc_ephemeral(&mut self, ip: u32, proto: Proto) -> Result<u16, Errno> {
         let start = self.ephemeral;
         loop {
@@ -447,7 +455,7 @@ impl Net {
             } else {
                 port + 1
             };
-            if !self.port_busy(ip, port, proto) {
+            if !self.bind_conflicts(ip, port, proto) {
                 return Ok(port);
             }
             if self.ephemeral == start {

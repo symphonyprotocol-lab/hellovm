@@ -85,7 +85,16 @@ including the gateway, the rest of `192.0.2.0/24`, and any fake IP, is
 (Linux's default `ip_local_port_range`), unique per local address and
 protocol; the range answers `EADDRINUSE` when it is exhausted. `listen`'s
 backlog is clamped to **[1, 128]**; a full accept queue refuses the next
-in-kernel connect with `ECONNREFUSED`.
+in-kernel connect with `ECONNREFUSED`. A connection whose client sends and
+closes before the server calls `accept` stays queued: `accept` returns it
+and the server reads the data, then EOF.
+
+UDP follows Linux: a full receive queue (64 datagrams or 64 KiB) drops the
+datagram and `sendto` still succeeds, an unconnected `sendto` never changes
+the socket's bound address, and a connected UDP socket may `connect` again
+or dissolve the association with `AF_UNSPEC`. Virtual DNS over TCP accepts
+frames up to the 65535-byte maximum and applies backpressure: a client that
+never reads its replies gets `EAGAIN` (or blocks) instead of growing memory.
 
 A connect or send that is not loopback, not the guest NIC, not virtual DNS,
 and not an issued fake IP fails immediately with `ENETUNREACH`. That
@@ -127,7 +136,10 @@ and orthogonal to 002b's `--egress`. 002b will put it behind the
 `insecure-test-hooks` feature. A guest connect to an issued fake IP is
 spliced to that address; the fake IP is not dialed. Nothing issues a fake
 IP unless a test (or, later, egress DNS) calls `Kernel::issue_fake_ip`.
-There are at most 4096 sockets. `SO_REUSEADDR` is stored but a second bind
+At most 512 spliced streams may be open or still draining after close at
+once; past that, `connect` to a fake IP returns `EAGAIN`. Bytes waiting on a
+spliced stream are visible to `poll`, `select` and `FIONREAD` before any
+`recv`. There are at most 4096 sockets. `SO_REUSEADDR` is stored but a second bind
 of the same port, including `0.0.0.0` against a specific address, is still
 `EADDRINUSE`. With no endpoint configured, a connect to an issued fake IP
 is `ENETUNREACH`.

@@ -300,6 +300,70 @@ static void check_addrinfo(void) {
     }
 }
 
+// A loopback listener on an ephemeral port; its address goes to `a`.
+static int listener(struct sockaddr_in *a) {
+    int srv = tcp();
+    *a = v4("127.0.0.1", 0);
+    socklen_t len = sizeof *a;
+    bind(srv, (void *)a, sizeof *a);
+    listen(srv, 4);
+    getsockname(srv, (void *)a, &len);
+    return srv;
+}
+
+// One blocking write() larger than the socket buffer, read by a child:
+// every byte arrives exactly once, in order.
+static void check_big_write(void) {
+    enum { N = 200000 };
+    static unsigned char out[N];
+    static unsigned char in[N + 1];
+    for (int i = 0; i < N; i++) {
+        out[i] = (unsigned char)(i % 251);
+    }
+    struct sockaddr_in a;
+    int srv = listener(&a);
+    int c = tcp();
+    connect(c, (void *)&a, sizeof a);
+    int s = accept(srv, NULL, NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(c);
+        size_t got = 0;
+        for (;;) {
+            ssize_t n = read(s, in + got, sizeof in - got);
+            if (n <= 0) {
+                break;
+            }
+            got += (size_t)n;
+        }
+        _exit(got == N && memcmp(in, out, N) == 0 ? 0 : 1);
+    }
+    close(s);
+    expect_ok("big-write", write(c, out, N) == N);
+    close(c);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    expect_ok("big-write-arrives-once", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    close(srv);
+}
+
+// The client sends and closes before the server accepts.
+static void check_close_before_accept(void) {
+    struct sockaddr_in a;
+    int srv = listener(&a);
+    int c = tcp();
+    connect(c, (void *)&a, sizeof a);
+    send(c, "early", 5, 0);
+    close(c);
+    int s = accept(srv, NULL, NULL);
+    char buf[8];
+    int n = s >= 0 ? (int)recv(s, buf, sizeof buf, 0) : -1;
+    expect_ok("close-before-accept", n == 5 && memcmp(buf, "early", 5) == 0);
+    expect_ok("close-before-accept-eof", s >= 0 && recv(s, buf, sizeof buf, 0) == 0);
+    close(s);
+    close(srv);
+}
+
 static int do_check(void) {
     check_errors();
     check_loopback();
@@ -309,6 +373,8 @@ static int do_check(void) {
     check_iface();
     check_dns();
     check_addrinfo();
+    check_big_write();
+    check_close_before_accept();
     if (fails) {
         printf("fails %d\n", fails);
         return 1;
@@ -332,8 +398,31 @@ static int do_splice(const char *ip) {
         printf("splice-shut errno=%d\n", errno);
         return 1;
     }
+    // An event loop's view: the echo must show up to poll and FIONREAD
+    // before any recv, and a zero-length recv must not look like EOF.
+    struct pollfd p = {.fd = c, .events = POLLIN};
+    if (poll(&p, 1, 5000) != 1 || !(p.revents & POLLIN)) {
+        printf("splice-poll revents=%#x errno=%d\n", p.revents, errno);
+        return 1;
+    }
+    int avail = -1;
+    if (ioctl(c, FIONREAD, &avail) != 0 || avail <= 0) {
+        printf("splice-fionread avail=%d errno=%d\n", avail, errno);
+        return 1;
+    }
     char buf[32];
-    int n = recv(c, buf, sizeof buf, 0);
+    if (recv(c, buf, 0, 0) != 0) {
+        printf("splice-recv0 errno=%d\n", errno);
+        return 1;
+    }
+    int n = 0;
+    while (n < 11) {
+        int got = (int)recv(c, buf + n, sizeof buf - (size_t)n, 0);
+        if (got <= 0) {
+            break;
+        }
+        n += got;
+    }
     if (n != 11 || memcmp(buf, "splice-ping", 11) != 0) {
         printf("splice-recv n=%d errno=%d\n", n, errno);
         return 1;
