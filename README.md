@@ -8,8 +8,8 @@ The kernel lives in `kernel/`, a Rust workspace:
 
 | Crate | Path | Role |
 |---|---|---|
-| `hellovm-core` | `kernel/core` | Syscall emulation: processes, threads, signals, pipes, ELF loading, memory map, filesystem, terminal, `/proc`; independent of the host OS |
-| `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks |
+| `hellovm-core` | `kernel/core` | Syscall emulation: processes, threads, signals, pipes, ELF loading, memory map, filesystem, terminal, `/proc`, IPv4 sockets; independent of the host OS |
+| `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks, spliced byte streams |
 | `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
 | `hellovm` | `kernel/hellovm` | Command-line launcher |
 | `hellovm-test-guest` | `kernel/test-guest` | Small test programs built at build time |
@@ -56,14 +56,102 @@ Debian system.
   layer. Paths are resolved entirely inside the kernel and cannot leave the
   sandbox root; writes never reach the image directory.
 - **`/proc`**: `self`, `<pid>/{exe,cwd,fd,maps,stat,status,statm,cmdline,
-  comm,task}`, `meminfo`, `cpuinfo`, `uptime`, `stat`, `loadavg`, `mounts`;
-  `ps` works.
+  comm,task}`, `meminfo`, `cpuinfo`, `uptime`, `stat`, `loadavg`, `mounts`,
+  `net/tcp`, `net/udp`; `ps` works.
 - **Terminal**: when hellovm runs on a terminal, the sandbox console is a
   terminal too (`/dev/console`, `/dev/tty`): line editing, echo, termios,
   window size, a foreground process group, and Ctrl-C, Ctrl-\ and Ctrl-Z
   for the foreground job.
 
-Not yet: networking (sockets fail with `ENOSYS`), `epoll`, `eventfd`,
+**Networking (002a).** Sockets are emulated in the kernel. There is no
+packet-level TCP/IP stack and no smoltcp: that is a user-approved deviation
+(2026-11-13) from design §4.4, which described an in-kernel userspace stack
+behind a normal NIC. The guest still sees a POSIX socket API and one
+virtual NIC. Outbound TCP to an address the kernel itself issued is spliced
+onto a host byte stream; everything else stays in the kernel or is refused.
+The egress proxy is not built yet (002b).
+
+| Role | Address | What the guest sees |
+|---|---|---|
+| Guest NIC | `192.0.2.2/24` (TEST-NET-1) | The guest's own address. `SIOCGIFCONF` / `SIOCGIFADDR` report it as `eth0`. |
+| Gateway / DNS | `192.0.2.1` port 53 | In-kernel DNS, UDP and TCP. Without an egress proxy every query is NXDOMAIN. Any other port is `ECONNREFUSED`. |
+| Rest of the NIC net | other `192.0.2.0/24` | `EHOSTUNREACH` |
+| Loopback | `127.0.0.0/8`, and `0.0.0.0` as a wildcard | In-kernel TCP and UDP. Connecting to `0.0.0.0` uses `127.0.0.1`. |
+| Fake-IP pool | `198.51.100.0/24` (TEST-NET-2) | The only destinations that may be spliced to the host, and only after the kernel has issued that address. |
+
+`bind` is allowed on `0.0.0.0`, `127.0.0.0/8`, and `192.0.2.2`. Anything else,
+including the gateway, the rest of `192.0.2.0/24`, and any fake IP, is
+`EADDRNOTAVAIL`. Ports the guest does not choose come from **32768–60999**
+(Linux's default `ip_local_port_range`), unique per local address and
+protocol; the range answers `EADDRINUSE` when it is exhausted. `listen`'s
+backlog is clamped to **[1, 128]**; a full accept queue refuses the next
+in-kernel connect with `ECONNREFUSED`. A connection whose client sends and
+closes before the server calls `accept` stays queued: `accept` returns it
+and the server reads the data, then EOF.
+
+UDP follows Linux: a full receive queue (64 datagrams or 64 KiB) drops the
+datagram and `sendto` still succeeds, an unconnected `sendto` never changes
+the socket's bound address, and a connected UDP socket may `connect` again
+or dissolve the association with `AF_UNSPEC`. Virtual DNS over TCP accepts
+frames up to the 65535-byte maximum and applies backpressure: a client that
+never reads its replies gets `EAGAIN` (or blocks) instead of growing memory.
+
+A connect or send that is not loopback, not the guest NIC, not virtual DNS,
+and not an issued fake IP fails immediately with `ENETUNREACH`. That
+includes metadata (`169.254.169.254`), RFC1918, and any other public
+address. Outbound UDP is `ENETUNREACH` except virtual DNS and in-kernel
+loopback / the guest NIC. An issued fake IP with no splice endpoint
+configured is also `ENETUNREACH`. The guest address is never used as a host
+dial address.
+
+`shutdown(SHUT_WR)` half-closes: the peer reads EOF and the caller can
+still receive. A bare FIN does not cause `EPIPE`. After a clean full close
+the first write is accepted and the next one returns `EPIPE` and raises
+`SIGPIPE`, unless the write used `MSG_NOSIGNAL`. A reset (the peer closed
+with unread data, or a host write fails) fails the write immediately. A
+non-blocking connect that will proceed returns
+`EINPROGRESS`; `poll` then reports `POLLOUT` and `SO_ERROR` is the result.
+A blocking connect to a loopback address with no listener is `ECONNREFUSED`.
+The same connect on a non-blocking socket is `EINPROGRESS` with
+`SO_ERROR == ECONNREFUSED`.
+
+Unnamed `AF_UNIX` `socketpair` (`SOCK_STREAM` and `SOCK_DGRAM`) works.
+`socket(AF_UNIX)`, path-bound `AF_UNIX`, `AF_INET6`, and netlink
+(`AF_NETLINK`) return `EAFNOSUPPORT`. IPv6 and raw sockets are
+`EAFNOSUPPORT` / `EPROTONOSUPPORT`.
+
+glibc 2.39 (this host's libc, also what CPython and distro busybox-static
+are built with) opens a netlink socket in `getifaddrs` and in
+`getaddrinfo`'s `AI_ADDRCONFIG` check. When that socket returns
+`EAFNOSUPPORT`, `getifaddrs` fails with errno 97 and does not fall back to
+ioctl. `__check_pf` instead assumes both IPv4 and IPv6 are configured, so
+`AI_ADDRCONFIG` still returns IPv4 answers. Confirmed in the sandbox:
+`getifaddrs` and CPython `socket.if_nameindex()` fail with `EAFNOSUPPORT`,
+while `getaddrinfo("127.0.0.1")` and `getaddrinfo("localhost")` return
+`127.0.0.1`, and busybox `nc` moves `hi` across `127.0.0.1:5000`. Netlink
+is not implemented.
+
+`--splice-to 127.0.0.1:PORT` is a **dev-only** hook, restricted to loopback,
+and orthogonal to 002b's `--egress`. 002b will put it behind the
+`insecure-test-hooks` feature. A guest connect to an issued fake IP is
+spliced to that address; the fake IP is not dialed. Nothing issues a fake
+IP unless a test (or, later, egress DNS) calls `Kernel::issue_fake_ip`.
+At most 512 spliced streams may be open or still draining after close at
+once; past that, `connect` to a fake IP returns `EAGAIN`. Bytes waiting on a
+spliced stream are visible to `poll`, `select` and `FIONREAD` before any
+`recv`. There are at most 4096 sockets. `SO_REUSEADDR` is stored but a second bind
+of the same port, including `0.0.0.0` against a specific address, is still
+`EADDRINUSE`. With no endpoint configured, a connect to an issued fake IP
+is `ENETUNREACH`.
+
+Loopback in one command (the trace lists `socket`, `connect`, `sendto`, and
+`recvfrom`; libc has no separate `send`/`recv` syscall):
+
+```sh
+mkdir -p /tmp/image/bin && cp /bin/busybox /tmp/image/bin/busybox && ln -sfn busybox /tmp/image/bin/sh && ln -sfn busybox /tmp/image/bin/nc && ln -sfn busybox /tmp/image/bin/echo && ln -sfn busybox /tmp/image/bin/cat && ln -sfn busybox /tmp/image/bin/usleep && timeout 15 cargo run -p hellovm -- --root /tmp/image --no-tty --trace /bin/sh -c ': > /got; { n=0; while [ ! -s /got ] && [ "$n" -lt 300 ]; do usleep 10000; n=$((n + 1)); done; } | nc -l -p 5000 > /got & i=0; while [ "$i" -lt 50 ]; do echo hello-loopback | nc -w 2 127.0.0.1 5000 && break; i=$((i+1)); done; wait; cat /got'
+```
+
+Not yet: the egress proxy (`pip install`, `git clone`), `epoll`, `eventfd`,
 `timerfd`, `inotify`, `clone3` (glibc falls back to `clone`), `fexecve`,
 POSIX timers, `ITIMER_VIRTUAL`/`ITIMER_PROF`, priority-inheritance futexes,
 writable shared *file* mappings (they are private copies), and permission
@@ -123,7 +211,8 @@ runs it with the host's libraries the same way.
 
 Run a program in a sandbox whose root is an image directory. The program path
 is a path inside the sandbox; `--trace` lists every syscall the kernel
-handled, and `--timeout SECONDS` kills every process of a sandbox that runs
+handled, `--splice-to 127.0.0.1:PORT` is a dev-only loopback hook that
+splices issued fake IPs onto that address (it is not `--egress`), and `--timeout SECONDS` kills every process of a sandbox that runs
 longer (hellovm then exits with 124). When hellovm's stdin and stdout are a
 terminal, the sandbox gets a terminal console (`--tty`/`--no-tty` override
 this), so an interactive shell works:

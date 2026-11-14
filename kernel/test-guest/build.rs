@@ -18,7 +18,7 @@ use std::process::Command;
 const ASM_GUESTS: &[&str] = &["hello", "enosys"];
 const C_GUESTS: &[&str] = &["pie", "signals", "threads"];
 /// C guests linked dynamically against the build host's libc.
-const DYNAMIC_GUESTS: &[&str] = &["dynamic"];
+const DYNAMIC_GUESTS: &[&str] = &["dynamic", "netcheck"];
 
 fn build(cc: &str, name: &str, src: &Path, out: &Path, flags: &[&str]) {
     let output = Command::new(cc)

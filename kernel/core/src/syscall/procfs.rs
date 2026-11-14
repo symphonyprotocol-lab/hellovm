@@ -162,6 +162,12 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             [b"thread-self"] => Ok(ProcNode::Link(
                 format!("{}/task/{}", self.pid, self.tid).into_bytes(),
             )),
+            [b"net"] => Ok(ProcNode::Dir(vec![
+                entry("tcp", FileType::Regular),
+                entry("udp", FileType::Regular),
+            ])),
+            [b"net", b"tcp"] => Ok(ProcNode::File(self.st.net.proc_tcp())),
+            [b"net", b"udp"] => Ok(ProcNode::File(self.st.net.proc_udp())),
             [name] if parse_id(name).is_none() => self.proc_global(name),
             [pid, rest @ ..] => {
                 let pid = parse_id(pid).ok_or(Errno(ENOENT))?;
@@ -209,6 +215,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         ] {
             entries.push(entry(name, FileType::Regular));
         }
+        entries.push(entry("net", FileType::Directory));
         for pid in self.st.procs.keys() {
             entries.push(entry(&pid.to_string(), FileType::Directory));
         }
@@ -301,6 +308,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                     (Some(path), _) => path.clone(),
                     (None, FileObject::PipeRead(p) | FileObject::PipeWrite(p)) => {
                         format!("pipe:[{}]", 0x1000 + p).into_bytes()
+                    }
+                    (None, FileObject::Socket(id)) => {
+                        format!("socket:[{}]", 0x10_0000 + id).into_bytes()
                     }
                     (None, FileObject::Node(ino)) => {
                         self.vfs.dir_path(ino).unwrap_or_else(|| b"/".to_vec())

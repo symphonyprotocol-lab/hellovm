@@ -17,7 +17,12 @@
 //!   never writes to the image;
 //! * random bytes and clocks. The kernel never sleeps itself: timeouts are
 //!   deadlines on [`Host::clock_monotonic`] that bound its wait for app
-//!   events.
+//!   events;
+//! * optional spliced byte streams ([`Host::open_stream`]). The kernel asks
+//!   the host to connect to a configured endpoint and never passes a guest
+//!   IP as a dial address. The connect, read, and write run off the kernel
+//!   thread (`WouldBlock` plus a [`Waker`]), including a write-side
+//!   half-close.
 //!
 //! Host errors are `std::io::Error`s; the core translates them by kind
 //! ([`crate::errno::Errno::from_host`]), never by host errno number.
@@ -27,6 +32,50 @@ use std::io;
 use std::time::Duration;
 
 use crate::platform::Waker;
+
+/// Identifies one host byte stream opened by [`Host::open_stream`].
+///
+/// The kernel treats the value as opaque. It never encodes a guest address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostStreamId(pub u64);
+
+/// Audit metadata for one outbound guest TCP flow.
+///
+/// The kernel passes this when it splices a connection onto the host. `dest_ip`
+/// is the guest's destination and is **audit only**: an implementation must
+/// not dial it. 002a dials the single configured endpoint (see
+/// [`Host::egress_configured`]). 002b will dial the egress proxy's Unix
+/// socket and send this metadata in the handshake, still without dialing
+/// `dest_ip`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutboundFlow {
+    /// Sandbox id. 002a passes 0; 002b will pass the real id.
+    pub sandbox_id: u64,
+    /// Guest pid that called `connect`.
+    pub guest_pid: u32,
+    /// Guest destination IPv4, network byte order. Never a dial address.
+    pub dest_ip: [u8; 4],
+    /// Guest destination port.
+    pub dest_port: u16,
+}
+
+/// Non-blocking view of a host byte stream.
+///
+/// `readable` means a read returns data or EOF rather than `WouldBlock`.
+/// `writable` means a short write can accept bytes. `broken` means the peer
+/// is gone and further writes fail. `failed` means the connect itself failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamStatus {
+    /// The connect attempt has finished, successfully or not.
+    pub established: bool,
+    /// The connect attempt failed. Implies `established`.
+    pub failed: bool,
+    pub readable: bool,
+    pub writable: bool,
+    pub broken: bool,
+    /// The local write side has been shut down.
+    pub shut_write: bool,
+}
 
 /// The sandbox console stream a guest write goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +221,90 @@ pub trait Host {
 
     /// A monotonic clock, starting at some arbitrary point.
     fn clock_monotonic(&mut self) -> Duration;
+
+    /// Whether an outbound splice endpoint is configured.
+    ///
+    /// 002a: a local TCP server set by the host (the `--splice-to` flag).
+    /// 002b: the egress Unix socket (`--egress`). When this is false, a
+    /// guest `connect` to an issued fake IP fails with `ENETUNREACH` and
+    /// the kernel does not call [`Host::open_stream`].
+    fn egress_configured(&self) -> bool {
+        false
+    }
+
+    /// Opens a byte stream to the **configured** endpoint for `flow`.
+    ///
+    /// Must not block the caller and must not dial `flow.dest_ip`. The
+    /// connect itself runs off the kernel thread. [`Host::stream_connect_result`]
+    /// reports `WouldBlock` until it finishes; the `waker` is called when
+    /// the result, or later readability or room for a write, may have changed.
+    ///
+    /// The default refuses: no endpoint is configured.
+    fn open_stream(&mut self, flow: OutboundFlow, waker: Waker) -> io::Result<HostStreamId> {
+        let _ = (flow, waker);
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no splice endpoint configured",
+        ))
+    }
+
+    /// Whether `id`'s connect has finished.
+    ///
+    /// `Ok(())` means the stream is connected. `WouldBlock` means the
+    /// attempt is still running. Any other error is a failed connect (the
+    /// guest observes it as `SO_ERROR`).
+    fn stream_connect_result(&mut self, id: HostStreamId) -> io::Result<()> {
+        let _ = id;
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no splice endpoint configured",
+        ))
+    }
+
+    /// Current readiness. Does not consume bytes.
+    fn stream_status(&mut self, id: HostStreamId) -> io::Result<StreamStatus> {
+        let _ = id;
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no splice endpoint configured",
+        ))
+    }
+
+    /// Reads bytes the peer has already sent. 0 is EOF (the peer half-closed
+    /// or closed). `WouldBlock` means nothing is buffered yet.
+    fn stream_read(&mut self, id: HostStreamId, buf: &mut [u8]) -> io::Result<usize> {
+        let _ = (id, buf);
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no splice endpoint configured",
+        ))
+    }
+
+    /// Writes bytes toward the peer. `WouldBlock` means the buffer is full.
+    /// `BrokenPipe` or `ConnectionReset` means the peer is gone: the guest
+    /// observes `EPIPE`.
+    fn stream_write(&mut self, id: HostStreamId, data: &[u8]) -> io::Result<usize> {
+        let _ = (id, data);
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no splice endpoint configured",
+        ))
+    }
+
+    /// Half-closes the write side. The peer reads EOF; the guest can still
+    /// receive. Further writes fail.
+    fn stream_shutdown_write(&mut self, id: HostStreamId) -> io::Result<()> {
+        let _ = id;
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no splice endpoint configured",
+        ))
+    }
+
+    /// Drops the stream. Further use of `id` fails. Idempotent.
+    fn stream_close(&mut self, id: HostStreamId) {
+        let _ = id;
+    }
 }
 
 impl<H: Host + ?Sized> Host for &mut H {
@@ -207,6 +340,30 @@ impl<H: Host + ?Sized> Host for &mut H {
     }
     fn clock_monotonic(&mut self) -> Duration {
         (**self).clock_monotonic()
+    }
+    fn egress_configured(&self) -> bool {
+        (**self).egress_configured()
+    }
+    fn open_stream(&mut self, flow: OutboundFlow, waker: Waker) -> io::Result<HostStreamId> {
+        (**self).open_stream(flow, waker)
+    }
+    fn stream_connect_result(&mut self, id: HostStreamId) -> io::Result<()> {
+        (**self).stream_connect_result(id)
+    }
+    fn stream_status(&mut self, id: HostStreamId) -> io::Result<StreamStatus> {
+        (**self).stream_status(id)
+    }
+    fn stream_read(&mut self, id: HostStreamId, buf: &mut [u8]) -> io::Result<usize> {
+        (**self).stream_read(id, buf)
+    }
+    fn stream_write(&mut self, id: HostStreamId, data: &[u8]) -> io::Result<usize> {
+        (**self).stream_write(id, data)
+    }
+    fn stream_shutdown_write(&mut self, id: HostStreamId) -> io::Result<()> {
+        (**self).stream_shutdown_write(id)
+    }
+    fn stream_close(&mut self, id: HostStreamId) {
+        (**self).stream_close(id)
     }
 }
 
