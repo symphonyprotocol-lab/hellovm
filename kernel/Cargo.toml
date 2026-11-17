@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "host", "platform-seccomp", "test-guest", "hellovm", "egress", "egress-wire"]
+members = ["core", "host", "platform-seccomp", "sandbox", "test-guest", "hellovm", "egress", "egress-wire"]
 
 [workspace.package]
 version = "0.0.1"
@@ -18,6 +18,7 @@ hellovm-host = { path = "host" }
 hellovm-egress = { path = "egress" }
 hellovm-egress-wire = { path = "egress-wire" }
 hellovm-platform-seccomp = { path = "platform-seccomp" }
+hellovm-sandbox = { path = "sandbox" }
 hellovm-test-guest = { path = "test-guest" }
 libc = "0.2"
 log = "0.4"

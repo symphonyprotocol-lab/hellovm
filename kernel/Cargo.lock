@@ -6,10 +6,12 @@ version = 4
 name = "hellovm"
 version = "0.0.1"
 dependencies = [
+ "hellovm",
  "hellovm-core",
  "hellovm-egress",
  "hellovm-host",
  "hellovm-platform-seccomp",
+ "hellovm-sandbox",
  "hellovm-test-guest",
  "libc",
  "log",
@@ -53,6 +55,15 @@ name = "hellovm-platform-seccomp"
 version = "0.0.1"
 dependencies = [
  "hellovm-core",
+ "libc",
+ "log",
+]
+
+[[package]]
+name = "hellovm-sandbox"
+version = "0.0.1"
+dependencies = [
+ "hellovm-platform-seccomp",
  "libc",
  "log",
 ]
