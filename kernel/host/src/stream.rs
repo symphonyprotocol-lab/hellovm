@@ -1,26 +1,45 @@
-//! Host byte streams for guest TCP sockets spliced to a configured endpoint.
+//! Host byte streams for guest TCP flows that leave the sandbox.
 //!
 //! The kernel thread never blocks on the network. Each stream has a reader
 //! thread and a writer thread (the same shape as the stdin helper). The
-//! guest destination IP is recorded on [`OutboundFlow`] and is not dialed:
-//! every stream connects to the one [`SpliceTable`] endpoint. 002b replaces
-//! that endpoint with the egress proxy's Unix socket and sends the flow
-//! metadata in the handshake; this type is the hook that call sits on.
+//! guest destination IP is recorded on [`OutboundFlow`] and is never
+//! dialed. Every stream goes to the one configured [`Endpoint`]:
 //!
-//! Half-close is `TcpStream::shutdown(Shutdown::Write)` after the outbound
-//! buffer drains, so the peer reads EOF while the guest can still receive.
+//! * [`Endpoint::Egress`]: the egress proxy's Unix socket. The helper sends
+//!   the flow header ([`hellovm_egress::wire`]: sandbox id, the hostname
+//!   the kernel bound, the port) and waits for the proxy's verdict, so the
+//!   guest's `connect` completes only once the proxy has connected
+//!   upstream. A refusal is a connect error of kind `ConnectionRefused`
+//!   (the guest sees `ECONNREFUSED`), an upstream connect timeout or no
+//!   verdict within [`VERDICT_TIMEOUT`] is `TimedOut` (`ETIMEDOUT`), and an
+//!   unreachable proxy is `ConnectionRefused` too. A flow without a
+//!   hostname is refused before anything is dialed.
+//! * `Endpoint::Splice` (feature `insecure-test-hooks` only): a loopback
+//!   TCP address every flow is spliced to, with no header and no policy.
+//!
+//! Half-close is `shutdown(Shutdown::Write)` after the outbound buffer
+//! drains, so the peer reads EOF while the guest can still receive.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Shutdown, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// A connect that the guest abandons must not block its helper thread forever.
-/// `TcpStream::connect_timeout` reports this as [`io::ErrorKind::TimedOut`],
-/// which the kernel returns to a blocking guest connect as `ETIMEDOUT`.
-/// 002b can revisit the limit.
+use hellovm_egress::wire::{Request, Status, REPLY};
+
+/// How long the helper waits for the egress proxy's verdict. The proxy
+/// bounds its own work (header 5 s, resolution 5 s, upstream connect 10 s),
+/// so this only fires when the proxy is wedged. Reported as `TimedOut`.
+pub const VERDICT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A splice connect that the guest abandons must not block its helper
+/// thread forever. Reported as `TimedOut` (`ETIMEDOUT` for a blocking
+/// guest connect).
+#[cfg(feature = "insecure-test-hooks")]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bounds one `write` so the loop can notice close, progress, and errors.
@@ -30,6 +49,105 @@ const WRITE_POLL: Duration = Duration::from_millis(250);
 /// After close, give up only when the peer accepts nothing for this long.
 /// A slow reader that keeps taking bytes resets the timer.
 const NO_PROGRESS: Duration = Duration::from_secs(45);
+
+/// Where outbound streams go.
+#[derive(Clone, Debug)]
+pub enum Endpoint {
+    /// The egress proxy's Unix socket.
+    Egress(PathBuf),
+    /// Test hook: splice every flow to this loopback TCP address.
+    #[cfg(feature = "insecure-test-hooks")]
+    Splice(std::net::SocketAddr),
+}
+
+/// The connection a stream runs on.
+enum Conn {
+    Unix(UnixStream),
+    #[cfg_attr(not(feature = "insecure-test-hooks"), allow(dead_code))]
+    Tcp(TcpStream),
+}
+
+impl Conn {
+    fn try_clone(&self) -> io::Result<Conn> {
+        Ok(match self {
+            Conn::Unix(s) => Conn::Unix(s.try_clone()?),
+            Conn::Tcp(s) => Conn::Tcp(s.try_clone()?),
+        })
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Conn::Unix(s) => s.shutdown(how),
+            Conn::Tcp(s) => s.shutdown(how),
+        }
+    }
+
+    fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        match self {
+            Conn::Unix(s) => s.set_write_timeout(d),
+            Conn::Tcp(s) => s.set_write_timeout(d),
+        }
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Conn::Unix(s) => s.read(buf),
+            Conn::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Conn::Unix(s) => s.write(buf),
+            Conn::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn refused(why: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionRefused, why)
+}
+
+/// Opens a flow at the egress proxy and waits for its verdict.
+fn egress_connect(path: &PathBuf, req: &[u8]) -> io::Result<Conn> {
+    let sock = UnixStream::connect(path).map_err(|_| refused("egress proxy unreachable"))?;
+    sock.set_write_timeout(Some(VERDICT_TIMEOUT))?;
+    sock.set_read_timeout(Some(VERDICT_TIMEOUT))?;
+    (&sock)
+        .write_all(req)
+        .map_err(|_| refused("egress proxy closed the flow"))?;
+    let mut reply = [0u8; REPLY];
+    match (&sock).read_exact(&mut reply) {
+        Ok(()) => {}
+        Err(err) if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no verdict from the egress proxy",
+            ))
+        }
+        Err(_) => return Err(refused("egress proxy closed the flow")),
+    }
+    match Status::parse_reply(&reply) {
+        Some(Status::Ok) => {
+            sock.set_write_timeout(None)?;
+            sock.set_read_timeout(None)?;
+            Ok(Conn::Unix(sock))
+        }
+        Some(Status::UpstreamTimeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "egress upstream connect timed out",
+        )),
+        Some(_) => Err(refused("egress proxy refused the flow")),
+        None => Err(refused("egress proxy sent a bad verdict")),
+    }
+}
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -79,7 +197,7 @@ struct Inner {
     connect_error: Option<io::ErrorKind>,
     /// A clone used to unblock the reader and writer on close. `shutdown`
     /// returns immediately; it does not read or write payload.
-    control: Option<TcpStream>,
+    control: Option<Conn>,
 }
 
 struct Shared {
@@ -109,13 +227,13 @@ impl Shared {
 /// `connect` fails with `EAGAIN` instead of exhausting host threads.
 const MAX_LIVE_STREAMS: usize = 512;
 
-/// Most recent flows kept for [`SpliceTable::flows`].
+/// Most recent flows kept for [`StreamTable::flows`].
 const FLOW_LOG: usize = 1024;
 
-/// Configured splice endpoint and the streams currently open to it.
+/// The configured endpoint and the streams currently open to it.
 #[derive(Default)]
-pub struct SpliceTable {
-    endpoint: Option<SocketAddr>,
+pub struct StreamTable {
+    endpoint: Option<Endpoint>,
     streams: HashMap<u64, Arc<Shared>>,
     next: u64,
     /// The last [`FLOW_LOG`] flows, oldest first.
@@ -123,9 +241,9 @@ pub struct SpliceTable {
     live: Arc<AtomicUsize>,
 }
 
-impl SpliceTable {
-    pub fn set_endpoint(&mut self, addr: SocketAddr) {
-        self.endpoint = Some(addr);
+impl StreamTable {
+    pub fn set_endpoint(&mut self, endpoint: Endpoint) {
+        self.endpoint = Some(endpoint);
     }
 
     pub fn configured(&self) -> bool {
@@ -137,20 +255,39 @@ impl SpliceTable {
     }
 
     pub fn open(&mut self, flow: OutboundFlow, waker: Waker) -> io::Result<HostStreamId> {
-        let Some(addr) = self.endpoint else {
+        let Some(endpoint) = self.endpoint.clone() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                "no splice endpoint configured",
+                "no outbound endpoint configured",
             ));
         };
         if self.live.load(Ordering::Relaxed) >= MAX_LIVE_STREAMS {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "too many splice streams are open or draining",
+                "too many outbound streams are open or draining",
             ));
         }
-        // `flow.dest_ip` is stored for the test (and, later, the egress
-        // audit record). The dial below uses `addr` only.
+        // The flow header is built from what the kernel derived. A fake IP
+        // with no name bound cannot be named to the proxy: refuse it here.
+        let header = match &endpoint {
+            Endpoint::Egress(_) => {
+                let host = flow.host.clone().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "flow names no host")
+                })?;
+                let req = Request {
+                    sandbox_id: flow.sandbox_id,
+                    port: flow.dest_port,
+                    host,
+                };
+                Some(req.encode().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "flow names no valid host")
+                })?)
+            }
+            #[cfg(feature = "insecure-test-hooks")]
+            Endpoint::Splice(_) => None,
+        };
+        // `flow.dest_ip` is kept for tests and audit. The dial below uses the
+        // endpoint only.
         if self.flows.len() >= FLOW_LOG {
             self.flows.remove(0);
         }
@@ -179,8 +316,8 @@ impl SpliceTable {
         // Register only once the helper runs: a failed spawn must not leave
         // an entry the kernel will never close.
         thread::Builder::new()
-            .name(format!("hellovm-splice-{id}"))
-            .spawn(move || drive(addr, helper))
+            .name(format!("hellovm-stream-{id}"))
+            .spawn(move || drive(endpoint, header, helper))
             .map_err(io::Error::other)?;
         self.streams.insert(id, shared);
         Ok(HostStreamId(id))
@@ -196,7 +333,7 @@ impl SpliceTable {
                 inner
                     .connect_error
                     .unwrap_or(io::ErrorKind::ConnectionRefused),
-                "splice connect failed",
+                "outbound connect failed",
             )),
         }
     }
@@ -225,7 +362,7 @@ impl SpliceTable {
             return if inner.broken {
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
-                    "splice peer reset",
+                    "outbound peer reset",
                 ))
             } else if inner.read_eof {
                 Ok(0)
@@ -251,7 +388,7 @@ impl SpliceTable {
         if inner.broken || inner.shut_wr {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "splice peer is gone",
+                "outbound peer is gone",
             ));
         }
         if !matches!(inner.phase, Phase::Up) {
@@ -304,9 +441,9 @@ impl SpliceTable {
     }
 }
 
-impl std::fmt::Debug for SpliceTable {
+impl std::fmt::Debug for StreamTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpliceTable")
+        f.debug_struct("StreamTable")
             .field("endpoint", &self.endpoint)
             .field("streams", &self.streams.len())
             .field("flows", &self.flows.len())
@@ -314,17 +451,46 @@ impl std::fmt::Debug for SpliceTable {
     }
 }
 
-impl SpliceTable {
+impl StreamTable {
+    /// Closes every stream still open (gracefully: queued bytes are still
+    /// flushed), then waits until every helper has finished or `limit` has
+    /// passed. Returns whether all finished. hellovm calls this before it
+    /// exits, so bytes a guest wrote just before the sandbox ended are not
+    /// cut off by process exit, without waiting forever on a peer that
+    /// never reads.
+    pub fn drain(&mut self, limit: Duration) -> bool {
+        let ids: Vec<u64> = self.streams.keys().copied().collect();
+        for id in ids {
+            self.close(HostStreamId(id));
+        }
+        let start = Instant::now();
+        while self.live.load(Ordering::Relaxed) > 0 {
+            if start.elapsed() >= limit {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     fn shared(&self, id: HostStreamId) -> io::Result<Arc<Shared>> {
         self.streams
             .get(&id.0)
             .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "splice stream is closed"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "outbound stream is closed"))
     }
 }
 
-fn drive(addr: SocketAddr, shared: Arc<Shared>) {
-    let stream = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+fn drive(endpoint: Endpoint, header: Option<Vec<u8>>, shared: Arc<Shared>) {
+    let connected = match &endpoint {
+        Endpoint::Egress(path) => egress_connect(path, header.as_deref().unwrap_or_default()),
+        #[cfg(feature = "insecure-test-hooks")]
+        Endpoint::Splice(addr) => TcpStream::connect_timeout(addr, CONNECT_TIMEOUT).map(|s| {
+            let _ = s.set_nodelay(true);
+            Conn::Tcp(s)
+        }),
+    };
+    let stream = match connected {
         Ok(stream) => stream,
         Err(err) => {
             {
@@ -336,7 +502,6 @@ fn drive(addr: SocketAddr, shared: Arc<Shared>) {
             return;
         }
     };
-    let _ = stream.set_nodelay(true);
     let reader = match stream.try_clone() {
         Ok(reader) => reader,
         Err(err) => {
@@ -364,7 +529,7 @@ fn drive(addr: SocketAddr, shared: Arc<Shared>) {
     shared.wake();
     let reader_shared = Arc::clone(&shared);
     let _ = thread::Builder::new()
-        .name("hellovm-splice-read".into())
+        .name("hellovm-stream-read".into())
         .spawn(move || read_loop(reader, reader_shared));
     write_loop(writer, shared);
 }
@@ -382,13 +547,13 @@ fn fail(shared: &Shared, kind: io::ErrorKind) {
         .wake();
 }
 
-fn finish_stream(sock: &TcpStream) {
+fn finish_stream(sock: &Conn) {
     // `Read` unblocks the reader even when the remote never closes.
     let _ = sock.shutdown(Shutdown::Write);
     let _ = sock.shutdown(Shutdown::Read);
 }
 
-fn read_loop(mut sock: TcpStream, shared: Arc<Shared>) {
+fn read_loop(mut sock: Conn, shared: Arc<Shared>) {
     let _guard = helper_guard();
     let mut buf = [0u8; CHUNK];
     loop {
@@ -428,7 +593,7 @@ fn read_loop(mut sock: TcpStream, shared: Arc<Shared>) {
     }
 }
 
-fn write_loop(mut sock: TcpStream, shared: Arc<Shared>) {
+fn write_loop(mut sock: Conn, shared: Arc<Shared>) {
     let _guard = helper_guard();
     // Set on this fd. A timeout applied to the control dup does not
     // interrupt a write that is already blocked here. The timeout only
@@ -518,7 +683,9 @@ fn mark_broken(shared: &Shared) {
         .wake();
 }
 
-#[cfg(test)]
+/// The helper lifecycle, against a plain TCP peer through the test splice
+/// endpoint. The egress handshake is covered by `egress_tests`.
+#[cfg(all(test, feature = "insecure-test-hooks"))]
 mod tests {
     use std::io::ErrorKind;
     use std::net::TcpListener;
@@ -529,7 +696,7 @@ mod tests {
     use hellovm_core::host::OutboundFlow;
     use hellovm_core::platform::Waker;
 
-    use super::{SpliceTable, LIVE_HELPERS};
+    use super::{Endpoint, StreamTable, LIVE_HELPERS};
 
     /// Peer reset, not a peer that stays open without reading. The 45s
     /// no-progress bound for that case is not exercised here.
@@ -544,8 +711,8 @@ mod tests {
             drop(sock);
         });
         let baseline = LIVE_HELPERS.load(std::sync::atomic::Ordering::Relaxed);
-        let mut table = SpliceTable::default();
-        table.set_endpoint(addr);
+        let mut table = StreamTable::default();
+        table.set_endpoint(Endpoint::Splice(addr));
         let id = table
             .open(
                 OutboundFlow {
@@ -553,6 +720,7 @@ mod tests {
                     guest_pid: 1,
                     dest_ip: [198, 51, 100, 1],
                     dest_port: 9,
+                    host: None,
                 },
                 Waker::new(|| {}),
             )
@@ -612,8 +780,8 @@ mod tests {
             let _ = wait.recv_timeout(Duration::from_secs(10));
             drop(sock);
         });
-        let mut table = SpliceTable::default();
-        table.set_endpoint(addr);
+        let mut table = StreamTable::default();
+        table.set_endpoint(Endpoint::Splice(addr));
         let id = table
             .open(
                 OutboundFlow {
@@ -621,6 +789,7 @@ mod tests {
                     guest_pid: 1,
                     dest_ip: [198, 51, 100, 1],
                     dest_port: 9,
+                    host: None,
                 },
                 Waker::new(|| {}),
             )
@@ -643,5 +812,155 @@ mod tests {
         }
         let _ = release.send(());
         server.join().unwrap();
+    }
+}
+
+/// The egress handshake against an in-process proxy.
+#[cfg(test)]
+mod egress_tests {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use hellovm_core::host::{HostStreamId, OutboundFlow};
+    use hellovm_core::platform::Waker;
+    use hellovm_egress::audit::{AuditSink, MemorySink};
+    use hellovm_egress::policy::Policy;
+    use hellovm_egress::resolve::Resolver;
+    use hellovm_egress::sniff::client_hello_for_test;
+    use hellovm_egress::{Config, Limits, Proxy, ProxyHandle};
+
+    use super::{Endpoint, StreamTable};
+
+    fn sock(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hvhost-{tag}-{}.sock", std::process::id()))
+    }
+
+    fn proxy(tag: &str, policy: &str, table: &str) -> (ProxyHandle, MemorySink) {
+        let mut p = Policy::new();
+        p.add_file(policy).unwrap();
+        let audit = MemorySink::default();
+        let config = Config {
+            policy: p,
+            limits: Limits::default(),
+            audit: AuditSink::new(Box::new(audit.clone())),
+            resolver: Resolver::parse_test_table(table).unwrap(),
+        };
+        (Proxy::bind(sock(tag), config).unwrap().spawn(), audit)
+    }
+
+    fn flow(host: Option<&str>, port: u16) -> OutboundFlow {
+        OutboundFlow {
+            sandbox_id: 0x51,
+            guest_pid: 1,
+            dest_ip: [198, 51, 100, 1],
+            dest_port: port,
+            host: host.map(str::to_string),
+        }
+    }
+
+    fn connect_result(table: &mut StreamTable, id: HostStreamId) -> std::io::Result<()> {
+        let start = Instant::now();
+        loop {
+            match table.connect_result(id) {
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    assert!(start.elapsed() < Duration::from_secs(10), "connect");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[test]
+    fn an_allowed_flow_moves_bytes_both_ways() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hello = client_hello_for_test(&["echo.test"]);
+        let want = hello.len() + 4;
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut got = vec![0u8; want];
+            s.read_exact(&mut got).unwrap();
+            s.write_all(b"pong").unwrap();
+            got
+        });
+        let (proxy, audit) = proxy(
+            "allow",
+            "allow echo.test:443",
+            &format!("echo.test 127.0.0.1:{port}"),
+        );
+        let mut table = StreamTable::default();
+        table.set_endpoint(Endpoint::Egress(proxy.path().to_path_buf()));
+        let id = table
+            .open(flow(Some("echo.test"), 443), Waker::new(|| {}))
+            .unwrap();
+        connect_result(&mut table, id).unwrap();
+        let mut out = hello.clone();
+        out.extend_from_slice(b"ping");
+        let mut sent = 0;
+        while sent < out.len() {
+            sent += table.write(id, &out[sent..]).unwrap();
+        }
+        let mut buf = [0u8; 4];
+        let start = Instant::now();
+        let mut n = 0;
+        while n < 4 {
+            match table.read(id, &mut buf[n..]) {
+                Ok(k) => n += k,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    assert!(start.elapsed() < Duration::from_secs(10), "read");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("read: {err}"),
+            }
+        }
+        assert_eq!(&buf, b"pong");
+        assert_eq!(&server.join().unwrap()[hello.len()..], b"ping");
+        assert!(table.drain(Duration::from_secs(5)), "drained");
+        drop(proxy);
+        let lines = audit.lines();
+        assert!(lines[0].contains(" sandbox=0000000000000051 host=echo.test port=443 verdict=allow "), "{lines:?}");
+    }
+
+    #[test]
+    fn refusals_are_connection_refused() {
+        let (proxy, _audit) = proxy("deny", "allow other.test", "");
+        let mut table = StreamTable::default();
+        table.set_endpoint(Endpoint::Egress(proxy.path().to_path_buf()));
+        let id = table
+            .open(flow(Some("evil.test"), 443), Waker::new(|| {}))
+            .unwrap();
+        let err = connect_result(&mut table, id).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
+        table.close(id);
+        // Not resolvable (empty test table) is a refusal too.
+        let id = table
+            .open(flow(Some("other.test"), 443), Waker::new(|| {}))
+            .unwrap();
+        let err = connect_result(&mut table, id).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn a_missing_proxy_is_connection_refused() {
+        let mut table = StreamTable::default();
+        table.set_endpoint(Endpoint::Egress(sock("absent")));
+        let id = table
+            .open(flow(Some("a.test"), 443), Waker::new(|| {}))
+            .unwrap();
+        let err = connect_result(&mut table, id).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn a_flow_without_a_name_is_not_opened() {
+        let mut table = StreamTable::default();
+        table.set_endpoint(Endpoint::Egress(sock("noname")));
+        let err = table.open(flow(None, 443), Waker::new(|| {})).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(table.flows().is_empty());
     }
 }

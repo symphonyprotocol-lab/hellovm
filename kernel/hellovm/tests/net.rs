@@ -81,7 +81,7 @@ fn run_guest(root: &Path, args: &[&str], splice: Option<SocketAddr>, fake_ip: bo
         stdout: String::from_utf8_lossy(&host.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&host.stderr).into_owned(),
         trace: kernel.trace().iter().map(|r| r.sysno).collect(),
-        flows: host.splice_flows().to_vec(),
+        flows: host.outbound_flows().to_vec(),
     }
 }
 
@@ -188,7 +188,7 @@ fn issued_fake_ip_is_spliced_not_dialed() {
     assert!(out.stdout.contains("splice-ok"), "{}", out.stdout);
     server.join().expect("echo server");
     assert_eq!(out.flows.len(), 1, "one spliced flow");
-    let flow = out.flows[0];
+    let flow = &out.flows[0];
     assert_eq!(flow.dest_port, 443);
     assert_eq!(flow.dest_ip[0], 198);
     assert_eq!(flow.dest_ip[1], 51);

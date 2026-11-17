@@ -41,4 +41,6 @@ mod tty;
 pub mod vfs;
 
 pub use arch::{Arch, Sysno};
-pub use kernel::{ConsoleMode, ExitStatus, Kernel, KernelError, Outcome, SyscallRecord};
+pub use kernel::{
+    ConsoleMode, ExitStatus, Kernel, KernelError, Outcome, SyscallRecord, RESOLV_CONF,
+};

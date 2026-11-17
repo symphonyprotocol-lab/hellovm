@@ -38,7 +38,7 @@ use crate::errno::{
 use crate::fd::{Access, FileObject, OpenFile};
 use crate::host::{Host, OutboundFlow};
 use crate::net::{
-    dns_nxdomain, source_ip, Class, Domain, Link, Net, Phase, Proto, SockId, DGRAM_BYTES_CAP,
+    source_ip, Class, Domain, Link, Net, Phase, Proto, SockId, DGRAM_BYTES_CAP,
     DGRAM_CAP, DGRAM_MAX, DNS_IN_CAP, DNS_PORT, GATEWAY_IP, STREAM_CAP,
 };
 use crate::platform::{GuestAddr, Platform};
@@ -853,14 +853,16 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Err(Errno(crate::errno::ENETUNREACH));
         }
         self.ensure_local(id, source_ip(ip))?;
+        // The flow is named by the kernel's own DNS table, never by
+        // anything the guest passes now. `dest_ip` is audit metadata; the
+        // host dials only its configured endpoint (the egress proxy).
         let flow = OutboundFlow {
-            sandbox_id: 0,
+            sandbox_id: self.st.net.sandbox_id,
             guest_pid: self.pid,
             dest_ip: ip.to_be_bytes(),
             dest_port: port,
+            host: self.st.net.name_of(ip).map(str::to_string),
         };
-        // `dest_ip` is audit metadata. The host dials only its configured
-        // endpoint (002b: the egress Unix socket).
         let waker = self.plat.waker();
         let stream = match self.host.open_stream(flow, waker) {
             Ok(id) => id,
@@ -1165,7 +1167,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         // the datagram and `sendto` succeeds.
         match class {
             Class::Dns => {
-                if let Some(reply) = dns_nxdomain(data) {
+                let outbound = self.host.egress_configured();
+                if let Some(reply) = self.st.net.dns_reply(data, outbound) {
                     self.enqueue_dgram(id, GATEWAY_IP, DNS_PORT, reply, nonblock, true)?;
                 }
                 Ok(data.len())
@@ -1332,9 +1335,11 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 return;
             }
             let query = buf[2..2 + need].to_vec();
+            self.st.net.get_mut(id).dns_in.drain(..2 + need);
+            let outbound = self.host.egress_configured();
+            let reply = self.st.net.dns_reply(&query, outbound);
             let sock = self.st.net.get_mut(id);
-            sock.dns_in.drain(..2 + need);
-            if let Some(reply) = dns_nxdomain(&query) {
+            if let Some(reply) = reply {
                 let len = (reply.len() as u16).to_be_bytes();
                 sock.rx.extend(len);
                 sock.rx.extend(reply);

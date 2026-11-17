@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty]
-//!         [--splice-to IP:PORT] --root DIR
+//!         [--egress SOCKET] [--sandbox-id ID] --root DIR
 //!         [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
 //!
@@ -18,6 +18,15 @@
 //! every process of the sandbox after that many seconds (decimals allowed)
 //! and makes hellovm exit with 124, like `timeout(1)`. `--trace` prints
 //! every syscall the kernel handled to stderr.
+//!
+//! `--egress SOCKET` sends the sandbox's outbound TCP flows to the
+//! `hellovm-egress` proxy listening on that Unix socket; without it nothing
+//! leaves the sandbox. `--sandbox-id` names the sandbox to the proxy (16 hex
+//! digits or a decimal number; random by default). When the program ends,
+//! hellovm waits up to 10 s for bytes the sandbox already wrote to reach
+//! the proxy. With the `insecure-test-hooks` feature, `--splice-to
+//! 127.0.0.1:PORT` instead splices every flow to a loopback TCP address
+//! with no policy (tests only).
 //!
 //! When hellovm's stdin and stdout are terminals (or with `--tty`), the
 //! sandbox console is a terminal: fds 0, 1 and 2 are `/dev/console`, with
@@ -35,8 +44,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
-     [--splice-to 127.0.0.1:PORT] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]\n\
-     --splice-to is a dev-only hook (loopback only). It is not --egress.";
+     [--egress SOCKET] [--sandbox-id ID] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+
+/// How long hellovm waits, after the program ends, for outbound bytes the
+/// sandbox already wrote to be delivered.
+const EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Exit status when the program was killed by `--timeout`.
 const EXIT_TIMEOUT: u8 = 124;
@@ -80,9 +92,12 @@ struct Options {
     tty: Option<bool>,
     timeout: Option<std::time::Duration>,
     root: PathBuf,
-    /// Dev-only: splice issued-fake-IP TCP to this loopback address.
-    /// Not `--egress` (that flag arrives with the 002b proxy). 002b will
-    /// gate the hook behind `insecure-test-hooks`.
+    /// The egress proxy's Unix socket.
+    egress: Option<PathBuf>,
+    /// Names the sandbox to the egress proxy.
+    sandbox_id: Option<u64>,
+    /// Test hook: splice outbound TCP to this loopback address.
+    #[cfg(feature = "insecure-test-hooks")]
     splice_to: Option<std::net::SocketAddr>,
     env: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
@@ -93,6 +108,9 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut tty = None;
     let mut timeout = None;
     let mut root = None;
+    let mut egress = None;
+    let mut sandbox_id = None;
+    #[cfg(feature = "insecure-test-hooks")]
     let mut splice_to = None;
     let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
     let mut args = args.peekable();
@@ -124,6 +142,28 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 timeout = Some(seconds);
                 continue;
             }
+            Some("--egress") => {
+                args.next();
+                egress = Some(PathBuf::from(
+                    args.next().ok_or("--egress needs a socket path")?,
+                ));
+                continue;
+            }
+            Some("--sandbox-id") => {
+                args.next();
+                let value = args.next().ok_or("--sandbox-id needs an id")?;
+                let text = value.to_string_lossy();
+                let id = if text.len() == 16 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    u64::from_str_radix(&text, 16).ok()
+                } else {
+                    text.parse::<u64>().ok()
+                };
+                sandbox_id = Some(id.ok_or_else(|| {
+                    format!("--sandbox-id {text}: expected 16 hex digits or a decimal number")
+                })?);
+                continue;
+            }
+            #[cfg(feature = "insecure-test-hooks")]
             Some("--splice-to") => {
                 args.next();
                 let value = args.next().ok_or("--splice-to needs IP:PORT")?;
@@ -138,7 +178,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 })?;
                 if !addr.ip().is_ipv4() || !addr.ip().is_loopback() {
                     return Err(format!(
-                        "--splice-to {text}: dev-only hook, and the address must be IPv4 loopback"
+                        "--splice-to {text}: test-only hook, and the address must be IPv4 loopback"
                     ));
                 }
                 splice_to = Some(addr);
@@ -179,6 +219,9 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         tty,
         timeout,
         root,
+        egress,
+        sandbox_id,
+        #[cfg(feature = "insecure-test-hooks")]
         splice_to,
         env,
         argv,
@@ -238,11 +281,24 @@ fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
     let mut app = SeccompPlatform::new()?;
     let mut host = StdioHost::new(Some(image));
+    if let Some(path) = &options.egress {
+        host.set_egress(path);
+    }
+    #[cfg(feature = "insecure-test-hooks")]
     if let Some(addr) = options.splice_to {
         // Every issued fake IP is spliced here. The guest address is not dialed.
         host.set_splice_endpoint(addr);
     }
-    let mut kernel = Kernel::new(host);
+    let sandbox_id = match options.sandbox_id {
+        Some(id) => id,
+        None => {
+            let mut bytes = [0u8; 8];
+            hellovm_core::host::Host::random(&mut host, &mut bytes)?;
+            u64::from_be_bytes(bytes)
+        }
+    };
+    log::info!("sandbox id {sandbox_id:016x}");
+    let mut kernel = Kernel::new(host).with_sandbox_id(sandbox_id);
     if options.trace {
         kernel = kernel.with_trace();
     }
@@ -280,6 +336,11 @@ fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
     let status = kernel.run(&mut app);
     for record in kernel.trace() {
         eprintln!("hellovm: trace: {record}");
+    }
+    // The helpers that deliver what the guest wrote are threads of this
+    // process: give them a bounded time before exit ends them.
+    if !kernel.host_mut().drain_streams(EXIT_DRAIN) {
+        log::warn!("outbound streams still had undelivered bytes after {EXIT_DRAIN:?}");
     }
     let status = status?;
     match (status, options.timeout) {

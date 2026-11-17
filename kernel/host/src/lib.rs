@@ -9,6 +9,10 @@
 //!   the kernel never blocks on it.
 //! * [`CaptureHost`] keeps console output in memory and feeds console input
 //!   from memory (for tests and embedding).
+//!
+//! Both send outbound guest flows to the egress proxy set with
+//! `set_egress` (see `stream.rs`); with the `insecure-test-hooks` feature,
+//! `set_splice_endpoint` sends them to a loopback TCP address instead.
 
 #![forbid(unsafe_code)]
 
@@ -27,7 +31,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hellovm_core::platform::Waker;
 
-use stream::SpliceTable;
+use stream::{Endpoint, StreamTable};
+
+pub use stream::VERDICT_TIMEOUT;
 
 pub use image::ImageDir;
 
@@ -203,7 +209,7 @@ pub struct StdioHost {
     stdin: Option<Arc<StdinReader>>,
     /// Given to the stdin reader when it starts.
     waker: Option<Waker>,
-    splice: SpliceTable,
+    splice: StreamTable,
 }
 
 impl std::fmt::Debug for StdioHost {
@@ -218,14 +224,26 @@ impl StdioHost {
             common: Common::new(image),
             stdin: None,
             waker: None,
-            splice: SpliceTable::default(),
+            splice: StreamTable::default(),
         }
     }
 
-    /// Splice every issued-fake-IP TCP connect to `addr`. The guest's
-    /// destination is not dialed. Orthogonal to 002b's `--egress`.
+    /// Sends every outbound flow to the egress proxy listening on `path`.
+    pub fn set_egress(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.splice.set_endpoint(Endpoint::Egress(path.into()));
+    }
+
+    /// Test hook: splice every issued-fake-IP TCP connect to `addr`, with
+    /// no egress policy. The guest's destination is not dialed.
+    #[cfg(feature = "insecure-test-hooks")]
     pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) {
-        self.splice.set_endpoint(addr);
+        self.splice.set_endpoint(Endpoint::Splice(addr));
+    }
+
+    /// See [`StreamTable::drain`]: closes the remaining outbound streams and
+    /// waits at most `limit` for their queued bytes to be delivered.
+    pub fn drain_streams(&mut self, limit: Duration) -> bool {
+        self.splice.drain(limit)
     }
 
     /// The stdin reader, started when the sandbox first asks for console
@@ -299,7 +317,7 @@ pub struct CaptureHost {
     pub stderr: Vec<u8>,
     pub stdin: VecDeque<u8>,
     common: Common,
-    splice: SpliceTable,
+    splice: StreamTable,
 }
 
 impl CaptureHost {
@@ -309,19 +327,30 @@ impl CaptureHost {
             stderr: Vec::new(),
             stdin: VecDeque::new(),
             common: Common::new(image),
-            splice: SpliceTable::default(),
+            splice: StreamTable::default(),
         }
     }
 
-    /// Splice every issued-fake-IP TCP connect to `addr`.
-    pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) {
-        self.splice.set_endpoint(addr);
+    /// Sends every outbound flow to the egress proxy listening on `path`.
+    pub fn set_egress(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.splice.set_endpoint(Endpoint::Egress(path.into()));
     }
 
-    /// Flows the kernel asked to splice, in order. `dest_ip` is the guest
-    /// address that was **not** dialed.
-    pub fn splice_flows(&self) -> &[hellovm_core::host::OutboundFlow] {
+    /// Test hook: splice every issued-fake-IP TCP connect to `addr`.
+    #[cfg(feature = "insecure-test-hooks")]
+    pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) {
+        self.splice.set_endpoint(Endpoint::Splice(addr));
+    }
+
+    /// Outbound flows the kernel opened (the last 1024), in order.
+    /// `dest_ip` is the guest address that was **not** dialed.
+    pub fn outbound_flows(&self) -> &[hellovm_core::host::OutboundFlow] {
         self.splice.flows()
+    }
+
+    /// See [`StdioHost::drain_streams`].
+    pub fn drain_streams(&mut self, limit: Duration) -> bool {
+        self.splice.drain(limit)
     }
 }
 
