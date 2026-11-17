@@ -368,6 +368,7 @@ where
         Some(Sendto) => ctx.sys_sendto(int(a[0]), a[1], a[2], a[3], a[4], int(a[5])),
         Some(Recvfrom) => ctx.sys_recvfrom(int(a[0]), a[1], a[2], a[3], a[4], a[5]),
         Some(Sendmsg) => ctx.sys_sendmsg(int(a[0]), a[1], a[2]),
+        Some(Sendmmsg) => ctx.sys_sendmmsg(int(a[0]), a[1], a[2], a[3]),
         Some(Recvmsg) => ctx.sys_recvmsg(int(a[0]), a[1], a[2]),
         Some(Shutdown) => ctx.sys_shutdown(int(a[0]), int(a[1])),
         Some(Getsockname) => ctx.sys_getsockname(int(a[0]), a[1], a[2]),
@@ -483,8 +484,9 @@ where
         // Deliberately refused: glibc falls back without restartable
         // sequences, and without clone3. epoll is not implemented.
         // CPython's DefaultSelector is EpollSelector and errors if
-        // epoll_create1 returns ENOSYS; 002b inventories whether pip or
-        // git need it. subprocess can use poll.
+        // epoll_create1 returns ENOSYS. Under --trace, neither `pip install`
+        // (CPython 3.11, pip 23) nor `git clone` over HTTPS (git 2.39,
+        // libcurl) calls epoll; subprocess and urllib3 use poll.
         Some(Rseq | EpollCreate1) => Err(Errno(ENOSYS)),
         _ => unimplemented(trap.nr, sysno, &a),
     };

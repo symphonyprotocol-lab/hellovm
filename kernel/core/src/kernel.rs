@@ -241,9 +241,7 @@ impl<H: Host> Kernel<H> {
         ) else {
             return;
         };
-        let _ = self
-            .vfs
-            .write(&mut self.host, file, 0, RESOLV_CONF, time);
+        let _ = self.vfs.write(&mut self.host, file, 0, RESOLV_CONF, time);
     }
 
     /// Limits the sandbox's in-memory filesystem layer to `bytes` (file
@@ -1478,7 +1476,14 @@ mod tests {
             sc(
                 arch,
                 Sysno::Sendto,
-                &[3, SCRATCH + 0x100, query.len() as u64, 0, SCRATCH + 0x20, 16],
+                &[
+                    3,
+                    SCRATCH + 0x100,
+                    query.len() as u64,
+                    0,
+                    SCRATCH + 0x20,
+                    16,
+                ],
             ),
             sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x200, 512, 0, 0, 0]),
             sc(arch, Sysno::Socket, &[2, 1, 0]),
@@ -1493,7 +1498,8 @@ mod tests {
         plat.mem(INIT).poke(SCRATCH, &[0; 0x1000]);
         // The first name bound gets the first pool address.
         plat.mem(INIT).poke(SCRATCH, &sin([198, 51, 100, 1], 443));
-        plat.mem(INIT).poke(SCRATCH + 0x20, &sin([192, 0, 2, 1], 53));
+        plat.mem(INIT)
+            .poke(SCRATCH + 0x20, &sin([192, 0, 2, 1], 53));
         plat.mem(INIT).poke(SCRATCH + 0x100, &query);
         assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
         let got = returns(&plat, INIT);
@@ -1510,6 +1516,67 @@ mod tests {
         assert_eq!(flow.dest_ip, [198, 51, 100, 1]);
     }
 
+    /// glibc's resolver sends A and AAAA together with `sendmmsg`; each
+    /// gets its own reply and its `msg_len`.
+    #[test]
+    fn sendmmsg_sends_each_query() {
+        let arch = Arch::Aarch64;
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        let mut a = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        a.extend_from_slice(b"\x03git\x04test\x00\x00\x01\x00\x01");
+        let mut aaaa = a.clone();
+        aaaa[1] = 2;
+        let n = aaaa.len();
+        aaaa[n - 3] = 28;
+        let vec_at = SCRATCH + 0x300;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 2, 0]),
+            sc(arch, Sysno::Sendmmsg, &[3, vec_at, 2, 0x4000]),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x600, 512, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x800, 512, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        let mem = plat.mem(INIT);
+        mem.poke(SCRATCH, &[0; 0x1000]);
+        mem.poke(SCRATCH + 0x20, &sin([192, 0, 2, 1], 53));
+        mem.poke(SCRATCH + 0x100, &a);
+        mem.poke(SCRATCH + 0x200, &aaaa);
+        // Two iovecs, then two mmsghdrs (msghdr + msg_len, 64 bytes each).
+        for (i, (buf, len)) in [(SCRATCH + 0x100, a.len()), (SCRATCH + 0x200, aaaa.len())]
+            .into_iter()
+            .enumerate()
+        {
+            let iov = SCRATCH + 0x40 + 16 * i as u64;
+            mem.poke(iov, &buf.to_le_bytes());
+            mem.poke(iov + 8, &(len as u64).to_le_bytes());
+            let hdr = vec_at + 64 * i as u64;
+            mem.poke(hdr, &(SCRATCH + 0x20).to_le_bytes());
+            mem.poke(hdr + 8, &16u32.to_le_bytes());
+            mem.poke(hdr + 16, &iov.to_le_bytes());
+            mem.poke(hdr + 24, &1u64.to_le_bytes());
+        }
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[1], 2, "{got:?}");
+        let mem = plat.mem(INIT);
+        assert_eq!(mem.peek(vec_at + 56, 4), (a.len() as u32).to_le_bytes());
+        assert_eq!(
+            mem.peek(vec_at + 64 + 56, 4),
+            (aaaa.len() as u32).to_le_bytes()
+        );
+        // An A answer with one record, then an empty AAAA answer.
+        let first = mem.peek(SCRATCH + 0x600, got[2] as usize);
+        assert_eq!((first[1], first[7]), (1, 1));
+        let second = mem.peek(SCRATCH + 0x800, got[3] as usize);
+        assert_eq!((second[1], second[3] & 0x0f, second[7]), (2, 0, 0));
+    }
+
     /// Without an outbound endpoint, virtual DNS binds nothing.
     #[test]
     fn without_egress_dns_is_nxdomain_and_binds_nothing() {
@@ -1522,7 +1589,14 @@ mod tests {
             sc(
                 arch,
                 Sysno::Sendto,
-                &[3, SCRATCH + 0x100, query.len() as u64, 0, SCRATCH + 0x20, 16],
+                &[
+                    3,
+                    SCRATCH + 0x100,
+                    query.len() as u64,
+                    0,
+                    SCRATCH + 0x20,
+                    16,
+                ],
             ),
             sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x200, 512, 0, 0, 0]),
             sc(arch, Sysno::Socket, &[2, 1, 0]),
@@ -1536,7 +1610,8 @@ mod tests {
             .unwrap();
         plat.mem(INIT).poke(SCRATCH, &[0; 0x1000]);
         plat.mem(INIT).poke(SCRATCH, &sin([198, 51, 100, 1], 443));
-        plat.mem(INIT).poke(SCRATCH + 0x20, &sin([192, 0, 2, 1], 53));
+        plat.mem(INIT)
+            .poke(SCRATCH + 0x20, &sin([192, 0, 2, 1], 53));
         plat.mem(INIT).poke(SCRATCH + 0x100, &query);
         assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
         let got = returns(&plat, INIT);

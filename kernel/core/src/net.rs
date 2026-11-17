@@ -1061,7 +1061,9 @@ mod tests {
     fn other_types_and_bad_names() {
         let mut net = Net::default();
         for qtype in [28, 65, 15, 16, 255] {
-            let resp = net.dns_reply(&query(1, "pypi.org", qtype, 1), true).unwrap();
+            let resp = net
+                .dns_reply(&query(1, "pypi.org", qtype, 1), true)
+                .unwrap();
             assert_eq!((rcode(&resp), ancount(&resp)), (0, 0), "type {qtype}");
         }
         assert!(net.names.is_empty(), "only A binds a name");
@@ -1095,7 +1097,9 @@ mod tests {
                 .unwrap();
             assert_eq!(rcode(&resp), 0);
         }
-        let resp = net.dns_reply(&query(1, "one-more.example", 1, 1), true).unwrap();
+        let resp = net
+            .dns_reply(&query(1, "one-more.example", 1, 1), true)
+            .unwrap();
         assert_eq!(rcode(&resp), 2, "SERVFAIL when full");
         // Names already bound still answer.
         let resp = net.dns_reply(&query(1, "h3.example", 1, 1), true).unwrap();

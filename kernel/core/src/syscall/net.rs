@@ -38,8 +38,8 @@ use crate::errno::{
 use crate::fd::{Access, FileObject, OpenFile};
 use crate::host::{Host, OutboundFlow};
 use crate::net::{
-    source_ip, Class, Domain, Link, Net, Phase, Proto, SockId, DGRAM_BYTES_CAP,
-    DGRAM_CAP, DGRAM_MAX, DNS_IN_CAP, DNS_PORT, GATEWAY_IP, STREAM_CAP,
+    source_ip, Class, Domain, Link, Net, Phase, Proto, SockId, DGRAM_BYTES_CAP, DGRAM_CAP,
+    DGRAM_MAX, DNS_IN_CAP, DNS_PORT, GATEWAY_IP, STREAM_CAP,
 };
 use crate::platform::{GuestAddr, Platform};
 use crate::signal::{self, SigInfo};
@@ -91,6 +91,12 @@ const SIOCGIFADDR: u64 = 0x8915;
 /// `sizeof(struct ifreq)` on 64-bit glibc.
 const IFREQ_SIZE: usize = 40;
 const IFNAMSIZ: usize = 16;
+
+/// `sizeof(struct msghdr)` and `sizeof(struct mmsghdr)` on 64-bit ABIs.
+const MSGHDR_SIZE: u64 = 56;
+const MMSGHDR_SIZE: u64 = 64;
+/// Most messages one `sendmmsg` handles (Linux `UIO_MAXIOV`).
+const UIO_MAXIOV: u64 = 1024;
 
 /// One `recv`/`recvfrom`/`recvmsg` payload and, for UDP, its source.
 type Recv = SysResult<(Vec<u8>, Option<(u32, u16)>)>;
@@ -600,6 +606,44 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let (dest, data) = self.read_msg_out(msg)?;
         let id = self.sock_id(fd)?;
         self.socket_send(id, &data, flags, dest).map(|n| n as u64)
+    }
+
+    /// `sendmmsg`: `sendmsg` for each of up to [`UIO_MAXIOV`] `mmsghdr`s,
+    /// storing each message's length in its `msg_len`. Stops at the first
+    /// failure: that error if nothing was sent, else the count so far, as
+    /// Linux does. glibc's resolver sends its A and AAAA queries this way.
+    pub fn sys_sendmmsg(
+        &mut self,
+        fd: i64,
+        vec: GuestAddr,
+        vlen: u64,
+        flags: u64,
+    ) -> SysResult<u64> {
+        self.sock_id(fd)?;
+        let vlen = vlen.min(UIO_MAXIOV);
+        let mut sent = 0u64;
+        while sent < vlen {
+            let hdr = vec + sent * MMSGHDR_SIZE;
+            // Only the first message may block (and park the call, which
+            // then restarts from scratch). Later ones must not park once
+            // something was sent: they go out with `MSG_DONTWAIT`.
+            let flags = if sent == 0 {
+                flags
+            } else {
+                flags | MSG_DONTWAIT
+            };
+            match self.sys_sendmsg(fd, hdr, flags) {
+                Ok(n) => {
+                    if let Err(err) = self.write_u32(hdr + MSGHDR_SIZE, n as u32) {
+                        return if sent == 0 { Err(err) } else { Ok(sent) };
+                    }
+                    sent += 1;
+                }
+                Err(err) if sent == 0 => return Err(err),
+                Err(_) => return Ok(sent),
+            }
+        }
+        Ok(sent)
     }
 
     pub fn sys_recvmsg(&mut self, fd: i64, msg: GuestAddr, flags: u64) -> SysResult<u64> {
