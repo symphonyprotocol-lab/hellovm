@@ -126,7 +126,12 @@ fn egress_connect(path: &PathBuf, req: &[u8]) -> io::Result<Conn> {
     let mut reply = [0u8; REPLY];
     match (&sock).read_exact(&mut reply) {
         Ok(()) => {}
-        Err(err) if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "no verdict from the egress proxy",
@@ -922,7 +927,10 @@ mod egress_tests {
         assert!(table.drain(Duration::from_secs(5)), "drained");
         drop(proxy);
         let lines = audit.lines();
-        assert!(lines[0].contains(" sandbox=0000000000000051 host=echo.test port=443 verdict=allow "), "{lines:?}");
+        assert!(
+            lines[0].contains(" sandbox=0000000000000051 host=echo.test port=443 verdict=allow "),
+            "{lines:?}"
+        );
     }
 
     #[test]

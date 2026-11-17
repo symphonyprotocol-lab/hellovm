@@ -35,7 +35,7 @@ jobs:
       - name: Install distro e2e dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends busybox-static gcc libc6-dev python3
+          sudo apt-get install -y --no-install-recommends busybox-static gcc libc6-dev python3 python3-pip git openssl
 
       - name: Run the x86_64 e2e script
         run: kernel/dev/run-e2e.sh

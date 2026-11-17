@@ -229,10 +229,14 @@ impl ProxyHandle {
 
     fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        // Wake the accept loop.
-        let _ = UnixStream::connect(&self.path);
+        // Wake the accept loop. If the socket file is already gone, nothing
+        // can reach the loop: leave the thread blocked in `accept` rather
+        // than wait for it.
+        let woke = UnixStream::connect(&self.path).is_ok();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if woke {
+                let _ = thread.join();
+            }
         }
         let _ = std::fs::remove_file(&self.path);
     }
