@@ -6,7 +6,11 @@
 //! * mount: the root becomes an empty, read-only tmpfs. The old root is
 //!   detached, so no host path can be named any more. The image stays
 //!   reachable through the directory fd opened before; the egress socket,
-//!   if any, is bind-mounted into the new root as `/egress.sock`.
+//!   if any, is bind-mounted into the new root as `/egress.sock`. The bind
+//!   pins the socket that existed at start-up: a proxy restarted later
+//!   (a new socket at the same path) is reached only by kernel processes
+//!   started after it, and one that was not running at start-up not at
+//!   all (flows are refused, as with no proxy).
 //! * network: only a loopback interface, which is down. Pathname Unix
 //!   sockets (the egress socket) still work across network namespaces;
 //!   abstract Unix sockets of the host do not.
@@ -19,7 +23,9 @@
 
 use std::ffi::CString;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// Where the egress socket appears inside the new root.
@@ -40,6 +46,16 @@ fn write_file(path: &str, data: &str) -> Result<(), String> {
     std::fs::write(path, data).map_err(|err| format!("writing {path}: {err}"))
 }
 
+/// Why [`enter`] did not finish.
+#[derive(Debug)]
+pub enum NsError {
+    /// The host refused the namespaces; nothing was changed.
+    Unavailable(String),
+    /// A step after `unshare` failed: the process is in half-built
+    /// namespaces and must not go on.
+    Failed(String),
+}
+
 /// What [`enter`] set up.
 #[derive(Debug, Default)]
 pub struct Entered {
@@ -49,12 +65,17 @@ pub struct Entered {
 }
 
 /// Enters the namespaces and switches to the empty root. `egress` is the
-/// host path of the egress socket (absolute). With `keep_net`, the
+/// host path of the egress socket. With `keep_net`, the
 /// network namespace is not created (the `--splice-to` test hook needs the
 /// host's loopback).
-pub fn enter(egress: Option<&Path>, keep_net: bool) -> Result<Entered, String> {
+pub fn enter(egress: Option<&Path>, keep_net: bool) -> Result<Entered, NsError> {
     // SAFETY: plain syscalls.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let ids = unsafe { (libc::getuid(), libc::getgid()) };
+    unshare(keep_net).map_err(NsError::Unavailable)?;
+    build(egress, keep_net, ids).map_err(NsError::Failed)
+}
+
+fn unshare(keep_net: bool) -> Result<(), String> {
     let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWIPC;
     if !keep_net {
         flags |= libc::CLONE_NEWNET;
@@ -72,8 +93,32 @@ pub fn enter(egress: Option<&Path>, keep_net: bool) -> Result<Entered, String> {
             _ => format!("unshare: {err}"),
         });
     }
-    // From here on a failure leaves the process in half-built namespaces,
-    // which are still no less confining than none; the caller reports it.
+    Ok(())
+}
+
+fn build(
+    egress: Option<&Path>,
+    keep_net: bool,
+    (uid, gid): (libc::uid_t, libc::gid_t),
+) -> Result<Entered, String> {
+    // Opened in the new mount namespace (a bind mount refuses a source
+    // from another one) and before the new root is mounted, so that its
+    // mount cannot hide the socket's path. A socket that does not exist
+    // yet (no proxy running) is not bound: flows are then refused, as
+    // without the namespace.
+    let socket = egress.and_then(|path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|err| {
+                log::info!(
+                    "egress socket {}: {err}; flows will be refused",
+                    path.display()
+                )
+            })
+            .ok()
+    });
     write_file("/proc/self/setgroups", "deny")?;
     write_file("/proc/self/uid_map", &format!("{uid} {uid} 1"))?;
     write_file("/proc/self/gid_map", &format!("{gid} {gid} 1"))?;
@@ -117,16 +162,20 @@ pub fn enter(egress: Option<&Path>, keep_net: bool) -> Result<Entered, String> {
         net: !keep_net,
         egress: None,
     };
-    if let Some(socket) = egress {
+    if egress.is_some() {
+        entered.egress = Some(PathBuf::from(EGRESS_INSIDE));
+    }
+    if let Some(socket) = &socket {
         let target = mountpoint.join(EGRESS_INSIDE.trim_start_matches('/'));
         std::fs::File::create(&target)
             .map_err(|err| format!("creating {}: {err}", target.display()))?;
+        let source = PathBuf::from(format!("/proc/self/fd/{}", socket.as_raw_fd()));
         // SAFETY: valid C strings.
         unsafe {
             check(
                 "bind-mounting the egress socket",
                 libc::mount(
-                    c(socket).as_ptr(),
+                    c(&source).as_ptr(),
                     c(&target).as_ptr(),
                     std::ptr::null(),
                     libc::MS_BIND,
@@ -134,8 +183,8 @@ pub fn enter(egress: Option<&Path>, keep_net: bool) -> Result<Entered, String> {
                 ),
             )?;
         }
-        entered.egress = Some(PathBuf::from(EGRESS_INSIDE));
     }
+    drop(socket);
     // SAFETY: valid C strings; pivot_root has no libc wrapper.
     unsafe {
         check("chdir to the new root", libc::chdir(root.as_ptr()))?;

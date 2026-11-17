@@ -203,7 +203,8 @@ impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--sandbox=require: a required hardening layer is unavailable:\n{}",
+            "cannot harden the kernel process (a required layer is unavailable, \
+             or a layer failed half-way):\n{}",
             self.0
         )
     }
@@ -255,22 +256,29 @@ pub fn apply(config: Config<'_>) -> Result<Report, Refused> {
             .map_err(|err| format!("{}: {err}", path.display()))
     });
 
-    let ns = ns::enter(config.egress.as_deref(), config.tcp_port.is_some());
-    report.push(
-        Layer::Namespaces,
-        ns.as_ref()
-            .map(|e| {
-                if e.net {
+    match ns::enter(config.egress.as_deref(), config.tcp_port.is_some()) {
+        Ok(entered) => {
+            report.push(
+                Layer::Namespaces,
+                Ok(if entered.net {
                     "user, mount, network, IPC".into()
                 } else {
                     "user, mount, IPC; network kept for --splice-to".into()
-                }
-            })
-            .map_err(Clone::clone),
-    );
-    if let Ok(entered) = &ns {
-        if config.egress.is_some() {
-            report.egress = entered.egress.clone();
+                }),
+            );
+            if config.egress.is_some() {
+                report.egress = entered.egress;
+            }
+        }
+        Err(ns::NsError::Unavailable(reason)) => report.push(Layer::Namespaces, Err(reason)),
+        Err(ns::NsError::Failed(reason)) => {
+            // Half-built namespaces: never run guest code like this.
+            report.push(
+                Layer::Namespaces,
+                Err(format!("FAILED after unshare: {reason}")),
+            );
+            report.log();
+            return Err(Refused(report));
         }
     }
 
