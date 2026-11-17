@@ -641,3 +641,85 @@ fn live_pip_and_git() {
     audit_line(&audit, "files.pythonhosted.org", "ok");
     audit_line(&audit, "github.com", "ok");
 }
+
+/// A template that fetches over plain HTTP while it boots, then has each
+/// clone fetch over TLS.
+const CLONE_FETCH: &str = r#"
+import socket, ssl, sys
+ca = sys.argv[1]
+def get(host, tls):
+    s = socket.create_connection((host, 443 if tls else 80))
+    if tls:
+        s = ssl.create_default_context(cafile=ca).wrap_socket(s, server_hostname=host)
+    s.sendall(f"GET /hello.txt HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    return data
+print("boot", get("web.test", False).split(b"\r\n")[0].decode(), flush=True)
+open("/dev/hellovm-clone", "rb").read()
+reply = get("tls.test", True)
+print("clone", reply.split(b"\r\n")[0].decode(), b"hello-outside" in reply, flush=True)
+"#;
+
+/// Waits for the audit line of an allowed flow to `host` from `sandbox`.
+fn allowed_for(audit: &MemorySink, host: &str, sandbox: &str) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(line) = audit.lines().into_iter().find(|l| {
+            audit_field(l, "host") == Some(host)
+                && audit_field(l, "reason") == Some("ok")
+                && audit_field(l, "sandbox") == Some(sandbox)
+        }) {
+            return line;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no allowed flow to {host} from {sandbox}:\n{}",
+            audit.lines().join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_clone_reaches_the_proxy_with_its_own_sandbox_id() {
+    if !require_all() {
+        return;
+    }
+    let outside = Outside::start();
+    let (proxy, audit, _dir) = proxy(
+        POLICY,
+        Resolver::parse_test_table(&outside.table()).unwrap(),
+    );
+    let ca = outside.ca();
+    let egress = proxy.path().to_str().unwrap().to_string();
+    let template = common::Template::start(
+        &["/usr/bin/python3", "-c", CLONE_FETCH, ca.to_str().unwrap()],
+        &["--egress", &egress, "--sandbox-id", "15"],
+    );
+    template
+        .ready()
+        .unwrap_or_else(|err| panic!("{err}\n{}", template.output()));
+    assert!(
+        template.output().contains("boot HTTP/1.0 200 OK"),
+        "{}",
+        template.output()
+    );
+    allowed_for(&audit, "web.test", "000000000000000f");
+    for id in [0xc1u64, 0xc2] {
+        let run = template.spawn(Some(id), b"").unwrap().finish();
+        assert_eq!(run.stdout, "clone HTTP/1.0 200 OK True\n", "{run:?}");
+        allowed_for(&audit, "tls.test", &format!("{id:016x}"));
+    }
+    // The template itself never went to tls.test.
+    assert!(!audit
+        .lines()
+        .iter()
+        .any(|l| audit_field(l, "host") == Some("tls.test")
+            && audit_field(l, "sandbox") == Some("000000000000000f")));
+}

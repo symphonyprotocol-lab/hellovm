@@ -447,3 +447,190 @@ impl Sandbox {
         out.stdout
     }
 }
+
+/// A `hellovm --template SOCKET` process (warm clones, see `tests/warm.rs`)
+/// whose image is the host's `/`. Killed on drop, which kills its clones.
+pub struct Template {
+    child: Child,
+    pub socket: PathBuf,
+    _dir: TempDir,
+    output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+/// Collects everything `reader` produces into `into`, on a thread.
+fn collect(
+    mut reader: impl std::io::Read + Send + 'static,
+    into: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            into.lock().unwrap().extend_from_slice(&chunk[..n]);
+        }
+    })
+}
+
+/// What a finished clone did.
+#[derive(Debug)]
+pub struct CloneRun {
+    pub status: hellovm::warm::Status,
+    pub started: hellovm::warm::Started,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// A clone that runs, with pipes for its console.
+pub struct RunningClone {
+    pub conn: hellovm::warm::WarmClone,
+    pub started: hellovm::warm::Started,
+    pub stdin: Option<std::io::PipeWriter>,
+    stdout: std::io::BufReader<std::io::PipeReader>,
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_done: std::thread::JoinHandle<()>,
+}
+
+impl RunningClone {
+    /// The next line of the clone's stdout (empty at end of file).
+    pub fn line(&mut self) -> String {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut self.stdout, &mut line).unwrap();
+        line
+    }
+
+    /// Writes to the clone's stdin.
+    pub fn send(&mut self, data: &[u8]) {
+        std::io::Write::write_all(self.stdin.as_mut().unwrap(), data).unwrap();
+    }
+
+    /// Kills the clone by closing the connection; returns the rest of its
+    /// stdout (up to the end of file its death causes).
+    pub fn kill(mut self) -> String {
+        self.conn.kill();
+        self.stdin = None;
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut self.stdout, &mut rest).unwrap();
+        rest
+    }
+
+    /// Closes stdin, reads the rest of the output and waits for the end.
+    pub fn finish(mut self) -> CloneRun {
+        self.stdin = None;
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(&mut self.stdout, &mut stdout).unwrap();
+        let status = self.conn.wait().expect("the clone's exit status");
+        self.stderr_done.join().unwrap();
+        let stderr = String::from_utf8_lossy(&self.stderr.lock().unwrap()).into_owned();
+        CloneRun {
+            status,
+            started: self.started,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+impl Template {
+    /// Starts `argv` as a template; `options` go before `--root`.
+    pub fn start(argv: &[&str], options: &[&str]) -> Template {
+        let dir = TempDir::new("template");
+        let socket = dir.path().join("template.sock");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hellovm"))
+            .arg("--template")
+            .arg(&socket)
+            .args(options)
+            .args(["--root", "/", "--"])
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start hellovm --template");
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        collect(child.stdout.take().unwrap(), output.clone());
+        collect(child.stderr.take().unwrap(), output.clone());
+        Template {
+            child,
+            socket,
+            _dir: dir,
+            output,
+        }
+    }
+
+    /// What the template process printed (its guest's console before the
+    /// freeze, and hellovm's messages).
+    pub fn output(&self) -> String {
+        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    /// Waits until the template is frozen: the bytes and areas of its
+    /// snapshot, or the error it answered.
+    pub fn ready(&self) -> std::io::Result<(u64, u32)> {
+        let start = std::time::Instant::now();
+        while !self.socket.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "no control socket after 30 s:\n{}",
+                self.output()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        hellovm::warm::wait_ready(&self.socket)
+    }
+
+    /// Waits for the template process to end.
+    pub fn wait(&mut self) -> std::process::ExitStatus {
+        self.child.wait().unwrap()
+    }
+
+    /// Asks for a clone with pipes as its console and waits until it runs.
+    pub fn spawn(&self, sandbox_id: Option<u64>, input: &[u8]) -> std::io::Result<RunningClone> {
+        use std::os::fd::AsFd;
+        let (in_r, in_w) = std::io::pipe()?;
+        let (out_r, out_w) = std::io::pipe()?;
+        let (err_r, err_w) = std::io::pipe()?;
+        let mut conn = hellovm::warm::WarmClone::request(
+            &self.socket,
+            sandbox_id,
+            input,
+            [in_r.as_fd(), out_w.as_fd(), err_w.as_fd()],
+        )?;
+        // Only the clone holds them now: its end of output is end of file.
+        drop((in_r, out_w, err_w));
+        let started = conn.start()?;
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_done = collect(err_r, stderr.clone());
+        Ok(RunningClone {
+            conn,
+            started,
+            stdin: Some(in_w),
+            stdout: std::io::BufReader::new(out_r),
+            stderr,
+            stderr_done,
+        })
+    }
+
+    /// Runs a clone to its end with `stdin` as its input.
+    pub fn run(&self, input: &[u8], stdin: &[u8]) -> CloneRun {
+        let mut clone = self
+            .spawn(None, input)
+            .unwrap_or_else(|err| panic!("a clone: {err}\n{}", self.output()));
+        let stdin = stdin.to_vec();
+        let mut writer = clone.stdin.take().unwrap();
+        let feeder = std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut writer, &stdin);
+        });
+        let run = clone.finish();
+        feeder.join().unwrap();
+        run
+    }
+}
+
+impl Drop for Template {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
