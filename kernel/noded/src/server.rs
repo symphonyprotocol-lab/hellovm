@@ -10,7 +10,12 @@
 //! | `POST /v1/sandboxes` | `NodeCreate` | `201` `SandboxInfo` |
 //! | `GET /v1/sandboxes/{id}` | | `SandboxInfo` |
 //! | `DELETE /v1/sandboxes/{id}` | | `204` |
-//! | `POST /v1/sandboxes/{id}/exec` | `ExecRequest` | `ExecResult` |
+//! | `POST /v1/sandboxes/{id}/exec` | `ExecRequest` | `ExecResult` (runs it to its end) |
+//! | `POST /v1/sandboxes/{id}/execs` | `ExecRequest` | `201` `ExecStatus` (once started) |
+//! | `GET /v1/sandboxes/{id}/execs` | | `ExecList` (the latest exec) |
+//! | `GET /v1/sandboxes/{id}/execs/{exec}?cursor=&wait=&max_bytes=` | | `ExecPoll` |
+//! | `POST /v1/sandboxes/{id}/execs/{exec}/cancel` | | `ExecStatus` |
+//! | `POST /v1/sandboxes/{id}/python/reset` | | `ResetResult` |
 //! | `GET /v1/sandboxes/{id}/files?path=P` | | the bytes |
 //! | `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `WriteResult` |
 //! | `POST /v1/sandboxes/{id}/files/edit` | `EditRequest` | `EditResult` |
@@ -19,7 +24,7 @@ use std::sync::Arc;
 
 use hellovm_control::http::{Handler, Request, Response};
 use hellovm_control::ids::token_eq;
-use hellovm_control::types::{self, SandboxList};
+use hellovm_control::types::{self, PollQuery, SandboxList};
 use serde::de::DeserializeOwned;
 
 use crate::node::{ApiError, Node};
@@ -75,6 +80,26 @@ impl NodeApi {
                         200,
                         json_body(request).and_then(|r| node.exec(id, Some(tenant), &r)),
                     ),
+                    ("POST", ["execs"]) => respond(
+                        201,
+                        json_body(request).and_then(|r| node.start(id, Some(tenant), &r)),
+                    ),
+                    ("GET", ["execs"]) => respond(200, node.execs(id, Some(tenant))),
+                    ("GET", ["execs", exec]) => {
+                        let query = PollQuery::parse(
+                            request.query("cursor"),
+                            request.query("wait"),
+                            request.query("max_bytes"),
+                        );
+                        match query {
+                            Ok(query) => respond(200, node.poll(id, Some(tenant), exec, query)),
+                            Err(m) => ApiError::new(400, "bad_request", m).response(),
+                        }
+                    }
+                    ("POST", ["execs", exec, "cancel"]) => {
+                        respond(200, node.cancel(id, Some(tenant), exec))
+                    }
+                    ("POST", ["python", "reset"]) => respond(200, node.reset(id, Some(tenant))),
                     ("GET", ["files"]) | ("PUT", ["files"]) => {
                         let Some(path) = request.query("path") else {
                             return ApiError::new(400, "bad_request", "no ?path=").response();
