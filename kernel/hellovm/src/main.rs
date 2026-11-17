@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty]
-//!         [--egress SOCKET] [--sandbox-id ID] --root DIR
+//!         [--egress SOCKET] [--sandbox-id ID]
+//!         [--sandbox require|best-effort|off] --root DIR
 //!         [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
 //!
@@ -34,6 +35,17 @@
 //! window size, and the host terminal is put in raw mode while the program
 //! runs (so Ctrl-C reaches the sandbox's foreground job, not hellovm).
 //! `--no-tty` keeps plain streams.
+//!
+//! Before it reads the program, hellovm takes away its own privileges
+//! (`hellovm-sandbox`): it closes inherited fds, enters user, mount,
+//! network and IPC namespaces with an empty root, lowers its resource
+//! limits, sets `no_new_privs`, restricts itself with Landlock to reading
+//! the image, becomes non-dumpable and installs a seccomp allowlist.
+//! `--sandbox best-effort` (the default) uses every layer the host allows
+//! and logs the reason for each one it skips; `--sandbox require` refuses
+//! to start (exit 125) when a required layer is unavailable; `--sandbox
+//! off` uses none. `HELLOVM_LOG=debug` lists the active layers.
+//!
 //! `HELLOVM_LOG` sets the log level (`error`, `warn` (default), `info`,
 //! `debug`, `trace`).
 
@@ -44,7 +56,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
-     [--egress SOCKET] [--sandbox-id ID] --root DIR [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+     [--egress SOCKET] [--sandbox-id ID] [--sandbox require|best-effort|off] --root DIR \
+     [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
 
 /// How long hellovm waits, after the program ends, for outbound bytes the
 /// sandbox already wrote to be delivered.
@@ -99,6 +112,13 @@ struct Options {
     /// Test hook: splice outbound TCP to this loopback address.
     #[cfg(feature = "insecure-test-hooks")]
     splice_to: Option<std::net::SocketAddr>,
+    /// Test hook: serve programs on stdin (`hellovm::session`).
+    #[cfg(feature = "insecure-test-hooks")]
+    session: bool,
+    /// Test hook: try to break out of the hardened process, then exit.
+    #[cfg(feature = "insecure-test-hooks")]
+    fence_test: Option<String>,
+    sandbox: SandboxMode,
     env: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
 }
@@ -112,6 +132,11 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut sandbox_id = None;
     #[cfg(feature = "insecure-test-hooks")]
     let mut splice_to = None;
+    #[cfg(feature = "insecure-test-hooks")]
+    let mut session = false;
+    #[cfg(feature = "insecure-test-hooks")]
+    let mut fence_test = None;
+    let mut sandbox = SandboxMode::default();
     let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
     let mut args = args.peekable();
     while let Some(arg) = args.peek() {
@@ -184,6 +209,26 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 splice_to = Some(addr);
                 continue;
             }
+            Some("--sandbox") => {
+                args.next();
+                let value = args
+                    .next()
+                    .ok_or("--sandbox needs require, best-effort or off")?;
+                sandbox = value.to_string_lossy().parse()?;
+                continue;
+            }
+            Some(flag) if flag.starts_with("--sandbox=") => {
+                sandbox = flag["--sandbox=".len()..].parse()?;
+            }
+            #[cfg(feature = "insecure-test-hooks")]
+            Some("--insecure-test-session") => session = true,
+            #[cfg(feature = "insecure-test-hooks")]
+            Some("--insecure-fence-test") => {
+                args.next();
+                let value = args.next().ok_or("--insecure-fence-test needs a test")?;
+                fence_test = Some(value.to_string_lossy().into_owned());
+                continue;
+            }
             Some("--env") => {
                 args.next();
                 let var = args.next().ok_or("--env needs NAME=VALUE")?.into_vec();
@@ -210,7 +255,11 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         args.next();
     }
     let argv: Vec<Vec<u8>> = args.map(OsString::into_vec).collect();
-    if argv.is_empty() {
+    #[cfg(feature = "insecure-test-hooks")]
+    let needs_program = !session && fence_test.is_none();
+    #[cfg(not(feature = "insecure-test-hooks"))]
+    let needs_program = true;
+    if argv.is_empty() && needs_program {
         return Err(USAGE.to_string());
     }
     let root = root.ok_or_else(|| format!("--root is required\n{USAGE}"))?;
@@ -223,9 +272,44 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         sandbox_id,
         #[cfg(feature = "insecure-test-hooks")]
         splice_to,
+        #[cfg(feature = "insecure-test-hooks")]
+        session,
+        #[cfg(feature = "insecure-test-hooks")]
+        fence_test,
+        sandbox,
         env,
         argv,
     })
+}
+
+#[cfg(target_os = "linux")]
+use hellovm_sandbox::Mode as SandboxMode;
+
+/// Only Linux has the hardening; elsewhere the flag is accepted and has
+/// nothing to do.
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SandboxMode {
+    Require,
+    #[default]
+    BestEffort,
+    Off,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl std::str::FromStr for SandboxMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<SandboxMode, String> {
+        match s {
+            "require" => Ok(SandboxMode::Require),
+            "best-effort" => Ok(SandboxMode::BestEffort),
+            "off" => Ok(SandboxMode::Off),
+            _ => Err(format!(
+                "--sandbox {s}: expected require, best-effort or off"
+            )),
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -237,7 +321,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&options) {
+    // Before anything opens an fd of its own.
+    #[cfg(target_os = "linux")]
+    let fds = if options.sandbox == SandboxMode::Off {
+        Err("--sandbox=off".to_string())
+    } else {
+        hellovm_sandbox::close_inherited_fds()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let fds: Result<usize, String> = Err("not Linux".into());
+    match run(&options, fds) {
         Ok(Ended::TimedOut(after)) => {
             eprintln!("hellovm: program timed out after {after:?}");
             ExitCode::from(EXIT_TIMEOUT)
@@ -268,8 +361,35 @@ fn exit_code(status: hellovm_core::ExitStatus) -> ExitCode {
     }
 }
 
+/// Applies `hellovm-sandbox` to this process; returns where the egress
+/// socket is now reachable.
 #[cfg(target_os = "linux")]
-fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
+fn harden(
+    options: &Options,
+    image: std::os::fd::BorrowedFd<'_>,
+    egress: Option<PathBuf>,
+    fds: Result<usize, String>,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    #[cfg(feature = "insecure-test-hooks")]
+    let (tcp_port, learn) = (
+        options.splice_to.map(|addr| addr.port()),
+        std::env::var_os("HELLOVM_SECCOMP_LEARN").map(PathBuf::from),
+    );
+    #[cfg(not(feature = "insecure-test-hooks"))]
+    let (tcp_port, learn) = (None, None);
+    let report = hellovm_sandbox::apply(hellovm_sandbox::Config {
+        mode: options.sandbox,
+        image,
+        egress,
+        tcp_port,
+        learn,
+        fds,
+    })?;
+    Ok(report.egress)
+}
+
+#[cfg(target_os = "linux")]
+fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn std::error::Error>> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -279,15 +399,31 @@ fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
 
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
+    let image_fd = image.dir_fd().try_clone_to_owned()?;
+    let egress = options
+        .egress
+        .as_deref()
+        .map(std::path::absolute)
+        .transpose()?;
+    #[cfg(feature = "insecure-test-hooks")]
+    if options.session {
+        return run_session(options, image, image_fd, egress, fds);
+    }
+    // Takes the host profile the sandbox and the platform share.
     let mut app = SeccompPlatform::new()?;
     let mut host = StdioHost::new(Some(image));
-    if let Some(path) = &options.egress {
-        host.set_egress(path);
-    }
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(addr) = options.splice_to {
         // Every issued fake IP is spliced here. The guest address is not dialed.
         host.set_splice_endpoint(addr);
+    }
+    if let Some(path) = harden(options, std::os::fd::AsFd::as_fd(&image_fd), egress, fds)? {
+        host.set_egress(path);
+    }
+    drop(image_fd);
+    #[cfg(feature = "insecure-test-hooks")]
+    if let Some(test) = &options.fence_test {
+        fence_test(test);
     }
     let sandbox_id = match options.sandbox_id {
         Some(id) => id,
@@ -353,8 +489,108 @@ fn run(options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
     }
 }
 
+/// `--insecure-test-session`: see `hellovm::session`.
+#[cfg(all(target_os = "linux", feature = "insecure-test-hooks"))]
+fn run_session(
+    options: &Options,
+    image: hellovm_host::ImageDir,
+    image_fd: std::os::fd::OwnedFd,
+    egress: Option<PathBuf>,
+    fds: Result<usize, String>,
+) -> Result<Ended, Box<dyn std::error::Error>> {
+    let mut host = hellovm_host::CaptureHost::new(Some(image));
+    if let Some(addr) = options.splice_to {
+        host.set_splice_endpoint(addr);
+    }
+    let mut kernel = hellovm_core::Kernel::new(host);
+    if let Some(id) = options.sandbox_id {
+        kernel = kernel.with_sandbox_id(id);
+    }
+    if options.trace {
+        kernel = kernel.with_trace();
+    }
+    hellovm_platform_seccomp::host_profile()?;
+    if let Some(path) = harden(options, std::os::fd::AsFd::as_fd(&image_fd), egress, fds)? {
+        kernel.host_mut().set_egress(path);
+    }
+    drop(image_fd);
+    hellovm::session::serve(kernel)?;
+    Ok(Ended::Status(hellovm_core::ExitStatus::Exited(0)))
+}
+
+/// `--insecure-fence-test`: from inside the hardened kernel process, tries
+/// something the hardening must stop, reports and exits: 0 when it was
+/// refused, 1 when it worked (a process the hardening kills never gets
+/// to report).
+#[cfg(all(target_os = "linux", feature = "insecure-test-hooks"))]
+fn fence_test(test: &str) -> ! {
+    let outcome: Result<String, String> = match test {
+        "open-host-file" => match std::fs::read("/etc/passwd") {
+            Ok(data) => Ok(format!("read {} bytes", data.len())),
+            Err(err) => Err(err.to_string()),
+        },
+        t if t.starts_with("tcp-connect:") => match std::net::TcpStream::connect(&t[12..]) {
+            Ok(_) => Ok("connected".into()),
+            Err(err) => Err(err.to_string()),
+        },
+        "unix-connect-abstract" => {
+            use std::os::linux::net::SocketAddrExt;
+            match std::os::unix::net::SocketAddr::from_abstract_name(b"hellovm-fence-test")
+                .and_then(|addr| std::os::unix::net::UnixStream::connect_addr(&addr))
+            {
+                Ok(_) => Ok("connected".into()),
+                Err(err) => Err(err.to_string()),
+            }
+        }
+        "forbidden-syscall" => {
+            // setns(-1, 0): harmless even if it ran (EBADF), and never
+            // made by the kernel process.
+            // SAFETY: plain syscall with integer arguments.
+            let ret = unsafe { libc::syscall(libc::SYS_setns, -1, 0) };
+            Ok(format!(
+                "setns returned {ret}: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+        "ptrace-attach" => {
+            // SAFETY: plain syscall with integer arguments.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_ptrace,
+                    libc::PTRACE_ATTACH,
+                    libc::getppid(),
+                    0usize,
+                    0usize,
+                )
+            };
+            if ret == 0 {
+                Ok("attached to the parent".into())
+            } else {
+                Err(std::io::Error::last_os_error().to_string())
+            }
+        }
+        other => {
+            eprintln!("fence: unknown test {other}");
+            std::process::exit(2);
+        }
+    };
+    match outcome {
+        Ok(what) => {
+            println!("fence: {test}: allowed: {what}");
+            std::process::exit(1);
+        }
+        Err(why) => {
+            println!("fence: {test}: refused: {why}");
+            std::process::exit(0);
+        }
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
-fn run(_options: &Options) -> Result<Ended, Box<dyn std::error::Error>> {
+fn run(
+    _options: &Options,
+    _fds: Result<usize, String>,
+) -> Result<Ended, Box<dyn std::error::Error>> {
     Err("no platform for this host yet: only Linux (seccomp) is implemented".into())
 }
 
