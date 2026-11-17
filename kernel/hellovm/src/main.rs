@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty]
-//!         [--egress SOCKET] [--sandbox-id ID]
+//!         [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES]
 //!         [--sandbox require|best-effort|off] --root DIR
 //!         [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
@@ -18,7 +18,9 @@
 //! started). The program's processes end when it ends. `--timeout` kills
 //! every process of the sandbox after that many seconds (decimals allowed)
 //! and makes hellovm exit with 124, like `timeout(1)`. `--trace` prints
-//! every syscall the kernel handled to stderr.
+//! every syscall the kernel handled to stderr. `--fs-limit` caps the
+//! in-memory writable layer (file contents plus a small cost per file;
+//! default 2 GiB): writes past it fail with `ENOSPC`.
 //!
 //! `--egress SOCKET` sends the sandbox's outbound TCP flows to the
 //! `hellovm-egress` proxy listening on that Unix socket; without it nothing
@@ -80,7 +82,7 @@ use hellovm_sandbox::Mode as SandboxMode;
 mod template;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
-     [--egress SOCKET] [--sandbox-id ID] [--sandbox require|best-effort|off] --root DIR \
+     [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES] [--sandbox require|best-effort|off] --root DIR \
      [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
        hellovm --template SOCKET [options] --root DIR PROGRAM [ARGS...]
        hellovm --clone SOCKET [--sandbox-id ID] [--input DATA] [--timeout SECONDS] [--ready]";
@@ -136,6 +138,8 @@ struct Options {
     egress: Option<PathBuf>,
     /// Names the sandbox to the egress proxy.
     sandbox_id: Option<u64>,
+    /// `--fs-limit BYTES`: the writable layer's limit.
+    fs_limit: Option<u64>,
     /// Test hook: splice outbound TCP to this loopback address.
     #[cfg(feature = "insecure-test-hooks")]
     splice_to: Option<std::net::SocketAddr>,
@@ -165,6 +169,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut root = None;
     let mut egress = None;
     let mut sandbox_id = None;
+    let mut fs_limit = None;
     #[cfg(feature = "insecure-test-hooks")]
     let mut splice_to = None;
     #[cfg(feature = "insecure-test-hooks")]
@@ -247,6 +252,18 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 })?);
                 continue;
             }
+            Some("--fs-limit") => {
+                args.next();
+                let value = args.next().ok_or("--fs-limit needs a number of bytes")?;
+                let text = value.to_string_lossy();
+                fs_limit = Some(
+                    text.parse::<u64>()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .ok_or_else(|| format!("--fs-limit {text}: expected a number of bytes"))?,
+                );
+                continue;
+            }
             #[cfg(feature = "insecure-test-hooks")]
             Some("--splice-to") => {
                 args.next();
@@ -325,6 +342,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
             root: PathBuf::new(),
             egress,
             sandbox_id,
+            fs_limit,
             #[cfg(feature = "insecure-test-hooks")]
             splice_to,
             #[cfg(feature = "insecure-test-hooks")]
@@ -363,6 +381,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         root,
         egress,
         sandbox_id,
+        fs_limit,
         #[cfg(feature = "insecure-test-hooks")]
         splice_to,
         #[cfg(feature = "insecure-test-hooks")]
@@ -533,6 +552,9 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     };
     log::info!("sandbox id {sandbox_id:016x}");
     let mut kernel = Kernel::new(host).with_sandbox_id(sandbox_id);
+    if let Some(bytes) = options.fs_limit {
+        kernel = kernel.with_fs_limit(bytes);
+    }
     if options.trace {
         kernel = kernel.with_trace();
     }

@@ -142,6 +142,10 @@ pub fn run(
     };
     log::info!("template sandbox id {sandbox_id:016x}");
     let mut kernel = Kernel::new(host).with_sandbox_id(sandbox_id).template();
+    // Kernel state: every clone keeps the template's limit.
+    if let Some(bytes) = options.fs_limit {
+        kernel = kernel.with_fs_limit(bytes);
+    }
     if options.trace {
         kernel = kernel.with_trace();
     }
