@@ -229,6 +229,8 @@ pub struct TemplateStatus {
     pub starts: u64,
     /// The one tenant it serves, if it is not shared.
     pub tenant: Option<String>,
+    /// The template's `hellovm` process, while it runs.
+    pub pid: Option<u32>,
 }
 
 /// `GET /v1/node`: what a node offers.

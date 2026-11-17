@@ -716,6 +716,13 @@ impl ClientResponse {
         }
     }
 
+    /// The error body's code, if it is one.
+    pub fn error_code(&self) -> Option<String> {
+        serde_json::from_slice::<ErrorBody>(&self.body)
+            .ok()
+            .map(|body| body.error.code)
+    }
+
     /// Turns it back into a response to pass on.
     pub fn into_response(self) -> Response {
         let content_type = if self.content_type == "application/octet-stream" {

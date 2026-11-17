@@ -1,0 +1,24 @@
+[package]
+name = "hellovm-api"
+description = "hellovm public API: tenants, sandbox life cycle, placement on nodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hellovm-api"
+path = "src/main.rs"
+
+[dependencies]
+hellovm-control.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# The end-to-end test runs an egress proxy in the test process, pointing a
+# name at a local server (only the test hooks allow that).
+hellovm-egress = { workspace = true, features = ["insecure-test-hooks"] }
+libc.workspace = true

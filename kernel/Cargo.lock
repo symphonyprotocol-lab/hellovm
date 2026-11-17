@@ -20,6 +20,14 @@ dependencies = [
 [[package]]
 name = "hellovm-api"
 version = "0.0.1"
+dependencies = [
+ "hellovm-control",
+ "hellovm-egress",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hellovm-control"
@@ -67,6 +75,14 @@ dependencies = [
 [[package]]
 name = "hellovm-noded"
 version = "0.0.1"
+dependencies = [
+ "hellovm",
+ "hellovm-control",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hellovm-platform-seccomp"
