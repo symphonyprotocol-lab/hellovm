@@ -96,7 +96,7 @@ fn sandboxes_through_the_api() {
         "echo kept > state.txt; cd /tmp; X=1; (sleep 1000 >/dev/null 2>&1 &)",
     );
     let r = plane.sh(ACME, &id, "cat state.txt; pwd; echo \"x=$X\"");
-    assert_eq!(r["stdout"], "kept\n/root\nx=\n", "{r}");
+    assert_eq!(r["stdout"], "kept\n/home/sandbox\nx=\n", "{r}");
     let r = plane.exec(
         ACME,
         &id,
@@ -168,7 +168,7 @@ fn sandboxes_through_the_api() {
             ACME,
             "POST",
             &format!("/v1/sandboxes/{id}/files/edit"),
-            json!({"path": "/root/notes/a.txt", "old": old, "new": new, "replace_all": all}),
+            json!({"path": "/home/sandbox/notes/a.txt", "old": old, "new": new, "replace_all": all}),
         )
     };
     let ambiguous = edit("world", "there", false);
@@ -362,8 +362,12 @@ fn sandboxes_through_the_api() {
     let other = plane.create(BETA, json!({}));
     assert_ne!(id_of(&other), id);
     assert_eq!(
-        plane.sh(BETA, &id_of(&other), "cat /root/state.txt 2>&1; echo $?")["stdout"],
-        "cat: /root/state.txt: No such file or directory\n1\n"
+        plane.sh(
+            BETA,
+            &id_of(&other),
+            "cat /home/sandbox/state.txt 2>&1; echo $?"
+        )["stdout"],
+        "cat: /home/sandbox/state.txt: No such file or directory\n1\n"
     );
 
     // The tenant limit (acme: 3 at once).
@@ -526,10 +530,10 @@ fn restarts_of_the_template_noded_and_api() {
 
     // The API restarts: sandboxes keep running and are found again.
     let first = id_of(&plane.create(ACME, json!({})));
-    plane.sh(ACME, &first, "echo before > /root/mark");
+    plane.sh(ACME, &first, "echo before > /home/sandbox/mark");
     plane.restart_api();
     assert_eq!(
-        plane.sh(ACME, &first, "cat /root/mark")["stdout"],
+        plane.sh(ACME, &first, "cat /home/sandbox/mark")["stdout"],
         "before\n"
     );
     let list = plane.call(ACME, "GET", "/v1/sandboxes", b"").json();

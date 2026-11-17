@@ -844,6 +844,11 @@ functions (each `command` is a new shell), and the variables of a
 `python` run (each is a new fork). An interactive interpreter whose
 namespace survives between calls is a later step (SDK and MCP server).
 
+Relative paths and the default working directory are the agent's home:
+`HOME` from the template's `env`, else `/root`. The user `noded` runs as
+must be able to read that directory in the image (a host's own `/root`
+is not, for anyone but root): set `HOME` to one that is.
+
 *Files.* `read_file` and `write_file` take any path (`write_file`
 creates the parent directories); only regular files are read or written
 (a FIFO or device is refused, never opened for blocking I/O); at most

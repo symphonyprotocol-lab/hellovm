@@ -299,6 +299,10 @@ impl Plane {
                 "memory_limit_mb": self.options.memory_limit_mb,
                 "fs_limit_mb": 256,
                 "max_processes": self.options.max_processes,
+                // The image is the host's `/`, whose /root (the agent's
+                // default home) only root can read; the tests also run
+                // as another user.
+                "env": {"HOME": "/home/sandbox"},
             });
             if let Some(tenant) = tenant {
                 t["tenant"] = json!(tenant);
