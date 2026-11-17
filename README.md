@@ -527,7 +527,8 @@ and when nothing runs K checks that the sandbox can be cloned (below).
 The platform then copies every memory area of every address space into a
 memfd made before K confined itself (sparse; pages that are all zero
 stay holes, an area the guest cannot read is made readable first), keeps
-every thread's registers, FP/SIMD state and thread pointer, kills the
+every thread's registers, FP/SIMD state, thread pointer and (aarch64)
+pointer-authentication keys, kills the
 app processes and seals the file (`F_SEAL_WRITE | F_SEAL_GROW |
 F_SEAL_SHRINK | F_SEAL_SEAL`): nobody, not even a compromised clone
 holding the fd, can change it again. Everything else, the kernel state
