@@ -90,7 +90,11 @@ fn write_seed_corpus() {
     }
 
     write("dns", "a", &dns_query(0x1234, "pypi.org", 1, &[]));
-    write("dns", "aaaa", &dns_query(7, "files.pythonhosted.org", 28, &[]));
+    write(
+        "dns",
+        "aaaa",
+        &dns_query(7, "files.pythonhosted.org", 28, &[]),
+    );
     write("dns", "txt", &dns_query(8, "example.com", 16, &[]));
     write("dns", "single-label", &dns_query(9, "localhost", 1, &[]));
     // An EDNS OPT record in the additional section.
@@ -104,9 +108,12 @@ fn write_seed_corpus() {
     compressed.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1]);
     write("dns", "two-questions-compressed", &compressed);
 
-    for (i, (id, port, host)) in [(1u64, 443u16, "pypi.org"), (u64::MAX, 80, "a.b.example.com")]
-        .into_iter()
-        .enumerate()
+    for (i, (id, port, host)) in [
+        (1u64, 443u16, "pypi.org"),
+        (u64::MAX, 80, "a.b.example.com"),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let req = Request {
             sandbox_id: id,
@@ -118,22 +125,38 @@ fn write_seed_corpus() {
     write("wire", "reply", &[0, 0, 0, 0, 0, 0]);
 
     write("sniff", "tls", &sniff::client_hello_for_test(&["pypi.org"]));
-    write("sniff", "tls-two-names", &sniff::client_hello_for_test(&["a.example", "b.example"]));
+    write(
+        "sniff",
+        "tls-two-names",
+        &sniff::client_hello_for_test(&["a.example", "b.example"]),
+    );
     write("sniff", "tls-no-sni", &sniff::client_hello_for_test(&[]));
-    write("sniff", "http", b"GET /simple/ HTTP/1.1\r\nHost: pypi.org\r\nAccept: */*\r\n\r\n");
+    write(
+        "sniff",
+        "http",
+        b"GET /simple/ HTTP/1.1\r\nHost: pypi.org\r\nAccept: */*\r\n\r\n",
+    );
     write(
         "sniff",
         "http-absolute",
         b"POST http://example.com:8080/x HTTP/1.0\r\nHost: example.com:8080\r\nContent-Length: 0\r\n\r\n",
     );
-    write("sniff", "http-two-hosts", b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n");
+    write(
+        "sniff",
+        "http-two-hosts",
+        b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n",
+    );
 
     write(
         "policy",
         "file",
         b"# comment\n\nallow pypi.org\nallow files.pythonhosted.org:443\nallow *.github.com:80,443,9418\n",
     );
-    write("policy", "bad", b"allow *\nallow *.com\nallow a.example:0\nallow a.example:99999\ndeny x\n");
+    write(
+        "policy",
+        "bad",
+        b"allow *\nallow *.com\nallow a.example:0\nallow a.example:99999\ndeny x\n",
+    );
 
     write(
         "vfs_path",
@@ -163,12 +186,18 @@ fn write_seed_corpus() {
                 arch,
                 &memory,
                 &[
-                    (Sysno::Write, &[Arg::Small(1), Arg::Scratch(64), Arg::Small(6)]),
+                    (
+                        Sysno::Write,
+                        &[Arg::Small(1), Arg::Scratch(64), Arg::Small(6)],
+                    ),
                     (
                         Sysno::Openat,
                         &[at_fdcwd, Arg::Scratch(0), Arg::Small(0), Arg::Small(0)],
                     ),
-                    (Sysno::Read, &[Arg::Small(3), Arg::Scratch(128), Arg::Small(64)]),
+                    (
+                        Sysno::Read,
+                        &[Arg::Small(3), Arg::Scratch(128), Arg::Small(64)],
+                    ),
                     (
                         Sysno::Mmap,
                         &[

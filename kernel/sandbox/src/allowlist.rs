@@ -75,6 +75,17 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
     }
     #[allow(unused_mut)]
     let mut list = vec![
+        // Most frequent first: the filter checks the entries in order.
+        // Driving app processes (`hellovm-platform-seccomp`).
+        checked(
+            SYS_ptrace,
+            vec![Check::HighZero(0), one_of(0, &PTRACE_REQUESTS)],
+        ),
+        allow(SYS_wait4),
+        allow(SYS_process_vm_readv),
+        allow(SYS_process_vm_writev),
+        allow(SYS_futex),
+        allow(SYS_rt_sigreturn),
         // I/O on fds the kernel holds: the console, image files, sockets
         // to the egress proxy, pipes of std.
         allow(SYS_read),
@@ -132,7 +143,6 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
             nr: SYS_clone3 as u32,
             rule: Rule::Errno(ENOSYS as u32),
         },
-        allow(SYS_futex),
         allow(SYS_set_robust_list),
         allow(SYS_rseq),
         allow(SYS_sched_getaffinity),
@@ -144,7 +154,6 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
         // Signals: the SIGCHLD handler of the event loop, std's guard pages.
         allow(SYS_rt_sigaction),
         allow(SYS_rt_sigprocmask),
-        allow(SYS_rt_sigreturn),
         allow(SYS_restart_syscall),
         allow(SYS_sigaltstack),
         // Time.
@@ -152,14 +161,6 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
         allow(SYS_clock_gettime),
         allow(SYS_gettimeofday),
         allow(SYS_getrandom),
-        // Driving app processes (`hellovm-platform-seccomp`).
-        checked(
-            SYS_ptrace,
-            vec![Check::HighZero(0), one_of(0, &PTRACE_REQUESTS)],
-        ),
-        allow(SYS_wait4),
-        allow(SYS_process_vm_readv),
-        allow(SYS_process_vm_writev),
         checked(SYS_pidfd_open, vec![one_of(1, &[0])]),
         checked(SYS_pidfd_send_signal, vec![one_of(1, &[SIGKILL])]),
         // SIGKILL to an app process, SIGSTOP of a new one to itself.
@@ -204,4 +205,18 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
     #[cfg(target_arch = "x86_64")]
     list.push(allow(SYS_poll));
     list
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_syscall_has_one_rule() {
+        for tcp in [false, true] {
+            let entries = super::entries(5, tcp);
+            let mut nrs: Vec<u32> = entries.iter().map(|e| e.nr).collect();
+            nrs.sort_unstable();
+            nrs.dedup();
+            assert_eq!(nrs.len(), entries.len(), "a syscall is listed twice");
+        }
+    }
 }

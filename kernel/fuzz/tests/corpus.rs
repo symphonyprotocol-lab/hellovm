@@ -146,7 +146,9 @@ fn mutate(rng: &mut Rng, input: &mut Vec<u8>, corpus: &[Vec<u8>]) {
 }
 
 fn corpus_dir(target: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus").join(target)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("corpus")
+        .join(target)
 }
 
 fn load(target: &str) -> Vec<Vec<u8>> {
@@ -191,9 +193,9 @@ fn save_failure(target: &str, input: &[u8]) -> PathBuf {
         .join("fuzz-failures")
         .join(target);
     std::fs::create_dir_all(&dir).unwrap();
-    let hash = input
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    let hash = input.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
     let path = dir.join(format!("{hash:016x}"));
     std::fs::write(&path, input).unwrap();
     path
@@ -234,10 +236,17 @@ fn every_target_over_its_corpus_and_mutations() {
             continue;
         }
         let corpus = load(name);
-        assert!(!corpus.is_empty(), "{name}: no corpus in {}", corpus_dir(name).display());
+        assert!(
+            !corpus.is_empty(),
+            "{name}: no corpus in {}",
+            corpus_dir(name).display()
+        );
         for input in &corpus {
             if let Err(what) = check(run, input) {
-                failures.push(format!("{name}: corpus input {}: {what}", save_failure(name, input).display()));
+                failures.push(format!(
+                    "{name}: corpus input {}: {what}",
+                    save_failure(name, input).display()
+                ));
             }
         }
         let mut rng = Rng(seed ^ name.len() as u64 ^ (name.as_bytes()[0] as u64) << 32);
@@ -245,7 +254,10 @@ fn every_target_over_its_corpus_and_mutations() {
             let mut input = corpus[rng.below(corpus.len())].clone();
             mutate(&mut rng, &mut input, &corpus);
             if let Err(what) = check(run, &input) {
-                failures.push(format!("{name}: {}: {what}", save_failure(name, &input).display()));
+                failures.push(format!(
+                    "{name}: {}: {what}",
+                    save_failure(name, &input).display()
+                ));
                 break;
             }
         }

@@ -20,8 +20,11 @@ use hellovm_egress::policy::{Policy, Rule};
 use hellovm_egress::sniff::{self, Sniff};
 use hellovm_egress::wire::{self, Request, Status};
 
+/// A fuzz target.
+pub type Target = fn(&[u8]);
+
 /// Every target, by name.
-pub const TARGETS: &[(&str, fn(&[u8]))] = &[
+pub const TARGETS: &[(&str, Target)] = &[
     ("elf", elf),
     ("dns", dns),
     ("wire", wire),
@@ -57,7 +60,11 @@ pub fn dns(data: &[u8]) {
         if let Some(reply) = fuzzing::dns_reply(&mut net, data, outbound) {
             assert!(reply.len() >= 12, "short reply");
             assert_eq!(reply[..2], data[..2], "reply id");
-            assert!(reply.len() <= 12 + data.len() + 16, "reply grew: {}", reply.len());
+            assert!(
+                reply.len() <= 12 + data.len() + 16,
+                "reply grew: {}",
+                reply.len()
+            );
         }
     }
     // The same query again gets the same answer (bindings are stable).
@@ -127,7 +134,11 @@ pub fn policy(data: &[u8]) {
     }
     for line in text.lines().take(16) {
         let host = line.trim().trim_start_matches("allow").trim();
-        let host = host.split(':').next().unwrap_or("").trim_start_matches("*.");
+        let host = host
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("*.");
         for port in [80, 443, 8080] {
             let _ = policy.allows(host, port);
         }
@@ -142,7 +153,10 @@ fn tricky_image() -> MockHost {
         ("bin", MockEntry::Dir),
         ("bin/sh", MockEntry::File(b"#!/bin/sh\n".to_vec())),
         ("etc", MockEntry::Dir),
-        ("etc/passwd", MockEntry::File(b"root:x:0:0::/:/bin/sh\n".to_vec())),
+        (
+            "etc/passwd",
+            MockEntry::File(b"root:x:0:0::/:/bin/sh\n".to_vec()),
+        ),
         ("loop", MockEntry::Symlink(b"loop".to_vec())),
         ("a", MockEntry::Symlink(b"b".to_vec())),
         ("b", MockEntry::Symlink(b"a".to_vec())),
@@ -151,7 +165,10 @@ fn tricky_image() -> MockHost {
         ("dir", MockEntry::Dir),
         ("dir/self", MockEntry::Symlink(b".".to_vec())),
         ("dir/parent", MockEntry::Symlink(b"..".to_vec())),
-        ("dir/deep", MockEntry::Symlink(b"self/self/self/self/self/deep".to_vec())),
+        (
+            "dir/deep",
+            MockEntry::Symlink(b"self/self/self/self/self/deep".to_vec()),
+        ),
         ("empty", MockEntry::Symlink(Vec::new())),
         ("long", MockEntry::Symlink(vec![b'x'; 4096])),
     ])
@@ -302,7 +319,9 @@ pub fn syscalls(data: &[u8]) {
     let mut input = Input(data);
     let arch = ARCHES[usize::from(input.byte() & 1)];
     let mem_len = usize::from(input.byte()) * 64;
-    let memory: Vec<u8> = (0..mem_len.min(SCRATCH_LEN)).map(|_| input.byte()).collect();
+    let memory: Vec<u8> = (0..mem_len.min(SCRATCH_LEN))
+        .map(|_| input.byte())
+        .collect();
     let mut scripts = Vec::new();
     for _ in 0..4 {
         let n = usize::from(input.byte() % 64);
@@ -335,7 +354,12 @@ pub fn syscalls(data: &[u8]) {
     let mut plat = MockPlatform::with_scripts(arch, &host, scripts);
     let mut kernel = Kernel::new(host);
     if kernel
-        .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[b"PATH=/bin".to_vec()])
+        .exec(
+            &mut plat,
+            b"/bin/prog",
+            &[b"prog".to_vec()],
+            &[b"PATH=/bin".to_vec()],
+        )
         .is_err()
     {
         return;
