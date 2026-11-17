@@ -4,9 +4,15 @@
 
 use crate::net::Net;
 
-/// The virtual DNS responder on one query datagram (or TCP frame body).
-pub fn dns_reply(net: &mut Net, query: &[u8], outbound: bool) -> Option<Vec<u8>> {
-    net.dns_reply(query, outbound)
+/// The virtual DNS responder on one query datagram (or TCP frame body),
+/// at sandbox time `now`.
+pub fn dns_reply(
+    net: &mut Net,
+    query: &[u8],
+    outbound: bool,
+    now: std::time::Duration,
+) -> Option<Vec<u8>> {
+    net.dns_reply(query, outbound, now)
 }
 
 /// The `#!` line parser on a file's contents. Like `execve`, it only

@@ -8,6 +8,7 @@
 //! toolchain.
 
 use std::io::Cursor;
+use std::time::Duration;
 
 use hellovm_core::elf::{self, Placement};
 use hellovm_core::mm::Mm;
@@ -56,8 +57,9 @@ pub fn elf(data: &[u8]) {
 /// proxy. A reply is a DNS message for the same id.
 pub fn dns(data: &[u8]) {
     let mut net = Net::default();
+    let now = Duration::from_secs(1);
     for outbound in [true, false] {
-        if let Some(reply) = fuzzing::dns_reply(&mut net, data, outbound) {
+        if let Some(reply) = fuzzing::dns_reply(&mut net, data, outbound, now) {
             assert!(reply.len() >= 12, "short reply");
             assert_eq!(reply[..2], data[..2], "reply id");
             assert!(
@@ -67,9 +69,12 @@ pub fn dns(data: &[u8]) {
             );
         }
     }
-    // The same query again gets the same answer (bindings are stable).
-    let first = fuzzing::dns_reply(&mut net, data, true);
-    assert_eq!(first, fuzzing::dns_reply(&mut net, data, true));
+    // The same query again gets the same answer (bindings are stable),
+    // also much later.
+    let first = fuzzing::dns_reply(&mut net, data, true, now);
+    assert_eq!(first, fuzzing::dns_reply(&mut net, data, true, now));
+    let later = Duration::from_secs(1 << 20);
+    let _ = fuzzing::dns_reply(&mut net, data, true, later);
 }
 
 /// The egress flow header (proxy side) and verdict (kernel side).
@@ -106,10 +111,24 @@ fn contains_ignoring_case(haystack: &[u8], needle: &[u8]) -> bool {
 /// in the input, and it is a valid hostname.
 pub fn sniff(data: &[u8]) {
     match sniff::sniff(data) {
-        Sniff::Tls(name) | Sniff::Http(name, _) => {
+        Sniff::Tls(name) => {
             assert!(
                 contains_ignoring_case(data, name.as_bytes()),
                 "sniffed {name:?}, which is not in the input"
+            );
+        }
+        Sniff::Http(req) => {
+            assert!(
+                contains_ignoring_case(&data[..req.head_len.min(data.len())], req.host.as_bytes()),
+                "sniffed {:?}, which is not in the request head",
+                req.host
+            );
+            assert!(req.head_len <= data.len(), "head past the input");
+            assert!(
+                req.forward.len() <= req.head_len + 64,
+                "forwarded head grew from {} to {}",
+                req.head_len,
+                req.forward.len()
             );
         }
         Sniff::NeedMore | Sniff::Invalid(_) => {}

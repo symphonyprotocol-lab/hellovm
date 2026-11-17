@@ -47,11 +47,20 @@ dependencies = [
 name = "hellovm-core"
 version = "0.0.1"
 dependencies = [
+ "hellovm-egress-wire",
  "log",
 ]
 
 [[package]]
 name = "hellovm-egress"
+version = "0.0.1"
+dependencies = [
+ "hellovm-egress-wire",
+ "libc",
+]
+
+[[package]]
+name = "hellovm-egress-wire"
 version = "0.0.1"
 
 [[package]]
