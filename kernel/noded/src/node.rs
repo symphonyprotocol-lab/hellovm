@@ -415,10 +415,9 @@ impl Node {
                         if logged < LOG_BUDGET {
                             let text = String::from_utf8_lossy(&chunk[..n]);
                             for line in text.lines().filter(|l| !l.is_empty()) {
-                                log::info!(
-                                    "sandbox {id}: {}",
-                                    line.chars().take(500).collect::<String>()
-                                );
+                                let line: String =
+                                    line.chars().filter(|c| !c.is_control()).take(500).collect();
+                                log::info!("sandbox {id}: {line}");
                             }
                             logged += n;
                             if logged >= LOG_BUDGET {

@@ -16,6 +16,7 @@ The kernel lives in `kernel/`, a Rust workspace:
 | `hellovm-egress` | `kernel/egress` | The egress proxy (`hellovm-egress` binary): default-deny domain allowlist, one per host |
 | `hellovm-egress-wire` | `kernel/egress-wire` | The flow header and hostname rule the kernel and the proxy share |
 | `hellovm-test-guest` | `kernel/test-guest` | Small test programs built at build time |
+| `hellovm-noded`, `hellovm-api`, `hellovm-control` | `kernel/noded`, `kernel/api`, `kernel/control` | The control plane: the node daemon, the public API, and what they share (see **Control plane**) |
 
 Syscall interception on Linux is ptrace plus `SECCOMP_RET_TRACE`, not
 seccomp user notification. Every app thread is a host process. Its filter
@@ -27,7 +28,7 @@ address space, and new tasks, are injected `mmap`, `munmap`, `mprotect` and
 `kernel/platform-seccomp/src/spawn.rs` is the full argument, including why
 an in-app stub plus user notification was rejected.
 
-What runs today (milestone U5a): x86_64 and aarch64 Linux programs,
+What runs today (milestone U5b): x86_64 and aarch64 Linux programs,
 static or dynamically linked, with any number of processes and threads.
 A busybox shell runs external commands, pipelines, background jobs, traps
 and job control; dynamically linked glibc programs and CPython (with
@@ -64,6 +65,10 @@ Debian system.
 - **Warm clones**: a template sandbox loads its environment once (CPython
   with its modules imported, say) and new sandboxes are forked from it in
   a few milliseconds (see **Warm clones**).
+- **Control plane**: `hellovm-api` and `hellovm-noded` create sandboxes
+  with CPython already loaded over HTTP in 7 to 8 ms, run commands and
+  Python in them, read, write and edit their files, and keep tenants
+  apart (see **Control plane**).
 - **Terminal**: when hellovm runs on a terminal, the sandbox console is a
   terminal too (`/dev/console`, `/dev/tty`): line editing, echo, termios,
   window size, a foreground process group, and Ctrl-C, Ctrl-\ and Ctrl-Z
@@ -376,12 +381,13 @@ never runs there. The allowlist (62 calls on aarch64, 4 of them for warm
 clones, see **Warm clones**) was measured with
 `HELLOVM_SECCOMP_LEARN=FILE` (a test-hooks build), which records every
 syscall the kernel process makes and lets it continue, over the whole
-test suite, on Debian bookworm (glibc 2.36) and Ubuntu 26.04 (glibc
+test suite (the control plane's included: templates running the sandbox
+agent, and their clones), on Debian bookworm (glibc 2.36) and Ubuntu 26.04 (glibc
 2.43, which adds `fstat` and the termios2 `ioctl`s);
 `kernel/sandbox/learn-summary.py FILE` condenses the log. The x86_64
 list is the same calls by name, and CI measures it: the `test-x86_64`
 job runs the end-to-end tests once with `HELLOVM_SECCOMP_LEARN=FILE`
-(`cargo test -p hellovm --no-fail-fast`) and then
+(`cargo test -p hellovm -p hellovm-api --no-fail-fast`) and then
 checks the recording against the allowlist
 (`HELLOVM_SECCOMP_LEARNED=FILE cargo test -p hellovm-sandbox measured`),
 which names any call the list lacks. Do the same after changing what the
@@ -516,7 +522,7 @@ connection kills the clone. `kernel/hellovm/src/warm.rs` documents the
 bytes and has a client (`hellovm::warm::WarmClone`). Who can connect to
 the socket can make clones: put it in a directory only the node daemon
 can reach. The socket file outlives the template (the confined template
-cannot remove it).
+cannot remove it); `hellovm-noded` removes it.
 
 **How a clone is made.** The template's kernel process (K) runs the
 guest as usual until a thread reads the clone point. From then on K
@@ -704,6 +710,7 @@ active), medians of 30 clones and 5 cold starts:
 | **Clone, request to first guest instruction** (`S`) | **7.0 ms** (4.1–10.4) | **5.7 ms** (3.7–9.1) |
 | **Clone, request to first line** | **8.2 ms** (4.7–11.3) | **6.6 ms** (4.6–10.3) |
 | Clone, request to exit status | 24.7 ms | 25.7 ms |
+| **Sandbox through `hellovm-api`, request to ready** (see **Control plane**) | **8.3 ms** (5.8–8.7) | **7.1 ms** (4.1–7.9) |
 
 The 50-clone test makes 50 clones one after another and then 50 at once,
 each running and ending a small program, in about half a second each way
@@ -721,6 +728,330 @@ batching the injected `mmap`s, which the current one-syscall-per-stop
 injection does not do. A clone's exit takes longer than its
 start: CPython's finalization writes to most of its objects, and every
 first write to a page shared with the template is a copy.
+
+## Control plane
+
+Two services make sandboxes available over the network, both in Rust in
+this workspace:
+
+| Crate | Path | Role |
+|---|---|---|
+| `hellovm-api` | `kernel/api` | The public API: authenticates tenants, enforces their limits, places sandboxes on a node, keeps the sandbox metadata, passes each request about a sandbox to its node |
+| `hellovm-noded` | `kernel/noded` | The node daemon, one per host: keeps warm templates alive, makes sandboxes by cloning them, carries `exec` and file operations to the agent inside each sandbox, removes sandboxes, reports capacity |
+| `hellovm-control` | `kernel/control` | What both share: a small HTTP/1.1 server and client, sandbox ids, token comparison, the JSON types |
+
+```text
+client --HTTP, tenant token--> hellovm-api --HTTP, node token--> hellovm-noded
+                                                                    | warm-clone protocol (Unix socket)
+                                                                    v
+                         hellovm --template (frozen CPython running the agent)
+                                                                    | fork per sandbox
+                                                                    v
+                    clone kernel process <-- console pipes: agent frames --> noded
+```
+
+They live in `kernel/` because `noded` uses the warm-clone client of the
+`hellovm` crate and the whole repository has one workspace and one CI
+gate. When the API is deployed apart from the nodes (U6), `api` and
+`control` would move to a top-level `services/` workspace, with `noded`
+staying next to the kernel it drives.
+
+**Running it.** One egress proxy, one `noded` and one `api` per host here:
+
+```sh
+hellovm-egress --listen /run/hellovm/egress/egress.sock --policy /etc/hellovm/egress.policy &
+hellovm-noded --config /etc/hellovm/noded.json &
+hellovm-api --config /etc/hellovm/api.json &
+```
+
+```json
+{"node": "node-1", "listen": "127.0.0.1:7071", "token_file": "/etc/hellovm/node.token",
+ "hellovm": "/usr/local/bin/hellovm", "state_dir": "/run/hellovm-noded",
+ "egress": "/run/hellovm/egress/egress.sock", "max_sandboxes": 64,
+ "templates": [{"name": "python", "root": "/", "python": "/usr/bin/python3",
+                "preload": ["json", "decimal", "sqlite3"], "memory_limit_mb": 1024,
+                "fs_limit_mb": 1024}]}
+```
+
+```json
+{"listen": "0.0.0.0:7070",
+ "tenants": [{"name": "acme", "token_file": "/etc/hellovm/acme.token", "max_sandboxes": 10}],
+ "nodes": [{"name": "node-1", "addr": "127.0.0.1:7071", "token_file": "/etc/hellovm/node.token"}],
+ "default_idle_timeout": 600, "max_idle_timeout": 86400,
+ "default_lifetime": 3600, "max_lifetime": 86400}
+```
+
+Unknown fields in either file are errors. Tokens are at least 22
+printable characters; two tenants cannot share one. Both services run
+unprivileged and log to stderr (`HELLOVM_LOG`, default `info`).
+
+```sh
+curl -s -H "Authorization: Bearer $TOKEN" -d '{"template": "python"}' http://127.0.0.1:7070/v1/sandboxes
+curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}' \
+  http://127.0.0.1:7070/v1/sandboxes/sb-.../exec
+```
+
+**The API.** JSON bodies; errors are `{"error": {"code": ..., "message": ...}}`.
+
+| Method and path | Body | Answer |
+|---|---|---|
+| `GET /v1/templates` | | `{"templates": [{"name", "ready", "starts", "tenant", "pid"}]}` |
+| `POST /v1/sandboxes` | `{"template", "idle_timeout"?, "lifetime"?}` (seconds) | `201`, the sandbox |
+| `GET /v1/sandboxes` | | `{"sandboxes": [...]}`, the caller's |
+| `GET /v1/sandboxes/{id}` | | `{"id", "tenant", "template", "node", "egress_id", "created_at", "last_used_at", "expires_at", "idle_timeout", "memory_bytes", "memory_limit_bytes", "ready_ms"}` |
+| `DELETE /v1/sandboxes/{id}` | | `204` |
+| `POST /v1/sandboxes/{id}/exec` | `{"command"` or `"python", "timeout"?, "cwd"?, "env"?, "stdin"?, "max_output"?}` | `{"exit_code", "signal", "timed_out", "stdout", "stderr", "stdout_truncated", "stderr_truncated", "stdout_bytes", "stderr_bytes", "duration_ms"}` |
+| `GET /v1/sandboxes/{id}/files?path=P` | | the file's bytes |
+| `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `{"bytes"}` |
+| `POST /v1/sandboxes/{id}/files/edit` | `{"path", "old", "new", "replace_all"?}` | `{"replacements"}` |
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `bad_request`, `is_directory`, `not_regular`, `not_text` | malformed request; not a file; not UTF-8 (edit) |
+| 401 | `unauthorized` | no or unknown token |
+| 404 | `sandbox_not_found` | no such sandbox, **or another tenant's** (the same answer) |
+| 404 | `not_found`, `template_not_found` | no such file or working directory; no such template |
+| 409 | `busy` | the sandbox is running another request (one at a time) |
+| 410 | `sandbox_ended` | the node removed it and still remembers why (idle, lifetime, memory, its agent ended) |
+| 413 | `too_large` | a body or file over 16 MiB |
+| 422 | `no_match`, `ambiguous` | edit: `old` does not occur, or occurs more than once without `replace_all` |
+| 429 | `tenant_limit` | the tenant has `max_sandboxes` already |
+| 502 | `sandbox_failed`, `node_unreachable` | the sandbox's agent broke (the sandbox is removed); the node does not answer |
+| 503 | `template_not_ready`, `node_full` | try again |
+| 507 | `no_space` | the writable layer is full |
+
+*exec.* `command` runs as `/bin/sh -c COMMAND`; `python` runs the
+source in a fork of the sandbox's warm interpreter, so the template's
+modules are already imported (`SystemExit` sets the exit code, an
+uncaught exception prints its traceback and exits 1). The working
+directory is `/root` unless `cwd` says otherwise (relative paths in file
+operations are relative to it too); `env` adds variables; `stdin` is
+the command's input (otherwise it reads end of file). `timeout` (default
+60 s, at most 3600 s) kills the command's whole process group with
+`SIGKILL`: `timed_out` is `true` and `signal` 9. Output is decoded as
+UTF-8 with invalid bytes replaced; each stream keeps at most
+`max_output` bytes (default 64 KiB, at most 1 MiB): the first and the
+last half, with `[... N bytes omitted ...]` between them, and
+`stdout_bytes` says how much there was. Limits: command, Python source
+and stdin 1 MiB each, 256 environment variables in 64 KiB.
+
+*State between requests.* Kept: the filesystem (the writable layer),
+processes started in the background that hold none of the command's
+pipes (`nohup server >log 2>&1 &`; output written to the pipes after
+the command ended is dropped, 100 ms after it ended), and everything the
+template set up. Not kept: the shell's working directory, variables and
+functions (each `command` is a new shell), and the variables of a
+`python` run (each is a new fork). An interactive interpreter whose
+namespace survives between calls is a later step (SDK and MCP server).
+
+*Files.* `read_file` and `write_file` take any path (`write_file`
+creates the parent directories); only regular files are read or written
+(a FIFO or device is refused, never opened for blocking I/O); at most
+16 MiB. `edit_file` replaces exactly one occurrence of `old` by `new` in
+a UTF-8 file (all of them with `replace_all`) and says how many it
+replaced.
+
+*Life cycle.* A sandbox is removed by `DELETE`, after `idle_timeout`
+seconds without a request (a running request is not idle), at the end
+of its `lifetime` however busy it is (both default and capped by the API
+configuration, at most a week), when its processes' private memory goes
+over the template's `memory_limit_mb`, or when its agent ends. Its node
+answers `410` with the reason for a while (4096 ended sandboxes), then
+`404`.
+
+*Tenants.* A tenant is a bearer token in the API's configuration. Every
+request about a sandbox looks it up and checks the tenant before
+anything reaches a node, and the node checks again (`X-Hellovm-Tenant`):
+another tenant's sandbox answers exactly like a missing one. Sandbox ids
+are `sb-` and 128 random bits (`getentropy`). A tenant's sandboxes and
+creations in progress count against its `max_sandboxes` (`429` past
+it). Tokens are compared in constant time, all of them on every request.
+
+*Egress.* `noded` passes `--egress` to every template, and gives each
+clone a sandbox id for the proxy: the first 64 bits of the sandbox id,
+so the `sandbox=` field of the proxy's audit lines is `egress_id`, the
+first 16 hex digits of the id. Nothing about outbound traffic changes:
+the policy is the proxy's.
+
+**How exec and files reach the guest.** By an agent that is part of the
+template: `noded` runs every template as `python3 -I -c AGENT MODULE...`
+(the agent is `kernel/noded/src/agent.py`, compiled into `noded`). The
+agent imports the template's modules, makes `/root`, and waits at the
+clone point. Each clone continues in the agent with its own console,
+which `noded` creates as three pipes and passes with the clone request:
+requests come in on stdin, answers go out on stdout, the agent's own log
+on stderr (`noded` logs at most 64 KiB of it per sandbox). A frame is
+`[header length u32][body length u32][JSON header][body]`; the agent
+greets with its version once the clone runs, and each answer carries
+its request's id. The agent is the sandbox's first process, so it also
+reaps orphans. Its frames are untrusted: anything in the sandbox can
+write to `/dev/console`, so `noded` bounds every length before
+allocating (a 64 KiB header; a body no longer than the request can
+produce), has a deadline on every read and write, checks every field,
+and on any violation removes the sandbox (it can only have broken
+itself). Rejected:
+
+* *Something in the kernel process.* A command runner and file server
+  in the process that parses guest bytes would enlarge the most
+  exposed process and its seccomp allowlist, and could not run a
+  command without a guest process anyway. The kernel stays generic.
+* *Another channel* (a socket passed as a fourth fd, or a connection
+  into the guest's loopback). It needs a protocol change and kernel
+  support for a host connection reaching a guest socket (that is
+  ingress, U6). The console exists, is already per clone, and carries
+  the agent's traffic well.
+* *A new `hellovm` (or clone) per exec.* State would not survive
+  between execs, and each would pay the clone again.
+
+**How `api` and `noded` talk.** HTTP/1.1 with JSON, the same shapes as
+the public API (the node API is listed in `kernel/noded/src/server.rs`):
+`POST /v1/sandboxes` carries the id, tenant, template and the resolved
+timeouts the API chose. Each node has its own bearer token, which the
+API presents; every request about a sandbox also names its tenant. With
+many nodes, the node API needs TLS with a certificate per node (mutual
+TLS, so a node knows the API and the API knows the node), which is not
+done: the node API must listen on loopback or a private network until
+then. Rejected: gRPC (out of scope for now, and many dependencies for
+what a dozen JSON routes do); a Unix socket (does not reach other
+hosts).
+
+**Where the metadata lives.** The nodes are the source of truth: each
+knows the tenant, template, deadlines and memory of every sandbox it
+runs, and removes them itself. The API keeps a store (`Store` in
+`kernel/api/src/store.rs`; `MemoryStore` in its memory today) of which
+sandbox is whose and where, rebuilt from the nodes when it starts and
+reconciled every `reconcile_interval` (2 s): a sandbox a node no longer
+lists is dropped, one created while the node was being asked is kept.
+Postgres replaces `MemoryStore` behind the same trait: a row per
+sandbox written on create and delete, the tenant's count and
+reservation in the same transaction, and the reconciliation updating
+rows from the nodes. Listing and per-sandbox requests ask the node
+anyway, so what a client sees is fresh.
+
+**Restarts.** The API: nothing is lost; it rebuilds its store from the
+nodes before serving and running sandboxes keep their state (tested).
+`noded`: its templates die with it (`PR_SET_PDEATHSIG`) and their clones
+with them, so its sandboxes are gone; the next `noded` removes the
+stale sockets, starts the templates again, and the API drops the lost
+sandboxes at its next reconciliation (tested). A template that dies is
+started again at once (if it had run a minute; otherwise after a delay
+that doubles up to 30 s), and its sandboxes are gone (tested). Keeping
+sandboxes across a `noded` restart would need the templates and the
+clones' control connections to outlive it (an fd store, re-adoption):
+not done.
+
+**Resource limits.** All clones of a template run in the template's
+cgroup: a clone runs before whoever asked for it learns its pid. What
+is enforced without root:
+
+| Limit | How | Past it |
+|---|---|---|
+| Writable layer (`fs_limit_mb`) | the kernel process (`hellovm --fs-limit`, kernel state every clone inherits) | `ENOSPC` |
+| Memory (`memory_limit_mb`) | `noded` sums the private memory (`RssAnon` + `RssShmem`) of the clone's kernel process and every process below it once a second, each address space once (`kcmp`), and removes the sandbox | the sandbox is removed; `410` with the reason |
+| Time | per-exec `timeout`, idle timeout, lifetime | killed or removed |
+| Tasks, sockets, outbound flows | the kernel (2048 tasks, 4096 sockets) and the egress proxy (64 flows per sandbox) | `EAGAIN` and the like |
+| Sandboxes | per tenant (API) and per node (`max_sandboxes`) | `429`, `503` |
+
+The memory measurement is a poll, not a limit: a sandbox can go over it
+for up to a second (and so can the host's memory). It counts the
+template's snapshot pages a clone has read but not written as its own,
+so it overestimates by up to the snapshot's size (about 30 MiB) per
+address space. The writable layer is in the kernel process's memory, so
+it counts too. Not done, because it needs cgroup delegation (a cgroup v2
+subtree the service user may write, e.g. from systemd's `Delegate=yes`):
+hard memory limits, CPU shares and quotas, a pids limit per sandbox and
+I/O limits. The way in is a step in the warm-clone protocol where the
+clone's kernel process reports its pid and waits until `noded` has
+moved it into the sandbox's cgroup before it rebuilds the app processes
+(or `clone3` with `CLONE_INTO_CGROUP` in the template, given a cgroup fd
+with the request).
+
+**Shared templates or one per tenant.** A template is trusted more
+than its clones: every clone starts from its kernel process's memory.
+`noded`'s templates are the operator's (the agent, an image the
+operator controls, modules named in the configuration), so one template
+is shared by all tenants by default. That is safe only because each
+clone's kernel process gets a Landlock domain of its own (see **Warm
+clones**), so a shared template (no `tenant` in its configuration)
+always runs with `--sandbox require`, which refuses to start it on a
+host without Landlock. On such a host, or for a template built from a
+tenant's own image or code, give the template a `tenant`: only that
+tenant's sandboxes are made from it (the API shows it to no one else,
+and `noded` refuses other tenants), and it may run with `"sandbox":
+"best-effort"`. Per-tenant templates cost a template process and its
+snapshot per tenant and template, and for real separation each tenant's
+`noded` and templates should run as a uid of their own.
+
+**Hardening of the services.** Every byte from a caller or a sandbox is
+untrusted. HTTP: a request head of at most 16 KiB in 10 s, at most 64
+headers, CRLF only, no folded headers, `Content-Length` only (no
+`Transfer-Encoding`), bodies limited per route (4 MiB of JSON, 16 MiB
+for a file) and to 256 MiB across all connections being read at once,
+read within 60 s, at most 256 connections (one thread each; the next
+gets `503`), 30 s idle between keep-alive requests. JSON with unknown
+fields is refused. The agent channel: see above. Logged text from a
+sandbox is bounded per line and per sandbox. Neither service dials an
+address a sandbox chose: `noded` connects only to its templates'
+sockets, the API only to its configured nodes.
+
+**Dependencies.** `serde` and `serde_json` (with their derive macro's
+`syn`, `quote`, `proc-macro2`, `unicode-ident`, and `itoa`, `memchr`,
+`ryu`): the JSON of both APIs. Nothing else: the HTTP server and client
+are about 700 lines of strict, bounded code in `hellovm-control`, and
+one thread per connection (at most 256) is enough at this scale.
+Rejected for now: `tokio` with `hyper` or `axum` (dozens of crates and
+an async runtime for what a thread pool does), a hand-written JSON
+parser.
+
+**Tests.** `kernel/api/tests/control_plane.rs` runs the whole plane on
+the host: an egress proxy in the test process whose test name table
+points `web.test` at a local HTTP server, `hellovm-noded` with a CPython
+template of the host's `/` (shared when the host has Landlock, else one
+per tenant, with a note), and `hellovm-api` with two tenants, all
+talking HTTP on loopback. It covers authentication, create, `exec`
+(exit codes, stderr, stdin, cwd, env, timeouts, truncation, Python in the
+warm interpreter), state between execs, read, write and edit (binary
+data, missing files, directories, ambiguous and missing edits), the
+writable layer's limit, outbound HTTP through the proxy with the
+sandbox's id in the audit line and a refused name, one request at a
+time, tenant isolation for every endpoint, the tenant limit, delete,
+idle timeout, lifetime, the memory limit, a template killed and
+restarted, `noded` killed and restarted with stale sockets, the API
+restarted with sandboxes running, and a clean shutdown.
+`kernel/noded` has unit tests for the agent protocol (against the
+host's Python), garbage from a sandbox, configurations, memory
+measurement and stale sockets; `kernel/control` for HTTP parsing and
+limits.
+
+**Measurements.** `cargo test --release -p hellovm-api --test
+control_plane bench_create_and_exec -- --ignored --nocapture`: the plane
+above, 30 sandboxes one after another, each created, used and deleted
+through the API over loopback HTTP. Same machine and setup as the
+**Warm clones** numbers (release build, Apple M3 Max, Docker Desktop
+aarch64, default seccomp profile), medians with the range:
+
+| | Debian bookworm (CPython 3.11) | Ubuntu 26.04 (CPython 3.14) |
+|---|---|---|
+| **Create, request to ready** (through the API) | **8.3 ms** (5.8–8.7) | **7.1 ms** (4.1–7.9) |
+| of that, on the node (clone request to the agent's greeting) | 8.0 ms | 6.8 ms |
+| `exec` of `echo hi` (`/bin/sh -c`) | 10.6 ms (8.3–11.4) | 12.9 ms (9.9–23.4) |
+| Create and first `exec`, together | 18.9 ms (14.3–20.1) | 19.9 ms (14.2–30.4) |
+| `exec` of Python (`json.dumps`, in a fork of the warm interpreter) | 4.9 ms (3.8–5.5) | 3.7 ms (2.6–4.1) |
+| `write_file` / `read_file`, 5 bytes | 0.8 / 1.0 ms | 0.8 / 0.6 ms |
+| `delete` | 0.3 ms | 0.2 ms |
+| For comparison: a cold `hellovm --root / python3 -c 'import json; ...'`, start to exit | 60.6 ms | 51.4 ms |
+
+The template preloads `json`, `decimal`, `hashlib`, `sqlite3` and
+`urllib.request`. A shell `exec` costs more than a Python one because
+`/bin/sh` is forked from the agent (a CPython process of about 30 MiB
+of mappings) and then executed, both emulated; a Python `exec` is only
+the fork.
+
+*Request to ready* is from sending `POST /v1/sandboxes` to the API until
+its `201`: the API's checks and placement, the node's clone request,
+the clone's start, and the agent's greeting from inside the sandbox. The
+first exec right after it is the earliest point a client sees its own
+command's output.
 
 ## Fuzzing
 
@@ -830,7 +1161,11 @@ denied, SNI-mismatch, Host-mismatch, private and metadata cases, a proxy
 that is down, the audit lines, `pip install` from a local index and
 `git clone` from a local server. The warm-clone tests (`kernel/hellovm/tests/warm.rs`) also use the host's
 `/` with its CPython and busybox; `tests/warm_bench.rs` is the ignored
-benchmark of **Warm clones**.
+benchmark of **Warm clones**. The control plane's test
+(`kernel/api/tests/control_plane.rs`, see **Control plane**) runs the
+`hellovm`, `hellovm-noded` and `hellovm-api` binaries it finds next to
+itself, so run it as part of `cargo test --workspace` (as `run-e2e.sh`
+does) or after `cargo build --workspace`.
 `HELLOVM_NET_E2E=1` also runs
 `live_pip_and_git`, a real `pip install` and `git clone` over the internet
 with an allowlist of `pypi.org`, `files.pythonhosted.org` and

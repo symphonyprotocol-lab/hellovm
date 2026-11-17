@@ -674,6 +674,7 @@ fn reason(status: u16) -> &'static str {
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
+        507 => "Insufficient Storage",
         _ => "Status",
     }
 }

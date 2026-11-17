@@ -42,13 +42,15 @@ jobs:
       # the kernel process really does here (nothing is enforced while
       # recording, so a gap cannot fail this run; its result is ignored),
       # then check the recording against the allowlist, which
-      # names every syscall it lacks. Before the e2e script: with a gap
+      # names every syscall it lacks. hellovm-api's tests run the kernel
+      # as noded does (templates with the sandbox agent, and their
+      # clones). Before the e2e script: with a gap
       # in the list that one only shows kernel processes dying of SIGSYS.
       - name: The seccomp allowlist covers x86_64
         working-directory: kernel
         run: |
           learn=$(mktemp)
-          HELLOVM_SECCOMP_LEARN="$learn" cargo test -p hellovm --no-fail-fast >/dev/null 2>&1 || true
+          HELLOVM_SECCOMP_LEARN="$learn" cargo test -p hellovm -p hellovm-api --no-fail-fast >/dev/null 2>&1 || true
           echo "recorded $(wc -l <"$learn") syscalls"
           HELLOVM_SECCOMP_LEARNED="$learn" \
             cargo test -p hellovm-sandbox every_measured_syscall_is_allowed -- --nocapture

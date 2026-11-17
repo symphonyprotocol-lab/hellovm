@@ -288,7 +288,8 @@ fn sandboxes_through_the_api() {
         );
     }
     // A made-up id is just as missing.
-    let guess = format!("{}0", &id[..34]);
+    let last = if id.ends_with('0') { '1' } else { '0' };
+    let guess = format!("{}{last}", &id[..34]);
     assert_eq!(
         plane
             .call(ACME, "GET", &format!("/v1/sandboxes/{guess}"), b"")
