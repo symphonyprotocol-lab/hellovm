@@ -14,7 +14,8 @@ insecure-test-hooks = []
 
 [dependencies]
 hellovm-core.workspace = true
-hellovm-egress.workspace = true
+# Only the flow header: the kernel process does not link the proxy.
+hellovm-egress-wire.workspace = true
 libc.workspace = true
 log.workspace = true
 

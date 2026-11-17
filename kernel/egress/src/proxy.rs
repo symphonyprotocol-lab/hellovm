@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::addr;
 use crate::audit::{AuditSink, Record};
+use crate::peer::peer_pid;
 use crate::policy::Policy;
 use crate::resolve::{Candidate, Resolver};
 use crate::sniff::{sniff, Sniff};
@@ -46,6 +47,10 @@ pub struct Limits {
     pub idle_timeout: Duration,
     /// Bytes buffered per direction while relaying.
     pub buffer: usize,
+    /// Deny lines one peer may add to the audit log in a burst.
+    pub deny_audit_burst: u32,
+    /// Deny lines per second one peer may add after its burst.
+    pub deny_audit_per_sec: u32,
 }
 
 impl Default for Limits {
@@ -61,6 +66,8 @@ impl Default for Limits {
             sniff_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(300),
             buffer: 16 * 1024,
+            deny_audit_burst: 50,
+            deny_audit_per_sec: 5,
         }
     }
 }
@@ -85,11 +92,67 @@ impl Config {
     }
 }
 
+/// Who a flow is counted against. The sandbox id in the header is whatever
+/// the connecting process wrote, so it cannot be the only key: a kernel
+/// process that a guest took over could send a new id with every flow. The
+/// peer's process id comes from the host kernel (`SO_PEERCRED`) and cannot
+/// be chosen, and one kernel process serves one sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Owner {
+    Peer(u32),
+    Claimed(u64),
+}
+
+/// A token bucket for one peer's deny lines.
+struct DenyBucket {
+    tokens: f64,
+    refilled: Instant,
+    suppressed: u64,
+}
+
+/// Peers tracked for deny-line limiting; when full, the table starts over
+/// (every peer gets a fresh burst, which is still a bound).
+const MAX_DENY_BUCKETS: usize = 4096;
+
 struct Shared {
     config: Config,
     active: AtomicUsize,
-    per_sandbox: Mutex<HashMap<u64, usize>>,
+    per_owner: Mutex<HashMap<Owner, usize>>,
+    deny_log: Mutex<HashMap<Owner, DenyBucket>>,
     stop: AtomicBool,
+}
+
+impl Shared {
+    /// Writes `rec` to the audit log, subject to the deny-line limit of
+    /// `owner`.
+    fn audit(&self, owner: Owner, rec: &mut Record) {
+        let limits = &self.config.limits;
+        let mut buckets = self.deny_log.lock().unwrap_or_else(|e| e.into_inner());
+        if buckets.len() >= MAX_DENY_BUCKETS && !buckets.contains_key(&owner) {
+            buckets.clear();
+        }
+        let now = Instant::now();
+        let burst = f64::from(limits.deny_audit_burst.max(1));
+        let bucket = buckets.entry(owner).or_insert(DenyBucket {
+            tokens: burst,
+            refilled: now,
+            suppressed: 0,
+        });
+        let gained = now.duration_since(bucket.refilled).as_secs_f64()
+            * f64::from(limits.deny_audit_per_sec);
+        bucket.tokens = (bucket.tokens + gained).min(burst);
+        bucket.refilled = now;
+        if !rec.allowed {
+            if bucket.tokens < 1.0 {
+                bucket.suppressed += 1;
+                return;
+            }
+            bucket.tokens -= 1.0;
+        }
+        rec.suppressed = std::mem::take(&mut bucket.suppressed);
+        drop(buckets);
+        self.config.audit.write(rec);
+    }
 }
 
 /// A bound proxy.
@@ -135,7 +198,8 @@ impl Proxy {
             shared: Arc::new(Shared {
                 config,
                 active: AtomicUsize::new(0),
-                per_sandbox: Mutex::new(HashMap::new()),
+                per_owner: Mutex::new(HashMap::new()),
+                deny_log: Mutex::new(HashMap::new()),
                 stop: AtomicBool::new(false),
             }),
         })
@@ -173,10 +237,14 @@ impl Proxy {
             // Do not let a full proxy block on this client.
             let _ = conn.set_nonblocking(true);
             let _ = (&conn).write_all(&Status::Limit.reply());
-            self.shared.config.audit.write(&Record {
+            let peer = peer_pid(&conn);
+            let mut rec = Record {
                 reason: "limit",
+                peer,
                 ..Record::default()
-            });
+            };
+            self.shared
+                .audit(peer.map_or(Owner::Claimed(0), Owner::Peer), &mut rec);
             return;
         }
         let shared = Arc::clone(&self.shared);
@@ -258,36 +326,44 @@ impl Drop for ActiveGuard<'_> {
     }
 }
 
-/// One sandbox's flow slot.
+/// One flow's slots: one per owner it is counted against.
 struct SandboxSlot<'a> {
     shared: &'a Shared,
-    id: u64,
+    owners: Vec<Owner>,
 }
 
 impl Drop for SandboxSlot<'_> {
     fn drop(&mut self) {
         let mut map = self
             .shared
-            .per_sandbox
+            .per_owner
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = map.get_mut(&self.id) {
-            *n -= 1;
-            if *n == 0 {
-                map.remove(&self.id);
+        for owner in &self.owners {
+            if let Some(n) = map.get_mut(owner) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(owner);
+                }
             }
         }
     }
 }
 
-fn take_slot(shared: &Shared, id: u64) -> Option<SandboxSlot<'_>> {
-    let mut map = shared.per_sandbox.lock().unwrap_or_else(|e| e.into_inner());
-    let n = map.entry(id).or_insert(0);
-    if *n >= shared.config.limits.max_flows_per_sandbox {
+/// Counts a flow against the sandbox id it claims and against its peer
+/// process; `None` when either is at [`Limits::max_flows_per_sandbox`].
+fn take_slot(shared: &Shared, id: u64, peer: Option<u32>) -> Option<SandboxSlot<'_>> {
+    let mut owners = vec![Owner::Claimed(id)];
+    owners.extend(peer.map(Owner::Peer));
+    let max = shared.config.limits.max_flows_per_sandbox;
+    let mut map = shared.per_owner.lock().unwrap_or_else(|e| e.into_inner());
+    if owners.iter().any(|o| map.get(o).is_some_and(|&n| n >= max)) {
         return None;
     }
-    *n += 1;
-    Some(SandboxSlot { shared, id })
+    for owner in &owners {
+        *map.entry(*owner).or_insert(0) += 1;
+    }
+    Some(SandboxSlot { shared, owners })
 }
 
 /// Reads with one deadline for all reads together.
@@ -315,10 +391,18 @@ impl Read for Deadline<'_> {
 
 fn handle(shared: &Shared, client: UnixStream) {
     let start = Instant::now();
-    let mut rec = Record::default();
+    let peer = peer_pid(&client);
+    let mut rec = Record {
+        peer,
+        ..Record::default()
+    };
     flow(shared, client, &mut rec);
     rec.duration = start.elapsed();
-    shared.config.audit.write(&rec);
+    let owner = match (peer, rec.sandbox) {
+        (Some(pid), _) => Owner::Peer(pid),
+        (None, id) => Owner::Claimed(id.unwrap_or(0)),
+    };
+    shared.audit(owner, &mut rec);
 }
 
 fn refuse(client: &UnixStream, rec: &mut Record, status: Status, reason: &'static str) {
@@ -348,7 +432,7 @@ fn flow(shared: &Shared, client: UnixStream, rec: &mut Record) {
     rec.sandbox = Some(req.sandbox_id);
     rec.host = Some(req.host.clone());
     rec.port = req.port;
-    let Some(_slot) = take_slot(shared, req.sandbox_id) else {
+    let Some(_slot) = take_slot(shared, req.sandbox_id, rec.peer) else {
         refuse(&client, rec, Status::Limit, "limit");
         return;
     };
@@ -392,7 +476,7 @@ fn flow(shared: &Shared, client: UnixStream, rec: &mut Record) {
         rec.reason = "bad-request";
         return;
     }
-    let first = match sniff_first(&client, &req, limits, rec) {
+    let (first, up_limit) = match sniff_first(&client, &req, limits, rec) {
         Some(first) => first,
         None => {
             let _ = client.shutdown(Shutdown::Both);
@@ -402,7 +486,7 @@ fn flow(shared: &Shared, client: UnixStream, rec: &mut Record) {
     };
     rec.allowed = true;
     rec.reason = "ok";
-    relay(client, upstream, first, limits, rec);
+    relay(client, upstream, first, up_limit, limits, rec);
 }
 
 /// The candidates that may be dialed, in order, and the first blocked one.
@@ -449,15 +533,22 @@ fn dial(addrs: &[SocketAddr], limits: &Limits) -> Result<(TcpStream, SocketAddr)
     Err(timed_out)
 }
 
-/// Reads the guest's first bytes until they name a host. Returns them when
-/// the name matches the flow; otherwise records the reason and returns
-/// `None`.
+/// Reads the guest's first bytes until they name a host. When the name
+/// matches the flow, returns the bytes to send upstream first and how many
+/// more the guest may send (`None`: no limit); otherwise records the reason
+/// and returns `None`.
+///
+/// A TLS flow is opaque after its ClientHello and is relayed as it is. A
+/// plain-HTTP flow carries exactly one request: its head goes upstream with
+/// `Connection: close`, then its declared body, and nothing the guest sends
+/// after that. A second request with another `Host` on the same connection
+/// would otherwise go unchecked.
 fn sniff_first(
     client: &UnixStream,
     req: &Request,
     limits: &Limits,
     rec: &mut Record,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Option<u64>)> {
     let mut r = Deadline {
         sock: client,
         until: Instant::now() + limits.sniff_timeout,
@@ -496,13 +587,19 @@ fn sniff_first(
             rec.asked = Some(("sni", name));
             "sni-mismatch"
         }
-        Sniff::Tls(_) => return Some(buf),
+        Sniff::Tls(_) => return Some((buf, None)),
         Sniff::Http(..) if req.port == 443 => "not-tls",
-        Sniff::Http(name, port) if name != req.host || port.is_some_and(|p| p != req.port) => {
-            rec.asked = Some(("http_host", name));
+        Sniff::Http(r) if r.host != req.host || r.port.is_some_and(|p| p != req.port) => {
+            rec.asked = Some(("http_host", r.host));
             "host-mismatch"
         }
-        Sniff::Http(..) => return Some(buf),
+        Sniff::Http(r) => {
+            let body = &buf[r.head_len..];
+            let take = (body.len() as u64).min(r.body_len) as usize;
+            let mut first = r.forward;
+            first.extend_from_slice(&body[..take]);
+            return Some((first, Some(r.body_len - take as u64)));
+        }
         Sniff::Invalid(_) | Sniff::NeedMore => "unparsable",
     };
     rec.reason = reason;
@@ -513,6 +610,7 @@ fn sniff_first(
 trait Half: Read + Write + Send + 'static {
     fn shut(&self, how: Shutdown);
     fn timeouts(&self, read: Duration, write: Duration);
+    fn read_timeout(&self, read: Duration);
 }
 
 impl Half for TcpStream {
@@ -523,6 +621,9 @@ impl Half for TcpStream {
         let _ = self.set_read_timeout(Some(read));
         let _ = self.set_write_timeout(Some(write));
     }
+    fn read_timeout(&self, read: Duration) {
+        let _ = self.set_read_timeout(Some(read));
+    }
 }
 
 impl Half for UnixStream {
@@ -532,6 +633,9 @@ impl Half for UnixStream {
     fn timeouts(&self, read: Duration, write: Duration) {
         let _ = self.set_read_timeout(Some(read));
         let _ = self.set_write_timeout(Some(write));
+    }
+    fn read_timeout(&self, read: Duration) {
+        let _ = self.set_read_timeout(Some(read));
     }
 }
 
@@ -553,25 +657,33 @@ impl Clock {
     }
 }
 
-/// How often a relay direction wakes to check the idle timeout.
-const TICK: Duration = Duration::from_millis(500);
-
+/// Moves bytes from `src` to `dst` until end of file, an error, the idle
+/// timeout, or `limit` bytes (after which it returns without closing
+/// anything: the other direction is still running).
 fn pump<S: Half, D: Half>(
     mut src: S,
     mut dst: D,
     moved: &AtomicU64,
     clock: &Clock,
     limits: &Limits,
+    mut limit: Option<u64>,
 ) {
-    // The read timeout is a tick for the idle check. A write that makes no
-    // progress for the idle timeout ends the flow. Both directions set both
-    // timeouts on their own fds to the same values.
-    let tick = TICK.min(limits.idle_timeout);
-    src.timeouts(tick, limits.idle_timeout);
-    dst.timeouts(tick, limits.idle_timeout);
+    // A blocked read wakes only when the flow may have gone idle: after the
+    // idle timeout, and then after whatever is left of it if the other
+    // direction moved bytes meanwhile. A write that makes no progress for
+    // the idle timeout ends the flow. Both directions set both timeouts on
+    // their own fds to the same values.
+    let idle = limits.idle_timeout.max(Duration::from_millis(1));
+    src.timeouts(idle, idle);
+    dst.timeouts(idle, idle);
     let mut buf = vec![0u8; limits.buffer.max(1)];
     loop {
-        match src.read(&mut buf) {
+        let want = match limit {
+            Some(0) => return,
+            Some(left) => (left.min(buf.len() as u64)) as usize,
+            None => buf.len(),
+        };
+        match src.read(&mut buf[..want]) {
             Ok(0) => {
                 dst.shut(Shutdown::Write);
                 return;
@@ -585,6 +697,9 @@ fn pump<S: Half, D: Half>(
                 }
                 moved.fetch_add(n as u64, Ordering::Relaxed);
                 clock.touch();
+                if let Some(left) = &mut limit {
+                    *left -= n as u64;
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err)
@@ -593,12 +708,14 @@ fn pump<S: Half, D: Half>(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                if clock.idle_for() >= limits.idle_timeout {
+                let quiet = clock.idle_for();
+                if quiet >= limits.idle_timeout {
                     clock.idle.store(true, Ordering::Relaxed);
                     src.shut(Shutdown::Both);
                     dst.shut(Shutdown::Both);
                     return;
                 }
+                src.read_timeout((idle - quiet).max(Duration::from_millis(1)));
             }
             Err(_) => {
                 src.shut(Shutdown::Both);
@@ -613,6 +730,7 @@ fn relay(
     client: UnixStream,
     mut upstream: TcpStream,
     first: Vec<u8>,
+    up_limit: Option<u64>,
     limits: &Limits,
     rec: &mut Record,
 ) {
@@ -637,10 +755,10 @@ fn relay(
     let (up2, clock2) = (Arc::clone(&up), Arc::clone(&clock));
     let upward = thread::Builder::new()
         .name("egress-up".into())
-        .spawn(move || pump(client2, upstream2, &up2, &clock2, &limits2));
+        .spawn(move || pump(client2, upstream2, &up2, &clock2, &limits2, up_limit));
     match upward {
         Ok(upward) => {
-            pump(upstream, client, &down, &clock, limits);
+            pump(upstream, client, &down, &clock, limits, None);
             let _ = upward.join();
         }
         Err(_) => {

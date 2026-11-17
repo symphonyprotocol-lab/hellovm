@@ -19,11 +19,32 @@ pub enum Sniff {
     NeedMore,
     /// A complete TLS ClientHello with this server name.
     Tls(String),
-    /// A complete HTTP/1.x request head with this `Host` name and, if the
-    /// header carried one, port.
-    Http(String, Option<u16>),
+    /// A complete HTTP/1.x request head.
+    Http(HttpRequest),
     /// Neither, or ambiguous. Refuse.
     Invalid(&'static str),
+}
+
+/// The one request a plain-HTTP flow carries.
+///
+/// The proxy checks a flow once, so a plain-HTTP flow must not be able to
+/// carry a second request with another `Host` after the checked one. The
+/// head is therefore forwarded with `Connection: close`, and the proxy
+/// relays exactly `body_len` more bytes from the client and nothing after
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpRequest {
+    /// The `Host` name, normalized.
+    pub host: String,
+    /// The port the `Host` header carried, if any.
+    pub port: Option<u16>,
+    /// Bytes of the input the head takes, its blank line included.
+    pub head_len: usize,
+    /// The request body's length (`Content-Length`, or 0).
+    pub body_len: u64,
+    /// The head to send upstream: as received, minus `Connection`,
+    /// `Keep-Alive` and `Proxy-Connection`, plus `Connection: close`.
+    pub forward: Vec<u8>,
 }
 
 /// Decides what `buf`, the client's first bytes, is.
@@ -198,23 +219,59 @@ fn http(buf: &[u8]) -> Sniff {
         return Sniff::Invalid("unsupported HTTP version");
     }
     let mut host = None;
+    let mut body_len = None;
+    let mut forward = Vec::with_capacity(end + 24);
+    if !request
+        .bytes()
+        .all(|b| (0x21..0x7f).contains(&b) || b == b' ')
+    {
+        return Sniff::Invalid("control bytes in the HTTP request line");
+    }
+    forward.extend_from_slice(request.as_bytes());
+    forward.extend_from_slice(b"\r\n");
     for line in lines {
+        // Only CRLF ends a line. A bare CR or LF, or any other control
+        // byte, inside one could make the upstream see other headers than
+        // the ones checked here.
+        if line.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+            return Sniff::Invalid("control bytes in an HTTP header");
+        }
         if line.starts_with([' ', '\t']) {
             return Sniff::Invalid("folded HTTP header");
         }
         let Some((name, value)) = line.split_once(':') else {
             return Sniff::Invalid("bad HTTP header");
         };
-        if name.is_empty() || name.ends_with([' ', '\t']) {
+        if name.is_empty() || !name.bytes().all(is_token_byte) {
             return Sniff::Invalid("bad HTTP header name");
         }
+        let value = value.trim_matches([' ', '\t']);
         if name.eq_ignore_ascii_case("host") {
             if host.is_some() {
                 return Sniff::Invalid("two Host headers");
             }
-            host = Some(value.trim_matches([' ', '\t']));
+            host = Some(value);
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if body_len.is_some() {
+                return Sniff::Invalid("two Content-Length headers");
+            }
+            if value.is_empty() || value.len() > 18 || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Sniff::Invalid("bad Content-Length");
+            }
+            body_len = value.parse::<u64>().ok();
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Its end cannot be found without parsing the body.
+            return Sniff::Invalid("Transfer-Encoding is not supported on plain HTTP");
+        } else if ["connection", "keep-alive", "proxy-connection"]
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h))
+        {
+            continue;
         }
+        forward.extend_from_slice(line.as_bytes());
+        forward.extend_from_slice(b"\r\n");
     }
+    forward.extend_from_slice(b"Connection: close\r\n\r\n");
     let Some(host) = host else {
         return Sniff::Invalid("no Host header");
     };
@@ -235,7 +292,18 @@ fn http(buf: &[u8]) -> Sniff {
             return Sniff::Invalid("request target and Host disagree");
         }
     }
-    Sniff::Http(authority.0, authority.1)
+    Sniff::Http(HttpRequest {
+        host: authority.0,
+        port: authority.1,
+        head_len: end + 4,
+        body_len: body_len.unwrap_or(0),
+        forward,
+    })
+}
+
+/// RFC 9110 `tchar`: what a header name is made of.
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// `name[:port]`, normalized.
@@ -352,15 +420,38 @@ mod tests {
         }
     }
 
+    fn http_of(req: &[u8]) -> HttpRequest {
+        match sniff(req) {
+            Sniff::Http(r) => r,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn http_host() {
         let req = b"GET /simple/ HTTP/1.1\r\nHost: Pypi.Test:8080\r\nAccept: */*\r\n\r\n";
-        assert_eq!(sniff(req), Sniff::Http("pypi.test".into(), Some(8080)));
-        let req = b"GET / HTTP/1.0\r\nhost:a.example\r\n\r\n";
-        assert_eq!(sniff(req), Sniff::Http("a.example".into(), None));
+        let r = http_of(req);
+        assert_eq!((r.host.as_str(), r.port), ("pypi.test", Some(8080)));
+        assert_eq!((r.head_len, r.body_len), (req.len(), 0));
+        let r = http_of(b"GET / HTTP/1.0\r\nhost:a.example\r\n\r\n");
+        assert_eq!((r.host.as_str(), r.port), ("a.example", None));
         assert_eq!(sniff(b"GET / HT"), Sniff::NeedMore);
         let abs = b"GET http://a.example/x HTTP/1.1\r\nHost: a.example\r\n\r\n";
-        assert_eq!(sniff(abs), Sniff::Http("a.example".into(), None));
+        assert_eq!(http_of(abs).host, "a.example");
+    }
+
+    #[test]
+    fn http_is_forwarded_as_one_request() {
+        let req = b"POST /u HTTP/1.1\r\nHost: a.example\r\nConnection: keep-alive\r\n\
+                    Keep-Alive: timeout=5\r\nContent-Length: 5\r\nX-Y: z\r\n\r\nhelloGET /2";
+        let r = http_of(req);
+        assert_eq!(r.body_len, 5);
+        assert_eq!(&req[r.head_len..r.head_len + 5], b"hello");
+        assert_eq!(
+            String::from_utf8(r.forward).unwrap(),
+            "POST /u HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\nX-Y: z\r\n\
+             Connection: close\r\n\r\n"
+        );
     }
 
     #[test]
@@ -376,6 +467,17 @@ mod tests {
             b"GET / HTTP/2.0\r\nHost: a.example\r\n\r\n",
             b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
             b"GET http://b.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n",
+            // A bare LF or CR, or a NUL, inside the head.
+            b"GET / HTTP/1.1\r\nHost: a.example\r\nX: a\nHost: b.example\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a.example\r\nX: a\rb\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a.example\r\nX: a\0b\r\n\r\n",
+            b"GET /\tx HTTP/1.1\r\nHost: a.example\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a.example\r\nX Y: z\r\n\r\n",
+            // Bodies whose end the proxy cannot find, or that are ambiguous.
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: +1\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 1, 1\r\n\r\n",
             b"SSH-2.0-OpenSSH\r\n",
             b"\x00\x01",
         ] {

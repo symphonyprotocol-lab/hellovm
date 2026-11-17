@@ -16,6 +16,10 @@ insecure-test-hooks = []
 name = "hellovm-egress"
 path = "src/main.rs"
 
+[dependencies]
+hellovm-egress-wire.workspace = true
+libc.workspace = true
+
 [dev-dependencies]
 # The integration tests run the proxy against loopback servers, which only
 # the test hooks allow.

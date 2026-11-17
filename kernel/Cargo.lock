@@ -19,6 +19,7 @@ dependencies = [
 name = "hellovm-core"
 version = "0.0.1"
 dependencies = [
+ "hellovm-egress-wire",
  "log",
 ]
 
@@ -27,7 +28,13 @@ name = "hellovm-egress"
 version = "0.0.1"
 dependencies = [
  "hellovm-egress",
+ "hellovm-egress-wire",
+ "libc",
 ]
+
+[[package]]
+name = "hellovm-egress-wire"
+version = "0.0.1"
 
 [[package]]
 name = "hellovm-host"
@@ -35,6 +42,7 @@ version = "0.0.1"
 dependencies = [
  "hellovm-core",
  "hellovm-egress",
+ "hellovm-egress-wire",
  "hellovm-host",
  "libc",
  "log",

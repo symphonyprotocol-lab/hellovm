@@ -6,7 +6,7 @@
 //! dialed. Every stream goes to the one configured [`Endpoint`]:
 //!
 //! * [`Endpoint::Egress`]: the egress proxy's Unix socket. The helper sends
-//!   the flow header ([`hellovm_egress::wire`]: sandbox id, the hostname
+//!   the flow header ([`hellovm_egress_wire`]: sandbox id, the hostname
 //!   the kernel bound, the port) and waits for the proxy's verdict, so the
 //!   guest's `connect` completes only once the proxy has connected
 //!   upstream. A refusal is a connect error of kind `ConnectionRefused`
@@ -29,7 +29,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hellovm_egress::wire::{Request, Status, REPLY};
+use hellovm_egress_wire::{Request, Status, REPLY};
 
 /// How long the helper waits for the egress proxy's verdict. The proxy
 /// bounds its own work (header 5 s, resolution 5 s, upstream connect 10 s),

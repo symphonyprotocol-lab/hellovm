@@ -217,15 +217,31 @@ impl<H: Host> Kernel<H> {
     }
 
     /// The sandbox's network is the kernel's, so its resolver configuration
-    /// is too: when the image has an `/etc` directory, `/etc/resolv.conf` is
+    /// is too: `/etc/resolv.conf` is
     /// replaced (in the writable layer) by one naming virtual DNS, whatever
     /// the image had there (often the build host's resolver, which the
     /// guest cannot reach). The guest may still change it.
     fn present_resolv_conf(&mut self) {
         let time = now(&mut self.host);
         let root = self.vfs.root();
-        let Ok(etc) = self.vfs.resolve(&mut self.host, root, b"/etc", true) else {
-            return;
+        let etc = match self.vfs.resolve(&mut self.host, root, b"/etc", true) {
+            Ok(etc) => etc,
+            // A minimal image: without the file libc would ask 127.0.0.1,
+            // where nothing answers.
+            Err(_) => {
+                let made = self.vfs.create(
+                    &mut self.host,
+                    root,
+                    b"etc",
+                    crate::vfs::NewNode::Dir,
+                    0o755,
+                    time,
+                );
+                match made {
+                    Ok(etc) => etc,
+                    Err(_) => return,
+                }
+            }
         };
         if !self.vfs.is_dir(etc) {
             return;
@@ -1641,14 +1657,19 @@ mod tests {
             .vfs
             .resolve(&mut kernel.host, root, b"/etc/motd", true)
             .is_ok());
-        // No /etc: nothing is created.
+        // No /etc in the image: it is created, or libc would have no
+        // resolver at all.
         let bare = MockHost::with_image(&[("bin", MockEntry::Dir)]);
         let mut kernel = Kernel::new(bare);
         let root = kernel.vfs.root();
-        assert!(kernel
+        let file = kernel
             .vfs
-            .resolve(&mut kernel.host, root, b"/etc", true)
-            .is_err());
+            .resolve(&mut kernel.host, root, b"/etc/resolv.conf", true)
+            .unwrap();
+        assert_eq!(
+            kernel.vfs.read_all(&mut kernel.host, file).unwrap(),
+            RESOLV_CONF
+        );
     }
 
     fn poll_memory(fd: i32, events: u16) -> [u8; 8] {

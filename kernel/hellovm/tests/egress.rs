@@ -333,7 +333,7 @@ fn audit_line(audit: &MemorySink, host: &str, reason: &str) -> String {
 }
 
 const POLICY: &str = "allow tls.test:443\nallow pypi.test:443\nallow git.test:443\n\
-                      allow web.test:80\nallow private.test\nallow meta.test\n";
+                      allow web.test:80\nallow private.test\nallow meta.test:80\n";
 
 /// One guest program checks every socket-level case; each prints a line.
 const SOCKET_CASES: &str = r#"

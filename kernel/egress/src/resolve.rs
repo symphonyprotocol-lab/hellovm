@@ -16,6 +16,33 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Most resolutions in flight at once. A helper thread can stay inside
+/// `getaddrinfo` long after its flow gave up waiting (the flow's slot is
+/// free again by then), so the flow limit does not bound these threads;
+/// this does. Past it, a resolution fails at once.
+pub const MAX_RESOLVING: usize = 256;
+
+static RESOLVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct Resolving;
+
+impl Resolving {
+    fn begin() -> Option<Resolving> {
+        use std::sync::atomic::Ordering;
+        if RESOLVING.fetch_add(1, Ordering::SeqCst) >= MAX_RESOLVING {
+            RESOLVING.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Resolving)
+    }
+}
+
+impl Drop for Resolving {
+    fn drop(&mut self) {
+        RESOLVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Most addresses kept from one resolution.
 pub const MAX_ADDRS: usize = 16;
 
@@ -98,10 +125,13 @@ fn system(host: &str, port: u16, timeout: Duration) -> io::Result<Vec<Candidate>
     let (tx, rx) = mpsc::sync_channel(1);
     let name = host.to_string();
     // The thread may outlive the timeout inside getaddrinfo; it then exits
-    // on its own. The proxy's flow limit bounds how many can exist.
+    // on its own. `MAX_RESOLVING` bounds how many can exist.
+    let in_flight =
+        Resolving::begin().ok_or_else(|| io::Error::other("too many resolutions in flight"))?;
     std::thread::Builder::new()
         .name("egress-resolve".into())
         .spawn(move || {
+            let _in_flight = in_flight;
             let result = (name.as_str(), port)
                 .to_socket_addrs()
                 .map(|it| it.take(MAX_ADDRS).collect::<Vec<_>>());

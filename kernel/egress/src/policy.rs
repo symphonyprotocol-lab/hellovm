@@ -7,7 +7,9 @@
 //! * `*.githubusercontent.com` matches any name *under* that suffix (one or
 //!   more extra labels), not the suffix itself. The suffix needs at least
 //!   two labels, so `*.com` and `*` are rejected;
-//! * without ports, a rule allows 80 and 443.
+//! * without ports, a rule allows 443 only. Plain HTTP (port 80) must be
+//!   asked for (`pypi.org:80,443`): it is not encrypted, and the proxy
+//!   carries one request per connection on it (see [`crate::sniff`]).
 //!
 //! A policy file holds one `allow RULE` per line; blank lines and lines
 //! starting with `#` are ignored. Names are case-insensitive.
@@ -15,7 +17,7 @@
 use crate::wire::{normalize_hostname, valid_hostname};
 
 /// Ports a rule allows when it names none.
-pub const DEFAULT_PORTS: [u16; 2] = [80, 443];
+pub const DEFAULT_PORTS: [u16; 1] = [443];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Pattern {
@@ -144,7 +146,9 @@ mod tests {
     fn exact_names_and_default_ports() {
         let p = policy("# comment\n\nallow PyPI.org\n");
         assert!(p.allows("pypi.org", 443));
-        assert!(p.allows("pypi.org", 80));
+        // Plain HTTP is not a default: it must be asked for.
+        assert!(!p.allows("pypi.org", 80));
+        assert!(policy("allow pypi.org:80,443\n").allows("pypi.org", 80));
         assert!(!p.allows("pypi.org", 22));
         assert!(!p.allows("files.pypi.org", 443));
         assert!(!p.allows("evilpypi.org", 443));

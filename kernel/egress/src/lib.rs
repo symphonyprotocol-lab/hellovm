@@ -73,14 +73,17 @@
 //! Protocols where the server speaks first (SSH, SMTP) are refused at the
 //! sniff timeout.
 
-#![forbid(unsafe_code)]
+// `peer` alone opts out, for one `getsockopt`.
+#![deny(unsafe_code)]
 
 pub mod addr;
 pub mod audit;
+mod peer;
 pub mod policy;
 pub mod proxy;
 pub mod resolve;
 pub mod sniff;
-pub mod wire;
+/// The flow header, shared with the kernel process.
+pub use hellovm_egress_wire as wire;
 
 pub use proxy::{Config, Limits, Proxy, ProxyHandle};

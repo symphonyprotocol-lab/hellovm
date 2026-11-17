@@ -158,12 +158,67 @@ fn allowed_http_flow() {
     );
     let (mut s, status) = f.open(1, "web.test", 80);
     assert_eq!(status, Some(Status::Ok));
-    s.write_all(b"GET / HTTP/1.1\r\nHost: web.test\r\n\r\nEND")
-        .unwrap();
+    // One request with a body, then a second request for another host on
+    // the same connection.
+    s.write_all(
+        b"POST / HTTP/1.1\r\nHost: web.test\r\nConnection: keep-alive\r\n\
+          Content-Length: 3\r\n\r\nENDGET /leak HTTP/1.1\r\nHost: evil.test\r\n\r\n",
+    )
+    .unwrap();
     assert!(read_all(&mut s).ends_with(b"hi"));
     drop(s);
-    server.join().unwrap();
-    assert_eq!(field(&f.audit_lines(1)[0], "verdict"), "allow");
+    let got = String::from_utf8(server.join().unwrap()).unwrap();
+    // Only the checked request reached the server, marked as the last one.
+    assert_eq!(
+        got,
+        "POST / HTTP/1.1\r\nHost: web.test\r\nContent-Length: 3\r\nConnection: close\r\n\r\nEND"
+    );
+    let line = &f.audit_lines(1)[0];
+    assert_eq!(field(line, "verdict"), "allow");
+    assert_eq!(field(line, "peer"), std::process::id().to_string());
+}
+
+#[test]
+fn a_peer_cannot_dodge_its_flow_limit_with_other_sandbox_ids() {
+    let limits = Limits {
+        max_flows_per_sandbox: 2,
+        ..Limits::default()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let f = Fixture::new("allow a.test", &format!("a.test 127.0.0.1:{port}"), limits);
+    // Two flows held open (the proxy waits for their first bytes), each
+    // under its own claimed id.
+    let (_one, status) = f.open(1, "a.test", 443);
+    assert_eq!(status, Some(Status::Ok));
+    let (_two, status) = f.open(2, "a.test", 443);
+    assert_eq!(status, Some(Status::Ok));
+    // A third id does not get this process a third flow.
+    let (_three, status) = f.open(3, "a.test", 443);
+    assert_eq!(status, Some(Status::Limit));
+}
+
+#[test]
+fn deny_lines_are_rate_limited_per_peer() {
+    let limits = Limits {
+        deny_audit_burst: 3,
+        deny_audit_per_sec: 20,
+        ..Limits::default()
+    };
+    let f = Fixture::new("allow a.test", "a.test 127.0.0.1:9", limits);
+    for _ in 0..10 {
+        let (_s, status) = f.open(1, "evil.test", 443);
+        assert_eq!(status, Some(Status::Denied));
+    }
+    thread::sleep(Duration::from_millis(300));
+    let before = f.audit.lines().len();
+    assert!((3..10).contains(&before), "{before} lines");
+    // The next line that is written says how many were left out.
+    let (_s, status) = f.open(1, "evil.test", 443);
+    assert_eq!(status, Some(Status::Denied));
+    let lines = f.audit_lines(before + 1);
+    let last = lines.last().unwrap();
+    assert_eq!(field(last, "suppressed"), (10 - before).to_string());
 }
 
 #[test]
@@ -411,10 +466,22 @@ fn flows_per_sandbox_are_bounded() {
     let (first, status) = f.open(1, "a.test", 443);
     assert_eq!(status, Some(Status::Ok));
     assert_eq!(f.open(1, "a.test", 443).1, Some(Status::Limit));
-    // Another sandbox is not affected.
-    let (other, status) = f.open(2, "a.test", 443);
-    assert_eq!(status, Some(Status::Ok));
-    drop((first, other));
+    // The limit also counts the connecting process, whatever id it claims
+    // (see `a_peer_cannot_dodge_its_flow_limit_with_other_sandbox_ids`), so
+    // from this one process another id is refused too...
+    assert_eq!(f.open(2, "a.test", 443).1, Some(Status::Limit));
+    // ...until the first flow ends and gives its slot back.
+    drop(first);
+    let start = Instant::now();
+    let other = loop {
+        let (other, status) = f.open(2, "a.test", 443);
+        if status == Some(Status::Ok) {
+            break other;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "{status:?}");
+        thread::sleep(Duration::from_millis(10));
+    };
+    drop(other);
     drop(accepted.join().unwrap());
     let lines = f.audit_lines(3);
     assert!(lines.iter().any(|l| field(l, "reason") == "limit"));

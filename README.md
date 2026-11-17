@@ -13,6 +13,7 @@ The kernel lives in `kernel/`, a Rust workspace:
 | `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
 | `hellovm` | `kernel/hellovm` | Command-line launcher |
 | `hellovm-egress` | `kernel/egress` | The egress proxy (`hellovm-egress` binary): default-deny domain allowlist, one per host |
+| `hellovm-egress-wire` | `kernel/egress-wire` | The flow header and hostname rule the kernel and the proxy share |
 | `hellovm-test-guest` | `kernel/test-guest` | Small test programs built at build time |
 
 Syscall interception on Linux is ptrace plus `SECCOMP_RET_TRACE`, not
@@ -138,18 +139,22 @@ There are at most 4096 sockets. `SO_REUSEADDR` is stored but a second
 bind of the same port, including `0.0.0.0` against a specific address, is
 still `EADDRINUSE`.
 
-**Virtual DNS.** Whenever the image has an `/etc` directory, the kernel
-replaces `/etc/resolv.conf` (in the writable layer) with one naming
-`192.0.2.1`, the only resolver the guest can reach. Without `--egress`,
+**Virtual DNS.** The kernel replaces `/etc/resolv.conf` (in the writable
+layer, creating `/etc` if the image has none) with one naming `192.0.2.1`,
+the only resolver the guest can reach. Without `--egress`,
 every query is NXDOMAIN. With it:
 
 - An `A` query for a hostname binds the next fake IP from
   `198.51.100.1`–`198.51.100.254` to that name and answers it (TTL 300 s).
-  The binding lasts as long as the sandbox, so a repeated query gets the
-  same address and an address the guest cached never changes meaning. The
-  pool stays a /24: at most **254 names per sandbox**; a new name past that
-  is `SERVFAIL` (names already bound still answer). A sandbox can only
-  exhaust its own table.
+  A repeated query gets the same address. The pool stays a /24: at most
+  **254 names bound at once per sandbox**. When all are bound, a new name
+  takes over the address of the name unused longest (no `A` query for it
+  and no connect to its address), provided that is at least 600 s, twice
+  the TTL; otherwise the new name is `SERVFAIL` (names already bound still
+  answer). A guest that keeps an address past that and connects to it after
+  it was rebound opens a flow named for the new owner, which the proxy
+  refuses because the SNI or `Host` names the old one; connections already
+  open are not affected. A sandbox can only exhaust its own table.
 - A hostname is at most 253 bytes of at least two labels, each 1–63
   letters, digits and `-` (not at either end), with a last label that is
   not all digits; matching is case-insensitive. Any other name (one label
@@ -196,7 +201,8 @@ line.
 *Policy*: deny by default. A rule is `NAME[:PORT[,PORT...]]` or
 `*.SUFFIX[:PORT[,PORT...]]`, given with `--allow RULE` or as `allow RULE`
 lines in a `--policy FILE` (`#` comments and blank lines ignored; several
-of each may be given). Without ports a rule allows 80 and 443. `*.SUFFIX`
+of each may be given). Without ports a rule allows 443 only; plain HTTP
+must be asked for (`pypi.org:80,443`). `*.SUFFIX`
 matches names below the suffix (`*.github.com` matches `api.github.com`,
 not `github.com`); the suffix needs two labels, so `*` and `*.com` are
 errors. Then, for an allowed name:
@@ -216,13 +222,22 @@ errors. Then, for an allowed name:
    header naming it (a port in it must be the flow's port; an absolute
    request target must agree). Port 443 must be TLS, port 80 must be HTTP,
    other allowed ports may be either. Traffic is never decrypted.
+5. A plain-HTTP flow carries **one request**. Its head must be strict
+   HTTP/1.x (CRLF line ends only, no control bytes, no folded headers, one
+   `Host`, at most one `Content-Length`, no `Transfer-Encoding`). The proxy
+   forwards it with `Connection: close` in place of any `Connection`,
+   `Keep-Alive` or `Proxy-Connection` header, then exactly the declared
+   body, and nothing the guest sends after that, so a second request with
+   another `Host` cannot ride on a checked connection. A TLS flow is opaque
+   after its ClientHello: what the guest says inside it, including an HTTP
+   `Host` that differs from the SNI, is not visible to the proxy.
 
-*Audit*: one line per flow when it ends or is refused, to stdout or
-`--audit FILE` (appended):
+*Audit*: one line per allowed flow when it ends, and one per refusal
+subject to a per-peer rate limit, to stdout or `--audit FILE` (appended):
 
 ```text
-egress ts=1794881916.960 sandbox=540b8195fe6e630a host=pypi.org port=443 verdict=allow reason=ok addr=151.101.0.223:443 up=681 down=2169 ms=6
-egress ts=1794881916.969 sandbox=540b8195fe6e630a host=pypi.org port=443 verdict=deny reason=sni-mismatch sni=evil.example addr=151.101.0.223:443 up=0 down=0 ms=0
+egress ts=1794881916.960 sandbox=540b8195fe6e630a host=pypi.org port=443 verdict=allow reason=ok addr=151.101.0.223:443 up=681 down=2169 ms=6 peer=4711
+egress ts=1794881916.969 sandbox=540b8195fe6e630a host=pypi.org port=443 verdict=deny reason=sni-mismatch sni=evil.example addr=151.101.0.223:443 up=0 down=0 ms=0 peer=4711
 ```
 
 `ts` is Unix time with milliseconds; `sandbox` 16 hex digits (`-` if the
@@ -233,15 +248,19 @@ header was unreadable); `verdict` `allow` or `deny`; `reason` is `ok` or
 `unparsable`, `sniff-timeout`. `sni=` or `http_host=` follows `reason` on a
 mismatch. `addr` is the upstream address dialed (for `blocked-address`,
 the first blocked one; else `-`); `up` and `down` are bytes delivered
-upstream and to the guest.
+upstream and to the guest. `peer` is the process id of the connecting
+kernel process as the host kernel reports it (`SO_PEERCRED`); unlike
+`sandbox`, the connecting process cannot choose it. Each peer may log 50
+refusals in a burst and 5 per second after that; the next line written for
+that peer ends with `suppressed=N`, the number of its refusals left out.
 
 *Limits*:
 
 | What | Limit |
 |---|---|
 | Flow header | 16 + at most 253 bytes, within 5 s |
-| Concurrent flows | 1024 in total (`--max-flows`), 64 per sandbox (`--max-flows-per-sandbox`) |
-| Name resolution | 5 s, at most 16 addresses kept |
+| Concurrent flows | 1024 in total (`--max-flows`); 64 per sandbox id and 64 per connecting process, whatever ids it claims (`--max-flows-per-sandbox`) |
+| Name resolution | 5 s, at most 16 addresses kept, at most 256 resolutions in flight (more fail at once) |
 | Upstream connect | 10 s across all addresses (`--connect-timeout`), at most 4 addresses tried |
 | SNI / `Host` sniffing | 16 KiB within 10 s |
 | Relay | 16 KiB buffered per direction in the proxy; idle (no byte either way) 300 s closes the flow (`--idle-timeout`) |
@@ -251,15 +270,14 @@ upstream and to the guest.
 Bytes waiting on an outbound stream are visible to `poll`, `select` and
 `FIONREAD` before any `recv`.
 
-*Not supported*: only the *first* request of a plain-HTTP connection is
-checked (later requests on a kept-alive connection go to the same
-upstream address); a ClientHello using Encrypted Client Hello is checked
+*Not supported*: plain-HTTP keep-alive, pipelining, chunked request bodies
+and upgrades (WebSocket), since a plain-HTTP flow is one request; a
+ClientHello using Encrypted Client Hello is checked
 by its outer SNI, so it is refused unless that names the flow's host;
 protocols where the server speaks first (SSH, SMTP), `git://`, and HTTP
 `CONNECT` are refused; outbound UDP (including QUIC/HTTP/3) and IPv6
 sockets stay unavailable; there is no per-sandbox policy (one allowlist
-per proxy) and no rate or byte quota; the fake-IP pool does not recycle
-names.
+per proxy) and no rate or byte quota.
 
 *Test hooks*: the cargo feature `insecure-test-hooks` (off by default)
 adds `hellovm --splice-to 127.0.0.1:PORT`, which sends every outbound flow

@@ -1,7 +1,7 @@
 //! One audit line per flow, written when the flow ends (or is refused):
 //!
 //! ```text
-//! egress ts=1763380000.123 sandbox=00000000000004d2 host=pypi.org port=443 verdict=allow reason=ok addr=151.101.0.223:443 up=812 down=40213 ms=388
+//! egress ts=1763380000.123 sandbox=00000000000004d2 host=pypi.org port=443 verdict=allow reason=ok addr=151.101.0.223:443 up=812 down=40213 ms=388 peer=4711
 //! ```
 //!
 //! Fields, always in this order and always present:
@@ -19,7 +19,16 @@
 //!   first blocked address, else `-`;
 //! * `up`: bytes from the guest delivered upstream; `down`: bytes from
 //!   upstream delivered to the guest;
-//! * `ms`: the flow's duration.
+//! * `ms`: the flow's duration;
+//! * `peer`: the process id of the connecting kernel process as the host
+//!   kernel reports it (`SO_PEERCRED`), `-` where that is unavailable.
+//!   Unlike `sandbox`, the connecting process cannot choose it.
+//!
+//! Every allowed flow is logged. Refusals are rate-limited per peer
+//! ([`crate::Limits::deny_audit_burst`], [`crate::Limits::deny_audit_per_sec`]),
+//! so a sandbox that retries a refused connect in a loop cannot fill the
+//! disk; the next line written for that peer ends with `suppressed=N`, the
+//! number of its deny lines left out.
 //!
 //! Values never contain spaces: hostnames are validated before they are
 //! logged, and a `sni` or `http_host` field is added (after `reason`) only on
@@ -99,6 +108,10 @@ pub struct Record {
     pub up: u64,
     pub down: u64,
     pub duration: Duration,
+    /// The connecting process, as the host kernel reports it.
+    pub peer: Option<u32>,
+    /// Deny lines of the same peer left out since its last written line.
+    pub suppressed: u64,
 }
 
 impl Record {
@@ -130,13 +143,23 @@ impl Record {
             }
             None => s.push_str(" addr=-"),
         }
-        let _ = writeln!(
+        let _ = write!(
             s,
             " up={} down={} ms={}",
             self.up,
             self.down,
             self.duration.as_millis()
         );
+        match self.peer {
+            Some(pid) => {
+                let _ = write!(s, " peer={pid}");
+            }
+            None => s.push_str(" peer=-"),
+        }
+        if self.suppressed > 0 {
+            let _ = write!(s, " suppressed={}", self.suppressed);
+        }
+        s.push('\n');
         s
     }
 }
@@ -158,12 +181,13 @@ mod tests {
             up: 0,
             down: 0,
             duration: Duration::from_millis(12),
+            ..Record::default()
         };
         let line = r.line();
         let rest = line.split_once(' ').unwrap().1.split_once(' ').unwrap().1;
         assert_eq!(
             rest,
-            "sandbox=00000000000004d2 host=pypi.org port=443 verdict=deny reason=sni-mismatch sni=evil.example addr=1.2.3.4:443 up=0 down=0 ms=12\n"
+            "sandbox=00000000000004d2 host=pypi.org port=443 verdict=deny reason=sni-mismatch sni=evil.example addr=1.2.3.4:443 up=0 down=0 ms=12 peer=-\n"
         );
         assert!(line.starts_with("egress ts="));
         let empty = Record {

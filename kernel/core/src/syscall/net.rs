@@ -900,6 +900,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         // The flow is named by the kernel's own DNS table, never by
         // anything the guest passes now. `dest_ip` is audit metadata; the
         // host dials only its configured endpoint (the egress proxy).
+        // A connect keeps the name bound to this address.
+        let now = self.host.clock_monotonic();
+        self.st.net.touch_name(ip, now);
         let flow = OutboundFlow {
             sandbox_id: self.st.net.sandbox_id,
             guest_pid: self.pid,
@@ -1212,7 +1215,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         match class {
             Class::Dns => {
                 let outbound = self.host.egress_configured();
-                if let Some(reply) = self.st.net.dns_reply(data, outbound) {
+                let now = self.host.clock_monotonic();
+                if let Some(reply) = self.st.net.dns_reply(data, outbound, now) {
                     self.enqueue_dgram(id, GATEWAY_IP, DNS_PORT, reply, nonblock, true)?;
                 }
                 Ok(data.len())
@@ -1381,7 +1385,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             let query = buf[2..2 + need].to_vec();
             self.st.net.get_mut(id).dns_in.drain(..2 + need);
             let outbound = self.host.egress_configured();
-            let reply = self.st.net.dns_reply(&query, outbound);
+            let now = self.host.clock_monotonic();
+            let reply = self.st.net.dns_reply(&query, outbound, now);
             let sock = self.st.net.get_mut(id);
             if let Some(reply) = reply {
                 let len = (reply.len() as u16).to_be_bytes();
