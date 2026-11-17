@@ -424,6 +424,48 @@ as a control. In the dev container (Docker's default seccomp profile)
 the namespaces are skipped and every other layer is active; with
 `--security-opt seccomp=unconfined` all seven are.
 
+## Fuzzing
+
+`kernel/fuzz` holds a fuzz target for everything that parses guest- or
+network-controlled bytes. It is its own Cargo workspace, excluded from
+`kernel/`'s, so the pinned stable toolchain and CI never build it.
+
+| Target | What it feeds | Property beyond "no panic, bounded time and memory" |
+|---|---|---|
+| `elf` | `elf::parse` and `elf::load` (both architectures, as program and as interpreter) | |
+| `dns` | the virtual DNS responder, with and without an egress proxy | a reply has the query's id, never grows past the query plus one answer, and a repeated query gets the same reply |
+| `wire` | the egress flow header (`Request::read_from`) and the verdict | a parsed header re-encodes to the same request |
+| `sniff` | the TLS ClientHello / HTTP `Host` sniffer, and prefixes of the input | a returned name appears in the input |
+| `policy` | the policy file and rule parser, then lookups | |
+| `vfs_path` | `resolve`, `resolve_parent`, `resolve_for_create`, `lookup` over an image with symlink loops, `..` above the root, absolute and empty targets | |
+| `shebang` | the `#!` line parser | the interpreter is non-empty and comes from the first line |
+| `sigreturn` | `rt_sigreturn` frame restore on both architectures | |
+| `syscalls` | arbitrary syscall numbers and arguments, faults and interrupts, for up to four tasks, with arbitrary guest memory, through the dispatcher and the mock platform (`hellovm_core::testutil`, feature `testutil`) | |
+
+With nightly and `cargo-fuzz` (libFuzzer):
+
+```sh
+cd kernel/fuzz
+cargo +nightly fuzz run syscalls --features libfuzzer -- -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10
+```
+
+On the stable toolchain, `tests/corpus.rs` runs every target over its
+corpus (`corpus/<target>/`: the seeds written by `tests/seeds.rs`, and
+the minimized input of every crash found) and then over seeded
+mutations of it, with at most 2 s and 256 MiB per input
+(`HELLOVM_FUZZ_ITERS`, default 2000 per target; `HELLOVM_FUZZ_TARGET`
+picks one; `HELLOVM_FUZZ_REPLAY=target:FILE` replays one input with a
+backtrace):
+
+```sh
+cd kernel/fuzz
+cargo test --release
+```
+
+The `syscalls` target only reports the faults the seccomp platform can
+report (`SIGILL`, `SIGTRAP`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, `SIGSYS`):
+the platform is trusted, the guest only chooses which fault it causes.
+
 ## Building and testing
 
 Running sandboxed programs needs a **Linux** host: kernel 5.5 or newer on
@@ -484,7 +526,9 @@ Run a program in a sandbox whose root is an image directory. The program path
 is a path inside the sandbox; `--trace` lists every syscall the kernel
 handled, `--egress SOCKET` lets the sandbox reach the network through the
 egress proxy (see **Egress**), and `--timeout SECONDS` kills every process of a sandbox that runs
-longer (hellovm then exits with 124). When hellovm's stdin and stdout are a
+longer (hellovm then exits with 124). `--sandbox require|best-effort|off` picks how strictly
+hellovm hardens its own process (see **Hardening**; default
+`best-effort`). When hellovm's stdin and stdout are a
 terminal, the sandbox gets a terminal console (`--tty`/`--no-tty` override
 this), so an interactive shell works:
 

@@ -27,6 +27,9 @@ pub mod elf;
 pub mod errno;
 mod eventfd;
 pub mod fd;
+#[cfg(feature = "testutil")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod host;
 mod kernel;
 pub mod mm;
@@ -39,9 +42,6 @@ mod task;
 #[cfg(any(test, feature = "testutil"))]
 #[doc(hidden)]
 pub mod testutil;
-#[cfg(feature = "testutil")]
-#[doc(hidden)]
-pub mod fuzzing;
 mod tty;
 pub mod vfs;
 
