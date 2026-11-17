@@ -25,6 +25,7 @@ pub mod abi;
 pub mod arch;
 pub mod elf;
 pub mod errno;
+mod eventfd;
 pub mod fd;
 pub mod host;
 mod kernel;

@@ -258,6 +258,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 self.st.pipes.close_end(id, true);
                 self.st.changed = true;
             }
+            FileObject::EventFd(id) => {
+                self.st.eventfds.remove(id);
+                self.st.changed = true;
+            }
             FileObject::Socket(id) => self.finish_drop(id),
             FileObject::Proc { .. } => {
                 let held = file.contents.as_ref().map_or(0, Vec::len);
@@ -386,6 +390,7 @@ where
         Some(Dup3) => ctx.sys_dup3(int(a[0]), int(a[1]), a[2]),
         Some(Pipe) => ctx.sys_pipe2(a[0], 0),
         Some(Pipe2) => ctx.sys_pipe2(a[0], a[1]),
+        Some(Eventfd2) => ctx.sys_eventfd2(a[0], a[1]),
         Some(Fcntl) => ctx.sys_fcntl(int(a[0]), int(a[1]), a[2]),
         Some(Ioctl) => ctx.sys_ioctl(int(a[0]), a[1], a[2]),
         Some(Poll) => ctx.sys_poll(a[0], a[1], Some(int(a[2]))),

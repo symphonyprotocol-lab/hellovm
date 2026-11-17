@@ -468,7 +468,7 @@ pub fn build_stack<P: AddressSpace + AppMemory + ?Sized>(
         (AT_SECURE, 0),
         (AT_RANDOM, at(0)),
         (AT_HWCAP, params.cpu.hwcap),
-        (AT_HWCAP2, params.cpu.hwcap2),
+        (AT_HWCAP2, guest_hwcap2(params.arch, params.cpu.hwcap2)),
         (AT_CLKTCK, 100),
         (AT_PLATFORM, at(platform_off)),
         (AT_EXECFN, at(execfn_off)),
@@ -495,6 +495,21 @@ pub fn build_stack<P: AddressSpace + AppMemory + ?Sized>(
         Errno(ENOMEM)
     })?;
     Ok(sp)
+}
+
+/// The `AT_HWCAP2` the guest sees. On aarch64, BTI and MTE are hidden: both
+/// only work with memory mapped `PROT_BTI` / `PROT_MTE`, which the kernel's
+/// `mmap` and `mprotect` do not offer (they pass only read, write and
+/// execute to the platform). A dynamic loader that sees BTI advertised
+/// insists on `mprotect(PROT_BTI)` for marked libraries and gives up when
+/// that fails ("failed to turn on BTI protection").
+fn guest_hwcap2(arch: Arch, hwcap2: u64) -> u64 {
+    const AARCH64_HWCAP2_BTI: u64 = 1 << 17;
+    const AARCH64_HWCAP2_MTE: u64 = 1 << 18;
+    match arch {
+        Arch::Aarch64 => hwcap2 & !(AARCH64_HWCAP2_BTI | AARCH64_HWCAP2_MTE),
+        Arch::X86_64 => hwcap2,
+    }
 }
 
 #[cfg(test)]

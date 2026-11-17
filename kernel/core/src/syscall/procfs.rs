@@ -309,6 +309,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                     (None, FileObject::PipeRead(p) | FileObject::PipeWrite(p)) => {
                         format!("pipe:[{}]", 0x1000 + p).into_bytes()
                     }
+                    (None, FileObject::EventFd(_)) => b"anon_inode:[eventfd]".to_vec(),
                     (None, FileObject::Socket(id)) => {
                         format!("socket:[{}]", 0x10_0000 + id).into_bytes()
                     }

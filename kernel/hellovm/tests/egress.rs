@@ -131,6 +131,12 @@ impl Outside {
             "2",
             "-subj",
             "/CN=hellovm-test-ca",
+            // Python 3.13 and later verify with VERIFY_X509_STRICT: a CA
+            // must say it is one and what its key may sign.
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
         ]));
         sh(Command::new("openssl").current_dir(&d).args([
             "req",
@@ -148,7 +154,8 @@ impl Outside {
             d.join("ext"),
             "subjectAltName=DNS:tls.test,DNS:pypi.test,DNS:git.test\n\
              basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n\
-             extendedKeyUsage=serverAuth\n",
+             extendedKeyUsage=serverAuth\n\
+             subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
         )
         .unwrap();
         sh(Command::new("openssl").current_dir(&d).args([

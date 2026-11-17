@@ -22,6 +22,16 @@ const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
 const TCSETSW: u64 = 0x5403;
 const TCSETSF: u64 = 0x5404;
+// The `termios2` requests (`_IOR`/`_IOW('T', 0x2a..=0x2d, struct termios2)`,
+// the same numbers on x86_64 and aarch64). glibc 2.42 and later use them
+// for `tcgetattr`, `tcsetattr` and `isatty`. `struct termios2` is the
+// kernel's `termios` followed by the input and output speeds.
+const TCGETS2: u64 = 0x802c_542a;
+const TCSETS2: u64 = 0x402c_542b;
+const TCSETSW2: u64 = 0x402c_542c;
+const TCSETSF2: u64 = 0x402c_542d;
+/// The speed reported in `termios2` (matching `B38400` in `c_cflag`).
+const TERMIOS2_SPEED: u32 = 38400;
 const TCSBRK: u64 = 0x5409;
 const TCXONC: u64 = 0x540a;
 const TCFLSH: u64 = 0x540b;
@@ -148,10 +158,23 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 self.write_mem(arg, &termios)?;
                 Ok(0)
             }
-            TCSETS | TCSETSW | TCSETSF => {
+            TCGETS2 => {
+                let mut raw = [0u8; Termios::SIZE + 8];
+                raw[..Termios::SIZE].copy_from_slice(&self.tty()?.termios.encode());
+                raw[Termios::SIZE..Termios::SIZE + 4]
+                    .copy_from_slice(&TERMIOS2_SPEED.to_le_bytes());
+                raw[Termios::SIZE + 4..].copy_from_slice(&TERMIOS2_SPEED.to_le_bytes());
+                self.write_mem(arg, &raw)?;
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF | TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                // The speeds of a `termios2` are read and ignored.
+                if matches!(request, TCSETS2 | TCSETSW2 | TCSETSF2) {
+                    self.read_array::<{ Termios::SIZE + 8 }>(arg)?;
+                }
                 let termios = Termios::decode(&self.read_array(arg)?);
                 let tty = self.tty()?;
-                if request == TCSETSF {
+                if request == TCSETSF || request == TCSETSF2 {
                     tty.flush_input();
                 }
                 tty.set_termios(termios);

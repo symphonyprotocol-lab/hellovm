@@ -294,7 +294,13 @@ Loopback in one command (the trace lists `socket`, `connect`, `sendto`, and
 mkdir -p /tmp/image/bin && cp /bin/busybox /tmp/image/bin/busybox && ln -sfn busybox /tmp/image/bin/sh && ln -sfn busybox /tmp/image/bin/nc && ln -sfn busybox /tmp/image/bin/echo && ln -sfn busybox /tmp/image/bin/cat && ln -sfn busybox /tmp/image/bin/usleep && timeout 15 cargo run -p hellovm -- --root /tmp/image --no-tty --trace /bin/sh -c ': > /got; { n=0; while [ ! -s /got ] && [ "$n" -lt 300 ]; do usleep 10000; n=$((n + 1)); done; } | nc -l -p 5000 > /got & i=0; while [ "$i" -lt 50 ]; do echo hello-loopback | nc -w 2 127.0.0.1 5000 && break; i=$((i+1)); done; wait; cat /got'
 ```
 
-Not yet: `epoll` (neither `pip install` nor `git clone` calls it), `eventfd`,
+`eventfd2` works (counter and semaphore modes; libcurl 8.18 wakes its
+resolver thread with one, so `git clone` needs it on recent distros). On
+aarch64 the guest does not see BTI or MTE in `AT_HWCAP2`: both need
+`PROT_BTI` / `PROT_MTE` mappings, which the kernel does not provide, and a
+dynamic loader that sees BTI refuses to load marked libraries without it.
+
+Not yet: `epoll` (neither `pip install` nor `git clone` calls it),
 `timerfd`, `inotify`, `clone3` (glibc falls back to `clone`), `fexecve`,
 POSIX timers, `ITIMER_VIRTUAL`/`ITIMER_PROF`, priority-inheritance futexes,
 writable shared *file* mappings (they are private copies), and permission

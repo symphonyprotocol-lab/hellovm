@@ -948,7 +948,7 @@ mod tests {
     fn unknown_syscalls_are_enosys() {
         for arch in Arch::ALL {
             let traps = vec![
-                sc(arch, Sysno::Eventfd2, &[0, 0]),
+                sc(arch, Sysno::EpollCreate1, &[0]),
                 sc(arch, Sysno::Clone3, &[SCRATCH, 88]),
                 Trap::Syscall(SyscallTrap {
                     nr: 100_000,
@@ -1634,6 +1634,55 @@ mod tests {
         let reply = plat.mem(INIT).peek(SCRATCH + 0x200, got[2] as usize);
         assert_eq!(reply[3] & 0x0f, 3, "NXDOMAIN");
         assert_eq!(got[4], -ENETUNREACH, "{got:?}");
+    }
+
+    /// `eventfd2`: writes add up, a read takes the counter, an empty
+    /// non-blocking read is `EAGAIN`, and `poll` follows the counter.
+    #[test]
+    fn eventfd_counts_and_polls() {
+        // x86_64 has plain `poll`.
+        let arch = Arch::X86_64;
+        let nonblock = 0o4000;
+        let pfd = SCRATCH + 0x100;
+        let traps = vec![
+            sc(arch, Sysno::Eventfd2, &[2, nonblock]),
+            sc(arch, Sysno::Write, &[3, SCRATCH, 8]),
+            sc(arch, Sysno::Poll, &[pfd, 1, 0]),
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x20, 8]),
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x20, 8]),
+            sc(arch, Sysno::Poll, &[pfd, 1, 0]),
+            // Too short a buffer, the reserved value, bad flags.
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x20, 4]),
+            sc(arch, Sysno::Write, &[3, SCRATCH + 0x40, 8]),
+            sc(arch, Sysno::Eventfd2, &[0, 0x10]),
+            sc(arch, Sysno::Close, &[3]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (five, reserved) = (5u64.to_le_bytes(), u64::MAX.to_le_bytes());
+        let data: Vec<(u64, &[u8])> = vec![(SCRATCH, &five), (SCRATCH + 0x40, &reserved)];
+        let (mut kernel, mut plat) = setup(arch, traps, &data);
+        // pollfd { fd 3, events POLLIN | POLLOUT }.
+        let mut raw = [0u8; 8];
+        raw[..4].copy_from_slice(&3i32.to_le_bytes());
+        raw[4..6].copy_from_slice(&5u16.to_le_bytes());
+        plat.mem(INIT).poke(pfd, &raw);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let r = returns(&plat, INIT);
+        assert_eq!(&r[..2], &[3, 8]);
+        assert_eq!(r[2], 1, "readable and writable");
+        assert_eq!(&r[3..5], &[8, -crate::errno::EAGAIN]);
+        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x20, 8), 7u64.to_le_bytes());
+        assert_eq!(r[5], 1, "only writable now");
+        assert_eq!(plat.mem(INIT).peek(pfd + 6, 2), 4u16.to_le_bytes());
+        assert_eq!(
+            &r[6..10],
+            &[
+                -crate::errno::EINVAL,
+                -crate::errno::EINVAL,
+                -crate::errno::EINVAL,
+                0
+            ]
+        );
     }
 
     #[test]
