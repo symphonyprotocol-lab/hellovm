@@ -347,7 +347,7 @@ hellovm: debug: sandbox: resource limits: active (core 0, nofile 4096, as 32 GiB
 hellovm: debug: sandbox: no_new_privs: active ()
 hellovm: debug: sandbox: Landlock: active (ABI 8: image read-only, no TCP, signals and abstract sockets scoped)
 hellovm: debug: sandbox: not dumpable: active ()
-hellovm: debug: sandbox: seccomp allowlist: active (57 syscalls, 277 instructions, 5 code ranges)
+hellovm: debug: sandbox: seccomp allowlist: active (58 syscalls, 281 instructions, 5 code ranges)
 ```
 
 *The seccomp allowlist.* App processes are forked from the kernel
@@ -361,10 +361,13 @@ the process if it is not on it; a syscall from anywhere else gets
 `SECCOMP_RET_TRACE`, which is what the app's own filter returns anyway
 (and in the kernel process, which nobody traces, `ENOSYS`). The platform
 reserves those code ranges in every app address space, so guest code
-never runs there. The allowlist (57 calls on aarch64) was measured with
+never runs there. The allowlist (58 calls on aarch64) was measured with
 `HELLOVM_SECCOMP_LEARN=FILE` (a test-hooks build), which records every
 syscall the kernel process makes and lets it continue, over the whole
-test suite; `kernel/sandbox/learn-summary.py FILE` condenses the log.
+test suite, on Debian bookworm (glibc 2.36) and Ubuntu 26.04 (glibc
+2.43, which adds `fstat` and the termios2 `ioctl`s);
+`kernel/sandbox/learn-summary.py FILE` condenses the log. The x86_64
+list is the same calls by name, type-checked but not measured.
 Arguments are checked where they decide what a call reaches: `socket`
 only `AF_UNIX` streams, `clone` only thread and fork flags (no
 namespaces; `clone3` fails with `ENOSYS` so glibc falls back), `ptrace`
@@ -420,9 +423,10 @@ makes the hardened kernel process itself (`--insecure-fence-test`, a test
 hook) open `/etc/passwd`, connect a TCP socket, connect to a host
 abstract Unix socket, call `setns` and `PTRACE_ATTACH` its parent, and
 asserts each is refused or kills it; with `--sandbox off` each succeeds,
-as a control. In the dev container (Docker's default seccomp profile)
-the namespaces are skipped and every other layer is active; with
-`--security-opt seccomp=unconfined` all seven are.
+as a control. In the dev container and in an Ubuntu 26.04 container
+(Docker's default seccomp profile) the namespaces are skipped and every
+other layer is active; with `--security-opt seccomp=unconfined` all
+seven are.
 
 ## Fuzzing
 
