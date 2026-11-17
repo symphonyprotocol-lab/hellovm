@@ -40,8 +40,8 @@ jobs:
       # The kernel process's seccomp allowlist kills it on a syscall that
       # is not listed, and the list was drawn up on aarch64. Record what
       # the kernel process really does here (nothing is enforced while
-      # recording, so the tests that expect a kill fail: ignore the
-      # result), then check the recording against the allowlist, which
+      # recording, so a gap cannot fail this run; its result is ignored),
+      # then check the recording against the allowlist, which
       # names every syscall it lacks. Before the e2e script: with a gap
       # in the list that one only shows kernel processes dying of SIGSYS.
       - name: The seccomp allowlist covers x86_64

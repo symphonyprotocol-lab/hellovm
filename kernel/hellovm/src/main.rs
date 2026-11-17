@@ -348,7 +348,11 @@ fn harden(
     #[cfg(feature = "insecure-test-hooks")]
     let (tcp_port, learn, skip_landlock) = (
         options.splice_to.map(|addr| addr.port()),
-        std::env::var_os("HELLOVM_SECCOMP_LEARN").map(PathBuf::from),
+        // A fence test's attempts are what the allowlist must refuse:
+        // they are enforced, never recorded as something it should allow.
+        std::env::var_os("HELLOVM_SECCOMP_LEARN")
+            .filter(|_| options.fence_test.is_none())
+            .map(PathBuf::from),
         std::env::var_os("HELLOVM_TEST_NO_LANDLOCK").is_some(),
     );
     #[cfg(not(feature = "insecure-test-hooks"))]
