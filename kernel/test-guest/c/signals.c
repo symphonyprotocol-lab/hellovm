@@ -165,6 +165,11 @@ int main(void) {
         for (int i = 1; i <= 1000; i++) expected += 1.0 / i;
     printf("ticks: %s fp: %s\n", ticks >= 20 ? "ok" : "missing",
            sum == expected ? "ok" : "corrupted");
+    // What went wrong, should it: one term off is an instruction run
+    // twice or skipped, anything else a register not restored.
+    if (sum != expected)
+        fprintf(stderr, "fp: sum=%a expected=%a difference=%a rounds=%ld ticks=%d\n", sum,
+                expected, sum - expected, rounds, (int)ticks);
 
     interrupted_read(SA_RESTART);
     interrupted_read(0);
