@@ -1,6 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["core", "host", "platform-seccomp", "sandbox", "test-guest", "hellovm", "egress", "egress-wire"]
+members = [
+    "core",
+    "host",
+    "platform-seccomp",
+    "sandbox",
+    "test-guest",
+    "hellovm",
+    "egress",
+    "egress-wire",
+    "control",
+    "noded",
+    "api",
+]
 # The fuzz targets need nightly and cargo-fuzz; see README.md.
 exclude = ["fuzz"]
 
@@ -15,12 +27,18 @@ publish = false
 rust-version = "1.99"
 
 [workspace.dependencies]
+hellovm = { path = "hellovm" }
 hellovm-core = { path = "core" }
 hellovm-host = { path = "host" }
 hellovm-egress = { path = "egress" }
 hellovm-egress-wire = { path = "egress-wire" }
+hellovm-control = { path = "control" }
+hellovm-noded = { path = "noded" }
 hellovm-platform-seccomp = { path = "platform-seccomp" }
 hellovm-sandbox = { path = "sandbox" }
 hellovm-test-guest = { path = "test-guest" }
 libc = "0.2"
 log = "0.4"
+# The control plane (`control`, `noded`, `api`) speaks JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

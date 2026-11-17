@@ -61,6 +61,30 @@ fn ok(sb: &mut Sandbox, script: &str) -> String {
     out.stdout
 }
 
+/// A program that runs itself again through `/proc/self/exe` (busybox
+/// does, for an applet that has no link in `PATH`) gets its own file from
+/// the kernel's `/proc`, whatever the image has at that path.
+#[test]
+fn exec_of_proc_self_exe_is_the_program_itself() {
+    let Some(busybox) = busybox() else { return };
+    let image = image(&busybox);
+    image.write("proc/self/exe", b"#!/bin/sh\necho from the image\n");
+    let mut sb = Sandbox::new(image.path());
+    // No /bin/basename: only busybox itself can be it.
+    assert_eq!(ok(&mut sb, "basename /a/b"), "b\n");
+    // Run by that name it is still busybox (which knows no applet "exe"),
+    // not the image's file.
+    let out = sh(&mut sb, "/proc/self/exe; /proc/$$/exe");
+    assert_eq!(
+        (out.stdout.as_str(), out.stderr.as_str()),
+        ("", "exe: applet not found\nexe: applet not found\n"),
+        "{out:?}"
+    );
+    // A file of /proc that is not a link to a program is not executable.
+    let out = sh(&mut sb, "/proc/self/stat");
+    assert_eq!(out.status, ExitStatus::Exited(126), "{out:?}");
+}
+
 #[test]
 fn pipelines() {
     let (_image, mut sb) = setup!();

@@ -689,3 +689,66 @@ fn require_refuses_a_template_whose_clones_would_not_be_fenced() {
     let run = template.run(b"print('one tenant')", b"");
     assert_eq!(run.stdout, "one tenant\n", "{run:?}");
 }
+
+/// `--fs-limit` caps the writable layer of a run, and of a template and
+/// every clone of it (the limit is kernel state the clones inherit).
+#[test]
+fn the_fs_limit_holds_in_a_run_and_in_every_clone() {
+    if !require_python() {
+        return;
+    }
+    const FILL: &str = r#"
+import errno, os
+try:
+    with open("/tmp/big", "wb") as f:
+        f.write(b"x" * (2 << 20))
+    print("wrote 2 MiB")
+except OSError as e:
+    print(errno.errorcode[e.errno])
+    os.remove("/tmp/big")
+with open("/tmp/small", "wb") as f:
+    f.write(b"x" * 1000)
+print("small ok")
+"#;
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_hellovm"))
+        .args([
+            "--fs-limit",
+            "1048576",
+            "--root",
+            "/",
+            "/usr/bin/python3",
+            "-c",
+            FILL,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ENOSPC\nsmall ok\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let template = Template::start(
+        &["/usr/bin/python3", "-c", PYTHON_TEMPLATE],
+        &["--fs-limit", "1048576"],
+    );
+    ready(&template);
+    for _ in 0..2 {
+        let run = template.run(FILL.as_bytes(), b"");
+        assert_eq!(run.stdout, "ENOSPC\nsmall ok\n", "{run:?}");
+    }
+    // Without the flag, the default limit (2 GiB) lets it through.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_hellovm"))
+        .args(["--root", "/", "/usr/bin/python3", "-c", FILL])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "wrote 2 MiB\nsmall ok\n"
+    );
+    let bad = std::process::Command::new(env!("CARGO_BIN_EXE_hellovm"))
+        .args(["--fs-limit", "0", "--root", "/", "/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+}

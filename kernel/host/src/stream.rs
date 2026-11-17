@@ -942,9 +942,21 @@ mod egress_tests {
         assert_eq!(&server.join().unwrap()[hello.len()..], b"ping");
         assert!(table.drain(Duration::from_secs(5)), "drained");
         drop(proxy);
-        let lines = audit.lines();
+        // The proxy writes the flow's audit line on a thread of its own:
+        // it may come a moment after the bytes.
+        let start = Instant::now();
+        let lines = loop {
+            let lines = audit.lines();
+            if !lines.is_empty() || start.elapsed() > Duration::from_secs(10) {
+                break lines;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
         assert!(
-            lines[0].contains(" sandbox=0000000000000051 host=echo.test port=443 verdict=allow "),
+            lines
+                .first()
+                .is_some_and(|l| l
+                    .contains(" sandbox=0000000000000051 host=echo.test port=443 verdict=allow ")),
             "{lines:?}"
         );
     }
