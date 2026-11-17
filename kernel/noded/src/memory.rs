@@ -172,8 +172,12 @@ mod tests {
             .arg("5")
             .spawn()
             .unwrap();
-        let with_child = measure(&[(me, MAX_PROCESSES)])[&me].bytes;
-        assert!(with_child >= after, "{after} -> {with_child}");
+        // The child belongs to this process's tree and has memory of its
+        // own. (Not compared with the total above: other tests of this
+        // process start and end children meanwhile.)
+        assert!(children()[&me].contains(&child.id()));
+        let alone = measure(&[(child.id(), MAX_PROCESSES)])[&child.id()];
+        assert!(alone.bytes > 0 && alone.processes == 1, "{alone:?}");
         let mut child = child;
         let _ = child.kill();
         let _ = child.wait();
