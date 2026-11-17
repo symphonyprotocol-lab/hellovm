@@ -30,5 +30,5 @@ mod sys;
 mod tracer;
 mod wake;
 
-pub use app::{AppKiller, SeccompPlatform};
+pub use app::{check_clean_spawn, AppKiller, SeccompPlatform};
 pub use profile::{host_profile, HostProfile};

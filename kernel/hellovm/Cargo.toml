@@ -17,11 +17,11 @@ insecure-test-hooks = ["hellovm-host/insecure-test-hooks", "hellovm-sandbox/inse
 [dependencies]
 hellovm-core.workspace = true
 hellovm-host.workspace = true
+hellovm-sandbox.workspace = true
 log.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hellovm-platform-seccomp.workspace = true
-hellovm-sandbox.workspace = true
 libc.workspace = true
 
 [dev-dependencies]

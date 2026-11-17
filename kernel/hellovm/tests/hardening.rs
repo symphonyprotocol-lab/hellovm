@@ -38,6 +38,22 @@ mod linux {
         hellovm(sandbox, &["--insecure-fence-test", test])
     }
 
+    /// The same with Landlock left out, at the default log level: what the
+    /// other layers hold on their own, and what an operator would see.
+    fn fence_without_landlock(test: &str) -> Output {
+        let image = TempDir::new("fence");
+        Command::new(env!("CARGO_BIN_EXE_hellovm"))
+            .env("HELLOVM_TEST_NO_LANDLOCK", "1")
+            .env_remove("HELLOVM_LOG")
+            .args(["--sandbox", "best-effort", "--root"])
+            .arg(image.path())
+            .args(["--insecure-fence-test", test])
+            .output()
+            .expect("run hellovm")
+    }
+
+    const UNCONFINED: &str = "neither namespaces nor Landlock are available";
+
     fn describe(out: &Output) -> String {
         format!(
             "status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -73,6 +89,65 @@ mod linux {
     fn host_files_are_out_of_reach() {
         assert_allowed(&fence("off", "open-host-file"), "open-host-file");
         assert_fenced(&fence("best-effort", "open-host-file"), "open-host-file");
+    }
+
+    /// The kernel process holds a directory fd of the image. `..` from it
+    /// must not lead to the host's files, whichever layer confines it.
+    #[test]
+    fn the_image_fd_does_not_lead_above_the_image() {
+        assert_allowed(&fence("off", "open-above-image"), "open-above-image");
+        assert_fenced(
+            &fence("best-effort", "open-above-image"),
+            "open-above-image",
+        );
+    }
+
+    /// Without Landlock the namespaces are the only filesystem fence. Where
+    /// the host has them they must hold alone; where it has neither, the
+    /// run goes on (best effort) but says so at the default log level.
+    #[test]
+    fn namespaces_alone_confine_or_the_gap_is_announced() {
+        for test in ["open-host-file", "open-above-image"] {
+            let out = fence_without_landlock(test);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains(UNCONFINED) {
+                assert!(
+                    stderr.contains("warn: sandbox: Landlock: skipped")
+                        && stderr.contains("warn: sandbox: user/mount/network/IPC namespaces"),
+                    "{}",
+                    describe(&out)
+                );
+                assert_allowed(&out, test);
+            } else {
+                assert_fenced(&out, test);
+            }
+        }
+        // With both fences this host has, nothing is announced.
+        let out = Command::new(env!("CARGO_BIN_EXE_hellovm"))
+            .env_remove("HELLOVM_LOG")
+            .args(["--root", "/", "--insecure-fence-test", "open-host-file"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains(UNCONFINED),
+            "{}",
+            describe(&out)
+        );
+    }
+
+    /// A compromised kernel process must not read or write the memory of
+    /// other processes of its user (here: this test process).
+    #[test]
+    fn other_processes_memory_is_out_of_reach() {
+        // Let any process of this user attach to the test process, so that
+        // the control run works under Yama's ptrace_scope=1 too.
+        // SAFETY: prctl with integer arguments.
+        unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
+        assert_allowed(&fence("off", "read-parent-memory"), "read-parent-memory");
+        assert_fenced(
+            &fence("best-effort", "read-parent-memory"),
+            "read-parent-memory",
+        );
     }
 
     #[test]

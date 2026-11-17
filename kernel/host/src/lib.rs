@@ -232,6 +232,12 @@ impl std::fmt::Debug for StdioHost {
 }
 
 impl StdioHost {
+    /// The image, to move it when the kernel process confines itself
+    /// (see [`ImageDir::rebind`]).
+    pub fn image_mut(&mut self) -> Option<&mut ImageDir> {
+        self.common.image.as_mut()
+    }
+
     pub fn new(image: Option<ImageDir>) -> StdioHost {
         StdioHost {
             common: Common::new(image),
@@ -334,6 +340,12 @@ pub struct CaptureHost {
 }
 
 impl CaptureHost {
+    /// The image, to move it when the kernel process confines itself
+    /// (see [`ImageDir::rebind`]).
+    pub fn image_mut(&mut self) -> Option<&mut ImageDir> {
+        self.common.image.as_mut()
+    }
+
     pub fn new(image: Option<ImageDir>) -> CaptureHost {
         CaptureHost {
             stdout: Vec::new(),

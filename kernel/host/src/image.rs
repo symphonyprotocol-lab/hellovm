@@ -28,6 +28,7 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hellovm_core::host::{HostFileKind, HostStat, ImagePath};
 
@@ -35,6 +36,8 @@ use crate::fsys;
 
 /// How many image files are kept open between reads.
 const OPEN_FILES: usize = 16;
+/// How many image directories are kept open between lookups.
+const OPEN_DIRS: usize = 32;
 
 #[derive(Debug)]
 pub struct ImageDir {
@@ -42,6 +45,12 @@ pub struct ImageDir {
     dir: OwnedFd,
     /// Recently read files, most recent last.
     open: Vec<(ImagePath, File)>,
+    /// Recently walked directories, most recent last, so that a lookup
+    /// does not open every directory on the way again. An entry stands for
+    /// the directory that was there when it was opened: the image is not
+    /// meant to change under a running sandbox, and a change can still
+    /// only show another part of the image.
+    dirs: Vec<(ImagePath, Arc<OwnedFd>)>,
 }
 
 fn invalid(what: &str) -> io::Error {
@@ -62,7 +71,7 @@ fn kind(mode: u32) -> HostFileKind {
 /// A lookup result: the directory holding the entry, and its name (`None`
 /// for the image root itself).
 struct Entry<'a> {
-    parent: Option<OwnedFd>,
+    parent: Option<Arc<OwnedFd>>,
     root: BorrowedFd<'a>,
     name: Option<Vec<u8>>,
 }
@@ -88,7 +97,17 @@ impl ImageDir {
             root,
             dir: dir.into(),
             open: Vec::new(),
+            dirs: Vec::new(),
         })
+    }
+
+    /// Serves the same image from `dir`, another fd of its directory (the
+    /// kernel process's hardening hands one out when it moves the image
+    /// into its new root). Everything opened through the old fd is dropped.
+    pub fn rebind(&mut self, dir: OwnedFd) {
+        self.open.clear();
+        self.dirs.clear();
+        self.dir = dir;
     }
 
     /// The host path the image was opened from (for messages only: lookups
@@ -105,14 +124,13 @@ impl ImageDir {
     /// Walks to the directory holding `path`'s last component, checking
     /// that every component is a plain name and every directory on the way
     /// is a real directory, not a symlink.
-    fn lookup(&self, path: &ImagePath) -> io::Result<Entry<'_>> {
+    fn lookup(&mut self, path: &ImagePath) -> io::Result<Entry<'_>> {
         let names: Vec<&[u8]> = path.components().collect();
         for name in &names {
             if !ImagePath::valid_name(name) {
                 return Err(invalid("invalid image path component"));
             }
         }
-        let mut parent: Option<OwnedFd> = None;
         let Some((last, dirs)) = names.split_last() else {
             return Ok(Entry {
                 parent: None,
@@ -120,7 +138,37 @@ impl ImageDir {
                 name: None,
             });
         };
-        for name in dirs {
+        let parent = self.directory(dirs)?;
+        Ok(Entry {
+            parent,
+            root: self.dir.as_fd(),
+            name: Some(last.to_vec()),
+        })
+    }
+
+    /// The directory `names` lead to from the image root (`None` for the
+    /// root itself), walked from the longest prefix that is still open.
+    fn directory(&mut self, names: &[&[u8]]) -> io::Result<Option<Arc<OwnedFd>>> {
+        let mut path = ImagePath::root();
+        let mut prefixes = Vec::with_capacity(names.len());
+        for name in names {
+            path = path
+                .join(name)
+                .ok_or_else(|| invalid("invalid image path component"))?;
+            prefixes.push(path.clone());
+        }
+        let mut parent: Option<Arc<OwnedFd>> = None;
+        let mut done = 0;
+        for (depth, prefix) in prefixes.iter().enumerate().rev() {
+            if let Some(index) = self.dirs.iter().position(|(p, _)| p == prefix) {
+                let hit = self.dirs.remove(index);
+                parent = Some(Arc::clone(&hit.1));
+                self.dirs.push(hit);
+                done = depth + 1;
+                break;
+            }
+        }
+        for (name, prefix) in names.iter().zip(&prefixes).skip(done) {
             let at = parent.as_ref().map_or(self.dir.as_fd(), |fd| fd.as_fd());
             let next = fsys::open_at(at, name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(
                 |err| match err.raw_os_error() {
@@ -131,13 +179,14 @@ impl ImageDir {
                     _ => err,
                 },
             )?;
+            let next = Arc::new(next);
+            if self.dirs.len() == OPEN_DIRS {
+                self.dirs.remove(0);
+            }
+            self.dirs.push((prefix.clone(), Arc::clone(&next)));
             parent = Some(next);
         }
-        Ok(Entry {
-            parent,
-            root: self.dir.as_fd(),
-            name: Some(last.to_vec()),
-        })
+        Ok(parent)
     }
 
     pub fn stat(&mut self, path: &ImagePath) -> io::Result<HostStat> {
@@ -191,7 +240,7 @@ impl ImageDir {
         result
     }
 
-    fn open_file(&self, path: &ImagePath) -> io::Result<File> {
+    fn open_file(&mut self, path: &ImagePath) -> io::Result<File> {
         let entry = self.lookup(path)?;
         let name = entry
             .name

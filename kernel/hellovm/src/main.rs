@@ -42,7 +42,8 @@
 //! limits, sets `no_new_privs`, restricts itself with Landlock to reading
 //! the image, becomes non-dumpable and installs a seccomp allowlist.
 //! `--sandbox best-effort` (the default) uses every layer the host allows
-//! and logs the reason for each one it skips; `--sandbox require` refuses
+//! and logs the reason for each one it skips (as a warning when what is
+//! left is less than `require` asks for); `--sandbox require` refuses
 //! to start (exit 125) when a required layer is unavailable; `--sandbox
 //! off` uses none. `HELLOVM_LOG=debug` lists the active layers.
 //!
@@ -54,6 +55,8 @@ use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use hellovm_sandbox::Mode as SandboxMode;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
      [--egress SOCKET] [--sandbox-id ID] [--sandbox require|best-effort|off] --root DIR \
@@ -282,36 +285,6 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     })
 }
 
-#[cfg(target_os = "linux")]
-use hellovm_sandbox::Mode as SandboxMode;
-
-/// Only Linux has the hardening; elsewhere the flag is accepted and has
-/// nothing to do.
-#[cfg(not(target_os = "linux"))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SandboxMode {
-    Require,
-    #[default]
-    BestEffort,
-    Off,
-}
-
-#[cfg(not(target_os = "linux"))]
-impl std::str::FromStr for SandboxMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<SandboxMode, String> {
-        match s {
-            "require" => Ok(SandboxMode::Require),
-            "best-effort" => Ok(SandboxMode::BestEffort),
-            "off" => Ok(SandboxMode::Off),
-            _ => Err(format!(
-                "--sandbox {s}: expected require, best-effort or off"
-            )),
-        }
-    }
-}
-
 fn main() -> ExitCode {
     init_logging();
     let options = match parse_args(std::env::args_os().skip(1)) {
@@ -361,31 +334,40 @@ fn exit_code(status: hellovm_core::ExitStatus) -> ExitCode {
     }
 }
 
-/// Applies `hellovm-sandbox` to this process; returns where the egress
-/// socket is now reachable.
+/// Applies `hellovm-sandbox` to this process, after checking that the
+/// platform can still do without `/proc` what it will have to. Moves
+/// `image` to where the hardening left the directory, and returns where
+/// the egress socket is now reachable.
 #[cfg(target_os = "linux")]
 fn harden(
     options: &Options,
-    image: std::os::fd::BorrowedFd<'_>,
+    image: &mut hellovm_host::ImageDir,
     egress: Option<PathBuf>,
     fds: Result<usize, String>,
 ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     #[cfg(feature = "insecure-test-hooks")]
-    let (tcp_port, learn) = (
+    let (tcp_port, learn, skip_landlock) = (
         options.splice_to.map(|addr| addr.port()),
         std::env::var_os("HELLOVM_SECCOMP_LEARN").map(PathBuf::from),
+        std::env::var_os("HELLOVM_TEST_NO_LANDLOCK").is_some(),
     );
     #[cfg(not(feature = "insecure-test-hooks"))]
-    let (tcp_port, learn) = (None, None);
-    let report = hellovm_sandbox::apply(hellovm_sandbox::Config {
+    let (tcp_port, learn, skip_landlock) = (None, None, false);
+    hellovm_platform_seccomp::check_clean_spawn()?;
+    let hardened = hellovm_sandbox::apply(hellovm_sandbox::Config {
         mode: options.sandbox,
-        image,
+        image: image.dir_fd(),
+        image_path: image.root(),
         egress,
         tcp_port,
         learn,
+        skip_landlock,
         fds,
     })?;
-    Ok(report.egress)
+    if let Some(dir) = hardened.image {
+        image.rebind(dir);
+    }
+    Ok(hardened.report.egress)
 }
 
 #[cfg(target_os = "linux")]
@@ -399,7 +381,6 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
 
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
-    let image_fd = image.dir_fd().try_clone_to_owned()?;
     let egress = options
         .egress
         .as_deref()
@@ -407,20 +388,22 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
         .transpose()?;
     #[cfg(feature = "insecure-test-hooks")]
     if options.session {
-        return run_session(options, image, image_fd, egress, fds);
+        return run_session(options, image, egress, fds);
     }
     // Takes the host profile the sandbox and the platform share.
     let mut app = SeccompPlatform::new()?;
+    // Before the hardening: the host opens what it needs from the host's
+    // filesystem (`/dev/urandom`) now.
     let mut host = StdioHost::new(Some(image));
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(addr) = options.splice_to {
         // Every issued fake IP is spliced here. The guest address is not dialed.
         host.set_splice_endpoint(addr);
     }
-    if let Some(path) = harden(options, std::os::fd::AsFd::as_fd(&image_fd), egress, fds)? {
+    let image = host.image_mut().expect("the host has the image");
+    if let Some(path) = harden(options, image, egress, fds)? {
         host.set_egress(path);
     }
-    drop(image_fd);
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(test) = &options.fence_test {
         fence_test(test);
@@ -494,11 +477,13 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
 fn run_session(
     options: &Options,
     image: hellovm_host::ImageDir,
-    image_fd: std::os::fd::OwnedFd,
     egress: Option<PathBuf>,
     fds: Result<usize, String>,
 ) -> Result<Ended, Box<dyn std::error::Error>> {
     let mut host = hellovm_host::CaptureHost::new(Some(image));
+    hellovm_platform_seccomp::host_profile()?;
+    let image = host.image_mut().expect("the host has the image");
+    let egress = harden(options, image, egress, fds)?;
     if let Some(addr) = options.splice_to {
         host.set_splice_endpoint(addr);
     }
@@ -509,11 +494,9 @@ fn run_session(
     if options.trace {
         kernel = kernel.with_trace();
     }
-    hellovm_platform_seccomp::host_profile()?;
-    if let Some(path) = harden(options, std::os::fd::AsFd::as_fd(&image_fd), egress, fds)? {
+    if let Some(path) = egress {
         kernel.host_mut().set_egress(path);
     }
-    drop(image_fd);
     hellovm::session::serve(kernel)?;
     Ok(Ended::Status(hellovm_core::ExitStatus::Exited(0)))
 }
@@ -540,6 +523,44 @@ fn fence_test(test: &str) -> ! {
             {
                 Ok(_) => Ok("connected".into()),
                 Err(err) => Err(err.to_string()),
+            }
+        }
+        "open-above-image" => {
+            // Every directory fd the kernel process holds, and `..` from it.
+            let found = (3..256).find(|&fd| {
+                // SAFETY: openat with a valid C string.
+                let up = unsafe {
+                    libc::openat(
+                        fd,
+                        c"../../../../../../../../etc/passwd".as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
+                };
+                up >= 0
+            });
+            match found {
+                Some(fd) => Ok(format!("opened /etc/passwd above fd {fd}")),
+                None => Err("no fd leads above the image".into()),
+            }
+        }
+        "read-parent-memory" => {
+            let mut byte = 0u8;
+            let local = libc::iovec {
+                iov_base: (&mut byte as *mut u8).cast(),
+                iov_len: 1,
+            };
+            // An address nothing is mapped at: with access, EFAULT.
+            let remote = libc::iovec {
+                iov_base: 0x1000 as *mut libc::c_void,
+                iov_len: 1,
+            };
+            // SAFETY: valid iovecs; reads at most one byte into `byte`.
+            let ret = unsafe { libc::process_vm_readv(libc::getppid(), &local, 1, &remote, 1, 0) };
+            let err = std::io::Error::last_os_error();
+            if ret >= 0 || err.raw_os_error() == Some(libc::EFAULT) {
+                Ok("the parent's memory is accessible".into())
+            } else {
+                Err(err.to_string())
             }
         }
         "forbidden-syscall" => {

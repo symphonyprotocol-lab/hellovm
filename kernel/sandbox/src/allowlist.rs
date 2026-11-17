@@ -9,7 +9,12 @@
 //! bookworm's glibc 2.36 and with Ubuntu 26.04's glibc 2.43 (which adds
 //! `fstat`, the termios2 `ioctl`s and `MADV_GUARD_INSTALL`); the x86_64 list
 //! is the same calls by name (plus `poll`, which x86_64 glibc uses where
-//! aarch64 has only `ppoll`), type-checked but not measured.
+//! aarch64 has only `ppoll`). The development machines are aarch64, so the
+//! x86_64 list is measured by CI instead: the `test-x86_64` job runs the
+//! test suite once in measuring mode and then the test
+//! `every_measured_syscall_is_allowed` below over what it recorded, which
+//! names any syscall the list lacks. Run the same two steps after changing
+//! what the kernel process does (see README).
 //!
 //! A few calls were not seen in the measurement but are on known C-library
 //! or `std` paths, and are allowed so that a rare path does not kill the
@@ -170,7 +175,10 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
         allow(SYS_getrandom),
         checked(SYS_pidfd_open, vec![one_of(1, &[0])]),
         checked(SYS_pidfd_send_signal, vec![one_of(1, &[SIGKILL])]),
-        // SIGKILL to an app process, SIGSTOP of a new one to itself.
+        // SIGKILL to an app process, SIGSTOP of a new one to itself. A
+        // filter cannot tell whose pid it is: see the crate documentation
+        // for what keeps these, `ptrace` and `process_vm_*` to K's own
+        // app processes.
         checked(SYS_kill, vec![one_of(1, &[SIGKILL, SIGSTOP])]),
         // SIGURG interrupts a running app task; SIGABRT is abort().
         checked(SYS_tgkill, vec![one_of(2, &[SIGURG, SIGABRT])]),
@@ -225,5 +233,52 @@ mod tests {
             nrs.dedup();
             assert_eq!(nrs.len(), entries.len(), "a syscall is listed twice");
         }
+    }
+
+    /// With `HELLOVM_SECCOMP_LEARNED=FILE`, a recording made by running
+    /// the tests with `HELLOVM_SECCOMP_LEARN=FILE` (see `learn`): the real
+    /// filter must let every recorded syscall through. Without the
+    /// variable there is nothing to check.
+    #[test]
+    fn every_measured_syscall_is_allowed() {
+        use crate::filter::{self, tests::data, Judge};
+        let Some(path) = std::env::var_os("HELLOVM_SECCOMP_LEARNED") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&path).expect("reading the recording");
+        let mut calls = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let fields: Vec<u64> = line
+                .split_whitespace()
+                .map(|f| u64::from_str_radix(f, 16).expect("a hex field"))
+                .collect();
+            assert_eq!(fields.len(), 7, "bad line {line:?}");
+            calls.insert(fields);
+        }
+        assert!(
+            calls.len() >= 100,
+            "only {} distinct calls recorded: the measuring run did not work",
+            calls.len()
+        );
+        let arch = crate::harden::audit_arch();
+        let code = [0x10_0000..0x20_0000, 0x40_0000..0x50_0000];
+        // The stub fd does not matter: the measuring filter lets `execveat`
+        // through without recording it. `tcp`: the `--splice-to` tests.
+        let entries = super::entries(3, true);
+        let prog = filter::build(arch, &code, Judge::Allowlist(&entries)).unwrap();
+        let mut refused = Vec::new();
+        for call in &calls {
+            let args: [u64; 6] = call[1..].try_into().unwrap();
+            let action = crate::bpf::run(&prog, &data(arch, call[0] as u32, 0x18_0000, args));
+            let errno = action & 0xffff_0000 == filter::SECCOMP_RET_ERRNO;
+            if action != filter::SECCOMP_RET_ALLOW && !errno {
+                refused.push(format!("syscall {} {args:x?}", call[0]));
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "the kernel process made syscalls its allowlist refuses on this architecture:\n{}",
+            refused.join("\n")
+        );
     }
 }

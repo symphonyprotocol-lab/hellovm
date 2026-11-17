@@ -212,12 +212,12 @@ pub fn build(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const ARCH: u32 = 0xc000_00b7;
 
-    fn data(arch: u32, nr: u32, ip: u64, args: [u64; 6]) -> [u8; 64] {
+    pub(crate) fn data(arch: u32, nr: u32, ip: u64, args: [u64; 6]) -> [u8; 64] {
         let mut d = [0u8; 64];
         d[0..4].copy_from_slice(&nr.to_ne_bytes());
         d[4..8].copy_from_slice(&arch.to_ne_bytes());

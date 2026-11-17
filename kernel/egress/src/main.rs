@@ -116,6 +116,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(err) = hellovm_egress::seal_process() {
+        eprintln!("hellovm-egress: cannot make the process non-dumpable: {err}");
+        return ExitCode::from(1);
+    }
     if options.config.policy.is_empty() {
         eprintln!("hellovm-egress: warning: the allowlist is empty; every flow is denied");
     }

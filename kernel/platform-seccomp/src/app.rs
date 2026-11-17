@@ -716,6 +716,33 @@ impl Platform for SeccompPlatform {
     }
 }
 
+/// Checks that a new app process really is empty but for the stub after
+/// the platform has cleared it. The platform clears every app process the
+/// same way, by address range and without looking (a confined kernel
+/// process cannot read `/proc/<pid>/maps`), so this looks once, at
+/// start-up, while `/proc` can still be read: a host that lays a process
+/// out differently than [`crate::profile`] assumes is found here and not
+/// by an app process that still has host mappings. The answer is kept for
+/// the life of the process.
+pub fn check_clean_spawn() -> io::Result<()> {
+    static CHECK: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    CHECK
+        .get_or_init(|| {
+            let mut platform = SeccompPlatform::new().map_err(|err| err.to_string())?;
+            let key = platform.spawn_task().map_err(|err| err.to_string())?;
+            let pid = platform.tasks[&key].tracee.pid;
+            let (left, _) = spawn::foreign_mappings(pid).map_err(|err| err.to_string())?;
+            if !left.is_empty() {
+                return Err(format!(
+                    "host mappings left in a new app address space: {left:#x?}"
+                ));
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(io::Error::other)
+}
+
 impl Drop for SeccompPlatform {
     fn drop(&mut self) {
         let keys: Vec<_> = self.tasks.keys().copied().collect();

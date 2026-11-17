@@ -415,9 +415,8 @@ pub fn spawn(arch: Arch, stub_fd: BorrowedFd<'_>) -> io::Result<Spawned> {
 
 /// The mappings of `pid` other than the stub, and one past the highest of
 /// them. The vsyscall page (x86_64) lies outside the user address range and
-/// is not a real mapping, so it is left out. For tests: a confined kernel
-/// process cannot read `/proc`.
-#[cfg(test)]
+/// is not a real mapping, so it is left out. Only before the kernel process
+/// confines itself: afterwards it cannot read `/proc`.
 pub fn foreign_mappings(pid: libc::pid_t) -> io::Result<(Vec<(u64, u64)>, u64)> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
         .map_err(|err| context(err, "reading the app's memory map"))?;
