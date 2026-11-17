@@ -22,6 +22,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellovm-egress"
+version = "0.0.1"
+dependencies = [
+ "hellovm-egress",
+]
+
+[[package]]
 name = "hellovm-host"
 version = "0.0.1"
 dependencies = [
