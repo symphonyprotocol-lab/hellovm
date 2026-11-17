@@ -1,0 +1,5 @@
+allow *
+allow *.com
+allow a.example:0
+allow a.example:99999
+deny x

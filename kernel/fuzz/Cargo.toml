@@ -1,0 +1,102 @@
+# Fuzz targets for everything in hellovm that parses guest- or
+# network-controlled bytes. Not part of the kernel workspace (it is listed
+# in `exclude` there), so the pinned stable toolchain and CI never build
+# it. See "Fuzzing" in README.md.
+[package]
+name = "hellovm-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+# The libFuzzer binaries (`cargo +nightly fuzz run TARGET --features
+# libfuzzer`). Without it, `cargo test` runs every target over its corpus
+# and seeded mutations on the stable toolchain.
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[dependencies]
+hellovm-core = { path = "../core", features = ["testutil"] }
+hellovm-egress = { path = "../egress" }
+libfuzzer-sys = { version = "0.4", optional = true }
+
+# Its own workspace: not a member of kernel/Cargo.toml's.
+[workspace]
+
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "sniff"
+path = "fuzz_targets/sniff.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "vfs_path"
+path = "fuzz_targets/vfs_path.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "shebang"
+path = "fuzz_targets/shebang.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "sigreturn"
+path = "fuzz_targets/sigreturn.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "syscalls"
+path = "fuzz_targets/syscalls.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]

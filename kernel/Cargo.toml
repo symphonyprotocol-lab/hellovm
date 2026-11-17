@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["core", "host", "platform-seccomp", "sandbox", "test-guest", "hellovm", "egress", "egress-wire"]
+# The fuzz targets need nightly and cargo-fuzz; see README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.1"

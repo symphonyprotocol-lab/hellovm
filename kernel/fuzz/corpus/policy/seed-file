@@ -1,0 +1,5 @@
+# comment
+
+allow pypi.org
+allow files.pythonhosted.org:443
+allow *.github.com:80,443,9418
