@@ -439,11 +439,14 @@ fn become_clone(
     template: libc::pid_t,
     stream: UnixStream,
     fds: Vec<OwnedFd>,
-    request: Request,
+    #[allow(unused_mut)] mut request: Request,
     kernel: &mut Kernel<StdioHost>,
     app: &mut SeccompPlatform,
     landlock: bool,
 ) -> i32 {
+    #[cfg(feature = "insecure-test-hooks")]
+    let probe = probe::target(&mut request.input);
+    let forked = Instant::now();
     let fail = |why: String| {
         let _ = (&stream).write_all(&Frame::Error(why).encode());
         CLONE_FAILED
@@ -455,9 +458,11 @@ fn become_clone(
             return fail("the template is gone".into());
         }
     }
+    let mut _abi = 0;
     if landlock {
-        if let Err(why) = hellovm_sandbox::nest_landlock_domain() {
-            return fail(format!("a Landlock domain for the clone: {why}"));
+        match hellovm_sandbox::nest_landlock_domain() {
+            Ok(abi) => _abi = abi,
+            Err(why) => return fail(format!("a Landlock domain for the clone: {why}")),
         }
     } else {
         log::debug!("clone: no Landlock domain of its own (the template has none)");
@@ -467,6 +472,8 @@ fn become_clone(
     else {
         return fail("missing stdio fds".into());
     };
+    #[cfg(feature = "insecure-test-hooks")]
+    let probe_out = stderr.try_clone();
     kernel.host_mut().set_console(stdin, stdout, stderr);
     let sandbox_id = match request.sandbox_id {
         Some(id) => id,
@@ -476,10 +483,20 @@ fn become_clone(
         },
     };
     kernel.set_sandbox_id(sandbox_id);
+    let thawing = Instant::now();
     if let Err(err) = kernel.thaw(app, request.input) {
         return fail(format!("rebuilding the clone: {err}"));
     }
     log::info!("clone sandbox id {sandbox_id:016x}");
+    log::debug!(
+        "clone: set up in {:?}, app processes rebuilt in {:?}",
+        thawing - forked,
+        thawing.elapsed()
+    );
+    #[cfg(feature = "insecure-test-hooks")]
+    if let (Some(target), Ok(mut out)) = (probe, probe_out) {
+        let _ = out.write_all(probe::run(_abi, app.host_pids()[0], target).as_bytes());
+    }
     let started = Frame::Started {
         sandbox_id,
         // SAFETY: plain getpid.
@@ -546,5 +563,59 @@ pub fn client(
             eprintln!("hellovm: {}: {err}", socket.display());
             125
         }
+    }
+}
+
+/// Test hook (`insecure-test-hooks`): a clone whose input starts with
+/// `\0probe:PID\n` has its kernel process, once its app processes exist,
+/// try to read the memory of its own first app process and of process
+/// `PID` (a sibling clone's app process, say) and to `SIGKILL` `PID`, and
+/// write the outcome to the clone's stderr. The rest of the input is the
+/// clone's input.
+#[cfg(feature = "insecure-test-hooks")]
+mod probe {
+    pub fn target(input: &mut Vec<u8>) -> Option<libc::pid_t> {
+        let rest = input.strip_prefix(b"\0probe:")?;
+        let end = rest.iter().position(|&b| b == b'\n')?;
+        let pid = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
+        let skip = b"\0probe:".len() + end + 1;
+        input.drain(..skip);
+        Some(pid)
+    }
+
+    fn outcome(ret: isize, ok_errno: i32) -> String {
+        let err = std::io::Error::last_os_error();
+        if ret >= 0 || err.raw_os_error() == Some(ok_errno) {
+            "ok".into()
+        } else {
+            format!("errno-{}", err.raw_os_error().unwrap_or(0))
+        }
+    }
+
+    fn read(pid: libc::pid_t) -> String {
+        let mut byte = 0u8;
+        let local = libc::iovec {
+            iov_base: (&mut byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        // Nothing is mapped there: with access, EFAULT.
+        let remote = libc::iovec {
+            iov_base: 0x1000 as *mut libc::c_void,
+            iov_len: 1,
+        };
+        // SAFETY: valid iovecs; reads at most one byte into `byte`.
+        let ret = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        outcome(ret, libc::EFAULT)
+    }
+
+    pub fn run(abi: i64, own: libc::pid_t, target: libc::pid_t) -> String {
+        let own_read = read(own);
+        let sibling_read = read(target);
+        // SAFETY: plain syscall.
+        let ret = unsafe { libc::kill(target, libc::SIGKILL) } as isize;
+        let sibling_kill = outcome(ret, 0);
+        format!(
+            "probe abi={abi} own-read={own_read} sibling-read={sibling_read} sibling-kill={sibling_kill}\n"
+        )
     }
 }

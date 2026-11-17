@@ -509,7 +509,8 @@ impl RunningClone {
     /// stdout (up to the end of file its death causes).
     pub fn kill(mut self) -> String {
         self.conn.kill();
-        self.stdin = None;
+        // stdin stays open until the clone is gone, so that it cannot see
+        // end of input first.
         let mut rest = String::new();
         std::io::Read::read_to_string(&mut self.stdout, &mut rest).unwrap();
         rest
@@ -557,6 +558,11 @@ impl Template {
             _dir: dir,
             output,
         }
+    }
+
+    /// The template's kernel process.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// What the template process printed (its guest's console before the

@@ -198,6 +198,11 @@ impl SeccompPlatform {
         self.tasks.get(&task).map(|t| t.tracee.pid)
     }
 
+    /// The host pids of the live tasks (for tests and diagnostics).
+    pub fn host_pids(&self) -> Vec<libc::pid_t> {
+        self.tasks.values().map(|t| t.tracee.pid).collect()
+    }
+
     /// The number of live tasks.
     pub fn task_count(&self) -> usize {
         self.tasks.len()
@@ -1095,6 +1100,73 @@ mod tests {
         p.kill(parent).unwrap();
         p.read(thread, private, &mut buf).unwrap();
         assert_eq!(p.task_count(), 2);
+    }
+
+    #[test]
+    fn freeze_and_thaw_keep_memory_and_registers() {
+        use hellovm_core::platform::FrozenArea;
+        let mut p = SeccompPlatform::new().unwrap();
+        p.prepare_snapshots().unwrap();
+        let t = p.spawn().unwrap();
+        let page = p.address_space().page_size;
+        let (private, shared, hidden) = (0x2000_0000, 0x3000_0000, 0x4000_0000);
+        p.map(t, private, 4 * page, Prot::RW, Sharing::Private)
+            .unwrap();
+        p.write(t, private + 3 * page + 5, b"private").unwrap();
+        p.map(t, shared, page, Prot::RW, Sharing::Shared).unwrap();
+        p.write(t, shared, b"shared").unwrap();
+        p.map(t, hidden, page, Prot::RW, Sharing::Private).unwrap();
+        p.write(t, hidden, b"hidden").unwrap();
+        p.protect(t, hidden, page, Prot::NONE).unwrap();
+        let u = p.clone_task(t, true).unwrap();
+        let mut context = p.context(u).unwrap();
+        context.set_pc(0x1234_5678);
+        context.set_thread_pointer(0xabcd_0000);
+        p.set_context(u, &context).unwrap();
+        let area = |start, pages, prot, sharing| FrozenArea {
+            start,
+            end: start + pages * page,
+            prot,
+            sharing,
+        };
+        p.freeze(&[FrozenSpace {
+            tasks: vec![t, u],
+            areas: vec![
+                area(private, 4, Prot::RW, Sharing::Private),
+                area(shared, 1, Prot::RW, Sharing::Shared),
+                area(hidden, 1, Prot::NONE, Sharing::Private),
+            ],
+        }])
+        .unwrap();
+        assert_eq!(p.task_count(), 0, "the frozen tasks are gone");
+        let (stored, areas) = p.snapshot_size().unwrap();
+        assert_eq!((stored, areas), (3 * page, 3), "zero pages are not stored");
+        let keys = p.thaw().unwrap();
+        let (t2, u2) = (keys[0][0], keys[0][1]);
+        let mut buf = [0u8; 7];
+        p.read(t2, private + 3 * page + 5, &mut buf).unwrap();
+        assert_eq!(&buf, b"private");
+        p.read(u2, shared, &mut buf[..6]).unwrap();
+        assert_eq!(&buf[..6], b"shared");
+        assert!(p.read(t2, hidden, &mut buf).is_err(), "PROT_NONE again");
+        p.protect(t2, hidden, page, Prot::READ).unwrap();
+        p.read(u2, hidden, &mut buf[..6]).unwrap();
+        assert_eq!(&buf[..6], b"hidden");
+        let back = p.context(u2).unwrap();
+        assert_eq!(back.pc(), 0x1234_5678);
+        assert_eq!(back.thread_pointer(), 0xabcd_0000);
+        // Copy-on-write: a write lands in the clone only, and the private
+        // area comes from the snapshot file, which the app no longer holds.
+        p.write(t2, private, b"changed").unwrap();
+        p.read(u2, private, &mut buf).unwrap();
+        assert_eq!(&buf, b"changed", "threads share the address space");
+        let maps = maps(&p, t2);
+        assert!(maps.contains("hellovm-snapshot"), "{maps}");
+        let fds = std::fs::read_dir(format!("/proc/{}/fd", p.host_pid(t2).unwrap()))
+            .unwrap()
+            .count();
+        assert_eq!(fds, 0, "the app process holds no fd");
+        assert!(p.thaw().is_err(), "thawed once per copy of the platform");
     }
 
     /// Code that loops forever at `addr`: `b .` / `jmp .`.

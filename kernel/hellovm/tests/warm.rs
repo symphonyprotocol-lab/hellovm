@@ -424,3 +424,97 @@ fn the_clone_cli() {
         .unwrap();
     assert_eq!(out.status.code(), Some(124), "{out:?}");
 }
+
+/// Fields of `/proc/PID/status` and `/proc/PID/limits` that show the
+/// confinement of a kernel process.
+fn confinement(pid: u32) -> Vec<String> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+    let mut fields: Vec<String> = status
+        .lines()
+        .filter(|l| {
+            ["NoNewPrivs", "Seccomp", "Seccomp_filters", "CapEff", "CapPrm", "CapBnd"]
+                .iter()
+                .any(|k| l.starts_with(&format!("{k}:")))
+        })
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    fields.extend(
+        limits
+            .lines()
+            .filter(|l| {
+                ["Max core file size", "Max open files", "Max locked memory", "Max msgqueue size"]
+                    .iter()
+                    .any(|k| l.starts_with(k))
+            })
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")),
+    );
+    fields
+}
+
+/// The host processes whose parent is `pid`.
+fn children(pid: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|child| {
+            std::fs::read_to_string(format!("/proc/{child}/stat")).is_ok_and(|stat| {
+                // pid (comm) state ppid ...
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+                    == Some(pid)
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn a_clone_is_as_confined_as_its_template_and_cannot_reach_a_sibling() {
+    if !require_python() {
+        return;
+    }
+    let template = python_template();
+    ready(&template);
+    let mut sibling = template
+        .spawn(None, b"print('up', flush=True)\nprint('sibling', sys.stdin.readline().strip())")
+        .unwrap();
+    assert_eq!(sibling.line(), "up\n");
+    // Same layers as the template's kernel process: no_new_privs, the same
+    // seccomp filters, no capabilities, the same limits.
+    let fields = confinement(sibling.started.pid);
+    assert!(fields.contains(&"NoNewPrivs: 1".to_string()), "{fields:?}");
+    assert!(fields.contains(&"Seccomp: 2".to_string()), "{fields:?}");
+    assert_eq!(fields, confinement(template.pid()));
+    // The sibling's app process: a child of its kernel process.
+    let apps = children(sibling.started.pid);
+    assert_eq!(apps.len(), 1, "{apps:?}");
+    let probe = template.run(
+        format!("\0probe:{}\nprint('prober')", apps[0]).as_bytes(),
+        b"",
+    );
+    assert_eq!(probe.stdout, "prober\n", "{probe:?}");
+    let line = probe.stderr.lines().next().unwrap_or_default().to_string();
+    let field = |k: &str| {
+        line.split(' ')
+            .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no {k} in {line:?}"))
+            .to_string()
+    };
+    let abi: i64 = field("abi").parse().unwrap();
+    assert_eq!(field("own-read"), "ok", "{line}");
+    if abi == 0 {
+        eprintln!("SKIPPING the cross-clone checks: no Landlock on this host ({line})");
+        return;
+    }
+    // Landlock: the clone's domain does not reach the sibling's.
+    assert_eq!(field("sibling-read"), "errno-1", "{line}");
+    if abi >= 6 {
+        assert_eq!(field("sibling-kill"), "errno-1", "{line}");
+        sibling.send(b"alive\n");
+        let run = sibling.finish();
+        assert_eq!(run.stdout, "sibling alive\n", "{run:?}");
+    } else {
+        eprintln!("Landlock ABI {abi} < 6 does not scope signals: {line}");
+    }
+}
