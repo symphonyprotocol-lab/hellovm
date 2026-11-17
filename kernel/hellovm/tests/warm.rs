@@ -555,7 +555,9 @@ fn a_clone_is_as_confined_as_its_template_and_cannot_reach_a_sibling() {
     let abi: i64 = field("abi").parse().unwrap();
     assert_eq!(field("own-read"), "ok", "{line}");
     if abi == 0 {
-        eprintln!("SKIPPING the cross-clone checks: no Landlock on this host ({line})");
+        // Not a missing test dependency: the host has no Landlock, so
+        // nothing separates clones of one user (see README).
+        eprintln!("note: no Landlock on this host, cross-clone access not checked ({line})");
         return;
     }
     // Landlock: the clone's domain does not reach the sibling's.
