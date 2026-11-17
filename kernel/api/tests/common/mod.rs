@@ -249,7 +249,7 @@ impl Plane {
             audit: AuditSink::new(Box::new(audit.clone())),
             resolver: Resolver::parse_test_table(&format!("web.test 127.0.0.1:{web}\n")).unwrap(),
         };
-        let proxy = Proxy::bind(&dir.join("egress/egress.sock"), config)
+        let proxy = Proxy::bind(dir.join("egress/egress.sock"), config)
             .unwrap()
             .spawn();
         let shared = landlock();
