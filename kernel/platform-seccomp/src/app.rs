@@ -9,18 +9,19 @@ use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hellovm_core::platform::{
-    AddressSpaceInfo, Context, CpuInfo, Event, Fault, GuestAddr, Platform, PlatformError, Prot,
-    Resume, Sharing, SyscallTrap, TaskKey, Trap, Waker,
+    AddressSpaceInfo, Context, CpuInfo, Event, Fault, FrozenSpace, GuestAddr, Platform,
+    PlatformError, Prot, Resume, Sharing, SyscallTrap, TaskKey, Trap, Waker,
 };
 use hellovm_core::{Arch, Sysno};
 
 use crate::profile;
 use crate::regs::{self, Regs, SYSCALL_INSN_LEN};
+use crate::snapshot::{self, AreaImage, Snapshots, SpaceImage, TaskImage};
 use crate::spawn;
 use crate::stub;
 use crate::sys;
@@ -104,6 +105,9 @@ pub struct SeccompPlatform {
     nr_munmap: u64,
     nr_mprotect: u64,
     nr_clone: u64,
+    nr_close: u64,
+    /// Warm clones (see `snapshot`), once prepared.
+    snapshots: Option<Snapshots>,
     /// The waker wake-up count [`Platform::wait`] last reported.
     wakes_seen: u32,
     _not_send: PhantomData<*const ()>,
@@ -149,6 +153,8 @@ impl SeccompPlatform {
             nr_munmap: number(Sysno::Munmap),
             nr_mprotect: number(Sysno::Mprotect),
             nr_clone: number(Sysno::Clone),
+            nr_close: number(Sysno::Close),
+            snapshots: None,
             wakes_seen: wake::wakes(),
             _not_send: PhantomData,
         };
@@ -162,6 +168,28 @@ impl SeccompPlatform {
     pub fn killer(&self) -> AppKiller {
         AppKiller {
             registry: Arc::clone(&self.registry),
+        }
+    }
+
+    /// Makes this platform able to freeze its sandbox for warm clones
+    /// ([`Platform::freeze`]): creates the snapshot file, which needs
+    /// syscalls a confined kernel process does not have, so before the
+    /// hardening.
+    pub fn prepare_snapshots(&mut self) -> io::Result<()> {
+        if self.snapshots.is_none() {
+            self.snapshots = Some(Snapshots::Prepared(snapshot::create_file()?));
+        }
+        Ok(())
+    }
+
+    /// After [`Platform::freeze`]: the bytes of template memory stored
+    /// (pages that were not all zero) and the number of areas.
+    pub fn snapshot_size(&self) -> Option<(u64, usize)> {
+        match &self.snapshots {
+            Some(Snapshots::Frozen { stored, spaces, .. }) => {
+                Some((*stored, spaces.iter().map(|s| s.areas.len()).sum()))
+            }
+            _ => None,
         }
     }
 
@@ -232,11 +260,11 @@ impl SeccompPlatform {
         Some(task)
     }
 
-    fn spawn_task(&mut self) -> Result<TaskKey, PlatformError> {
+    fn spawn_task(&mut self, keep: Option<BorrowedFd<'_>>) -> Result<TaskKey, PlatformError> {
         let profile = profile::host_profile()?;
         // SAFETY: the profile's stub memfd lives as long as the process.
         let stub_fd = unsafe { BorrowedFd::borrow_raw(profile.stub_fd()) };
-        let spawned = spawn::spawn(self.arch, stub_fd)?;
+        let spawned = spawn::spawn(self.arch, stub_fd, keep)?;
         let key = self.register(spawned.tracee, spawned.regs, StopKind::SyscallExit)?;
         // Everything the host put into the new address space (stack, vDSO,
         // vvar) lies outside the stub's range.
@@ -496,6 +524,175 @@ fn vm_io(
     Ok(())
 }
 
+impl SeccompPlatform {
+    /// See [`Platform::freeze`] and `snapshot`.
+    fn freeze_spaces(&mut self, spaces: &[FrozenSpace]) -> Result<(), PlatformError> {
+        let file = match self.snapshots.take() {
+            Some(Snapshots::Prepared(file)) => file,
+            other => {
+                self.snapshots = other;
+                return Err(PlatformError::Unsupported(
+                    "freezing without prepare_snapshots, or twice",
+                ));
+            }
+        };
+        let named: usize = spaces.iter().map(|s| s.tasks.len()).sum();
+        let mut keys: Vec<TaskKey> = spaces.iter().flat_map(|s| s.tasks.clone()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.len() != named || named != self.tasks.len() || spaces.iter().any(|s| s.tasks.is_empty())
+        {
+            return Err(PlatformError::Unsupported(
+                "a freeze must name every task once and no empty address space",
+            ));
+        }
+        let page = self.info.page_size;
+        let mut offset = 0u64;
+        let mut stored = 0u64;
+        let mut images = Vec::with_capacity(spaces.len());
+        let mut buf = vec![0u8; snapshot::CHUNK];
+        for space in spaces {
+            let first = space.tasks[0];
+            let mut image = SpaceImage::default();
+            for area in &space.areas {
+                let len = area.end.checked_sub(area.start).unwrap_or(0);
+                self.check_range(area.start, len)?;
+                let end = offset
+                    .checked_add(len)
+                    .filter(|&end| end <= snapshot::CAPACITY)
+                    .ok_or_else(|| {
+                        PlatformError::NoResources(format!(
+                            "the template maps more than {} GiB",
+                            snapshot::CAPACITY >> 30
+                        ))
+                    })?;
+                if !area.prot.contains(Prot::READ) {
+                    self.protect(first, area.start, len, area.prot.union(Prot::READ))?;
+                }
+                let pid = self.task(first)?.tracee.pid;
+                let mut done = 0u64;
+                while done < len {
+                    let n = (len - done).min(snapshot::CHUNK as u64) as usize;
+                    vm_io(pid, area.start + done, buf.as_mut_ptr(), n, false)?;
+                    stored += snapshot::store(file.as_fd(), offset + done, &buf[..n], page as usize)?;
+                    done += n as u64;
+                }
+                image.areas.push(AreaImage {
+                    start: area.start,
+                    len,
+                    prot: area.prot,
+                    shared: area.sharing == Sharing::Shared,
+                    offset,
+                });
+                offset = end;
+            }
+            for &key in &space.tasks {
+                let (task, _) = self.stopped(key)?;
+                let fp = task.tracee.fp_regs()?;
+                #[cfg(target_arch = "aarch64")]
+                let tls = task.tracee.tls()?;
+                #[cfg(target_arch = "x86_64")]
+                let tls = 0;
+                image.tasks.push(TaskImage {
+                    regs: task.regs,
+                    fp,
+                    tls,
+                });
+            }
+            images.push(image);
+        }
+        for key in keys {
+            self.kill(key)?;
+        }
+        snapshot::seal(file.as_fd())?;
+        self.snapshots = Some(Snapshots::Frozen {
+            file,
+            spaces: images,
+            stored,
+        });
+        Ok(())
+    }
+
+    /// See [`Platform::thaw`] and `snapshot`.
+    fn thaw_spaces(&mut self) -> Result<Vec<Vec<TaskKey>>, PlatformError> {
+        let Some(Snapshots::Frozen { file, spaces, .. }) = self.snapshots.take() else {
+            return Err(PlatformError::Unsupported("thawing what was not frozen"));
+        };
+        let mut keys = Vec::with_capacity(spaces.len());
+        for space in &spaces {
+            let first = self.spawn_task(Some(file.as_fd()))?;
+            let result = self.thaw_space(first, file.as_fd(), space);
+            match result {
+                Ok(space_keys) => keys.push(space_keys),
+                Err(err) => {
+                    let _ = self.kill(first);
+                    return Err(err);
+                }
+            }
+        }
+        // `file` is closed here: the app processes hold the mappings only.
+        Ok(keys)
+    }
+
+    fn thaw_space(
+        &mut self,
+        first: TaskKey,
+        file: BorrowedFd<'_>,
+        space: &SpaceImage,
+    ) -> Result<Vec<TaskKey>, PlatformError> {
+        let fd = file.as_raw_fd() as u64;
+        let mut buf = Vec::new();
+        for area in &space.areas {
+            self.check_range(area.start, area.len)?;
+            if area.shared {
+                self.map(first, area.start, area.len, Prot::RW, Sharing::Shared)?;
+                buf.resize(snapshot::CHUNK, 0);
+                let pid = self.task(first)?.tracee.pid;
+                let mut done = 0u64;
+                while done < area.len {
+                    let n = (area.len - done).min(snapshot::CHUNK as u64) as usize;
+                    snapshot::load(file, area.offset + done, &mut buf[..n])?;
+                    vm_io(pid, area.start + done, buf.as_mut_ptr(), n, true)?;
+                    done += n as u64;
+                }
+                if area.prot != Prot::RW {
+                    self.protect(first, area.start, area.len, area.prot)?;
+                }
+            } else {
+                let prot = u64::from(area.prot.0 & Prot::ALL.0);
+                let args = [
+                    area.start,
+                    area.len,
+                    prot,
+                    MAP_PRIVATE | MAP_FIXED,
+                    fd,
+                    area.offset,
+                ];
+                let ret = self.checked_inject(first, "mmap of the snapshot", self.nr_mmap, args)?;
+                if ret as u64 != area.start {
+                    return Err(self.violation(
+                        first,
+                        format!("mmap returned {ret:#x}, not {:#x}", area.start),
+                    ));
+                }
+            }
+        }
+        self.checked_inject(first, "close of the snapshot", self.nr_close, [fd, 0, 0, 0, 0, 0])?;
+        let mut keys = vec![first];
+        for _ in 1..space.tasks.len() {
+            keys.push(self.clone_task(first, true)?);
+        }
+        for (&key, image) in keys.iter().zip(&space.tasks) {
+            let task = self.task(key)?;
+            task.tracee.set_fp_regs(&image.fp)?;
+            #[cfg(target_arch = "aarch64")]
+            task.tracee.set_tls(image.tls)?;
+            task.regs = image.regs;
+        }
+        Ok(keys)
+    }
+}
+
 impl Platform for SeccompPlatform {
     fn arch(&self) -> Arch {
         self.arch
@@ -510,7 +707,7 @@ impl Platform for SeccompPlatform {
     }
 
     fn spawn(&mut self) -> Result<TaskKey, PlatformError> {
-        self.spawn_task()
+        self.spawn_task(None)
     }
 
     fn clone_task(
@@ -714,6 +911,14 @@ impl Platform for SeccompPlatform {
         )?;
         Ok(())
     }
+
+    fn freeze(&mut self, spaces: &[FrozenSpace]) -> Result<(), PlatformError> {
+        self.freeze_spaces(spaces)
+    }
+
+    fn thaw(&mut self) -> Result<Vec<Vec<TaskKey>>, PlatformError> {
+        self.thaw_spaces()
+    }
 }
 
 /// Checks that a new app process really is empty but for the stub after
@@ -729,7 +934,7 @@ pub fn check_clean_spawn() -> io::Result<()> {
     CHECK
         .get_or_init(|| {
             let mut platform = SeccompPlatform::new().map_err(|err| err.to_string())?;
-            let key = platform.spawn_task().map_err(|err| err.to_string())?;
+            let key = platform.spawn_task(None).map_err(|err| err.to_string())?;
             let pid = platform.tasks[&key].tracee.pid;
             let (left, _) = spawn::foreign_mappings(pid).map_err(|err| err.to_string())?;
             if !left.is_empty() {

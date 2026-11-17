@@ -309,8 +309,15 @@ fn unexpected(stop: Stop, hs: &Handshake, what: &str) -> io::Error {
 }
 
 /// Starts an app process running the stub under the filter, traced by the
-/// calling thread.
-pub fn spawn(arch: Arch, stub_fd: BorrowedFd<'_>) -> io::Result<Spawned> {
+/// calling thread. `keep`, if given, stays open in the app process (it must
+/// not be close-on-exec): the memfd of a warm-clone snapshot, which the
+/// kernel process maps into it by injection and then closes (see
+/// `snapshot`).
+pub fn spawn(
+    arch: Arch,
+    stub_fd: BorrowedFd<'_>,
+    keep: Option<BorrowedFd<'_>>,
+) -> io::Result<Spawned> {
     let execveat_nr = arch
         .syscall_nr(Sysno::Execveat)
         .expect("execveat exists on every architecture");
@@ -344,6 +351,7 @@ pub fn spawn(arch: Arch, stub_fd: BorrowedFd<'_>) -> io::Result<Spawned> {
                 hs,
                 parent,
                 stub_fd.as_raw_fd(),
+                keep.map_or(-1, |fd| fd.as_raw_fd()),
                 &prog,
                 empty.as_ptr(),
                 argv.as_ptr(),
@@ -457,6 +465,7 @@ unsafe fn child_bootstrap(
     hs: &Handshake,
     parent: libc::pid_t,
     stub_fd: libc::c_int,
+    keep_fd: libc::c_int,
     prog: *const libc::sock_fprog,
     empty: *const libc::c_char,
     argv: *const *const libc::c_char,
@@ -474,7 +483,7 @@ unsafe fn child_bootstrap(
     if libc::getppid() != parent {
         libc::_exit(127);
     }
-    close_all_fds_except(stub_fd);
+    close_all_fds_except(stub_fd, keep_fd);
     // Its own session: signals the host terminal sends to the kernel's
     // process group (Ctrl-C, window changes) never reach app processes.
     if libc::setsid() < 0 {
@@ -515,26 +524,38 @@ unsafe fn child_bootstrap(
     die_without_syscalls()
 }
 
-/// Closes every fd except `keep`. Async-signal-safe.
-unsafe fn close_all_fds_except(keep: libc::c_int) {
-    let keep = keep as libc::c_uint;
-    let ok = (keep == 0
-        || libc::syscall(
-            sys::SYS_CLOSE_RANGE,
-            0 as libc::c_long,
-            (keep - 1) as libc::c_long,
-            0 as libc::c_long,
-        ) == 0)
-        && libc::syscall(
-            sys::SYS_CLOSE_RANGE,
-            (keep + 1) as libc::c_long,
-            libc::c_uint::MAX as libc::c_long,
-            0 as libc::c_long,
-        ) == 0;
+/// Closes every fd except `a` and `b` (either may be -1). Async-signal-safe.
+unsafe fn close_all_fds_except(a: libc::c_int, b: libc::c_int) {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    // The fds to keep, ascending, without -1 and duplicates.
+    let keep: [libc::c_int; 2] = [lo, hi];
+    let mut next: libc::c_uint = 0;
+    let mut ok = true;
+    for (i, &fd) in keep.iter().enumerate() {
+        if fd < 0 || (i == 1 && fd == lo) {
+            continue;
+        }
+        let fd = fd as libc::c_uint;
+        if fd > next {
+            ok &= libc::syscall(
+                sys::SYS_CLOSE_RANGE,
+                next as libc::c_long,
+                (fd - 1) as libc::c_long,
+                0 as libc::c_long,
+            ) == 0;
+        }
+        next = fd + 1;
+    }
+    ok &= libc::syscall(
+        sys::SYS_CLOSE_RANGE,
+        next as libc::c_long,
+        libc::c_uint::MAX as libc::c_long,
+        0 as libc::c_long,
+    ) == 0;
     if !ok {
         // close_range needs Linux 5.9.
         for fd in 0..65536 {
-            if fd != keep as libc::c_int {
+            if fd != a && fd != b {
                 libc::close(fd);
             }
         }

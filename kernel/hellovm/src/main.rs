@@ -47,6 +47,24 @@
 //! to start (exit 125) when a required layer is unavailable; `--sandbox
 //! off` uses none. `HELLOVM_LOG=debug` lists the active layers.
 //!
+//! Warm clones (see README, "Warm clones"):
+//!
+//! ```text
+//! hellovm --template SOCKET [options as above, but not --tty or --timeout]
+//!         --root DIR PROGRAM [ARGS...]
+//! hellovm --clone SOCKET [--sandbox-id ID] [--input DATA] [--timeout SECONDS]
+//! hellovm --clone SOCKET --ready
+//! ```
+//!
+//! `--template` runs the program as a template: with no console input,
+//! until it reads `/dev/hellovm-clone`; then the sandbox is frozen and
+//! hellovm serves clones of it on the Unix socket `SOCKET` (created; it
+//! must not exist) until it is killed. Its clones die with it. `--clone`
+//! asks such a template for a clone whose console is this process's stdin,
+//! stdout and stderr, whose read of `/dev/hellovm-clone` returns `DATA`
+//! (then end of file), and exits with the clone's status (125 if it could
+//! not be made). `--ready` only waits until the template is frozen.
+//!
 //! `HELLOVM_LOG` sets the log level (`error`, `warn` (default), `info`,
 //! `debug`, `trace`).
 
@@ -58,9 +76,14 @@ use std::process::ExitCode;
 
 use hellovm_sandbox::Mode as SandboxMode;
 
+#[cfg(target_os = "linux")]
+mod template;
+
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
      [--egress SOCKET] [--sandbox-id ID] [--sandbox require|best-effort|off] --root DIR \
-     [--env NAME=VALUE]... [--] PROGRAM [ARGS...]";
+     [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
+       hellovm --template SOCKET [options] --root DIR PROGRAM [ARGS...]
+       hellovm --clone SOCKET [--sandbox-id ID] [--input DATA] [--timeout SECONDS] [--ready]";
 
 /// How long hellovm waits, after the program ends, for outbound bytes the
 /// sandbox already wrote to be delivered.
@@ -124,6 +147,14 @@ struct Options {
     sandbox: SandboxMode,
     env: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
+    /// `--template SOCKET`.
+    template: Option<PathBuf>,
+    /// `--clone SOCKET`.
+    clone: Option<PathBuf>,
+    /// `--input DATA` (with `--clone`).
+    input: Vec<u8>,
+    /// `--ready` (with `--clone`).
+    ready: bool,
 }
 
 fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
@@ -140,6 +171,10 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     #[cfg(feature = "insecure-test-hooks")]
     let mut fence_test = None;
     let mut sandbox = SandboxMode::default();
+    let mut template = None;
+    let mut clone = None;
+    let mut input = Vec::new();
+    let mut ready = false;
     let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
     let mut args = args.peekable();
     while let Some(arg) = args.peek() {
@@ -170,6 +205,26 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 timeout = Some(seconds);
                 continue;
             }
+            Some("--template") => {
+                args.next();
+                template = Some(PathBuf::from(
+                    args.next().ok_or("--template needs a socket path")?,
+                ));
+                continue;
+            }
+            Some("--clone") => {
+                args.next();
+                clone = Some(PathBuf::from(
+                    args.next().ok_or("--clone needs a socket path")?,
+                ));
+                continue;
+            }
+            Some("--input") => {
+                args.next();
+                input = args.next().ok_or("--input needs data")?.into_vec();
+                continue;
+            }
+            Some("--ready") => ready = true,
             Some("--egress") => {
                 args.next();
                 egress = Some(PathBuf::from(
@@ -258,6 +313,40 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         args.next();
     }
     let argv: Vec<Vec<u8>> = args.map(OsString::into_vec).collect();
+    if let Some(clone) = clone {
+        if !argv.is_empty() || template.is_some() {
+            return Err(format!("--clone takes no program\n{USAGE}"));
+        }
+        return Ok(Options {
+            trace,
+            tty,
+            timeout,
+            root: PathBuf::new(),
+            egress,
+            sandbox_id,
+            #[cfg(feature = "insecure-test-hooks")]
+            splice_to,
+            #[cfg(feature = "insecure-test-hooks")]
+            session,
+            #[cfg(feature = "insecure-test-hooks")]
+            fence_test,
+            sandbox,
+            env,
+            argv,
+            template,
+            clone: Some(clone),
+            input,
+            ready,
+        });
+    }
+    if !input.is_empty() || ready {
+        return Err(format!("--input and --ready go with --clone\n{USAGE}"));
+    }
+    if template.is_some() && (tty == Some(true) || timeout.is_some()) {
+        return Err(format!(
+            "--template: a template has no terminal and no --timeout (a clone can have one)\n{USAGE}"
+        ));
+    }
     #[cfg(feature = "insecure-test-hooks")]
     let needs_program = !session && fence_test.is_none();
     #[cfg(not(feature = "insecure-test-hooks"))]
@@ -282,6 +371,10 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         sandbox,
         env,
         argv,
+        template,
+        clone: None,
+        input,
+        ready,
     })
 }
 
@@ -294,6 +387,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[cfg(target_os = "linux")]
+    if let Some(socket) = &options.clone {
+        return ExitCode::from(template::client(
+            socket,
+            options.sandbox_id,
+            &options.input,
+            options.ready,
+            options.timeout,
+        ));
+    }
     // Before anything opens an fd of its own.
     #[cfg(target_os = "linux")]
     let fds = if options.sandbox == SandboxMode::Off {
@@ -337,14 +440,14 @@ fn exit_code(status: hellovm_core::ExitStatus) -> ExitCode {
 /// Applies `hellovm-sandbox` to this process, after checking that the
 /// platform can still do without `/proc` what it will have to. Moves
 /// `image` to where the hardening left the directory, and returns where
-/// the egress socket is now reachable.
+/// the egress socket is now reachable and whether Landlock is active.
 #[cfg(target_os = "linux")]
 fn harden(
     options: &Options,
     image: &mut hellovm_host::ImageDir,
     egress: Option<PathBuf>,
     fds: Result<usize, String>,
-) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+) -> Result<(Option<PathBuf>, bool), Box<dyn std::error::Error>> {
     #[cfg(feature = "insecure-test-hooks")]
     let (tcp_port, learn, skip_landlock) = (
         options.splice_to.map(|addr| addr.port()),
@@ -371,7 +474,8 @@ fn harden(
     if let Some(dir) = hardened.image {
         image.rebind(dir);
     }
-    Ok(hardened.report.egress)
+    let landlock = hardened.report.active(hellovm_sandbox::Layer::Landlock);
+    Ok((hardened.report.egress, landlock))
 }
 
 #[cfg(target_os = "linux")]
@@ -394,6 +498,10 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     if options.session {
         return run_session(options, image, egress, fds);
     }
+    if let Some(socket) = &options.template {
+        drop(image);
+        return template::run(options, socket, fds);
+    }
     // Takes the host profile the sandbox and the platform share.
     let mut app = SeccompPlatform::new()?;
     // Before the hardening: the host opens what it needs from the host's
@@ -405,7 +513,7 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
         host.set_splice_endpoint(addr);
     }
     let image = host.image_mut().expect("the host has the image");
-    if let Some(path) = harden(options, image, egress, fds)? {
+    if let (Some(path), _) = harden(options, image, egress, fds)? {
         host.set_egress(path);
     }
     #[cfg(feature = "insecure-test-hooks")]
@@ -487,7 +595,7 @@ fn run_session(
     let mut host = hellovm_host::CaptureHost::new(Some(image));
     hellovm_platform_seccomp::host_profile()?;
     let image = host.image_mut().expect("the host has the image");
-    let egress = harden(options, image, egress, fds)?;
+    let (egress, _) = harden(options, image, egress, fds)?;
     if let Some(addr) = options.splice_to {
         host.set_splice_endpoint(addr);
     }

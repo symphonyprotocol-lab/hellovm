@@ -313,6 +313,15 @@ pub trait Host {
     fn stream_close(&mut self, id: HostStreamId) {
         let _ = id;
     }
+
+    /// Waits at most `limit` until no outbound stream is open or still
+    /// delivering bytes after its close, and returns whether that is so.
+    /// A warm-clone template freezes only then: a stream (and its helper
+    /// threads) cannot be copied into a clone.
+    fn settle_streams(&mut self, limit: Duration) -> bool {
+        let _ = limit;
+        true
+    }
 }
 
 impl<H: Host + ?Sized> Host for &mut H {
@@ -372,6 +381,9 @@ impl<H: Host + ?Sized> Host for &mut H {
     }
     fn stream_close(&mut self, id: HostStreamId) {
         (**self).stream_close(id)
+    }
+    fn settle_streams(&mut self, limit: Duration) -> bool {
+        (**self).settle_streams(limit)
     }
 }
 

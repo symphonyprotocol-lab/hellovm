@@ -456,6 +456,25 @@ impl fmt::Debug for Waker {
     }
 }
 
+/// One memory area of an address space being frozen
+/// ([`Platform::freeze`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenArea {
+    pub start: GuestAddr,
+    pub end: GuestAddr,
+    pub prot: Prot,
+    pub sharing: Sharing,
+}
+
+/// One address space of a sandbox being frozen ([`Platform::freeze`]): the
+/// tasks that use it and every area the core has mapped in it (the
+/// reserved ranges excluded).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrozenSpace {
+    pub tasks: Vec<TaskKey>,
+    pub areas: Vec<FrozenArea>,
+}
+
 /// One sandbox's tasks. See the module documentation.
 ///
 /// Every method that names a task requires it to be live; the memory and
@@ -545,6 +564,29 @@ pub trait Platform {
         len: u64,
         prot: Prot,
     ) -> Result<(), PlatformError>;
+
+    /// Warm clones: captures every task (its whole register context) and
+    /// the contents of every area of `spaces`, which name every live task
+    /// of the platform, all of them stopped, and then ends the tasks. The
+    /// capture is kept by the platform and survives a copy of the platform
+    /// value made by forking the host process; [`Platform::thaw`] rebuilds
+    /// the tasks from it, as often as it is called on such copies. The
+    /// capture must be immutable: one thawed copy must never see what
+    /// another one, or the original, writes.
+    fn freeze(&mut self, spaces: &[FrozenSpace]) -> Result<(), PlatformError> {
+        let _ = spaces;
+        Err(PlatformError::Unsupported("warm clones"))
+    }
+
+    /// Rebuilds the tasks [`Platform::freeze`] captured: per space, in the
+    /// same order, new tasks with the same contexts, stopped, and a new
+    /// address space with the same areas and contents (shared areas are
+    /// shared by the new space's tasks only). Returns the new keys, space by
+    /// space. Each task resumes like a task stopped at a syscall, with
+    /// [`Resume::Return`] or [`Resume::Continue`].
+    fn thaw(&mut self) -> Result<Vec<Vec<TaskKey>>, PlatformError> {
+        Err(PlatformError::Unsupported("warm clones"))
+    }
 }
 
 /// One stopped task of a platform, as [`AppMemory`] and [`AddressSpace`].

@@ -103,7 +103,11 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
         allow(SYS_ppoll),
         checked(
             SYS_fcntl,
-            vec![one_of(1, &[F_GETFD, F_SETFD, F_GETFL, F_DUPFD_CLOEXEC])],
+            vec![one_of(
+                1,
+                // F_ADD_SEALS: a warm-clone template seals its snapshot.
+                &[F_GETFD, F_SETFD, F_GETFL, F_DUPFD_CLOEXEC, F_ADD_SEALS],
+            )],
         ),
         checked(
             SYS_ioctl,
@@ -216,6 +220,15 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
         allow(SYS_recvfrom),
         allow(SYS_setsockopt),
         allow(SYS_shutdown),
+        // Warm clones (`hellovm --template`): the template accepts requests
+        // on its control socket (bound before the hardening) and receives
+        // each clone's stdio fds with them; a clone's kernel process puts
+        // itself in a Landlock domain of its own (a ruleset without rules:
+        // only reduces what it may do).
+        checked(SYS_accept4, vec![one_of(3, &[SOCK_CLOEXEC])]),
+        checked(SYS_recvmsg, vec![one_of(2, &[MSG_CMSG_CLOEXEC])]),
+        allow(SYS_landlock_create_ruleset),
+        checked(SYS_landlock_restrict_self, vec![one_of(1, &[0])]),
     ];
     #[cfg(target_arch = "x86_64")]
     list.push(allow(SYS_poll));

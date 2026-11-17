@@ -116,6 +116,8 @@ pub enum Device {
     Tty {
         console: bool,
     },
+    /// `/dev/hellovm-clone`, the clone point of a warm-clone template.
+    Clone,
 }
 
 impl Device {
@@ -129,6 +131,8 @@ impl Device {
             Device::Urandom => (1, 9),
             Device::Tty { console: false } => (5, 0),
             Device::Tty { console: true } => (5, 1),
+            // A misc device number Linux does not assign.
+            Device::Clone => (10, 251),
             Device::Fd(_) | Device::Unusable => (0, 0),
         };
         makedev(major, minor)
@@ -305,7 +309,7 @@ impl Vfs {
             root_stat.map_or(2, |s| s.nlink.clamp(2, u32::MAX as u64) as u32);
 
         let dev = vfs.ensure_dir(host, root, b"dev", 0o755, now);
-        let devices: [(&[u8], Device, u32); 10] = [
+        let devices: [(&[u8], Device, u32); 11] = [
             (b"tty", Device::Tty { console: false }, 0o666),
             (b"console", Device::Tty { console: true }, 0o600),
             (b"null", Device::Null, 0o666),
@@ -316,6 +320,7 @@ impl Vfs {
             (b"stdin", Device::Fd(0), 0o620),
             (b"stdout", Device::Fd(1), 0o620),
             (b"stderr", Device::Fd(2), 0o620),
+            (b"hellovm-clone", Device::Clone, 0o444),
         ];
         for (name, device, perm) in devices {
             let ino = vfs.add_node(Content::Device(device), perm, now);
