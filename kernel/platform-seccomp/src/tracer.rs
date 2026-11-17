@@ -3,7 +3,7 @@
 use std::io;
 use std::mem;
 
-use crate::regs::{FpRegs, Regs};
+use crate::regs::{FpRegs, PacKeys, Regs};
 use crate::sys::{self, ptrace, ptrace_checked};
 
 /// Why a tracee stopped (or ended), as `waitpid` reports it.
@@ -230,6 +230,43 @@ impl Tracee {
     #[cfg(target_arch = "aarch64")]
     pub fn set_tls(&self, tls: u64) -> io::Result<()> {
         self.set_regset(sys::NT_ARM_TLS, &tls)
+    }
+
+    /// The pointer-authentication keys, or `None` where the host has no
+    /// pointer authentication or does not let a tracer read the keys
+    /// (Linux without `CONFIG_CHECKPOINT_RESTORE`).
+    #[cfg(target_arch = "aarch64")]
+    pub fn pac_keys(&self) -> io::Result<Option<PacKeys>> {
+        let mut keys = PacKeys::default();
+        let unavailable = |err: &io::Error| {
+            matches!(
+                err.raw_os_error(),
+                Some(libc::EINVAL | libc::ENODEV | libc::EIO)
+            )
+        };
+        match self.get_regset(sys::NT_ARM_PACA_KEYS, &mut keys.address) {
+            Ok(()) => {}
+            Err(err) if unavailable(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        self.get_regset(sys::NT_ARM_PACG_KEYS, &mut keys.generic)?;
+        Ok(Some(keys))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn pac_keys(&self) -> io::Result<Option<PacKeys>> {
+        Ok(None)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_pac_keys(&self, keys: &PacKeys) -> io::Result<()> {
+        self.set_regset(sys::NT_ARM_PACA_KEYS, &keys.address)?;
+        self.set_regset(sys::NT_ARM_PACG_KEYS, &keys.generic)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_pac_keys(&self, _keys: &PacKeys) -> io::Result<()> {
+        Ok(())
     }
 
     /// At a seccomp stop: makes the pending syscall a no-op, with every

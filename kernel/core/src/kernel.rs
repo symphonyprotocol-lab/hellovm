@@ -488,7 +488,7 @@ impl<H: Host> Kernel<H> {
         }
         self.host.set_console_waker(platform.waker());
         let result = self.event_loop(platform);
-        if self.st.init_status.is_none() && self.st.freeze_requested {
+        if result.is_ok() && self.st.init_status.is_none() && self.st.freeze_requested {
             let frozen = self.clonable().and_then(|spaces| {
                 let tids = spaces.iter().map(|(tids, _)| tids.clone()).collect();
                 let spaces: Vec<FrozenSpace> = spaces.into_iter().map(|(_, s)| s).collect();

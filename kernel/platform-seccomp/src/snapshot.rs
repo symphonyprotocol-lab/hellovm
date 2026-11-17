@@ -14,8 +14,8 @@
 //! readable first by an injected `mprotect`: the template's processes end
 //! right after, so nothing observes it. Pages that are all zero are not
 //! written and stay holes of the file (untouched heap, stacks and
-//! reservations cost nothing). Each task's registers, FP/SIMD state and
-//! thread pointer are kept, the template's app processes are killed, and
+//! reservations cost nothing). Each task's registers, FP/SIMD state,
+//! thread pointer and (aarch64) pointer-authentication keys are kept, the template's app processes are killed, and
 //! the file is sealed (`F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK |
 //! F_SEAL_SEAL`): from then on no process, not even a compromised clone
 //! kernel process holding the fd, can change it, so what a clone reads from
@@ -43,6 +43,16 @@
 //! again, the first task gets its registers back, and every other task of
 //! the space is an injected `clone(CLONE_VM)` of it with its own registers.
 //!
+//! The pointer-authentication keys (aarch64, `NT_ARM_PACA_KEYS` and
+//! `NT_ARM_PACG_KEYS`) matter because the app processes are new: the host
+//! gives every process new keys at `execve`, and a return address the
+//! template signed (`paciasp`) would fail authentication in the clone
+//! (`SIGILL` with FPAC). Distributions that build with
+//! `-mbranch-protection` (Ubuntu) need this; Debian bookworm does not. On a
+//! host with pointer authentication whose kernel does not let a tracer set
+//! the keys (no `CONFIG_CHECKPOINT_RESTORE`), freezing fails. Like the
+//! stack canary, the keys are therefore the same in every clone.
+//!
 //! These injected syscalls are added to the residual host-syscall surface
 //! of `spawn`: `mmap` of the memfd (only that fd, `MAP_PRIVATE | MAP_FIXED`,
 //! a range the platform checked) and `close` of it, both before any app
@@ -54,7 +64,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use hellovm_core::platform::Prot;
 
-use crate::regs::{FpRegs, Regs};
+use crate::regs::{FpRegs, PacKeys, Regs};
 
 /// Size of the snapshot memfd: the most memory, holes included, all the
 /// address spaces of a template may have mapped. Sparse, so its size costs
@@ -83,6 +93,8 @@ pub struct TaskImage {
     /// The thread pointer where it is not in [`Regs`] (aarch64).
     #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub tls: u64,
+    /// Its pointer-authentication keys, where the host has them.
+    pub pac: Option<PacKeys>,
 }
 
 #[derive(Clone, Debug, Default)]

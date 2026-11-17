@@ -46,6 +46,10 @@ pub const NT_PRFPREG: libc::c_long = 2;
 pub const NT_ARM_TLS: libc::c_long = 0x401;
 #[cfg(target_arch = "aarch64")]
 pub const NT_ARM_SYSTEM_CALL: libc::c_long = 0x404;
+#[cfg(target_arch = "aarch64")]
+pub const NT_ARM_PACA_KEYS: libc::c_long = 0x407;
+#[cfg(target_arch = "aarch64")]
+pub const NT_ARM_PACG_KEYS: libc::c_long = 0x408;
 
 /// `clone` flags the platform passes when it makes an app process fork.
 pub const CLONE_VM: u64 = 0x100;

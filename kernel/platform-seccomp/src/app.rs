@@ -477,6 +477,21 @@ impl SeccompPlatform {
     }
 }
 
+/// Whether the host CPU has pointer authentication (aarch64 `HWCAP_PACA`
+/// or `HWCAP_PACG`).
+fn host_has_pac() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        const HWCAP_PACA: u64 = 1 << 30;
+        const HWCAP_PACG: u64 = 1 << 31;
+        // SAFETY: plain libc call.
+        let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) };
+        hwcap & (HWCAP_PACA | HWCAP_PACG) != 0
+    }
+    #[cfg(target_arch = "x86_64")]
+    false
+}
+
 /// Signals the CPU raises for a fault of the task itself.
 fn is_fault(sig: i32) -> bool {
     matches!(
@@ -601,10 +616,18 @@ impl SeccompPlatform {
                 let tls = task.tracee.tls()?;
                 #[cfg(target_arch = "x86_64")]
                 let tls = 0;
+                let pac = task.tracee.pac_keys()?;
+                if pac.is_none() && host_has_pac() {
+                    return Err(PlatformError::Unsupported(
+                        "the host has pointer authentication but does not let a tracer \
+                         read and set the keys (CONFIG_CHECKPOINT_RESTORE)",
+                    ));
+                }
                 image.tasks.push(TaskImage {
                     regs: task.regs,
                     fp,
                     tls,
+                    pac,
                 });
             }
             images.push(image);
@@ -700,6 +723,9 @@ impl SeccompPlatform {
             task.tracee.set_fp_regs(&image.fp)?;
             #[cfg(target_arch = "aarch64")]
             task.tracee.set_tls(image.tls)?;
+            if let Some(keys) = &image.pac {
+                task.tracee.set_pac_keys(keys)?;
+            }
             task.regs = image.regs;
         }
         Ok(keys)
@@ -1131,6 +1157,7 @@ mod tests {
         context.set_pc(0x1234_5678);
         context.set_thread_pointer(0xabcd_0000);
         p.set_context(u, &context).unwrap();
+        let pac = p.tasks[&t].tracee.pac_keys().unwrap();
         let area = |start, pages, prot, sharing| FrozenArea {
             start,
             end: start + pages * page,
@@ -1162,6 +1189,11 @@ mod tests {
         assert_eq!(&buf[..6], b"hidden");
         let back = p.context(u2).unwrap();
         assert_eq!(back.pc(), 0x1234_5678);
+        if host_has_pac() {
+            let after = p.tasks[&t2].tracee.pac_keys().unwrap();
+            assert!(after.is_some(), "pointer-authentication keys are readable");
+            assert_eq!(after, pac, "the template's keys, not the new process's");
+        }
         assert_eq!(back.thread_pointer(), 0xabcd_0000);
         // Copy-on-write: a write lands in the clone only, and the private
         // area comes from the snapshot file, which the app no longer holds.

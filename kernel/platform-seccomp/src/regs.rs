@@ -79,6 +79,25 @@ pub struct FpRegs {
     pub reserved: [u32; 2],
 }
 
+/// aarch64 pointer-authentication keys (`struct user_pac_address_keys`
+/// and `struct user_pac_generic_keys`). The host makes new ones for every
+/// process at `execve`; a warm clone's app processes must get the
+/// template's, or returning through a frame the template signed fails.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacKeys {
+    /// APIA, APIB, APDA, APDB.
+    pub address: [u128; 4],
+    /// APGA.
+    pub generic: u128,
+}
+
+/// No pointer authentication on x86_64.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacKeys;
+
 /// The `pstate` bits the app may set: the condition flags N, Z, C and V.
 #[cfg(target_arch = "aarch64")]
 const PSTATE_USER: u64 = 0xf000_0000;
