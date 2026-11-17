@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ use hellovm_core::platform::{
 use hellovm_core::{Arch, Sysno};
 
 use crate::regs::{self, Regs, SYSCALL_INSN_LEN};
+use crate::profile;
 use crate::spawn;
 use crate::stub;
 use crate::sys;
@@ -117,15 +118,26 @@ impl SeccompPlatform {
         })?;
         wake::install()?;
         let page_size = sys::page_size();
+        let profile = profile::host_profile()?;
+        let max_addr = profile.app_max_addr(page_size);
         let number = |sysno: Sysno| arch.syscall_nr(sysno).expect("generic syscall");
-        let stub_range = stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED;
+        let mut reserved = vec![stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED];
+        // App code must never run where the kernel process's own code is:
+        // its seccomp filter tells the two apart by address (see `profile`).
+        reserved.extend(
+            profile
+                .code_ranges()
+                .iter()
+                .filter(|r| r.start < max_addr)
+                .map(|r| r.start & !(page_size - 1)..r.end.min(max_addr).next_multiple_of(page_size)),
+        );
         let platform = SeccompPlatform {
             arch,
             info: AddressSpaceInfo {
                 page_size,
                 min_addr: MIN_ADDR.max(page_size),
-                max_addr: 0,
-                reserved: vec![stub_range],
+                max_addr,
+                reserved,
             },
             hwcap: host_cpu_info(),
             tasks: HashMap::new(),
@@ -137,8 +149,6 @@ impl SeccompPlatform {
             wakes_seen: wake::wakes(),
             _not_send: PhantomData,
         };
-        // `max_addr` is set by the first spawn, from what the host gave
-        // that process (its stack sits at the top of the user range).
         Ok(platform)
     }
 
@@ -220,13 +230,14 @@ impl SeccompPlatform {
     }
 
     fn spawn_task(&mut self) -> Result<TaskKey, PlatformError> {
-        let spawned = spawn::spawn(self.arch)?;
-        let max_addr = spawned.top & !(self.info.page_size - 1);
-        if self.info.max_addr == 0 {
-            self.info.max_addr = max_addr;
-        }
+        let profile = profile::host_profile()?;
+        // SAFETY: the profile's stub memfd lives as long as the process.
+        let stub_fd = unsafe { BorrowedFd::borrow_raw(profile.stub_fd()) };
+        let spawned = spawn::spawn(self.arch, stub_fd)?;
         let key = self.register(spawned.tracee, spawned.regs, StopKind::SyscallExit)?;
-        for &(start, len) in &spawned.foreign {
+        // Everything the host put into the new address space (stack, vDSO,
+        // vvar) lies outside the stub's range.
+        for (start, len) in profile::outside_stub(self.info.page_size, profile.task_size()) {
             let ret = self
                 .inject(key, self.nr_munmap, [start, len, 0, 0, 0, 0])
                 .map(|(ret, _)| ret);
@@ -239,14 +250,6 @@ impl SeccompPlatform {
                     ))));
                 }
             }
-        }
-        let pid = self.tasks[&key].tracee.pid;
-        let (left, _) = spawn::foreign_mappings(pid)?;
-        if !left.is_empty() {
-            let _ = self.kill(key);
-            return Err(PlatformError::Host(io::Error::other(format!(
-                "host mappings left in the app address space: {left:#x?}"
-            ))));
         }
         Ok(key)
     }
@@ -753,6 +756,8 @@ mod tests {
     fn starts_with_only_the_stub() {
         let mut p = SeccompPlatform::new().unwrap();
         let key = p.spawn().unwrap();
+        let (foreign, _) = spawn::foreign_mappings(p.host_pid(key).unwrap()).unwrap();
+        assert!(foreign.is_empty(), "{foreign:#x?}");
         let maps = maps(&p, key);
         let lines: Vec<_> = maps
             .lines()

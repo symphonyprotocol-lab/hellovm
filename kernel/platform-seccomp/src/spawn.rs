@@ -95,8 +95,8 @@
 //!
 //! //! # Bootstrap
 //!
-//! 1. K generates the stub executable into a sealed memfd and prepares the
-//!    filter, the `execveat` arguments and a shared page for error reports,
+//! 1. K generates the stub executable into a sealed memfd (once per host
+//!    process, see `profile`) and prepares the filter, the `execveat` arguments and a shared page for error reports,
 //!    all before forking. After `fork`, C only makes raw syscalls and memory
 //!    stores (K may be multi-threaded, so C must not allocate).
 //! 2. C sets `PR_SET_PDEATHSIG`, closes every fd except the stub memfd, calls
@@ -108,9 +108,12 @@
 //!    is exactly the call it prepared and lets it run. C now has a fresh
 //!    address space (stub, stack, vdso, vvar), an empty fd table (the memfd
 //!    is close-on-exec) and default signal handlers.
-//! 4. At the `execveat` exit stop, K reads `/proc/<pid>/maps` and unmaps
-//!    everything except the stub page by injection. The core then sees an
-//!    empty address space with one reserved range, the stub.
+//! 4. At the `execveat` exit stop, K unmaps everything except the stub
+//!    page by injection: one `munmap` below the stub and one from above it
+//!    to the top of the user range (U4: no `/proc/<pid>/maps`, which a
+//!    confined kernel process cannot read; see `profile`). The core then
+//!    sees an empty address space with the reserved ranges: the stub, and
+//!    the kernel process's own code ranges (see `profile`).
 //!
 //! # Residual host-syscall surface
 //!
@@ -182,7 +185,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -284,15 +287,11 @@ impl Drop for SharedPage {
 }
 
 /// A freshly spawned app process, stopped at the exit of its `execveat` of
-/// the stub.
+/// the stub. Everything but the stub is still mapped.
 pub struct Spawned {
     pub tracee: Tracee,
     /// The registers at that stop.
     pub regs: Regs,
-    /// Every mapping other than the stub, to be unmapped.
-    pub foreign: Vec<(u64, u64)>,
-    /// One past the highest of those mappings.
-    pub top: u64,
 }
 
 fn context(err: io::Error, what: &str) -> io::Error {
@@ -311,14 +310,12 @@ fn unexpected(stop: Stop, hs: &Handshake, what: &str) -> io::Error {
 
 /// Starts an app process running the stub under the filter, traced by the
 /// calling thread.
-pub fn spawn(arch: Arch) -> io::Result<Spawned> {
+pub fn spawn(arch: Arch, stub_fd: BorrowedFd<'_>) -> io::Result<Spawned> {
     let execveat_nr = arch
         .syscall_nr(Sysno::Execveat)
         .expect("execveat exists on every architecture");
 
     // Everything C needs is prepared before the fork.
-    let stub_fd: OwnedFd = sys::sealed_memfd(c"hellovm-stub", &stub::elf(arch))
-        .map_err(|err| context(err, "creating the stub memfd"))?;
     let empty = CString::default();
     let arg0 = CString::new("hellovm-stub").unwrap();
     let argv: [*const libc::c_char; 2] = [arg0.as_ptr(), ptr::null()];
@@ -412,19 +409,15 @@ pub fn spawn(arch: Arch) -> io::Result<Spawned> {
         )));
     }
 
-    // Step 4: find everything the host put into the new address space.
-    let (foreign, top) = foreign_mappings(pid)?;
-    Ok(Spawned {
-        tracee,
-        regs,
-        foreign,
-        top,
-    })
+    // Step 4 (unmapping the rest) is the caller's.
+    Ok(Spawned { tracee, regs })
 }
 
 /// The mappings of `pid` other than the stub, and one past the highest of
 /// them. The vsyscall page (x86_64) lies outside the user address range and
-/// is not a real mapping, so it is left out.
+/// is not a real mapping, so it is left out. For tests: a confined kernel
+/// process cannot read `/proc`.
+#[cfg(test)]
 pub fn foreign_mappings(pid: libc::pid_t) -> io::Result<(Vec<(u64, u64)>, u64)> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
         .map_err(|err| context(err, "reading the app's memory map"))?;

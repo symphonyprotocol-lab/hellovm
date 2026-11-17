@@ -22,6 +22,7 @@ compile_error!("the seccomp platform supports x86_64 and aarch64 hosts only");
 
 mod app;
 mod filter;
+mod profile;
 mod regs;
 mod spawn;
 mod stub;
@@ -30,3 +31,4 @@ mod tracer;
 mod wake;
 
 pub use app::{AppKiller, SeccompPlatform};
+pub use profile::{host_profile, HostProfile};
