@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use hellovm::warm::{self, Frame, Kind, Request, Status};
@@ -130,7 +130,13 @@ pub fn run(
         "template frozen after {:?}: {stored} bytes of memory in {areas} areas",
         started.elapsed()
     );
-    serve(&listener, &mut kernel, &mut app, landlock, (stored, areas as u32))?;
+    serve(
+        &listener,
+        &mut kernel,
+        &mut app,
+        landlock,
+        (stored, areas as u32),
+    )?;
     Ok(Ended::Status(hellovm_core::ExitStatus::Exited(0)))
 }
 
@@ -419,8 +425,7 @@ fn reap(client: &mut Client) {
     if client.gone {
         return;
     }
-    let reported = libc::WIFEXITED(status)
-        && matches!(libc::WEXITSTATUS(status), 0 | CLONE_FAILED);
+    let reported = libc::WIFEXITED(status) && matches!(libc::WEXITSTATUS(status), 0 | CLONE_FAILED);
     if !reported {
         let how = if libc::WIFSIGNALED(status) {
             format!("killed by signal {}", libc::WTERMSIG(status))
@@ -453,8 +458,7 @@ fn become_clone(
     };
     // SAFETY: plain prctl and getppid.
     unsafe {
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != template
-        {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != template {
             return fail("the template is gone".into());
         }
     }
@@ -522,7 +526,7 @@ fn become_clone(
 /// process's stdio as its console, waits for it and returns its exit code
 /// (125 when it could not be made, 124 after `--timeout`).
 pub fn client(
-    socket: &PathBuf,
+    socket: &Path,
     sandbox_id: Option<u64>,
     input: &[u8],
     ready: bool,
@@ -555,7 +559,12 @@ pub fn client(
             }
             status.code()
         }
-        Err(err) if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
             eprintln!("hellovm: clone timed out after {timeout:?}");
             crate::EXIT_TIMEOUT
         }

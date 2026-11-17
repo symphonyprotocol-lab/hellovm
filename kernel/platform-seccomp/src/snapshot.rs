@@ -81,6 +81,7 @@ pub struct TaskImage {
     pub regs: Regs,
     pub fp: FpRegs,
     /// The thread pointer where it is not in [`Regs`] (aarch64).
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub tls: u64,
 }
 
@@ -251,7 +252,10 @@ mod tests {
         load(file.as_fd(), 8 * page as u64, &mut back).unwrap();
         assert_eq!(back, data);
         seal(file.as_fd()).unwrap();
-        assert!(Window::map(file.as_fd(), 0, page).is_err(), "sealed against writes");
+        assert!(
+            Window::map(file.as_fd(), 0, page).is_err(),
+            "sealed against writes"
+        );
         // SAFETY: plain syscall.
         let ret = unsafe { libc::pwrite(file.as_raw_fd(), b"x".as_ptr().cast(), 1, 0) };
         assert!(ret < 0);

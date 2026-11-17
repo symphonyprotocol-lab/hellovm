@@ -56,8 +56,15 @@ fn python_clones_see_the_preloaded_state() {
     }
     let template = python_template();
     let (stored, areas) = ready(&template);
-    assert!(stored > 1 << 20 && areas > 10, "{stored} bytes, {areas} areas");
-    assert!(template.output().contains("template ready"), "{}", template.output());
+    assert!(
+        stored > 1 << 20 && areas > 10,
+        "{stored} bytes, {areas} areas"
+    );
+    assert!(
+        template.output().contains("template ready"),
+        "{}",
+        template.output()
+    );
 
     let one = template.run(
         b"print(preloaded, 'decimal' in sys.modules, bytes(data).decode(), sum(range(10)))",
@@ -65,8 +72,7 @@ fn python_clones_see_the_preloaded_state() {
     );
     assert_eq!(one.status, Status::Exited(0), "{one:?}");
     assert_eq!(
-        one.stdout,
-        "['decimal', 'hashlib', 'json'] True template 45\n",
+        one.stdout, "['decimal', 'hashlib', 'json'] True template 45\n",
         "{one:?}"
     );
     // Different code, its own stdin, and its own exit status.
@@ -103,15 +109,21 @@ print(bytes(data).decode(), os.path.exists("/tmp/written"), os.read(r, 100).deco
     // A changes memory, the writable layer and the template's pipe, then
     // waits while B and C look.
     let mut a = template
-        .spawn(Some(0xa), &[look.as_slice(), br#"
+        .spawn(
+            Some(0xa),
+            &[
+                look.as_slice(),
+                br#"
 data[:] = b"clone-a"
 open("/tmp/written", "w").write("a")
 os.write(w, b"from-a")
 print("a changed", flush=True)
 sys.stdin.readline()
 print(bytes(data).decode(), os.path.exists("/tmp/written"), os.read(r, 100).decode(), flush=True)
-"#]
-        .concat())
+"#,
+            ]
+            .concat(),
+        )
         .unwrap();
     assert_eq!(a.line(), "template False pipe-data\n");
     assert_eq!(a.line(), "a changed\n");
@@ -120,7 +132,11 @@ print(bytes(data).decode(), os.path.exists("/tmp/written"), os.read(r, 100).deco
     // A sees its own changes.
     a.send(b"\n");
     let a = a.finish();
-    assert_eq!(a.stdout.lines().last(), Some("clone-a True from-a"), "{a:?}");
+    assert_eq!(
+        a.stdout.lines().last(),
+        Some("clone-a True from-a"),
+        "{a:?}"
+    );
     assert_eq!(a.status, Status::Exited(0));
     // A clone made after A ended sees the template as it was.
     let c = template.run(look, b"");
@@ -128,9 +144,13 @@ print(bytes(data).decode(), os.path.exists("/tmp/written"), os.read(r, 100).deco
 
     // Sandbox ids: the requested one, else a random one, never shared.
     assert_eq!(a.started.sandbox_id, 0xa);
-    let ids: BTreeSet<u64> = [a.started.sandbox_id, b.started.sandbox_id, c.started.sandbox_id]
-        .into_iter()
-        .collect();
+    let ids: BTreeSet<u64> = [
+        a.started.sandbox_id,
+        b.started.sandbox_id,
+        c.started.sandbox_id,
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(ids.len(), 3);
     // Each clone is a kernel process of its own.
     let pids: BTreeSet<u32> = [a.started.pid, b.started.pid, c.started.pid]
@@ -157,7 +177,10 @@ fn killing_a_clone_leaves_the_others_running() {
     assert_eq!(d.kill(), "");
     let start = Instant::now();
     while Path::new(&format!("/proc/{d_kernel}")).exists() {
-        assert!(start.elapsed() < Duration::from_secs(10), "clone D still runs");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "clone D still runs"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     e.send(b"still-here\n");
@@ -207,7 +230,7 @@ fn fifty_clones_one_after_another_and_at_once() {
 /// One template in every state the README lists as clonable at once:
 /// threads parked in `futex` (an `Event`), in a pipe read and in a sleep;
 /// a thread running pure Python (interrupted for the freeze); a child
-/// process blocked in a pipe read and a zombie; a loopback listener with a
+/// process blocked in a pipe read, a zombie and a stopped one; a loopback listener with a
 /// queued connection and data; a pipe with data; an `alarm`.
 const STATES: &str = r#"
 import os, socket, sys, threading, time, signal
@@ -234,6 +257,12 @@ if child == 0:
 zombie = os.fork()
 if zombie == 0:
     os._exit(7)
+stopped = os.fork()
+if stopped == 0:
+    time.sleep(0.2)
+    os._exit(9)
+os.kill(stopped, signal.SIGSTOP)
+os.waitpid(stopped, os.WUNTRACED)
 srv = socket.socket()
 srv.bind(("127.0.0.1", 0))
 srv.listen()
@@ -256,6 +285,8 @@ t_sleep.join()
 os.write(cw, b"xyz")
 print("child", os.waitpid(child, 0)[1] >> 8)
 print("zombie", os.waitpid(zombie, 0)[1] >> 8)
+os.kill(stopped, signal.SIGCONT)
+print("stopped", os.waitpid(stopped, 0)[1] >> 8)
 a, _ = srv.accept()
 print("socket", a.recv(100))
 time.sleep(0.05)
@@ -272,14 +303,18 @@ fn a_template_in_every_clonable_state() {
     }
     let template = Template::start(&["/usr/bin/python3", "-c", STATES], &[]);
     ready(&template);
-    assert!(template.output().contains("states set"), "{}", template.output());
+    assert!(
+        template.output().contains("states set"),
+        "{}",
+        template.output()
+    );
     // Twice: the second clone finds the same frozen state.
     for _ in 0..2 {
         let run = template.run(CHECK_STATES, b"");
         assert_eq!(run.status, Status::Exited(0), "{run:?}");
         assert_eq!(
             run.stdout,
-            "child 43\nzombie 7\nsocket b'queued'\nspinning True\n\
+            "child 43\nzombie 7\nstopped 9\nsocket b'queued'\nspinning True\n\
              woke ['alarm', 'event', 'sleep'] [b'to-thread']\n",
             "{run:?}"
         );
@@ -292,7 +327,8 @@ fn a_busybox_shell_template() {
         return;
     };
     // A shell with a pipeline and a background job waiting at the freeze.
-    let script = "sleep 100 & read x < /dev/hellovm-clone; echo \"clone says $x\"; kill $!; wait $!";
+    let script =
+        "sleep 100 & read x < /dev/hellovm-clone; echo \"clone says $x\"; kill $!; wait $!";
     let template = Template::start(&[&busybox, "sh", "-c", script], &[]);
     ready(&template);
     for word in ["one", "two"] {
@@ -433,9 +469,16 @@ fn confinement(pid: u32) -> Vec<String> {
     let mut fields: Vec<String> = status
         .lines()
         .filter(|l| {
-            ["NoNewPrivs", "Seccomp", "Seccomp_filters", "CapEff", "CapPrm", "CapBnd"]
-                .iter()
-                .any(|k| l.starts_with(&format!("{k}:")))
+            [
+                "NoNewPrivs",
+                "Seccomp",
+                "Seccomp_filters",
+                "CapEff",
+                "CapPrm",
+                "CapBnd",
+            ]
+            .iter()
+            .any(|k| l.starts_with(&format!("{k}:")))
         })
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect();
@@ -443,9 +486,14 @@ fn confinement(pid: u32) -> Vec<String> {
         limits
             .lines()
             .filter(|l| {
-                ["Max core file size", "Max open files", "Max locked memory", "Max msgqueue size"]
-                    .iter()
-                    .any(|k| l.starts_with(k))
+                [
+                    "Max core file size",
+                    "Max open files",
+                    "Max locked memory",
+                    "Max msgqueue size",
+                ]
+                .iter()
+                .any(|k| l.starts_with(k))
             })
             .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")),
     );
@@ -477,7 +525,10 @@ fn a_clone_is_as_confined_as_its_template_and_cannot_reach_a_sibling() {
     let template = python_template();
     ready(&template);
     let mut sibling = template
-        .spawn(None, b"print('up', flush=True)\nprint('sibling', sys.stdin.readline().strip())")
+        .spawn(
+            None,
+            b"print('up', flush=True)\nprint('sibling', sys.stdin.readline().strip())",
+        )
         .unwrap();
     assert_eq!(sibling.line(), "up\n");
     // Same layers as the template's kernel process: no_new_privs, the same

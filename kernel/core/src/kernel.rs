@@ -582,10 +582,12 @@ impl<H: Host> Kernel<H> {
                     .into(),
             );
         }
-        if !self.st.threads.values().any(|t| {
-            t.parked()
-                .is_some_and(|p| p.kind == WaitKind::ClonePoint)
-        }) {
+        if !self
+            .st
+            .threads
+            .values()
+            .any(|t| t.parked().is_some_and(|p| p.kind == WaitKind::ClonePoint))
+        {
             return Err("no thread is waiting at the clone point any more".into());
         }
         Ok(spaces.into_iter().map(|(_, t, s)| (t, s)).collect())
@@ -657,9 +659,7 @@ impl<H: Host> Kernel<H> {
             return Err(KernelError::NotClonable("not a frozen template".into()));
         };
         let keys = platform.thaw()?;
-        if keys.len() != frozen.len()
-            || keys.iter().zip(&frozen).any(|(k, t)| k.len() != t.len())
-        {
+        if keys.len() != frozen.len() || keys.iter().zip(&frozen).any(|(k, t)| k.len() != t.len()) {
             return Err(KernelError::Platform(PlatformError::Violation(
                 "the platform thawed other tasks than it froze".into(),
             )));

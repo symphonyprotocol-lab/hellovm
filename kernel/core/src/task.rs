@@ -175,6 +175,8 @@ impl Process {
 
 /// How a parked syscall is restarted when a signal handler interrupts it
 /// (Linux's `-ERESTARTSYS` and `-ERESTARTNOHAND`).
+// `IfSaRestart` names the flag it depends on (`SA_RESTART`).
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Restart {
     /// Restarted after a handler with `SA_RESTART`, else `EINTR`.

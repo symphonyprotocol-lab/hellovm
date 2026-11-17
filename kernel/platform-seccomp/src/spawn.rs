@@ -350,8 +350,7 @@ pub fn spawn(
             child_bootstrap(
                 hs,
                 parent,
-                stub_fd.as_raw_fd(),
-                keep.map_or(-1, |fd| fd.as_raw_fd()),
+                [stub_fd.as_raw_fd(), keep.map_or(-1, |fd| fd.as_raw_fd())],
                 &prog,
                 empty.as_ptr(),
                 argv.as_ptr(),
@@ -464,8 +463,8 @@ pub fn foreign_mappings(pid: libc::pid_t) -> io::Result<(Vec<(u64, u64)>, u64)> 
 unsafe fn child_bootstrap(
     hs: &Handshake,
     parent: libc::pid_t,
-    stub_fd: libc::c_int,
-    keep_fd: libc::c_int,
+    // The stub memfd, and an fd to keep open or -1.
+    [stub_fd, keep_fd]: [libc::c_int; 2],
     prog: *const libc::sock_fprog,
     empty: *const libc::c_char,
     argv: *const *const libc::c_char,

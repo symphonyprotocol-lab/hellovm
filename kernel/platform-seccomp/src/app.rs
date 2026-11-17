@@ -545,7 +545,9 @@ impl SeccompPlatform {
         let mut keys: Vec<TaskKey> = spaces.iter().flat_map(|s| s.tasks.clone()).collect();
         keys.sort_unstable();
         keys.dedup();
-        if keys.len() != named || named != self.tasks.len() || spaces.iter().any(|s| s.tasks.is_empty())
+        if keys.len() != named
+            || named != self.tasks.len()
+            || spaces.iter().any(|s| s.tasks.is_empty())
         {
             return Err(PlatformError::Unsupported(
                 "a freeze must name every task once and no empty address space",
@@ -560,7 +562,7 @@ impl SeccompPlatform {
             let first = space.tasks[0];
             let mut image = SpaceImage::default();
             for area in &space.areas {
-                let len = area.end.checked_sub(area.start).unwrap_or(0);
+                let len = area.end.saturating_sub(area.start);
                 self.check_range(area.start, len)?;
                 let end = offset
                     .checked_add(len)
@@ -579,7 +581,8 @@ impl SeccompPlatform {
                 while done < len {
                     let n = (len - done).min(snapshot::CHUNK as u64) as usize;
                     vm_io(pid, area.start + done, buf.as_mut_ptr(), n, false)?;
-                    stored += snapshot::store(file.as_fd(), offset + done, &buf[..n], page as usize)?;
+                    stored +=
+                        snapshot::store(file.as_fd(), offset + done, &buf[..n], page as usize)?;
                     done += n as u64;
                 }
                 image.areas.push(AreaImage {
@@ -682,7 +685,12 @@ impl SeccompPlatform {
                 }
             }
         }
-        self.checked_inject(first, "close of the snapshot", self.nr_close, [fd, 0, 0, 0, 0, 0])?;
+        self.checked_inject(
+            first,
+            "close of the snapshot",
+            self.nr_close,
+            [fd, 0, 0, 0, 0, 0],
+        )?;
         let mut keys = vec![first];
         for _ in 1..space.tasks.len() {
             keys.push(self.clone_task(first, true)?);
