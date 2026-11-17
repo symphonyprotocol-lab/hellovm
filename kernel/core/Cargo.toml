@@ -8,4 +8,6 @@ license-file.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The hostname rule shared with the egress proxy (no other code).
+hellovm-egress-wire.workspace = true
 log.workspace = true

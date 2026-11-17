@@ -25,6 +25,7 @@ pub mod abi;
 pub mod arch;
 pub mod elf;
 pub mod errno;
+mod eventfd;
 pub mod fd;
 pub mod host;
 mod kernel;
@@ -41,4 +42,6 @@ mod tty;
 pub mod vfs;
 
 pub use arch::{Arch, Sysno};
-pub use kernel::{ConsoleMode, ExitStatus, Kernel, KernelError, Outcome, SyscallRecord};
+pub use kernel::{
+    ConsoleMode, ExitStatus, Kernel, KernelError, Outcome, SyscallRecord, RESOLV_CONF,
+};

@@ -7,7 +7,18 @@ rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only: `set_splice_endpoint`, which sends every outbound flow to a
+# loopback TCP address with no egress policy. Off by default.
+insecure-test-hooks = []
+
 [dependencies]
 hellovm-core.workspace = true
+# Only the flow header: the kernel process does not link the proxy.
+hellovm-egress-wire.workspace = true
 libc.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+hellovm-host = { path = ".", features = ["insecure-test-hooks"] }
+hellovm-egress = { workspace = true, features = ["insecure-test-hooks"] }

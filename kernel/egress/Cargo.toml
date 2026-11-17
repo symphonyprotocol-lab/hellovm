@@ -1,0 +1,26 @@
+[package]
+name = "hellovm-egress"
+description = "hellovm egress proxy: default-deny outbound flows with a domain allowlist"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[features]
+# Test-only knobs: a static name table that may point allowed names at
+# loopback servers. Off by default; the default binary has no such flag.
+insecure-test-hooks = []
+
+[[bin]]
+name = "hellovm-egress"
+path = "src/main.rs"
+
+[dependencies]
+hellovm-egress-wire.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+# The integration tests run the proxy against loopback servers, which only
+# the test hooks allow.
+hellovm-egress = { path = ".", features = ["insecure-test-hooks"] }

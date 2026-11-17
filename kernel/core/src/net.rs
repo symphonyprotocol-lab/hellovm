@@ -1,4 +1,4 @@
-//! Emulated IPv4 sockets (spec 002a, decision D1).
+//! Emulated IPv4 sockets and virtual DNS (spec 002, decision D1).
 //!
 //! There is no packet-level TCP/IP stack and no smoltcp. The guest sees a
 //! POSIX socket API and one virtual NIC; the kernel moves bytes itself.
@@ -8,10 +8,10 @@
 //! | Role | Address | Behaviour |
 //! |---|---|---|
 //! | Guest NIC | `192.0.2.2/24` (TEST-NET-1) | The guest's own address. In-kernel. |
-//! | Gateway / virtual DNS | `192.0.2.1` port 53 | UDP and TCP DNS. Without egress, every query is NXDOMAIN. Any other port is `ECONNREFUSED`. |
+//! | Gateway / virtual DNS | `192.0.2.1` port 53 | UDP and TCP DNS ([`Net::dns_reply`]). Any other port is `ECONNREFUSED`. |
 //! | Rest of the NIC net | other `192.0.2.0/24` | `EHOSTUNREACH` |
 //! | Loopback | `127.0.0.0/8`, and `0.0.0.0` as a wildcard | In-kernel. Connecting to `0.0.0.0` uses `127.0.0.1`. |
-//! | Fake-IP pool | `198.51.100.0/24` (TEST-NET-2) | The only destinations that may be spliced to a [`crate::host::Host`] byte stream, and only after [`Net::issue_fake_ip`] handed that address out. |
+//! | Fake-IP pool | `198.51.100.0/24` (TEST-NET-2) | The only destinations that may leave the sandbox (as a [`crate::host::Host`] byte stream to the egress proxy), and only after virtual DNS bound that address to a name. |
 //!
 //! Anything else (`169.254.169.254`, RFC1918, off-list public addresses,
 //! unissued fake IPs, outbound UDP that is not virtual DNS) is
@@ -35,7 +35,10 @@
 //! immediately. That is what lets a server still reply after it has read
 //! the client's FIN.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
+
+use hellovm_egress_wire::valid_hostname;
 
 use crate::errno::{
     Errno, EADDRINUSE, EADDRNOTAVAIL, ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ENOMEM,
@@ -286,17 +289,44 @@ impl Arena {
     }
 }
 
-/// The sandbox's sockets, issued fake IPs, and the ephemeral-port cursor.
+/// Names virtual DNS can have bound at once in one sandbox: the fake-IP
+/// pool, `198.51.100.1`–`198.51.100.254`. When all are bound, a new name
+/// takes over the address of the name that has gone unused longest, if that
+/// is at least [`NAME_IDLE`]; otherwise it is answered with `SERVFAIL`.
+pub const MAX_NAMES: usize = 254;
+/// How long a name must have gone unused (no `A` query for it, no connect
+/// to its address) before its fake IP may be bound to another name: twice
+/// the TTL of the answers, so no resolver cache still holds it. A guest that
+/// keeps an address longer and connects to it after it was rebound opens a
+/// flow named for the new owner, which the egress proxy then refuses
+/// because the TLS SNI or HTTP `Host` names the old one. Connections that
+/// are already open are not affected.
+pub const NAME_IDLE: Duration = Duration::from_secs(2 * DNS_TTL as u64);
+/// TTL of a virtual DNS `A` answer, seconds.
+pub const DNS_TTL: u32 = 300;
+
+/// The sandbox's sockets, issued fake IPs and the names bound to them, and
+/// the ephemeral-port cursor.
 #[derive(Debug)]
 pub struct Net {
     sockets: Arena,
-    /// Fake IPs handed out by [`Net::issue_fake_ip`], host order.
+    /// Fake IPs handed out, host order: by virtual DNS for a name, or by
+    /// [`Net::issue_fake_ip`] without one.
     issued: BTreeSet<u32>,
+    /// Name to fake IP, for stable answers.
+    names: BTreeMap<String, u32>,
+    /// Fake IP to name: what a `connect` to it is a flow to.
+    by_ip: BTreeMap<u32, String>,
+    /// When each named fake IP was last asked for or connected to
+    /// (monotonic clock).
+    last_used: BTreeMap<u32, Duration>,
     /// Next host octet in `198.51.100.0/24` (1..=254).
     next_fake: u32,
     ephemeral: u16,
     /// `(local ip, port, protocol)` of sockets with `holds_port`.
     held: BTreeSet<(u32, u16, u8)>,
+    /// Names this sandbox to the egress proxy.
+    pub(crate) sandbox_id: u64,
 }
 
 impl Default for Net {
@@ -304,9 +334,13 @@ impl Default for Net {
         Net {
             sockets: Arena::default(),
             issued: BTreeSet::new(),
+            names: BTreeMap::new(),
+            by_ip: BTreeMap::new(),
+            last_used: BTreeMap::new(),
             next_fake: 1,
             ephemeral: EPHEMERAL_LO,
             held: BTreeSet::new(),
+            sandbox_id: 0,
         }
     }
 }
@@ -351,11 +385,16 @@ impl Net {
         self.sockets.insert(Socket::new(domain, proto))
     }
 
-    /// Hands out the next address from `198.51.100.1`–`198.51.100.254` and
-    /// records it as issued. Never returns a NIC address, a loopback
-    /// address, `0.0.0.0`, or anything in `198.18.0.0/15`. `None` when the
-    /// pool is exhausted.
+    /// Hands out the next address from `198.51.100.1`–`198.51.100.254`
+    /// without a name (a test hook: with an egress proxy, a flow to it is
+    /// refused because it names no host). Never returns a NIC address, a
+    /// loopback address, `0.0.0.0`, or anything in `198.18.0.0/15`. `None`
+    /// when the pool is exhausted.
     pub fn issue_fake_ip(&mut self) -> Option<[u8; 4]> {
+        self.next_ip().map(u32::to_be_bytes)
+    }
+
+    fn next_ip(&mut self) -> Option<u32> {
         if self.next_fake > 254 {
             return None;
         }
@@ -363,7 +402,52 @@ impl Net {
         self.next_fake += 1;
         debug_assert!(is_issued_shape(ip));
         self.issued.insert(ip);
-        Some(ip.to_be_bytes())
+        Some(ip)
+    }
+
+    /// The fake IP bound to `name` (a valid hostname) at time `now`,
+    /// binding one on first use: the next free address, or the one of the
+    /// name unused longest if that is at least [`NAME_IDLE`]. `None` when
+    /// neither exists.
+    pub(crate) fn bind_name(&mut self, name: &str, now: Duration) -> Option<u32> {
+        if let Some(&ip) = self.names.get(name) {
+            self.last_used.insert(ip, now);
+            return Some(ip);
+        }
+        let ip = match self.next_ip() {
+            Some(ip) => ip,
+            None => self.recycle_name(now)?,
+        };
+        self.names.insert(name.to_string(), ip);
+        self.by_ip.insert(ip, name.to_string());
+        self.last_used.insert(ip, now);
+        Some(ip)
+    }
+
+    /// Unbinds the name unused longest, if for at least [`NAME_IDLE`], and
+    /// returns its fake IP (which stays issued).
+    fn recycle_name(&mut self, now: Duration) -> Option<u32> {
+        let (&ip, &last) = self.last_used.iter().min_by_key(|(_, &last)| last)?;
+        if now.saturating_sub(last) < NAME_IDLE {
+            return None;
+        }
+        self.last_used.remove(&ip);
+        if let Some(old) = self.by_ip.remove(&ip) {
+            self.names.remove(&old);
+        }
+        Some(ip)
+    }
+
+    /// Records a connect to `ip` at `now`, which keeps its name bound.
+    pub(crate) fn touch_name(&mut self, ip: u32, now: Duration) {
+        if let Some(last) = self.last_used.get_mut(&ip) {
+            *last = now;
+        }
+    }
+
+    /// The name virtual DNS bound to `ip`, if any.
+    pub(crate) fn name_of(&self, ip: u32) -> Option<&str> {
+        self.by_ip.get(&ip).map(String::as_str)
     }
 
     pub(crate) fn is_issued(&self, ip: u32) -> bool {
@@ -697,67 +781,152 @@ fn is_issued_shape(ip: u32) -> bool {
         && !in_prefix(ip, 0xC612_0000, 15)
 }
 
-/// Builds an NXDOMAIN response for a query. Returns `None` when `query` is
-/// too short to be a DNS header. 002a has no egress, so every qtype,
-/// including AAAA, is NXDOMAIN; 002b answers AAAA with an empty NOERROR
-/// before this and only calls it for a deny.
-pub(crate) fn dns_nxdomain(query: &[u8]) -> Option<Vec<u8>> {
-    if query.len() < 12 {
-        return None;
-    }
-    let qend = dns_question_end(query).unwrap_or(query.len());
-    let mut resp = query[..qend.min(query.len())].to_vec();
-    if resp.len() < 12 {
-        return None;
-    }
-    let flags = u16::from_be_bytes([resp[2], resp[3]]);
-    let opcode = flags & 0x7800;
-    let rd = flags & 0x0100;
-    // QR, AA, copied opcode and RD, RCODE = NXDOMAIN.
-    let out = 0x8000 | 0x0400 | opcode | rd | 0x0003;
-    resp[2] = (out >> 8) as u8;
-    resp[3] = out as u8;
-    resp[6] = 0;
-    resp[7] = 0;
-    resp[8] = 0;
-    resp[9] = 0;
-    resp[10] = 0;
-    resp[11] = 0;
-    Some(resp)
+const RCODE_FORMERR: u16 = 1;
+const RCODE_SERVFAIL: u16 = 2;
+const RCODE_NXDOMAIN: u16 = 3;
+const RCODE_NOTIMP: u16 = 4;
+const RCODE_REFUSED: u16 = 5;
+const QTYPE_A: u16 = 1;
+const QCLASS_IN: u16 = 1;
+
+/// The one question of a query.
+struct Question {
+    /// Lowercased, if it is a hostname the egress path accepts.
+    name: Option<String>,
+    qtype: u16,
+    qclass: u16,
+    /// Offset just past the question.
+    end: usize,
 }
 
-/// Byte offset just past the first question, or `None` if it is truncated.
-fn dns_question_end(msg: &[u8]) -> Option<usize> {
-    if msg.len() < 12 {
-        return None;
-    }
-    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
-    let mut i = 12;
-    for _ in 0..qd.max(1) {
-        loop {
-            if i >= msg.len() {
-                return None;
-            }
-            let len = msg[i] as usize;
-            i += 1;
-            if len == 0 {
-                break;
-            }
-            if len > 63 || i + len > msg.len() {
-                return None;
-            }
-            i += len;
-        }
-        // qtype + qclass
-        if i + 4 > msg.len() {
+impl Net {
+    /// Virtual DNS: the reply to one query message, or `None` when `query`
+    /// is not a query worth answering (shorter than a header, or a
+    /// response).
+    ///
+    /// With `outbound` false (no egress proxy), every well-formed `IN`
+    /// query is NXDOMAIN. With it:
+    ///
+    /// * `A` for a hostname binds (or reuses) a fake IP and answers it,
+    ///   TTL [`DNS_TTL`]; `SERVFAIL` when [`MAX_NAMES`] are bound;
+    /// * any other type for a hostname, `AAAA` included, is an empty
+    ///   NOERROR answer (the name exists, without such records);
+    /// * a name that is not a hostname (one label, `_` or other bytes
+    ///   outside letters, digits and `-`, an all-digit last label) is
+    ///   NXDOMAIN.
+    ///
+    /// Always: a class other than `IN` is REFUSED, an opcode other than
+    /// QUERY is NOTIMP, and anything but exactly one parsable question is
+    /// FORMERR. The reply echoes the question as sent (so case
+    /// randomization survives) and carries no additional records.
+    pub(crate) fn dns_reply(
+        &mut self,
+        query: &[u8],
+        outbound: bool,
+        now: Duration,
+    ) -> Option<Vec<u8>> {
+        if query.len() < 12 {
             return None;
         }
-        i += 4;
-        if qd == 0 {
+        let flags = u16::from_be_bytes([query[2], query[3]]);
+        if flags & 0x8000 != 0 {
+            return None;
+        }
+        let opcode = flags & 0x7800;
+        let qd = u16::from_be_bytes([query[4], query[5]]);
+        let question = if qd == 1 && opcode == 0 {
+            parse_question(query)
+        } else {
+            None
+        };
+        let mut answer = None;
+        let rcode = match &question {
+            _ if opcode != 0 => RCODE_NOTIMP,
+            None => RCODE_FORMERR,
+            Some(q) if q.qclass != QCLASS_IN => RCODE_REFUSED,
+            Some(_) if !outbound => RCODE_NXDOMAIN,
+            Some(Question { name: None, .. }) => RCODE_NXDOMAIN,
+            Some(Question {
+                name: Some(name),
+                qtype,
+                ..
+            }) => {
+                if *qtype == QTYPE_A {
+                    match self.bind_name(name, now) {
+                        Some(ip) => {
+                            answer = Some(ip);
+                            0
+                        }
+                        None => RCODE_SERVFAIL,
+                    }
+                } else {
+                    0
+                }
+            }
+        };
+        let mut resp = Vec::with_capacity(64);
+        resp.extend_from_slice(&query[..2]);
+        // QR, AA, RA, the query's opcode and RD.
+        let out = 0x8000 | opcode | 0x0400 | (flags & 0x0100) | 0x0080 | rcode;
+        resp.extend_from_slice(&out.to_be_bytes());
+        let qdcount = u16::from(question.is_some());
+        resp.extend_from_slice(&qdcount.to_be_bytes());
+        resp.extend_from_slice(&u16::from(answer.is_some()).to_be_bytes());
+        resp.extend_from_slice(&[0, 0, 0, 0]);
+        if let Some(q) = &question {
+            resp.extend_from_slice(&query[12..q.end]);
+        }
+        if let Some(ip) = answer {
+            // Name: a pointer to the question's name at offset 12.
+            resp.extend_from_slice(&[0xC0, 12]);
+            resp.extend_from_slice(&QTYPE_A.to_be_bytes());
+            resp.extend_from_slice(&QCLASS_IN.to_be_bytes());
+            resp.extend_from_slice(&DNS_TTL.to_be_bytes());
+            resp.extend_from_slice(&4u16.to_be_bytes());
+            resp.extend_from_slice(&ip.to_be_bytes());
+        }
+        Some(resp)
+    }
+}
+
+/// Parses the question at offset 12. Compression pointers are not valid in
+/// a query's only question.
+fn parse_question(msg: &[u8]) -> Option<Question> {
+    let mut i = 12;
+    let mut name = Vec::new();
+    loop {
+        let len = *msg.get(i)? as usize;
+        i += 1;
+        if len == 0 {
             break;
         }
+        if len > 63 {
+            return None;
+        }
+        let label = msg.get(i..i + len)?;
+        i += len;
+        if !name.is_empty() {
+            name.push(b'.');
+        }
+        name.extend(label.iter().map(u8::to_ascii_lowercase));
+        if name.len() > 255 {
+            return None;
+        }
     }
-    Some(i)
+    let tail = msg.get(i..i + 4)?;
+    let qtype = u16::from_be_bytes([tail[0], tail[1]]);
+    let qclass = u16::from_be_bytes([tail[2], tail[3]]);
+    let name = if valid_hostname(&name) {
+        String::from_utf8(name).ok()
+    } else {
+        None
+    };
+    Some(Question {
+        name,
+        qtype,
+        qclass,
+        end: i + 4,
+    })
 }
 
 #[cfg(test)]
@@ -846,18 +1015,159 @@ mod tests {
         );
     }
 
+    /// A reply at time zero.
+    fn reply(net: &mut Net, query: &[u8], outbound: bool) -> Option<Vec<u8>> {
+        net.dns_reply(query, outbound, Duration::ZERO)
+    }
+
     #[test]
-    fn nxdomain_keeps_the_question_and_sets_rcode() {
-        // Header + name "hi" + A/IN.
-        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-        q.extend_from_slice(b"\x02hi\x00\x00\x01\x00\x01");
-        let resp = dns_nxdomain(&q).unwrap();
+    fn a_full_name_table_recycles_only_idle_names() {
+        let mut net = Net::default();
+        let t0 = Duration::from_secs(100);
+        let answer = |net: &mut Net, name: &str, now| {
+            let resp = net.dns_reply(&query(1, name, 1, 1), true, now).unwrap();
+            (rcode(&resp) == 0)
+                .then(|| u32::from_be_bytes(resp[resp.len() - 4..].try_into().unwrap()))
+        };
+        let mut ips = Vec::new();
+        for i in 0..MAX_NAMES {
+            ips.push(answer(&mut net, &format!("h{i}.example"), t0).unwrap());
+        }
+        // Nothing is idle long enough yet.
+        assert_eq!(answer(&mut net, "new.example", t0 + NAME_IDLE / 2), None);
+        // h0 is asked for again and h1 is connected to: both stay.
+        let later = t0 + NAME_IDLE;
+        assert_eq!(answer(&mut net, "h0.example", later), Some(ips[0]));
+        net.touch_name(ips[1], later);
+        // The longest-idle name, h2, gives up its address.
+        assert_eq!(answer(&mut net, "new.example", later), Some(ips[2]));
+        assert_eq!(net.name_of(ips[2]), Some("new.example"));
+        assert_eq!(net.name_of(ips[0]), Some("h0.example"));
+        assert_eq!(net.name_of(ips[1]), Some("h1.example"));
+        // h2 comes back on another idle address, not its old one.
+        let again = answer(&mut net, "h2.example", later).unwrap();
+        assert_ne!(again, ips[2]);
+        assert_eq!(net.names.len(), MAX_NAMES);
+    }
+
+    fn query(id: u16, name: &str, qtype: u16, qclass: u16) -> Vec<u8> {
+        let mut q = id.to_be_bytes().to_vec();
+        q.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        for label in name.split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&qclass.to_be_bytes());
+        q
+    }
+
+    fn rcode(resp: &[u8]) -> u16 {
+        u16::from_be_bytes([resp[2], resp[3]]) & 0x000F
+    }
+
+    fn ancount(resp: &[u8]) -> u16 {
+        u16::from_be_bytes([resp[6], resp[7]])
+    }
+
+    #[test]
+    fn without_egress_every_name_is_nxdomain() {
+        let mut net = Net::default();
+        let q = query(0x1234, "hi.example", 1, 1);
+        let resp = reply(&mut net, &q, false).unwrap();
         assert_eq!(&resp[..2], &q[..2]);
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
         assert_eq!(flags & 0x8000, 0x8000, "QR");
-        assert_eq!(flags & 0x000F, 3, "NXDOMAIN");
+        assert_eq!(rcode(&resp), 3, "NXDOMAIN");
+        assert_eq!(&resp[4..6], &[0, 1]);
         assert_eq!(&resp[6..12], &[0; 6]);
-        assert!(resp.windows(2).any(|w| w == b"hi"));
-        assert!(dns_nxdomain(&[0; 4]).is_none());
+        assert_eq!(&resp[12..], &q[12..]);
+        assert!(reply(&mut net, &[0; 4], false).is_none());
+        assert!(net.issued.is_empty());
+    }
+
+    #[test]
+    fn a_queries_bind_stable_fake_ips() {
+        let mut net = Net::default();
+        let resp = reply(&mut net, &query(7, "PyPI.org", 1, 1), true).unwrap();
+        assert_eq!(rcode(&resp), 0);
+        assert_eq!(ancount(&resp), 1);
+        // The question is echoed as sent.
+        assert!(resp.windows(4).any(|w| w == b"PyPI"));
+        let ip = u32::from_be_bytes(resp[resp.len() - 4..].try_into().unwrap());
+        assert!(is_issued_shape(ip));
+        assert_eq!(net.name_of(ip), Some("pypi.org"));
+        assert_eq!(net.classify(ip, 443, true), Class::Splice(ip));
+        let again = reply(&mut net, &query(8, "pypi.org", 1, 1), true).unwrap();
+        assert_eq!(&again[again.len() - 4..], &ip.to_be_bytes());
+        let other = reply(&mut net, &query(9, "files.pythonhosted.org", 1, 1), true).unwrap();
+        let ip2 = u32::from_be_bytes(other[other.len() - 4..].try_into().unwrap());
+        assert_ne!(ip, ip2);
+        assert_eq!(net.name_of(ip2), Some("files.pythonhosted.org"));
+        // TTL and the pointer to the question name.
+        let rr = &resp[resp.len() - 16..];
+        assert_eq!(&rr[..2], &[0xC0, 12]);
+        assert_eq!(u32::from_be_bytes(rr[6..10].try_into().unwrap()), DNS_TTL);
+    }
+
+    #[test]
+    fn other_types_and_bad_names() {
+        let mut net = Net::default();
+        for qtype in [28, 65, 15, 16, 255] {
+            let resp = reply(&mut net, &query(1, "pypi.org", qtype, 1), true).unwrap();
+            assert_eq!((rcode(&resp), ancount(&resp)), (0, 0), "type {qtype}");
+        }
+        assert!(net.names.is_empty(), "only A binds a name");
+        for name in ["localhost", "a_b.example", "1.2.3.4", "-a.example"] {
+            let resp = reply(&mut net, &query(1, name, 1, 1), true).unwrap();
+            assert_eq!(rcode(&resp), 3, "{name}");
+        }
+        let resp = reply(&mut net, &query(1, "pypi.org", 1, 3), true).unwrap();
+        assert_eq!(rcode(&resp), 5, "CHAOS is REFUSED");
+        let mut iquery = query(1, "pypi.org", 1, 1);
+        iquery[2] |= 0x08;
+        assert_eq!(rcode(&reply(&mut net, &iquery, true).unwrap()), 4);
+        let mut two = query(1, "pypi.org", 1, 1);
+        two[5] = 2;
+        assert_eq!(rcode(&reply(&mut net, &two, true).unwrap()), 1);
+        let mut pointer = query(1, "pypi.org", 1, 1);
+        pointer[12] = 0xC0;
+        assert_eq!(rcode(&reply(&mut net, &pointer, true).unwrap()), 1);
+        let mut response = query(1, "pypi.org", 1, 1);
+        response[2] |= 0x80;
+        assert!(reply(&mut net, &response, true).is_none());
+        assert!(net.names.is_empty());
+    }
+
+    #[test]
+    fn the_name_table_is_bounded() {
+        let mut net = Net::default();
+        for i in 0..MAX_NAMES {
+            let resp = reply(&mut net, &query(1, &format!("h{i}.example"), 1, 1), true).unwrap();
+            assert_eq!(rcode(&resp), 0);
+        }
+        let resp = reply(&mut net, &query(1, "one-more.example", 1, 1), true).unwrap();
+        assert_eq!(rcode(&resp), 2, "SERVFAIL when full");
+        // Names already bound still answer.
+        let resp = reply(&mut net, &query(1, "h3.example", 1, 1), true).unwrap();
+        assert_eq!(rcode(&resp), 0);
+        assert_eq!(net.issue_fake_ip(), None);
+    }
+
+    #[test]
+    fn dns_garbage_never_panics() {
+        let mut net = Net::default();
+        let q = query(1, "pypi.org", 1, 1);
+        for cut in 0..q.len() {
+            let _ = reply(&mut net, &q[..cut], true);
+        }
+        for i in 0..q.len() {
+            for v in [0u8, 0x3f, 0x40, 0xc0, 0xff] {
+                let mut bad = q.clone();
+                bad[i] = v;
+                let _ = reply(&mut net, &bad, true);
+            }
+        }
     }
 }

@@ -38,8 +38,8 @@ use crate::errno::{
 use crate::fd::{Access, FileObject, OpenFile};
 use crate::host::{Host, OutboundFlow};
 use crate::net::{
-    dns_nxdomain, source_ip, Class, Domain, Link, Net, Phase, Proto, SockId, DGRAM_BYTES_CAP,
-    DGRAM_CAP, DGRAM_MAX, DNS_IN_CAP, DNS_PORT, GATEWAY_IP, STREAM_CAP,
+    source_ip, Class, Domain, Link, Net, Phase, Proto, SockId, DGRAM_BYTES_CAP, DGRAM_CAP,
+    DGRAM_MAX, DNS_IN_CAP, DNS_PORT, GATEWAY_IP, STREAM_CAP,
 };
 use crate::platform::{GuestAddr, Platform};
 use crate::signal::{self, SigInfo};
@@ -91,6 +91,12 @@ const SIOCGIFADDR: u64 = 0x8915;
 /// `sizeof(struct ifreq)` on 64-bit glibc.
 const IFREQ_SIZE: usize = 40;
 const IFNAMSIZ: usize = 16;
+
+/// `sizeof(struct msghdr)` and `sizeof(struct mmsghdr)` on 64-bit ABIs.
+const MSGHDR_SIZE: u64 = 56;
+const MMSGHDR_SIZE: u64 = 64;
+/// Most messages one `sendmmsg` handles (Linux `UIO_MAXIOV`).
+const UIO_MAXIOV: u64 = 1024;
 
 /// One `recv`/`recvfrom`/`recvmsg` payload and, for UDP, its source.
 type Recv = SysResult<(Vec<u8>, Option<(u32, u16)>)>;
@@ -602,6 +608,44 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         self.socket_send(id, &data, flags, dest).map(|n| n as u64)
     }
 
+    /// `sendmmsg`: `sendmsg` for each of up to [`UIO_MAXIOV`] `mmsghdr`s,
+    /// storing each message's length in its `msg_len`. Stops at the first
+    /// failure: that error if nothing was sent, else the count so far, as
+    /// Linux does. glibc's resolver sends its A and AAAA queries this way.
+    pub fn sys_sendmmsg(
+        &mut self,
+        fd: i64,
+        vec: GuestAddr,
+        vlen: u64,
+        flags: u64,
+    ) -> SysResult<u64> {
+        self.sock_id(fd)?;
+        let vlen = vlen.min(UIO_MAXIOV);
+        let mut sent = 0u64;
+        while sent < vlen {
+            let hdr = vec + sent * MMSGHDR_SIZE;
+            // Only the first message may block (and park the call, which
+            // then restarts from scratch). Later ones must not park once
+            // something was sent: they go out with `MSG_DONTWAIT`.
+            let flags = if sent == 0 {
+                flags
+            } else {
+                flags | MSG_DONTWAIT
+            };
+            match self.sys_sendmsg(fd, hdr, flags) {
+                Ok(n) => {
+                    if let Err(err) = self.write_u32(hdr + MSGHDR_SIZE, n as u32) {
+                        return if sent == 0 { Err(err) } else { Ok(sent) };
+                    }
+                    sent += 1;
+                }
+                Err(err) if sent == 0 => return Err(err),
+                Err(_) => return Ok(sent),
+            }
+        }
+        Ok(sent)
+    }
+
     pub fn sys_recvmsg(&mut self, fd: i64, msg: GuestAddr, flags: u64) -> SysResult<u64> {
         let MsgIn {
             iov,
@@ -853,14 +897,19 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             return Err(Errno(crate::errno::ENETUNREACH));
         }
         self.ensure_local(id, source_ip(ip))?;
+        // The flow is named by the kernel's own DNS table, never by
+        // anything the guest passes now. `dest_ip` is audit metadata; the
+        // host dials only its configured endpoint (the egress proxy).
+        // A connect keeps the name bound to this address.
+        let now = self.host.clock_monotonic();
+        self.st.net.touch_name(ip, now);
         let flow = OutboundFlow {
-            sandbox_id: 0,
+            sandbox_id: self.st.net.sandbox_id,
             guest_pid: self.pid,
             dest_ip: ip.to_be_bytes(),
             dest_port: port,
+            host: self.st.net.name_of(ip).map(str::to_string),
         };
-        // `dest_ip` is audit metadata. The host dials only its configured
-        // endpoint (002b: the egress Unix socket).
         let waker = self.plat.waker();
         let stream = match self.host.open_stream(flow, waker) {
             Ok(id) => id,
@@ -1165,7 +1214,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         // the datagram and `sendto` succeeds.
         match class {
             Class::Dns => {
-                if let Some(reply) = dns_nxdomain(data) {
+                let outbound = self.host.egress_configured();
+                let now = self.host.clock_monotonic();
+                if let Some(reply) = self.st.net.dns_reply(data, outbound, now) {
                     self.enqueue_dgram(id, GATEWAY_IP, DNS_PORT, reply, nonblock, true)?;
                 }
                 Ok(data.len())
@@ -1332,9 +1383,12 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 return;
             }
             let query = buf[2..2 + need].to_vec();
+            self.st.net.get_mut(id).dns_in.drain(..2 + need);
+            let outbound = self.host.egress_configured();
+            let now = self.host.clock_monotonic();
+            let reply = self.st.net.dns_reply(&query, outbound, now);
             let sock = self.st.net.get_mut(id);
-            sock.dns_in.drain(..2 + need);
-            if let Some(reply) = dns_nxdomain(&query) {
+            if let Some(reply) = reply {
                 let len = (reply.len() as u16).to_be_bytes();
                 sock.rx.extend(len);
                 sock.rx.extend(reply);

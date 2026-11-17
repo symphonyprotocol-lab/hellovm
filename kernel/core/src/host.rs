@@ -18,9 +18,10 @@
 //! * random bytes and clocks. The kernel never sleeps itself: timeouts are
 //!   deadlines on [`Host::clock_monotonic`] that bound its wait for app
 //!   events;
-//! * optional spliced byte streams ([`Host::open_stream`]). The kernel asks
-//!   the host to connect to a configured endpoint and never passes a guest
-//!   IP as a dial address. The connect, read, and write run off the kernel
+//! * optional outbound byte streams ([`Host::open_stream`]). The kernel asks
+//!   the host to connect to its configured endpoint (the egress proxy) for
+//!   a flow it names by hostname, and never passes a guest IP as a dial
+//!   address. The connect, read, and write run off the kernel
 //!   thread (`WouldBlock` plus a [`Waker`]), including a write-side
 //!   half-close.
 //!
@@ -39,17 +40,17 @@ use crate::platform::Waker;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HostStreamId(pub u64);
 
-/// Audit metadata for one outbound guest TCP flow.
+/// One outbound guest TCP flow, as the kernel describes it to the host.
 ///
-/// The kernel passes this when it splices a connection onto the host. `dest_ip`
-/// is the guest's destination and is **audit only**: an implementation must
-/// not dial it. 002a dials the single configured endpoint (see
-/// [`Host::egress_configured`]). 002b will dial the egress proxy's Unix
-/// socket and send this metadata in the handshake, still without dialing
-/// `dest_ip`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Everything here is derived by the kernel itself. `host` is the name the
+/// kernel's virtual DNS bound to `dest_ip`, taken from the kernel's own
+/// table, never from guest memory at connect time. `dest_ip` is **audit
+/// only**: an implementation must not dial it. With an egress proxy the
+/// host dials the proxy's Unix socket and names the flow by `host` and
+/// `dest_port`; a flow without a `host` is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutboundFlow {
-    /// Sandbox id. 002a passes 0; 002b will pass the real id.
+    /// Sandbox id ([`crate::Kernel::with_sandbox_id`]; 0 by default).
     pub sandbox_id: u64,
     /// Guest pid that called `connect`.
     pub guest_pid: u32,
@@ -57,6 +58,10 @@ pub struct OutboundFlow {
     pub dest_ip: [u8; 4],
     /// Guest destination port.
     pub dest_port: u16,
+    /// The hostname bound to `dest_ip` by virtual DNS: lowercase LDH labels,
+    /// at most 253 bytes. `None` for a fake IP issued without a name (by
+    /// [`crate::Kernel::issue_fake_ip`], for tests).
+    pub host: Option<String>,
 }
 
 /// Non-blocking view of a host byte stream.
@@ -222,19 +227,22 @@ pub trait Host {
     /// A monotonic clock, starting at some arbitrary point.
     fn clock_monotonic(&mut self) -> Duration;
 
-    /// Whether an outbound splice endpoint is configured.
-    ///
-    /// 002a: a local TCP server set by the host (the `--splice-to` flag).
-    /// 002b: the egress Unix socket (`--egress`). When this is false, a
-    /// guest `connect` to an issued fake IP fails with `ENETUNREACH` and
-    /// the kernel does not call [`Host::open_stream`].
+    /// Whether outbound flows can leave the sandbox: an egress proxy is
+    /// configured (`--egress`), or a test splice endpoint. When this is
+    /// false, virtual DNS answers NXDOMAIN, a guest `connect` to an issued
+    /// fake IP fails with `ENETUNREACH`, and the kernel does not call
+    /// [`Host::open_stream`].
     fn egress_configured(&self) -> bool {
         false
     }
 
     /// Opens a byte stream to the **configured** endpoint for `flow`.
     ///
-    /// Must not block the caller and must not dial `flow.dest_ip`. The
+    /// Must not block the caller and must not dial `flow.dest_ip`. A
+    /// refusal (by the egress proxy, or because it cannot be reached) is a
+    /// connect result of kind `ConnectionRefused`; a timeout is `TimedOut`.
+    /// An error from this call itself makes the guest `connect` fail with
+    /// `ENETUNREACH` (or `EAGAIN` for `WouldBlock`: too many streams). The
     /// connect itself runs off the kernel thread. [`Host::stream_connect_result`]
     /// reports `WouldBlock` until it finishes; the `waker` is called when
     /// the result, or later readability or room for a write, may have changed.

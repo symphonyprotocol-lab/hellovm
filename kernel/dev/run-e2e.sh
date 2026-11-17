@@ -6,8 +6,8 @@
 # One-shot check, test, clippy and rustfmt on the machine it runs on
 # (a native host, or the dev container on either architecture). Requires
 # Rust 1.99.1 (rust-toolchain.toml), a C compiler, Debian/Ubuntu
-# busybox-static, and distro python3 with its standard library under
-# /usr/lib/python3.X.
+# busybox-static, distro python3 with its standard library under
+# /usr/lib/python3.X, python3-pip, git and openssl.
 # It does not install packages and does not need root or Docker when those
 # dependencies are already on the host.
 set -eu
@@ -78,7 +78,20 @@ if [ ! -d "/usr/lib/$python_name" ]; then
   exit 1
 fi
 
+for tool in /usr/bin/openssl /usr/bin/git /usr/lib/git-core/git-remote-https; do
+  if [ ! -e "$tool" ]; then
+    echo "run-e2e: $tool is missing; install openssl and git (the egress tests need them)" >&2
+    exit 1
+  fi
+done
+if ! /usr/bin/python3 -c 'import pip' 2>/dev/null; then
+  echo "run-e2e: python3 cannot import pip; install python3-pip (the egress tests run pip in a sandbox)" >&2
+  exit 1
+fi
+
 export HELLOVM_REQUIRE_E2E=1
+# The live internet test is opt-in only.
+unset HELLOVM_NET_E2E
 
 cargo check --workspace --all-targets
 
@@ -97,5 +110,25 @@ fi
 
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
+
+# The test hooks must not exist in a default build: neither binary may
+# accept them. `cargo build -p` does not build dev-dependencies, so the
+# feature stays off.
+cargo build -p hellovm -p hellovm-egress
+target_dir=${CARGO_TARGET_DIR:-target}
+if "$target_dir/debug/hellovm-egress" --listen /nonexistent --insecure-test-hosts /dev/null 2>/dev/null; then
+  echo "run-e2e: the default hellovm-egress accepted --insecure-test-hosts" >&2
+  exit 1
+fi
+if "$target_dir/debug/hellovm-egress" --listen /nonexistent --insecure-test-hosts /dev/null 2>&1 \
+  | grep -F 'unknown option --insecure-test-hosts' >/dev/null; then :; else
+  echo "run-e2e: the default hellovm-egress did not reject --insecure-test-hosts as unknown" >&2
+  exit 1
+fi
+if "$target_dir/debug/hellovm" --splice-to 127.0.0.1:9 --root / /bin/true 2>&1 \
+  | grep -F 'unknown option --splice-to' >/dev/null; then :; else
+  echo "run-e2e: the default hellovm did not reject --splice-to as unknown" >&2
+  exit 1
+fi
 
 echo "hellovm e2e: ok"

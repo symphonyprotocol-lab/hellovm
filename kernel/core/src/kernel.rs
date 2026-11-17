@@ -177,6 +177,10 @@ pub(crate) fn now<H: Host + ?Sized>(host: &mut H) -> Timespec {
     }
 }
 
+/// `/etc/resolv.conf` as the kernel presents it.
+pub const RESOLV_CONF: &[u8] =
+    b"# Written by the hellovm kernel: virtual DNS is the sandbox's only resolver.\nnameserver 192.0.2.1\n";
+
 /// A kernel instance serving one sandbox: its filesystem and its processes.
 pub struct Kernel<H> {
     host: H,
@@ -199,7 +203,7 @@ impl<H: Host> Kernel<H> {
         let mut vfs = Vfs::new(&mut host, time);
         let root = vfs.root();
         vfs.opened(root);
-        Kernel {
+        let mut kernel = Kernel {
             host,
             trace: None,
             vfs,
@@ -207,7 +211,53 @@ impl<H: Host> Kernel<H> {
             cwd: root,
             console_mode: ConsoleMode::Streams,
             arch: None,
+        };
+        kernel.present_resolv_conf();
+        kernel
+    }
+
+    /// The sandbox's network is the kernel's, so its resolver configuration
+    /// is too: `/etc/resolv.conf` is
+    /// replaced (in the writable layer) by one naming virtual DNS, whatever
+    /// the image had there (often the build host's resolver, which the
+    /// guest cannot reach). The guest may still change it.
+    fn present_resolv_conf(&mut self) {
+        let time = now(&mut self.host);
+        let root = self.vfs.root();
+        let etc = match self.vfs.resolve(&mut self.host, root, b"/etc", true) {
+            Ok(etc) => etc,
+            // A minimal image: without the file libc would ask 127.0.0.1,
+            // where nothing answers.
+            Err(_) => {
+                let made = self.vfs.create(
+                    &mut self.host,
+                    root,
+                    b"etc",
+                    crate::vfs::NewNode::Dir,
+                    0o755,
+                    time,
+                );
+                match made {
+                    Ok(etc) => etc,
+                    Err(_) => return,
+                }
+            }
+        };
+        if !self.vfs.is_dir(etc) {
+            return;
         }
+        let _ = self.vfs.unlink(&mut self.host, etc, b"resolv.conf", time);
+        let Ok(file) = self.vfs.create(
+            &mut self.host,
+            etc,
+            b"resolv.conf",
+            crate::vfs::NewNode::File,
+            0o644,
+            time,
+        ) else {
+            return;
+        };
+        let _ = self.vfs.write(&mut self.host, file, 0, RESOLV_CONF, time);
     }
 
     /// Limits the sandbox's in-memory filesystem layer to `bytes` (file
@@ -254,11 +304,19 @@ impl<H: Host> Kernel<H> {
         &mut self.host
     }
 
-    /// Issues the next fake IP from `198.51.100.0/24` and records it.
+    /// Names this sandbox to the egress proxy (it appears in every flow
+    /// header and audit line). The default is 0.
+    pub fn with_sandbox_id(mut self, id: u64) -> Self {
+        self.st.net.sandbox_id = id;
+        self
+    }
+
+    /// Issues the next fake IP from `198.51.100.0/24` without binding a name
+    /// to it (a test hook; virtual DNS issues named ones).
     ///
-    /// This is the 002a test helper. A later guest `connect` to the address
-    /// is spliced to the configured host endpoint; the address itself is
-    /// never a host dial target. Returns `None` once `.1` through `.254`
+    /// A later guest `connect` to the address goes to the configured host
+    /// endpoint; the address itself is never a host dial target. An egress
+    /// proxy refuses such a flow, since it names no host. Returns `None` once `.1` through `.254`
     /// have all been issued. The address is never a NIC, loopback,
     /// wildcard, or `198.18.0.0/15` address.
     pub fn issue_fake_ip(&mut self) -> Option<[u8; 4]> {
@@ -890,7 +948,7 @@ mod tests {
     fn unknown_syscalls_are_enosys() {
         for arch in Arch::ALL {
             let traps = vec![
-                sc(arch, Sysno::Eventfd2, &[0, 0]),
+                sc(arch, Sysno::EpollCreate1, &[0]),
                 sc(arch, Sysno::Clone3, &[SCRATCH, 88]),
                 Trap::Syscall(SyscallTrap {
                     nr: 100_000,
@@ -1418,6 +1476,249 @@ mod tests {
         assert_eq!(flow.dest_ip, ip);
         assert_eq!(flow.dest_port, 443);
         assert_eq!(host.splice_outbound(crate::host::HostStreamId(0)), b"ping");
+    }
+
+    /// Virtual DNS binds a fake IP to the name; a connect to it is a flow
+    /// the kernel names from its own table, with the sandbox id.
+    #[test]
+    fn a_dns_answer_names_the_flow() {
+        let arch = Arch::X86_64;
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        let mut query = vec![0xab, 0xcd, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x04PyPI\x03org\x00\x00\x01\x00\x01");
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 2, 0]),
+            sc(
+                arch,
+                Sysno::Sendto,
+                &[
+                    3,
+                    SCRATCH + 0x100,
+                    query.len() as u64,
+                    0,
+                    SCRATCH + 0x20,
+                    16,
+                ],
+            ),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x200, 512, 0, 0, 0]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host).with_trace().with_sandbox_id(42);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x1000]);
+        // The first name bound gets the first pool address.
+        plat.mem(INIT).poke(SCRATCH, &sin([198, 51, 100, 1], 443));
+        plat.mem(INIT)
+            .poke(SCRATCH + 0x20, &sin([192, 0, 2, 1], 53));
+        plat.mem(INIT).poke(SCRATCH + 0x100, &query);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[..2], [3, query.len() as i64], "{got:?}");
+        let n = got[2] as usize;
+        let reply = plat.mem(INIT).peek(SCRATCH + 0x200, n);
+        assert_eq!(&reply[..2], &[0xab, 0xcd]);
+        assert_eq!(&reply[n - 4..], &[198, 51, 100, 1]);
+        assert_eq!(got[3..5], [4, 0], "connect {got:?}");
+        let flow = kernel.host().splice_flows().next().unwrap();
+        assert_eq!(flow.host.as_deref(), Some("pypi.org"));
+        assert_eq!(flow.sandbox_id, 42);
+        assert_eq!(flow.dest_port, 443);
+        assert_eq!(flow.dest_ip, [198, 51, 100, 1]);
+    }
+
+    /// glibc's resolver sends A and AAAA together with `sendmmsg`; each
+    /// gets its own reply and its `msg_len`.
+    #[test]
+    fn sendmmsg_sends_each_query() {
+        let arch = Arch::Aarch64;
+        let mut host = host_with_prog(arch);
+        host.splice = true;
+        let mut a = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        a.extend_from_slice(b"\x03git\x04test\x00\x00\x01\x00\x01");
+        let mut aaaa = a.clone();
+        aaaa[1] = 2;
+        let n = aaaa.len();
+        aaaa[n - 3] = 28;
+        let vec_at = SCRATCH + 0x300;
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 2, 0]),
+            sc(arch, Sysno::Sendmmsg, &[3, vec_at, 2, 0x4000]),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x600, 512, 0, 0, 0]),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x800, 512, 0, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        let mem = plat.mem(INIT);
+        mem.poke(SCRATCH, &[0; 0x1000]);
+        mem.poke(SCRATCH + 0x20, &sin([192, 0, 2, 1], 53));
+        mem.poke(SCRATCH + 0x100, &a);
+        mem.poke(SCRATCH + 0x200, &aaaa);
+        // Two iovecs, then two mmsghdrs (msghdr + msg_len, 64 bytes each).
+        for (i, (buf, len)) in [(SCRATCH + 0x100, a.len()), (SCRATCH + 0x200, aaaa.len())]
+            .into_iter()
+            .enumerate()
+        {
+            let iov = SCRATCH + 0x40 + 16 * i as u64;
+            mem.poke(iov, &buf.to_le_bytes());
+            mem.poke(iov + 8, &(len as u64).to_le_bytes());
+            let hdr = vec_at + 64 * i as u64;
+            mem.poke(hdr, &(SCRATCH + 0x20).to_le_bytes());
+            mem.poke(hdr + 8, &16u32.to_le_bytes());
+            mem.poke(hdr + 16, &iov.to_le_bytes());
+            mem.poke(hdr + 24, &1u64.to_le_bytes());
+        }
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[1], 2, "{got:?}");
+        let mem = plat.mem(INIT);
+        assert_eq!(mem.peek(vec_at + 56, 4), (a.len() as u32).to_le_bytes());
+        assert_eq!(
+            mem.peek(vec_at + 64 + 56, 4),
+            (aaaa.len() as u32).to_le_bytes()
+        );
+        // An A answer with one record, then an empty AAAA answer.
+        let first = mem.peek(SCRATCH + 0x600, got[2] as usize);
+        assert_eq!((first[1], first[7]), (1, 1));
+        let second = mem.peek(SCRATCH + 0x800, got[3] as usize);
+        assert_eq!((second[1], second[3] & 0x0f, second[7]), (2, 0, 0));
+    }
+
+    /// Without an outbound endpoint, virtual DNS binds nothing.
+    #[test]
+    fn without_egress_dns_is_nxdomain_and_binds_nothing() {
+        let arch = Arch::X86_64;
+        let host = host_with_prog(arch);
+        let mut query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x04pypi\x03org\x00\x00\x01\x00\x01");
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 2, 0]),
+            sc(
+                arch,
+                Sysno::Sendto,
+                &[
+                    3,
+                    SCRATCH + 0x100,
+                    query.len() as u64,
+                    0,
+                    SCRATCH + 0x20,
+                    16,
+                ],
+            ),
+            sc(arch, Sysno::Recvfrom, &[3, SCRATCH + 0x200, 512, 0, 0, 0]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Connect, &[4, SCRATCH, 16]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host);
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        plat.mem(INIT).poke(SCRATCH, &[0; 0x1000]);
+        plat.mem(INIT).poke(SCRATCH, &sin([198, 51, 100, 1], 443));
+        plat.mem(INIT)
+            .poke(SCRATCH + 0x20, &sin([192, 0, 2, 1], 53));
+        plat.mem(INIT).poke(SCRATCH + 0x100, &query);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        let reply = plat.mem(INIT).peek(SCRATCH + 0x200, got[2] as usize);
+        assert_eq!(reply[3] & 0x0f, 3, "NXDOMAIN");
+        assert_eq!(got[4], -ENETUNREACH, "{got:?}");
+    }
+
+    /// `eventfd2`: writes add up, a read takes the counter, an empty
+    /// non-blocking read is `EAGAIN`, and `poll` follows the counter.
+    #[test]
+    fn eventfd_counts_and_polls() {
+        // x86_64 has plain `poll`.
+        let arch = Arch::X86_64;
+        let nonblock = 0o4000;
+        let pfd = SCRATCH + 0x100;
+        let traps = vec![
+            sc(arch, Sysno::Eventfd2, &[2, nonblock]),
+            sc(arch, Sysno::Write, &[3, SCRATCH, 8]),
+            sc(arch, Sysno::Poll, &[pfd, 1, 0]),
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x20, 8]),
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x20, 8]),
+            sc(arch, Sysno::Poll, &[pfd, 1, 0]),
+            // Too short a buffer, the reserved value, bad flags.
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x20, 4]),
+            sc(arch, Sysno::Write, &[3, SCRATCH + 0x40, 8]),
+            sc(arch, Sysno::Eventfd2, &[0, 0x10]),
+            sc(arch, Sysno::Close, &[3]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (five, reserved) = (5u64.to_le_bytes(), u64::MAX.to_le_bytes());
+        let data: Vec<(u64, &[u8])> = vec![(SCRATCH, &five), (SCRATCH + 0x40, &reserved)];
+        let (mut kernel, mut plat) = setup(arch, traps, &data);
+        // pollfd { fd 3, events POLLIN | POLLOUT }.
+        let mut raw = [0u8; 8];
+        raw[..4].copy_from_slice(&3i32.to_le_bytes());
+        raw[4..6].copy_from_slice(&5u16.to_le_bytes());
+        plat.mem(INIT).poke(pfd, &raw);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let r = returns(&plat, INIT);
+        assert_eq!(&r[..2], &[3, 8]);
+        assert_eq!(r[2], 1, "readable and writable");
+        assert_eq!(&r[3..5], &[8, -crate::errno::EAGAIN]);
+        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x20, 8), 7u64.to_le_bytes());
+        assert_eq!(r[5], 1, "only writable now");
+        assert_eq!(plat.mem(INIT).peek(pfd + 6, 2), 4u16.to_le_bytes());
+        assert_eq!(
+            &r[6..10],
+            &[
+                -crate::errno::EINVAL,
+                -crate::errno::EINVAL,
+                -crate::errno::EINVAL,
+                0
+            ]
+        );
+    }
+
+    #[test]
+    fn resolv_conf_names_virtual_dns() {
+        let arch = Arch::X86_64;
+        let mut host = host_with_prog(arch);
+        host.image.as_mut().unwrap().insert(
+            "etc/resolv.conf".into(),
+            MockEntry::File(b"nameserver 192.168.65.7\n".to_vec()),
+        );
+        let mut kernel = Kernel::new(host);
+        let root = kernel.vfs.root();
+        let ino = kernel
+            .vfs
+            .resolve(&mut kernel.host, root, b"/etc/resolv.conf", true)
+            .unwrap();
+        let text = kernel.vfs.read_all(&mut kernel.host, ino).unwrap();
+        assert_eq!(text, RESOLV_CONF);
+        // The rest of /etc is still the image's.
+        assert!(kernel
+            .vfs
+            .resolve(&mut kernel.host, root, b"/etc/motd", true)
+            .is_ok());
+        // No /etc in the image: it is created, or libc would have no
+        // resolver at all.
+        let bare = MockHost::with_image(&[("bin", MockEntry::Dir)]);
+        let mut kernel = Kernel::new(bare);
+        let root = kernel.vfs.root();
+        let file = kernel
+            .vfs
+            .resolve(&mut kernel.host, root, b"/etc/resolv.conf", true)
+            .unwrap();
+        assert_eq!(
+            kernel.vfs.read_all(&mut kernel.host, file).unwrap(),
+            RESOLV_CONF
+        );
     }
 
     fn poll_memory(fd: i32, events: u16) -> [u8; 8] {
@@ -1976,8 +2277,9 @@ mod tests {
         let got = returns(&plat, INIT);
         assert_eq!(got[2], len as i64, "send {got:?}");
         assert_eq!(got[3], 2, "reply length prefix {got:?}");
-        // The reply echoes the header and the (empty-name) question: 17 bytes.
-        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x40, 2), [0, 17]);
+        // The frame claims no question (QDCOUNT 0): the reply is a bare
+        // 12-byte FORMERR header.
+        assert_eq!(plat.mem(INIT).peek(SCRATCH + 0x40, 2), [0, 12]);
     }
 
     /// Loopback listener on `port`, a connected client on fd 4 and the

@@ -97,6 +97,8 @@ fn object_stat(object: FileObject, size: u64, time: Timespec) -> Stat {
         FileObject::Proc { dir: true } => (0x16, 0x20, S_IFDIR | 0o555, 0),
         FileObject::Proc { dir: false } => (0x16, 0x21, S_IFREG | 0o444, 0),
         FileObject::Socket(id) => (0x1d, 0x10_0000 + id as u64, S_IFSOCK | 0o777, 0),
+        // Linux shows eventfds as anonymous inodes.
+        FileObject::EventFd(id) => (0x0e, 0x20_0000 + id as u64, 0o600, 0),
         FileObject::Node(_) => unreachable!("nodes have their own stat"),
     };
     Stat {
@@ -279,6 +281,19 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             FileObject::Tty => self.tty_read(id, len),
             FileObject::ConsoleOut(_) | FileObject::PipeWrite(_) => Err(Errno(EBADF)),
             FileObject::Socket(sock) => self.socket_read(sock, len),
+            FileObject::EventFd(id) => {
+                if len < 8 {
+                    return Err(Errno(EINVAL));
+                }
+                match self.st.eventfds.get_mut(id).take() {
+                    Some(value) => {
+                        self.st.changed = true;
+                        Ok(value.to_le_bytes().to_vec())
+                    }
+                    None if nonblock => Err(Errno(EAGAIN)),
+                    None => Err(self.park_retry(None, Restart::IfSaRestart)),
+                }
+            }
             FileObject::PipeRead(pipe) => {
                 let mut buf = vec![0u8; len.min(PIPE_CAPACITY)];
                 match self.st.pipes.get_mut(pipe).read(&mut buf) {
@@ -337,6 +352,12 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
     fn unread(&mut self, id: FileId, data: &[u8]) {
         match self.st.files.get(id).object {
             FileObject::PipeRead(pipe) => self.st.pipes.get_mut(pipe).unread(data),
+            // The value was not delivered: put it back.
+            FileObject::EventFd(id) => {
+                if let Ok(raw) = <[u8; 8]>::try_from(data) {
+                    let _ = self.st.eventfds.get_mut(id).add(u64::from_le_bytes(raw));
+                }
+            }
             FileObject::ConsoleIn | FileObject::Tty => self.st.console.unread(data),
             FileObject::Socket(sock) => {
                 for &byte in data.iter().rev() {
@@ -364,6 +385,23 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 Err(Errno(EBADF))
             }
             FileObject::Socket(sock) => self.socket_write(sock, data),
+            FileObject::EventFd(id) => {
+                let Some(raw) = data.get(..8).and_then(|d| <[u8; 8]>::try_from(d).ok()) else {
+                    return Err(Errno(EINVAL));
+                };
+                let value = u64::from_le_bytes(raw);
+                if value == u64::MAX {
+                    return Err(Errno(EINVAL));
+                }
+                if self.st.eventfds.get_mut(id).add(value) {
+                    self.st.changed = true;
+                    Ok(8)
+                } else if nonblock {
+                    Err(Errno(EAGAIN))
+                } else {
+                    Err(self.park_retry(None, Restart::IfSaRestart))
+                }
+            }
             FileObject::ConsoleOut(stream) => self.console_write(stream, data),
             FileObject::Tty => self.tty_write(data),
             FileObject::PipeWrite(pipe) => {
@@ -986,6 +1024,25 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         Ok(new as u64)
     }
 
+    /// `eventfd2` (and `eventfd`, with no flags).
+    pub fn sys_eventfd2(&mut self, initval: u64, flags: u64) -> SysResult<u64> {
+        const EFD_SEMAPHORE: u64 = 1;
+        if flags & !(EFD_SEMAPHORE | abi::O_CLOEXEC | abi::O_NONBLOCK) != 0 {
+            return Err(Errno(EINVAL));
+        }
+        // The initial value is an `unsigned int`.
+        let id = self
+            .st
+            .eventfds
+            .create(u64::from(initval as u32), flags & EFD_SEMAPHORE != 0)
+            .ok_or(Errno(crate::errno::ENFILE))?;
+        let mut file = OpenFile::new(FileObject::EventFd(id), Access::ReadWrite);
+        file.nonblock = flags & abi::O_NONBLOCK != 0;
+        // `install` releases the object again if the fd table is full.
+        self.install(file, 0, flags & abi::O_CLOEXEC != 0)
+            .map(|fd| fd as u64)
+    }
+
     pub fn sys_pipe2(&mut self, fds: GuestAddr, flags: u64) -> SysResult<u64> {
         const O_DIRECT: u64 = 0o40000;
         if flags & !(abi::O_CLOEXEC | abi::O_NONBLOCK | O_DIRECT) != 0 {
@@ -1132,6 +1189,15 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let any_out = POLLOUT | POLLWRNORM;
         match file.object {
             FileObject::Node(_) | FileObject::Proc { .. } => any_in | any_out,
+            FileObject::EventFd(id) => {
+                let count = self.st.eventfds.get(id).count;
+                (if count > 0 { any_in } else { 0 })
+                    | if count < crate::eventfd::COUNTER_MAX {
+                        any_out
+                    } else {
+                        0
+                    }
+            }
             FileObject::ConsoleOut(_) => any_out,
             FileObject::ConsoleIn => match self.st.console.input_state(self.host) {
                 InputState::Empty => 0,
