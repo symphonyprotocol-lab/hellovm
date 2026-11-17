@@ -219,6 +219,60 @@ impl Tracee {
         self.set_regset(sys::NT_PRFPREG, fp)
     }
 
+    /// The extended FP/SIMD state as the host's ptrace gives it: on x86_64
+    /// the XSAVE area (`NT_X86_XSTATE`: the upper halves of the AVX
+    /// registers, AVX-512), on aarch64 the SVE state (`NT_ARM_SVE`). `None`
+    /// where the host CPU has none; [`FpRegs`] is then everything.
+    pub fn xstate(&self) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; sys::XSTATE_MAX];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        // SAFETY: GETREGSET writes at most `iov_len` bytes to `iov_base`
+        // and sets `iov_len` to what it wrote.
+        let got = unsafe {
+            ptrace_checked(
+                sys::PTRACE_GETREGSET,
+                self.pid,
+                sys::NT_XSTATE as usize,
+                &mut iov as *mut libc::iovec as usize,
+            )
+        };
+        match got {
+            Ok(()) => {
+                buf.truncate(iov.iov_len);
+                Ok(Some(buf))
+            }
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENODEV | libc::EIO)
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Sets what [`Tracee::xstate`] returned for a task of this host.
+    pub fn set_xstate(&self, state: &[u8]) -> io::Result<()> {
+        let mut iov = libc::iovec {
+            iov_base: state.as_ptr() as *mut libc::c_void,
+            iov_len: state.len(),
+        };
+        // SAFETY: SETREGSET reads `iov_len` bytes from `iov_base`.
+        unsafe {
+            ptrace_checked(
+                sys::PTRACE_SETREGSET,
+                self.pid,
+                sys::NT_XSTATE as usize,
+                &mut iov as *mut libc::iovec as usize,
+            )
+        }
+    }
+
     /// `tpidr_el0` (aarch64; on x86_64 the thread pointer is in [`Regs`]).
     #[cfg(target_arch = "aarch64")]
     pub fn tls(&self) -> io::Result<u64> {

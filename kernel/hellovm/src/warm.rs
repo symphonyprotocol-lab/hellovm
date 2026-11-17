@@ -32,7 +32,8 @@
 //! closes. The clone lives only as long as the connection: closing it (or
 //! shutting down its write side) kills the clone. Requests that arrive
 //! before the template is frozen wait; if the template cannot be frozen,
-//! they get `E` with the reason and the template exits.
+//! they get `E` with the reason and the template exits. A request must be
+//! complete within [`REQUEST_TIMEOUT`] of connecting, or it gets `E`.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -45,6 +46,10 @@ pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 20;
 /// Most bytes of input a clone request may carry. More goes to its stdin.
 pub const MAX_INPUT: usize = 64 * 1024;
+/// How long after connecting a request may take to arrive completely. A
+/// connection that sends nothing must not hold one of the template's
+/// connection slots for ever.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const FLAG_SANDBOX_ID: u16 = 1;
 /// Longest frame payload a client accepts.
 const MAX_FRAME: u32 = 64 * 1024;
@@ -229,6 +234,68 @@ impl Frame {
             _ => return Err(bad()),
         }))
     }
+}
+
+/// Sends one frame, all of it, on a connection that may be non-blocking
+/// (the template's are, and a clone's kernel process shares its
+/// connection's open file with the template): when the socket's buffer is
+/// full it waits for room until `patience` is over. An error means the
+/// requester did not get the frame.
+pub fn send_frame(
+    stream: &UnixStream,
+    frame: &Frame,
+    patience: std::time::Duration,
+) -> io::Result<()> {
+    let bytes = frame.encode();
+    let deadline = std::time::Instant::now() + patience;
+    let mut sent = 0;
+    while sent < bytes.len() {
+        let rest = &bytes[sent..];
+        // SAFETY: the buffer is valid for its length.
+        let n = unsafe {
+            libc::send(
+                stream.as_raw_fd(),
+                rest.as_ptr().cast(),
+                rest.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if n >= 0 {
+            sent += n as usize;
+            continue;
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the requester does not read its answers",
+                    ));
+                }
+                let mut poll = libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let ms = left.as_millis().clamp(1, 1000) as libc::c_int;
+                // SAFETY: one valid pollfd. A failure shows at the next send.
+                unsafe { libc::poll(&mut poll, 1, ms) };
+            }
+            _ => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Overwrites `bytes` with zeros in a way the compiler keeps even though
+/// the buffer is freed next: request bytes of one tenant must not stay in
+/// memory that a later clone (a fork of the template) starts with.
+pub fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::hint::black_box(bytes);
 }
 
 /// Sends `data` with `fds` attached (`SCM_RIGHTS`), all of it.
@@ -488,6 +555,45 @@ mod tests {
         }
         assert_eq!(Frame::read_from(&mut &b""[..]).unwrap(), None);
         assert!(Frame::read_from(&mut &b"Q\x00\x00\x00\x00"[..]).is_err());
+    }
+
+    #[test]
+    fn a_frame_to_a_requester_that_does_not_read_fails_instead_of_vanishing() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let frame = Frame::Error("x".repeat(4096));
+        let patience = std::time::Duration::from_millis(50);
+        // Fill the socket: at some point a frame no longer fits.
+        let mut sent = 0;
+        let err = loop {
+            match send_frame(&a, &frame, patience) {
+                Ok(()) => sent += 1,
+                Err(err) => break err,
+            }
+            assert!(sent < 100_000, "the socket never filled");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // A reader that comes back gets whole frames again: with room, a
+        // frame is sent completely even though the socket is non-blocking.
+        let reader = std::thread::spawn(move || {
+            let mut frames = 0;
+            while let Ok(Some(_)) = Frame::read_from(&mut b) {
+                frames += 1;
+            }
+            frames
+        });
+        // The frame cut short by the timeout makes the stream unusable for
+        // the reader at that point; what counts is that every frame
+        // reported as sent arrived whole.
+        drop(a);
+        assert!(reader.join().unwrap() >= sent);
+    }
+
+    #[test]
+    fn wipe_zeroes() {
+        let mut secret = b"tenant input".to_vec();
+        wipe(&mut secret);
+        assert!(secret.iter().all(|&b| b == 0));
     }
 
     #[test]

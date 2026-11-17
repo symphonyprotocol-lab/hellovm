@@ -536,6 +536,12 @@ impl RunningClone {
 impl Template {
     /// Starts `argv` as a template; `options` go before `--root`.
     pub fn start(argv: &[&str], options: &[&str]) -> Template {
+        Template::start_with_env(argv, options, &[])
+    }
+
+    /// [`Template::start`] with environment variables for the kernel
+    /// process (test hooks).
+    pub fn start_with_env(argv: &[&str], options: &[&str], env: &[(&str, &str)]) -> Template {
         let dir = TempDir::new("template");
         let socket = dir.path().join("template.sock");
         let mut child = Command::new(env!("CARGO_BIN_EXE_hellovm"))
@@ -544,6 +550,7 @@ impl Template {
             .args(options)
             .args(["--root", "/", "--"])
             .args(argv)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

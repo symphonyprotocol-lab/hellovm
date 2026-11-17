@@ -183,13 +183,29 @@ impl SeccompPlatform {
     }
 
     /// After [`Platform::freeze`]: the bytes of template memory stored
-    /// (pages that were not all zero) and the number of areas.
+    /// (the pages that were not all zero, and short runs of zero pages
+    /// between them) and the number of areas.
     pub fn snapshot_size(&self) -> Option<(u64, usize)> {
         match &self.snapshots {
             Some(Snapshots::Frozen { stored, spaces, .. }) => {
                 Some((*stored, spaces.iter().map(|s| s.areas.len()).sum()))
             }
             _ => None,
+        }
+    }
+
+    /// After [`Platform::freeze`]: how many extents of the snapshot file
+    /// the private areas have, that is, how many file mappings a clone's
+    /// app processes get.
+    pub fn snapshot_extents(&self) -> usize {
+        match &self.snapshots {
+            Some(Snapshots::Frozen { spaces, .. }) => spaces
+                .iter()
+                .flat_map(|s| &s.areas)
+                .filter(|a| !a.shared)
+                .map(|a| a.extents.len())
+                .sum(),
+            _ => 0,
         }
     }
 
@@ -569,8 +585,7 @@ impl SeccompPlatform {
             ));
         }
         let page = self.info.page_size;
-        let mut offset = 0u64;
-        let mut stored = 0u64;
+        let mut writer = snapshot::Writer::new(file.as_fd(), page);
         let mut images = Vec::with_capacity(spaces.len());
         let mut buf = vec![0u8; snapshot::CHUNK];
         for space in spaces {
@@ -579,39 +594,35 @@ impl SeccompPlatform {
             for area in &space.areas {
                 let len = area.end.saturating_sub(area.start);
                 self.check_range(area.start, len)?;
-                let end = offset
-                    .checked_add(len)
-                    .filter(|&end| end <= snapshot::CAPACITY)
-                    .ok_or_else(|| {
-                        PlatformError::NoResources(format!(
-                            "the template maps more than {} GiB",
-                            snapshot::CAPACITY >> 30
-                        ))
-                    })?;
-                if !area.prot.contains(Prot::READ) {
-                    self.protect(first, area.start, len, area.prot.union(Prot::READ))?;
-                }
-                let pid = self.task(first)?.tracee.pid;
-                let mut done = 0u64;
-                while done < len {
-                    let n = (len - done).min(snapshot::CHUNK as u64) as usize;
-                    vm_io(pid, area.start + done, buf.as_mut_ptr(), n, false)?;
-                    stored +=
-                        snapshot::store(file.as_fd(), offset + done, &buf[..n], page as usize)?;
-                    done += n as u64;
+                let mut extents = Vec::new();
+                // Memory the core knows to be zero is not read: an
+                // address-space reservation can be many gigabytes.
+                if !area.zero {
+                    if !area.prot.contains(Prot::READ) {
+                        self.protect(first, area.start, len, area.prot.union(Prot::READ))?;
+                    }
+                    let pid = self.task(first)?.tracee.pid;
+                    let (mut done, mut gap) = (0u64, 0u64);
+                    while done < len {
+                        let n = (len - done).min(snapshot::CHUNK as u64) as usize;
+                        vm_io(pid, area.start + done, buf.as_mut_ptr(), n, false)?;
+                        writer.store(&mut extents, &mut gap, done, &buf[..n])?;
+                        done += n as u64;
+                    }
+                    writer.finish(&mut extents, gap)?;
                 }
                 image.areas.push(AreaImage {
                     start: area.start,
                     len,
                     prot: area.prot,
                     shared: area.sharing == Sharing::Shared,
-                    offset,
+                    extents,
                 });
-                offset = end;
             }
             for &key in &space.tasks {
                 let (task, _) = self.stopped(key)?;
                 let fp = task.tracee.fp_regs()?;
+                let xstate = task.tracee.xstate()?;
                 #[cfg(target_arch = "aarch64")]
                 let tls = task.tracee.tls()?;
                 #[cfg(target_arch = "x86_64")]
@@ -626,6 +637,7 @@ impl SeccompPlatform {
                 image.tasks.push(TaskImage {
                     regs: task.regs,
                     fp,
+                    xstate,
                     tls,
                     pac,
                 });
@@ -635,6 +647,7 @@ impl SeccompPlatform {
         for key in keys {
             self.kill(key)?;
         }
+        let stored = writer.stored();
         snapshot::seal(file.as_fd())?;
         self.snapshots = Some(Snapshots::Frozen {
             file,
@@ -675,36 +688,54 @@ impl SeccompPlatform {
         let mut buf = Vec::new();
         for area in &space.areas {
             self.check_range(area.start, area.len)?;
+            let inside = |e: &snapshot::Extent| {
+                e.len > 0 && e.at.checked_add(e.len).is_some_and(|end| end <= area.len)
+            };
+            if !area.extents.iter().all(inside) {
+                return Err(self.violation(first, "a snapshot extent outside its area".into()));
+            }
             if area.shared {
                 self.map(first, area.start, area.len, Prot::RW, Sharing::Shared)?;
                 buf.resize(snapshot::CHUNK, 0);
                 let pid = self.task(first)?.tracee.pid;
-                let mut done = 0u64;
-                while done < area.len {
-                    let n = (area.len - done).min(snapshot::CHUNK as u64) as usize;
-                    snapshot::load(file, area.offset + done, &mut buf[..n])?;
-                    vm_io(pid, area.start + done, buf.as_mut_ptr(), n, true)?;
-                    done += n as u64;
+                for extent in &area.extents {
+                    let mut done = 0u64;
+                    while done < extent.len {
+                        let n = (extent.len - done).min(snapshot::CHUNK as u64) as usize;
+                        snapshot::load(file, extent.offset + done, &mut buf[..n])?;
+                        let addr = area.start + extent.at + done;
+                        vm_io(pid, addr, buf.as_mut_ptr(), n, true)?;
+                        done += n as u64;
+                    }
                 }
                 if area.prot != Prot::RW {
                     self.protect(first, area.start, area.len, area.prot)?;
                 }
-            } else {
-                let prot = u64::from(area.prot.0 & Prot::ALL.0);
+                continue;
+            }
+            // What was zero in the template is anonymous memory; only the
+            // pages the file really has are mapped from it (see `snapshot`:
+            // touching a hole of the file would grow it).
+            let whole = matches!(area.extents[..], [e] if e.at == 0 && e.len == area.len);
+            if !whole {
+                self.map(first, area.start, area.len, area.prot, Sharing::Private)?;
+            }
+            let prot = u64::from(area.prot.0 & Prot::ALL.0);
+            for extent in &area.extents {
+                let addr = area.start + extent.at;
                 let args = [
-                    area.start,
-                    area.len,
+                    addr,
+                    extent.len,
                     prot,
                     MAP_PRIVATE | MAP_FIXED,
                     fd,
-                    area.offset,
+                    extent.offset,
                 ];
                 let ret = self.checked_inject(first, "mmap of the snapshot", self.nr_mmap, args)?;
-                if ret as u64 != area.start {
-                    return Err(self.violation(
-                        first,
-                        format!("mmap returned {ret:#x}, not {:#x}", area.start),
-                    ));
+                if ret as u64 != addr {
+                    return Err(
+                        self.violation(first, format!("mmap returned {ret:#x}, not {addr:#x}"))
+                    );
                 }
             }
         }
@@ -721,6 +752,10 @@ impl SeccompPlatform {
         for (&key, image) in keys.iter().zip(&space.tasks) {
             let task = self.task(key)?;
             task.tracee.set_fp_regs(&image.fp)?;
+            // After the basic state: it holds the same registers' low parts.
+            if let Some(xstate) = &image.xstate {
+                task.tracee.set_xstate(xstate)?;
+            }
             #[cfg(target_arch = "aarch64")]
             task.tracee.set_tls(image.tls)?;
             if let Some(keys) = &image.pac {
@@ -1158,11 +1193,17 @@ mod tests {
         context.set_thread_pointer(0xabcd_0000);
         p.set_context(u, &context).unwrap();
         let pac = p.tasks[&t].tracee.pac_keys().unwrap();
+        let wide = set_wide_registers(&p.tasks[&u].tracee);
+        // A reservation: never writable, so the core knows it is zero.
+        let reserved = 0x5000_0000;
+        p.map(t, reserved, 64 * page, Prot::NONE, Sharing::Private)
+            .unwrap();
         let area = |start, pages, prot, sharing| FrozenArea {
             start,
             end: start + pages * page,
             prot,
             sharing,
+            zero: false,
         };
         p.freeze(&[FrozenSpace {
             tasks: vec![t, u],
@@ -1170,12 +1211,30 @@ mod tests {
                 area(private, 4, Prot::RW, Sharing::Private),
                 area(shared, 1, Prot::RW, Sharing::Shared),
                 area(hidden, 1, Prot::NONE, Sharing::Private),
+                FrozenArea {
+                    zero: true,
+                    ..area(reserved, 64, Prot::NONE, Sharing::Private)
+                },
             ],
         }])
         .unwrap();
         assert_eq!(p.task_count(), 0, "the frozen tasks are gone");
         let (stored, areas) = p.snapshot_size().unwrap();
-        assert_eq!((stored, areas), (3 * page, 3), "zero pages are not stored");
+        // Small areas are stored whole (4 + 1 + 1 pages); the reservation
+        // is not stored at all.
+        assert_eq!((stored, areas), (6 * page, 4));
+        let Some(Snapshots::Frozen { file, .. }) = &p.snapshots else {
+            panic!("not frozen");
+        };
+        let file = file.try_clone().unwrap();
+        let allocated = || {
+            // SAFETY: an all-zero stat is valid; fstat fills it.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: plain fstat on our fd.
+            assert_eq!(unsafe { libc::fstat(file.as_raw_fd(), &mut stat) }, 0);
+            stat.st_blocks as u64 * 512
+        };
+        assert_eq!(allocated(), 6 * page);
         let keys = p.thaw().unwrap();
         let (t2, u2) = (keys[0][0], keys[0][1]);
         let mut buf = [0u8; 7];
@@ -1195,6 +1254,11 @@ mod tests {
             assert_eq!(after, pac, "the template's keys, not the new process's");
         }
         assert_eq!(back.thread_pointer(), 0xabcd_0000);
+        assert_eq!(
+            wide_registers(&p.tasks[&u2].tracee),
+            wide,
+            "the registers beyond the basic FP/SIMD state"
+        );
         // Copy-on-write: a write lands in the clone only, and the private
         // area comes from the snapshot file, which the app no longer holds.
         p.write(t2, private, b"changed").unwrap();
@@ -1202,11 +1266,53 @@ mod tests {
         assert_eq!(&buf, b"changed", "threads share the address space");
         let maps = maps(&p, t2);
         assert!(maps.contains("hellovm-snapshot"), "{maps}");
+        // The clone reads and writes memory that was zero in the template
+        // (the first three pages of `private`, which the file holds as
+        // zeros, and the reservation, which it does not hold): the host
+        // must not allocate anything in the file for it.
+        let mut zeros = vec![1u8; 3 * page as usize];
+        p.read(t2, private + page, &mut zeros[..2 * page as usize])
+            .unwrap();
+        assert!(zeros[..2 * page as usize].iter().all(|&b| b == 0));
+        p.write(t2, private + page, &zeros[..2 * page as usize])
+            .unwrap();
+        p.protect(t2, reserved, 64 * page, Prot::RW).unwrap();
+        for i in 0..64 {
+            p.read(t2, reserved + i * page, &mut buf).unwrap();
+            assert_eq!(buf, [0; 7]);
+            p.write(t2, reserved + i * page, b"written").unwrap();
+        }
+        assert_eq!(allocated(), 6 * page, "a clone grew the snapshot file");
         let fds = std::fs::read_dir(format!("/proc/{}/fd", p.host_pid(t2).unwrap()))
             .unwrap()
             .count();
         assert_eq!(fds, 0, "the app process holds no fd");
         assert!(p.thaw().is_err(), "thawed once per copy of the platform");
+    }
+
+    /// Puts a value in registers that only the extended state holds (the
+    /// upper halves of the AVX registers), where the host has them, and
+    /// returns what [`wide_registers`] then reads.
+    fn set_wide_registers(tracee: &Tracee) -> Option<Vec<u8>> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(mut state) = tracee.xstate().unwrap() {
+            // The XSAVE area: the features the host has at 464, those in
+            // use at 512, bit 2 is AVX, whose registers are at 576.
+            let has = u64::from_le_bytes(state[464..472].try_into().unwrap());
+            if has & 4 != 0 && state.len() >= 832 {
+                state[512] |= 7;
+                state[576..832].fill(0xab);
+                tracee.set_xstate(&state).unwrap();
+            }
+        }
+        wide_registers(tracee)
+    }
+
+    fn wide_registers(tracee: &Tracee) -> Option<Vec<u8>> {
+        let state = tracee.xstate().unwrap()?;
+        #[cfg(target_arch = "x86_64")]
+        let state = state[576..832.min(state.len())].to_vec();
+        Some(state)
     }
 
     /// Code that loops forever at `addr`: `b .` / `jmp .`.

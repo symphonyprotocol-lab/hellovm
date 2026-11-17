@@ -14,13 +14,21 @@
 //! kernel process: a closed connection kills the clone, a clone kernel
 //! process that dies without reporting gets an `E` sent for it. Clones die
 //! with the template (`PR_SET_PDEATHSIG`).
+//!
+//! A clone starts with a copy of everything in this process's memory, so
+//! this process keeps nothing of one requester where another's clone could
+//! find it: request bytes live in one buffer per connection that never
+//! moves and is zeroed when the connection ends, and the child zeroes the
+//! other connections' buffers before anything else.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+#[cfg(feature = "insecure-test-hooks")]
+use std::io::Write;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hellovm::warm::{self, Frame, Kind, Request, Status};
 use hellovm_core::{Kernel, KernelError, TemplateEnd};
@@ -38,10 +46,17 @@ const MAX_CLIENTS: usize = 512;
 /// itself (frame `E`).
 const CLONE_FAILED: i32 = 3;
 
+/// How long a clone's kernel process waits for room in its connection
+/// when the requester does not read the clone's `S`, `X` or `E`.
+const FRAME_PATIENCE: Duration = Duration::from_secs(5);
+
 /// One connection.
 struct Client {
     stream: UnixStream,
-    /// The request so far.
+    /// When the request must be complete.
+    deadline: Instant,
+    /// The request so far. Its capacity is a whole request's from the first
+    /// byte on, so the bytes are never moved (leaving a copy behind).
     buf: Vec<u8>,
     /// fds received with it.
     fds: Vec<OwnedFd>,
@@ -54,10 +69,19 @@ struct Client {
 }
 
 impl Client {
+    /// Sends a frame without waiting: this process serves every
+    /// connection. Nothing was sent on the connection before, so only a
+    /// requester that is gone cannot take it.
     fn send(&self, frame: &Frame) {
-        // Small frames on a socket nobody else writes to at this point;
-        // a requester that does not read loses them.
-        let _ = (&self.stream).write_all(&frame.encode());
+        if let Err(err) = warm::send_frame(&self.stream, frame, Duration::ZERO) {
+            log::warn!("template: {frame:?} did not reach its requester: {err}");
+        }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        warm::wipe(&mut self.buf);
     }
 }
 
@@ -94,7 +118,21 @@ pub fn run(
         host.set_splice_endpoint(addr);
     }
     let image = host.image_mut().expect("the host has the image");
-    let (egress, landlock) = harden(options, image, egress, fds)?;
+    let (egress, landlock) = harden(options, image, egress, fds, true)?;
+    if !landlock {
+        // Clones are forks of this process: they share its user namespace
+        // and its Landlock domain (none), so nothing but a domain of their
+        // own keeps one clone's kernel process from the others' processes.
+        let why = "Landlock is not available here, so the clones of this template \
+                   would not be fenced from each other: a clone's kernel process, if \
+                   compromised, could read and write the memory of the other clones";
+        if options.sandbox == hellovm_sandbox::Mode::Require {
+            let why = format!("{why} (refused by --sandbox require)");
+            refuse(&listener, &why);
+            return Err(why.into());
+        }
+        log::warn!("{why}; use it for one tenant only");
+    }
     if let Some(path) = egress {
         host.set_egress(path);
     }
@@ -127,8 +165,9 @@ pub fn run(
     }
     let (stored, areas) = app.snapshot_size().unwrap_or_default();
     log::info!(
-        "template frozen after {:?}: {stored} bytes of memory in {areas} areas",
-        started.elapsed()
+        "template frozen after {:?}: {stored} bytes of memory in {areas} areas, {} extents",
+        started.elapsed(),
+        app.snapshot_extents()
     );
     serve(
         &listener,
@@ -159,7 +198,7 @@ fn refuse(listener: &UnixListener, why: &str) {
         return;
     }
     while let Ok((stream, _)) = listener.accept() {
-        let _ = (&stream).write_all(&Frame::Error(why.to_string()).encode());
+        let _ = warm::send_frame(&stream, &Frame::Error(why.to_string()), Duration::ZERO);
     }
 }
 
@@ -199,8 +238,16 @@ fn serve(
                 revents: 0,
             });
         }
+        // Until the first request that is still incomplete runs out of time.
+        let now = Instant::now();
+        let timeout = clients
+            .iter()
+            .filter(|c| c.clone.is_none())
+            .map(|c| c.deadline.saturating_duration_since(now))
+            .min()
+            .map_or(-1, |left| left.as_millis().min(60_000) as libc::c_int + 1);
         // SAFETY: a valid array of pollfds.
-        let n = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, -1) };
+        let n = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, timeout) };
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -221,6 +268,16 @@ fn serve(
                 reap(&mut clients[i]);
             }
         }
+        let now = Instant::now();
+        for client in &mut clients {
+            if client.clone.is_none() && !client.done && now >= client.deadline {
+                client.send(&Frame::Error(format!(
+                    "no complete request within {:?}",
+                    warm::REQUEST_TIMEOUT
+                )));
+                client.done = true;
+            }
+        }
         clients.retain(|c| !c.done);
         if polls[0].revents != 0 {
             loop {
@@ -229,6 +286,7 @@ fn serve(
                         stream.set_nonblocking(true)?;
                         clients.push(Client {
                             stream,
+                            deadline: Instant::now() + warm::REQUEST_TIMEOUT,
                             buf: Vec::new(),
                             fds: Vec::new(),
                             clone: None,
@@ -261,8 +319,29 @@ fn read_request(
     ready: (u64, u32),
 ) {
     let client = &mut clients[i];
-    let mut chunk = vec![0u8; 16 * 1024];
-    let n = match warm::recv_with_fds(client.stream.as_fd(), &mut chunk, &mut client.fds, 3) {
+    // Straight into the connection's buffer, which is as large as a request
+    // can be: no copy of the bytes is left anywhere else.
+    let whole = warm::HEADER_LEN + warm::MAX_INPUT;
+    if client.buf.capacity() < whole {
+        client.buf.reserve_exact(whole);
+    }
+    let have = client.buf.len();
+    if have >= whole {
+        // Cannot happen: a request this long is complete or malformed.
+        client.done = true;
+        return;
+    }
+    client.buf.resize(whole, 0);
+    let received = warm::recv_with_fds(
+        client.stream.as_fd(),
+        &mut client.buf[have..],
+        &mut client.fds,
+        3,
+    );
+    client
+        .buf
+        .truncate(have + received.as_ref().map_or(0, |&n| n));
+    let _n = match received {
         Ok(0) => {
             client.done = true;
             return;
@@ -276,7 +355,6 @@ fn read_request(
             return;
         }
     };
-    client.buf.extend_from_slice(&chunk[..n]);
     let request = match Request::decode(&client.buf) {
         Ok(Some((request, _))) => request,
         Ok(None) => return,
@@ -312,7 +390,7 @@ fn read_request(
 fn fork_clone(
     clients: &mut [Client],
     i: usize,
-    request: Request,
+    mut request: Request,
     kernel: &mut Kernel<StdioHost>,
     app: &mut SeccompPlatform,
     listener: &UnixListener,
@@ -341,6 +419,11 @@ fn fork_clone(
             // without returning.
             unsafe { libc::close(fd) };
         }
+        // What other requesters have sent so far is not this clone's to
+        // know (nor is the raw copy of its own request needed again).
+        for client in clients.iter_mut() {
+            warm::wipe(&mut client.buf);
+        }
         let client = &mut clients[i];
         let stream = client.stream.try_clone();
         let fds = std::mem::take(&mut client.fds);
@@ -350,8 +433,12 @@ fn fork_clone(
         };
         std::process::exit(code);
     }
+    // The child has its own copies; the next clone must not get this one's
+    // input.
+    warm::wipe(&mut request.input);
     let client = &mut clients[i];
-    // The child has its own copies.
+    warm::wipe(&mut client.buf);
+    client.buf.clear();
     client.fds.clear();
     if pid < 0 {
         client.send(&Frame::Error(format!(
@@ -452,8 +539,13 @@ fn become_clone(
     #[cfg(feature = "insecure-test-hooks")]
     let probe = probe::target(&mut request.input);
     let forked = Instant::now();
+    let send = |frame: Frame| {
+        if let Err(err) = warm::send_frame(&stream, &frame, FRAME_PATIENCE) {
+            log::warn!("clone: {frame:?} did not reach the requester: {err}");
+        }
+    };
     let fail = |why: String| {
-        let _ = (&stream).write_all(&Frame::Error(why).encode());
+        send(Frame::Error(why));
         CLONE_FAILED
     };
     // SAFETY: plain prctl and getppid.
@@ -468,8 +560,6 @@ fn become_clone(
             Ok(abi) => _abi = abi,
             Err(why) => return fail(format!("a Landlock domain for the clone: {why}")),
         }
-    } else {
-        log::debug!("clone: no Landlock domain of its own (the template has none)");
     }
     let mut stdio = fds.into_iter().map(File::from);
     let (Some(stdin), Some(stdout), Some(stderr)) = (stdio.next(), stdio.next(), stdio.next())
@@ -501,12 +591,11 @@ fn become_clone(
     if let (Some(target), Ok(mut out)) = (probe, probe_out) {
         let _ = out.write_all(probe::run(_abi, app.host_pids()[0], target).as_bytes());
     }
-    let started = Frame::Started {
+    send(Frame::Started {
         sandbox_id,
         // SAFETY: plain getpid.
         pid: unsafe { libc::getpid() } as u32,
-    };
-    let _ = (&stream).write_all(&started.encode());
+    });
     let status = kernel.run(app);
     print_trace(kernel);
     if !kernel.host_mut().drain_streams(EXIT_DRAIN) {
@@ -518,7 +607,7 @@ fn become_clone(
         Err(KernelError::Platform(err)) => return fail(format!("the clone failed: {err}")),
         Err(err) => return fail(format!("the clone failed: {err}")),
     };
-    let _ = (&stream).write_all(&Frame::Exit(status).encode());
+    send(Frame::Exit(status));
     0
 }
 

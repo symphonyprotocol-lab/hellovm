@@ -75,12 +75,16 @@ const PTRACE_REQUESTS: [c_int; 8] = [
 
 /// The allowlist. `stub_fd` is the only fd `execveat` may execute;
 /// `tcp` also allows `AF_INET` sockets (the `--splice-to` test hook).
-pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
+pub fn entries(stub_fd: i32, tcp: bool, warm: bool) -> Vec<Entry> {
     let mut domains = vec![AF_UNIX];
     if tcp {
         domains.push(AF_INET);
     }
-    #[allow(unused_mut)]
+    let mut fcntls = vec![F_GETFD, F_SETFD, F_GETFL, F_DUPFD_CLOEXEC];
+    if warm {
+        // A warm-clone template seals its snapshot.
+        fcntls.push(F_ADD_SEALS);
+    }
     let mut list = vec![
         // Most frequent first: the filter checks the entries in order.
         // Driving app processes (`hellovm-platform-seccomp`).
@@ -101,14 +105,7 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
         allow(SYS_close),
         allow(SYS_close_range),
         allow(SYS_ppoll),
-        checked(
-            SYS_fcntl,
-            vec![one_of(
-                1,
-                // F_ADD_SEALS: a warm-clone template seals its snapshot.
-                &[F_GETFD, F_SETFD, F_GETFL, F_DUPFD_CLOEXEC, F_ADD_SEALS],
-            )],
-        ),
+        checked(SYS_fcntl, vec![one_of(1, &fcntls)]),
         checked(
             SYS_ioctl,
             vec![Check::OneOf(
@@ -220,18 +217,22 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
         allow(SYS_recvfrom),
         allow(SYS_setsockopt),
         allow(SYS_shutdown),
-        // Warm clones (`hellovm --template`): the template accepts requests
-        // on its control socket (bound before the hardening) and receives
-        // each clone's stdio fds with them; a clone's kernel process puts
-        // itself in a Landlock domain of its own (a ruleset without rules:
-        // only reduces what it may do).
-        checked(SYS_accept4, vec![one_of(3, &[SOCK_CLOEXEC])]),
-        checked(SYS_recvmsg, vec![one_of(2, &[MSG_CMSG_CLOEXEC])]),
-        allow(SYS_landlock_create_ruleset),
-        checked(SYS_landlock_restrict_self, vec![one_of(1, &[0])]),
     ];
     #[cfg(target_arch = "x86_64")]
     list.push(allow(SYS_poll));
+    if warm {
+        // Warm clones (`hellovm --template`) only: the template accepts
+        // requests on its control socket (bound before the hardening) and
+        // receives each clone's stdio fds with them; a clone's kernel
+        // process puts itself in a Landlock domain of its own (a ruleset
+        // without rules: only reduces what it may do).
+        list.extend([
+            checked(SYS_accept4, vec![one_of(3, &[SOCK_CLOEXEC])]),
+            checked(SYS_recvmsg, vec![one_of(2, &[MSG_CMSG_CLOEXEC])]),
+            allow(SYS_landlock_create_ruleset),
+            checked(SYS_landlock_restrict_self, vec![one_of(1, &[0])]),
+        ]);
+    }
     list
 }
 
@@ -239,13 +240,44 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
 mod tests {
     #[test]
     fn every_syscall_has_one_rule() {
-        for tcp in [false, true] {
-            let entries = super::entries(5, tcp);
+        for (tcp, warm) in [(false, false), (true, false), (false, true), (true, true)] {
+            let entries = super::entries(5, tcp, warm);
             let mut nrs: Vec<u32> = entries.iter().map(|e| e.nr).collect();
             nrs.sort_unstable();
             nrs.dedup();
             assert_eq!(nrs.len(), entries.len(), "a syscall is listed twice");
         }
+    }
+
+    /// What only a warm-clone template needs is refused to every other
+    /// sandbox.
+    #[test]
+    fn warm_clone_syscalls_are_for_templates_only() {
+        use crate::filter::{Check, Rule};
+        use libc::*;
+        let only = [
+            SYS_accept4,
+            SYS_recvmsg,
+            SYS_landlock_create_ruleset,
+            SYS_landlock_restrict_self,
+        ];
+        let has = |warm: bool, nr: c_long| {
+            super::entries(5, true, warm)
+                .iter()
+                .any(|e| e.nr == nr as u32)
+        };
+        for nr in only {
+            assert!(has(true, nr) && !has(false, nr), "syscall {nr}");
+        }
+        let seals = |warm: bool| {
+            super::entries(5, false, warm).iter().any(|e| {
+                e.nr == SYS_fcntl as u32
+                    && matches!(&e.rule, Rule::Checked(checks) if checks.iter().any(
+                        |c| matches!(c, Check::OneOf(1, v) if v.contains(&(F_ADD_SEALS as u32)))
+                    ))
+            })
+        };
+        assert!(seals(true) && !seals(false));
     }
 
     /// With `HELLOVM_SECCOMP_LEARNED=FILE`, a recording made by running
@@ -276,8 +308,9 @@ mod tests {
         let arch = crate::harden::audit_arch();
         let code = [0x10_0000..0x20_0000, 0x40_0000..0x50_0000];
         // The stub fd does not matter: the measuring filter lets `execveat`
-        // through without recording it. `tcp`: the `--splice-to` tests.
-        let entries = super::entries(3, true);
+        // through without recording it. `tcp`: the `--splice-to` tests;
+        // `warm`: the template tests.
+        let entries = super::entries(3, true, true);
         let prog = filter::build(arch, &code, Judge::Allowlist(&entries)).unwrap();
         let mut refused = Vec::new();
         for call in &calls {

@@ -8,18 +8,26 @@
 //! `ftruncate` afterwards): empty, [`CAPACITY`] bytes long and sparse, so
 //! that it costs nothing until written. When the core freezes the template
 //! ([`hellovm_core::platform::Platform::freeze`]), every area of every
-//! address space is laid out in the file one after the other, page-aligned,
-//! and copied there with `process_vm_readv` from the first task of its
-//! space. An area the app cannot read (`PROT_NONE`, execute-only) is made
-//! readable first by an injected `mprotect`: the template's processes end
-//! right after, so nothing observes it. Pages that are all zero are not
-//! written and stay holes of the file (untouched heap, stacks and
-//! reservations cost nothing). Each task's registers, FP/SIMD state,
-//! thread pointer and (aarch64) pointer-authentication keys are kept, the template's app processes are killed, and
-//! the file is sealed (`F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK |
-//! F_SEAL_SEAL`): from then on no process, not even a compromised clone
-//! kernel process holding the fd, can change it, so what a clone reads from
-//! it is what the template had.
+//! address space is read with `process_vm_readv` from the first task of its
+//! space, except the areas the core knows to be all zero (anonymous memory
+//! that was never writable: address-space reservations, guard pages), which
+//! are not read at all. An area the app cannot read (`PROT_NONE`,
+//! execute-only) is made readable first by an injected `mprotect`: the
+//! template's processes end right after, so nothing observes it.
+//!
+//! Only the pages that are not all zero go into the file, appended one
+//! after the other as *extents*: runs of such pages, with the zero pages
+//! between two runs, or between a run and the area's start or end, stored
+//! too when they are fewer than [`GAP`] (so that a fragmented heap does not
+//! become thousands of extents, and an area that is mostly data is one). The file thus has
+//! no holes below its end, and how much address space a template has mapped
+//! does not matter, only how much it holds. Each task's registers, FP/SIMD
+//! state (the extended state included: AVX, SVE), thread pointer and
+//! (aarch64) pointer-authentication keys are kept, the template's app
+//! processes are killed, and the file is sealed (`F_SEAL_WRITE |
+//! F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`): from then on no process, not
+//! even a compromised clone kernel process holding the fd, can change it, so
+//! what a clone reads from it is what the template had.
 //!
 //! # Thaw
 //!
@@ -27,7 +35,8 @@
 //! platform value with the capture and the memfd at the same fd number.
 //! Per address space it spawns a fresh app process (the normal bootstrap,
 //! with the memfd left open in it, see [`crate::spawn::spawn`]) and injects,
-//! for each private area,
+//! for each private area, an anonymous mapping of the whole area (unless
+//! one extent covers it) and then, for each of its extents,
 //!
 //! ```text
 //! mmap(start, len, prot, MAP_PRIVATE | MAP_FIXED, memfd, offset)
@@ -36,8 +45,15 @@
 //! The host kernel then shares the template's pages between all clones and
 //! copies a page only when a clone writes it (a private mapping of a file),
 //! and a sealed file is never written, so the clones cannot see each
-//! other's writes. A `MAP_SHARED` area is instead mapped as fresh shared
-//! anonymous memory and filled from the file (the core only lets a template
+//! other's writes. Only pages the file really has are ever mapped from it:
+//! a private mapping of a *hole* of a memfd would make the host allocate
+//! the page in the file at the first touch, read or write, which the seals
+//! do not prevent, and every clone would grow the file all clones share
+//! (and pay for each page it writes twice). The memory that was zero in
+//! the template is plain anonymous memory in the clone instead.
+//!
+//! A `MAP_SHARED` area is mapped as fresh shared anonymous memory and its
+//! extents are copied into it from the file (the core only lets a template
 //! with a single address space have one, so it is shared with nobody yet).
 //! Then `close(memfd)` is injected, so the app process holds no host fd
 //! again, the first task gets its registers back, and every other task of
@@ -66,30 +82,47 @@ use hellovm_core::platform::Prot;
 
 use crate::regs::{FpRegs, PacKeys, Regs};
 
-/// Size of the snapshot memfd: the most memory, holes included, all the
-/// address spaces of a template may have mapped. Sparse, so its size costs
-/// nothing.
+/// Size of the snapshot memfd: the most memory (pages that are not zero)
+/// all the address spaces of a template may hold. Sparse, so its size
+/// costs nothing.
 pub const CAPACITY: u64 = 1 << 40;
+
+/// Zero pages between two runs of data (or the ends of the area) are
+/// stored with them when they are fewer bytes than this: one more extent costs every clone an injected
+/// `mmap`, a stored zero page costs the template a page once.
+pub const GAP: u64 = 128 << 10;
 
 /// How much of an area is copied at a time.
 pub const CHUNK: usize = 1 << 20;
 
-/// One area of a frozen address space and where its contents are in the
-/// file.
-#[derive(Clone, Copy, Debug)]
+/// A run of pages of an area that the file holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    /// Where it starts in the area.
+    pub at: u64,
+    pub len: u64,
+    /// Where it starts in the file.
+    pub offset: u64,
+}
+
+/// One area of a frozen address space. What its extents do not cover is
+/// zero.
+#[derive(Clone, Debug)]
 pub struct AreaImage {
     pub start: u64,
     pub len: u64,
     pub prot: Prot,
     pub shared: bool,
-    pub offset: u64,
+    pub extents: Vec<Extent>,
 }
 
 /// One frozen task.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TaskImage {
     pub regs: Regs,
     pub fp: FpRegs,
+    /// The extended FP/SIMD state (AVX, SVE), where the host has one.
+    pub xstate: Option<Vec<u8>>,
     /// The thread pointer where it is not in [`Regs`] (aarch64).
     #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
     pub tls: u64,
@@ -112,7 +145,7 @@ pub enum Snapshots {
     Frozen {
         file: OwnedFd,
         spaces: Vec<SpaceImage>,
-        /// Bytes actually stored (non-zero pages).
+        /// Bytes stored: the length of the file's contents.
         stored: u64,
     },
 }
@@ -160,71 +193,138 @@ fn zero_page(page: &[u8]) -> bool {
     head.iter().all(|&b| b == 0) && words.iter().all(|&w| w == 0) && tail.iter().all(|&b| b == 0)
 }
 
-/// A shared writable window onto part of the file.
-struct Window {
-    ptr: *mut libc::c_void,
-    len: usize,
+/// Appends the pages of a template to the file, in the order they come.
+/// The file's position is where the next page goes: nothing else moves it.
+pub struct Writer<'a> {
+    file: BorrowedFd<'a>,
+    /// Bytes written so far.
+    offset: u64,
+    page: u64,
+    zeros: Vec<u8>,
 }
 
-impl Window {
-    fn map(file: BorrowedFd<'_>, offset: u64, len: usize) -> io::Result<Window> {
-        // SAFETY: a new mapping chosen by the host; checked below.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                offset as libc::off_t,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+impl<'a> Writer<'a> {
+    /// For a file nothing was written to yet.
+    pub fn new(file: BorrowedFd<'a>, page: u64) -> Writer<'a> {
+        Writer {
+            file,
+            offset: 0,
+            page,
+            zeros: Vec::new(),
         }
-        let window = Window { ptr, len };
-        // A process forked meanwhile (by another thread: tests run in
-        // parallel) must not inherit a writable shared mapping of the
-        // file, or sealing it fails with EBUSY until that process execs.
-        // SAFETY: advice on our own mapping.
-        if unsafe { libc::madvise(ptr, len, libc::MADV_DONTFORK) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(window)
     }
-}
 
-impl Drop for Window {
-    fn drop(&mut self) {
-        // SAFETY: unmapping exactly what `map` mapped.
-        unsafe { libc::munmap(self.ptr, self.len) };
+    pub fn stored(&self) -> u64 {
+        self.offset
     }
-}
 
-/// Stores `data`, which belongs at `offset` of the file, skipping pages
-/// that are all zero (they read as zero from a hole). Returns the bytes
-/// stored.
-pub fn store(file: BorrowedFd<'_>, offset: u64, data: &[u8], page: usize) -> io::Result<u64> {
-    let pages = data.chunks(page).enumerate().filter(|(_, p)| !zero_page(p));
-    let mut window: Option<Window> = None;
-    let mut stored = 0;
-    for (i, bytes) in pages {
-        let window = match &window {
-            Some(window) => window,
-            None => window.insert(Window::map(file, offset, data.len())?),
-        };
-        // SAFETY: the window is `data.len()` bytes long and the page lies
-        // inside it; nothing else in this process uses the window.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (window.ptr as *mut u8).add(i * page),
-                bytes.len(),
-            );
+    fn append(&mut self, mut data: &[u8]) -> io::Result<()> {
+        if self.offset + data.len() as u64 > CAPACITY {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("the template holds more than {} GiB", CAPACITY >> 30),
+            ));
         }
-        stored += bytes.len() as u64;
+        self.offset += data.len() as u64;
+        while !data.is_empty() {
+            // SAFETY: the buffer is valid for its length.
+            let n = unsafe { libc::write(self.file.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+            match n {
+                n if n > 0 => data = &data[n as usize..],
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                _ => {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(stored)
+
+    fn append_zeros(&mut self, mut len: u64) -> io::Result<()> {
+        if self.zeros.is_empty() {
+            self.zeros = vec![0; GAP as usize];
+        }
+        while len > 0 {
+            let n = len.min(self.zeros.len() as u64) as usize;
+            let zeros = std::mem::take(&mut self.zeros);
+            let result = self.append(&zeros[..n]);
+            self.zeros = zeros;
+            result?;
+            len -= n as u64;
+        }
+        Ok(())
+    }
+
+    /// Ends an area after its last [`Writer::store`]: few zero pages at
+    /// its end are stored with its last extent.
+    pub fn finish(&mut self, extents: &mut [Extent], gap: u64) -> io::Result<()> {
+        if let Some(last) = extents.last_mut() {
+            if gap > 0 && gap < GAP {
+                last.len += gap;
+                self.append_zeros(gap)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores the next piece of an area: `data` (whole pages) is what the
+    /// area has at `at`, and follows what the previous call for this area
+    /// stored. `extents` is the area's list so far, `gap` the zero bytes
+    /// seen since its last extent.
+    pub fn store(
+        &mut self,
+        extents: &mut Vec<Extent>,
+        gap: &mut u64,
+        at: u64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        let page = self.page as usize;
+        let mut i = 0;
+        while i < data.len() {
+            let zero = zero_page(&data[i..(i + page).min(data.len())]);
+            let mut end = i + page;
+            while end < data.len() && zero_page(&data[end..(end + page).min(data.len())]) == zero {
+                end += page;
+            }
+            let end = end.min(data.len());
+            let run = (end - i) as u64;
+            if zero {
+                *gap += run;
+            } else {
+                match extents.last_mut() {
+                    Some(last) if *gap < GAP && last.at + last.len + *gap == at + i as u64 => {
+                        let between = *gap;
+                        last.len += between + run;
+                        self.append_zeros(between)?;
+                    }
+                    // Few zero pages at the start of the area: stored too,
+                    // so that an area that is nearly all data is one extent
+                    // (one mapping in a clone instead of two).
+                    None if *gap < GAP => {
+                        let before = *gap;
+                        extents.push(Extent {
+                            at: 0,
+                            len: before + run,
+                            offset: self.offset,
+                        });
+                        self.append_zeros(before)?;
+                    }
+                    _ => extents.push(Extent {
+                        at: at + i as u64,
+                        len: run,
+                        offset: self.offset,
+                    }),
+                }
+                *gap = 0;
+                self.append(&data[i..end])?;
+            }
+            i = end;
+        }
+        Ok(())
+    }
 }
 
 /// Reads `buf.len()` bytes of the file at `offset`.
@@ -260,24 +360,75 @@ mod tests {
     use std::os::fd::AsFd;
 
     #[test]
-    fn stores_only_non_zero_pages_and_seals() {
+    fn stores_only_data_as_extents_and_seals() {
         let file = create_file().unwrap();
         let page = crate::sys::page_size() as usize;
-        let mut data = vec![0u8; 4 * page];
-        data[page + 7] = 42;
-        data[3 * page] = 1;
-        let stored = store(file.as_fd(), 8 * page as u64, &data, page).unwrap();
-        assert_eq!(stored, 2 * page as u64);
-        let mut back = vec![9u8; 4 * page];
-        load(file.as_fd(), 8 * page as u64, &mut back).unwrap();
-        assert_eq!(back, data);
-        seal(file.as_fd()).unwrap();
-        assert!(
-            Window::map(file.as_fd(), 0, page).is_err(),
-            "sealed against writes"
+        let far = (GAP as usize).div_ceil(page) + 1;
+        // Zeros for longer than GAP, then data at pages far+1 and far+3 (a
+        // short gap: one extent with page far+2), then after another long
+        // gap two pages split over two calls and one last zero page.
+        let mut data = vec![0u8; (2 * far + 12) * page];
+        data[(far + 1) * page + 7] = 42;
+        data[(far + 3) * page] = 1;
+        let second = 2 * far + 9;
+        data[second * page..(second + 2) * page].fill(7);
+        let mut writer = Writer::new(file.as_fd(), page as u64);
+        let (mut extents, mut gap) = (Vec::new(), 0);
+        let cut = (second + 1) * page;
+        writer
+            .store(&mut extents, &mut gap, 0, &data[..cut])
+            .unwrap();
+        writer
+            .store(&mut extents, &mut gap, cut as u64, &data[cut..])
+            .unwrap();
+        writer.finish(&mut extents, gap).unwrap();
+        let p = page as u64;
+        assert_eq!(
+            extents,
+            [
+                Extent {
+                    at: (far as u64 + 1) * p,
+                    len: 3 * p,
+                    offset: 0
+                },
+                // With the zero page that ends the area.
+                Extent {
+                    at: second as u64 * p,
+                    len: 3 * p,
+                    offset: 3 * p
+                },
+            ]
         );
+        assert_eq!(writer.stored(), 6 * p);
+        for extent in &extents {
+            let mut back = vec![9u8; extent.len as usize];
+            load(file.as_fd(), extent.offset, &mut back).unwrap();
+            let at = extent.at as usize;
+            assert_eq!(back, data[at..at + back.len()]);
+        }
+        // A small area with zeros around its data is one extent.
+        let small = &data[far * page..(far + 6) * page];
+        let (mut extents, mut gap) = (Vec::new(), 0);
+        writer.store(&mut extents, &mut gap, 0, small).unwrap();
+        writer.finish(&mut extents, gap).unwrap();
+        assert_eq!(
+            extents,
+            [Extent {
+                at: 0,
+                len: 6 * p,
+                offset: 6 * p
+            }]
+        );
+        // Every page below the end is allocated: no hole a clone could
+        // fill. (`st_blocks` counts 512-byte units.)
+        // SAFETY: an all-zero stat is valid; fstat fills it.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: plain fstat on our fd.
+        assert_eq!(unsafe { libc::fstat(file.as_raw_fd(), &mut stat) }, 0);
+        assert_eq!(stat.st_blocks as u64 * 512, 12 * p);
+        seal(file.as_fd()).unwrap();
         // SAFETY: plain syscall.
         let ret = unsafe { libc::pwrite(file.as_raw_fd(), b"x".as_ptr().cast(), 1, 0) };
-        assert!(ret < 0);
+        assert!(ret < 0, "sealed against writes");
     }
 }

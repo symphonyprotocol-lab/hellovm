@@ -313,7 +313,7 @@ pub(crate) mod tests {
     #[test]
     fn many_ranges_and_the_real_allowlist_assemble() {
         let code: Vec<_> = (0..64u64).map(|i| i << 32..(i << 32) + 0x1000).collect();
-        let entries = crate::allowlist::entries(7, true);
+        let entries = crate::allowlist::entries(7, true, true);
         let prog = build(ARCH, &code, Judge::Allowlist(&entries)).unwrap();
         assert!(prog.len() < 4096);
         let read = libc::SYS_read as u32;

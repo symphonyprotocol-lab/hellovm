@@ -69,6 +69,12 @@ pub struct Vma {
     pub end: GuestAddr,
     pub prot: Prot,
     pub kind: VmaKind,
+    /// The area is known to hold only zeros: anonymous private memory that
+    /// has not been writable since it was mapped (an address-space
+    /// reservation, a guard page). Neither the app nor the kernel can have
+    /// written to it: the kernel writes app memory with the app's own
+    /// protection. Freezing a template does not read such areas.
+    pub zero: bool,
 }
 
 /// Non-overlapping memory areas, keyed by start address.
@@ -156,6 +162,7 @@ impl VmaMap {
         self.split_at(end);
         for (_, vma) in self.areas.range_mut(start..end) {
             vma.prot = prot;
+            vma.zero &= !prot.contains(Prot::WRITE);
         }
     }
 
@@ -209,6 +216,7 @@ impl Mm {
                 end: range.end,
                 prot: Prot::NONE,
                 kind: VmaKind::Reserved,
+                zero: false,
             });
         }
         let stack_top = (info.max_addr - page_size) & !(page_size - 1);
@@ -278,6 +286,7 @@ impl Mm {
             end,
             prot,
             kind,
+            zero: kind == VmaKind::Anonymous && !prot.contains(Prot::WRITE),
         });
         Ok(())
     }
@@ -571,6 +580,7 @@ mod tests {
             end,
             prot,
             kind: VmaKind::Anonymous,
+            zero: false,
         }
     }
 
@@ -625,6 +635,30 @@ mod tests {
         let app = MockApp::new(crate::Arch::Aarch64);
         let mm = Mm::new(&app.address_space());
         (mm, app)
+    }
+
+    #[test]
+    fn only_never_writable_anonymous_memory_is_known_zero() {
+        let (mut mm, mut app) = setup();
+        let zero = |mm: &Mm, addr| mm.vmas().find(addr).unwrap().zero;
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        let reserved = mm.mmap(&mut app, 0, 0x4000, 0, anon, None).unwrap();
+        assert!(zero(&mm, reserved));
+        // Writable once is enough: it may hold data from then on.
+        mm.mprotect(&mut app, reserved, 0x1000, 3).unwrap();
+        mm.mprotect(&mut app, reserved, 0x1000, 0).unwrap();
+        assert!(!zero(&mm, reserved));
+        assert!(zero(&mm, reserved + 0x1000));
+        let writable = mm.mmap(&mut app, 0, 0x1000, 3, anon, None).unwrap();
+        assert!(!zero(&mm, writable));
+        let file = mm
+            .mmap(&mut app, 0, 0x1000, 1, MAP_PRIVATE, Some(b"data"))
+            .unwrap();
+        assert!(!zero(&mm, file));
+        let shared = mm
+            .mmap(&mut app, 0, 0x1000, 1, MAP_SHARED | MAP_ANONYMOUS, None)
+            .unwrap();
+        assert!(!zero(&mm, shared));
     }
 
     #[test]

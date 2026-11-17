@@ -524,11 +524,16 @@ resumes no thread: running threads are interrupted, a thread that traps
 in the meantime keeps its syscall for later (the clone runs it, as if the
 thread had not reached it yet; a signal that comes first restarts it),
 and when nothing runs K checks that the sandbox can be cloned (below).
-The platform then copies every memory area of every address space into a
-memfd made before K confined itself (sparse; pages that are all zero
-stay holes, an area the guest cannot read is made readable first), keeps
-every thread's registers, FP/SIMD state, thread pointer and (aarch64)
-pointer-authentication keys, kills the
+The platform then copies the memory of every address space into a
+memfd made before K confined itself: only the pages that are not all
+zero, appended one after the other as extents (runs of such pages; fewer
+than 128 KiB of zero pages between two runs are stored with them, so a
+fragmented heap does not become thousands of extents). An area the guest
+cannot read is made readable first; anonymous memory that was never
+writable (an address-space reservation, guard pages) is known to be zero
+and not read at all. It keeps every thread's registers, FP/SIMD state
+including the extended state (x86_64 XSAVE: AVX, AVX-512; aarch64 SVE),
+thread pointer and (aarch64) pointer-authentication keys, kills the
 app processes and seals the file (`F_SEAL_WRITE | F_SEAL_GROW |
 F_SEAL_SHRINK | F_SEAL_SEAL`): nobody, not even a compromised clone
 holding the fd, can change it again. Everything else, the kernel state
@@ -539,11 +544,16 @@ the clone's kernel process and gets a copy-on-write copy of all that
 state from the host. K' enters a Landlock domain of its own (see
 **Hardening** below), makes the requester's fds its console, takes its
 sandbox id, and rebuilds the app processes: per address space a fresh app
-process (the normal bootstrap) in which K' injects one `mmap(MAP_PRIVATE |
-MAP_FIXED)` of the memfd per area and then `close` of the memfd, and one
-injected `clone(CLONE_VM)` per further thread; each task gets its
-registers back. The host shares the template's pages among all clones and
-copies a page only when a clone writes it. K' completes the parked read
+process (the normal bootstrap) in which K' injects, per area, an anonymous
+mapping and one `mmap(MAP_PRIVATE | MAP_FIXED)` of the memfd per extent,
+then `close` of the memfd, and one injected `clone(CLONE_VM)` per further
+thread; each task gets its registers back. The host shares the template's
+pages among all clones and copies a page only when a clone writes it.
+Memory that was zero in the template is anonymous memory in the clone and
+never mapped from the file: the host fills a hole of a memfd at the first
+touch through a private mapping, read or write, seals or not, so clones
+would otherwise grow the file they all share (a test compares the file's
+allocated size before and after clones that write 32 MiB of such memory). K' completes the parked read
 of the clone point with the input, reports `S` and runs the sandbox; K
 reaps K', watches the connection, and reports for a K' that dies without
 reporting itself. `kernel/platform-seccomp/src/snapshot.rs` and
@@ -593,10 +603,12 @@ written by every clone.
 
 **What can be cloned.** Any number of processes and threads, in any of
 the states above, zombies and stopped jobs (`tests/warm.rs` freezes one
-template in all of them at once). Register state is what the platform
-keeps for signal frames too: general registers, FP/SIMD (aarch64), the
-`fxsave` area (x86_64; AVX upper halves of a thread interrupted outside a
-syscall would be lost), the thread pointer, and on aarch64 the
+template in all of them at once). Register state: general registers, the
+basic FP/SIMD state, the extended state as the host's ptrace gives it
+(`NT_X86_XSTATE` on x86_64, `NT_ARM_SVE` on aarch64, so a thread
+interrupted in the middle of AVX or SVE code continues correctly; a
+thread in SME streaming mode or with ZA enabled is not supported), the
+thread pointer, and on aarch64 the
 pointer-authentication keys, which the clone's new processes must get from
 the template (Ubuntu builds glibc and CPython with `-mbranch-protection`:
 with new keys, returning through a frame the template signed is
@@ -612,9 +624,10 @@ and refused with the reason (the template answers every request with
 | A terminal console | refused on the command line: a template has plain streams |
 | The program ends before its clone point | nothing to clone |
 
-Limits: 512 connections served at once per template; 64 KiB of input;
-the areas of all address spaces at most 1 TiB together (holes count, so
-huge reservations count; the file is sparse).
+Limits: 512 connections served at once per template; a request must be
+complete within 10 s of connecting (an idle connection gets `E` and is
+closed); 64 KiB of input; at most 1 TiB of stored pages (how much address
+space the template has mapped does not matter).
 
 **Hardening.** A clone's kernel process is a fork of the template's, so
 it has every layer the template has, the same way (the seccomp filter,
@@ -631,11 +644,22 @@ as the same user and would otherwise be reachable, since seccomp cannot
 tell pids apart), and they cannot reach it. A test has one clone's
 kernel process try both on a sibling clone's app process (test hook):
 refused, and with the nested domain left out, both succeed. Without
-Landlock on the host this falls back to what the README says about
-processes of one user: give each tenant its own uid.
+Landlock on the host nothing fences the clones of one template from each
+other (they are forks, so they share its user namespace too, and a
+separate uid per tenant is not possible within one template):
+`--sandbox require` therefore refuses to start a template there, and
+`best-effort` warns that the template is fit for one tenant only.
 
-What cloning adds to the allowlist (measured with
-`HELLOVM_SECCOMP_LEARN` over the whole suite, warm-clone tests
+A clone starts with a copy of the template kernel process's memory, so
+that process keeps nothing of one request where another's clone would
+find it: the bytes of a request live in one buffer per connection that is
+never reallocated, is zeroed when the request has been handed to its
+clone or the connection ends, and the forked child zeroes the other
+connections' buffers before it does anything else.
+
+What `--template` adds to the allowlist, for templates and their clones
+only (a sandbox started without it gets the list without these; measured
+with `HELLOVM_SECCOMP_LEARN` over the whole suite, warm-clone tests
 included): `accept4` (`SOCK_CLOEXEC` only) and `recvmsg`
 (`MSG_CMSG_CLOEXEC` only) for the control socket, `fcntl(F_ADD_SEALS)`
 for sealing the snapshot, and `landlock_create_ruleset` and
@@ -673,13 +697,13 @@ active), medians of 30 clones and 5 cold starts:
 
 | | Debian bookworm (CPython 3.11) | Ubuntu 26.04 (CPython 3.14) |
 |---|---|---|
-| Native `python3`, start to first line | 39.9 ms | 43.1 ms |
-| Cold `hellovm`, start to first line | 194.5 ms | 146.0 ms |
-| Template, start to frozen (once) | 213.5 ms | 160.3 ms |
-| Snapshot (non-zero pages, areas) | 28.1 MiB, 128 | 33.5 MiB, 105 |
-| **Clone, request to first guest instruction** (`S`) | **6.4 ms** (3.9–10.3) | **5.7 ms** (3.3–8.6) |
-| **Clone, request to first line** | **7.2 ms** (4.5–11.3) | **6.5 ms** (3.9–9.5) |
-| Clone, request to exit status | 25.4 ms | 25.1 ms |
+| Native `python3`, start to first line | 38.8 ms | 44.1 ms |
+| Cold `hellovm`, start to first line | 193.6 ms | 141.8 ms |
+| Template, start to frozen (once) | 222.5 ms | 176.3 ms |
+| Snapshot (stored pages, areas) | 29.9 MiB, 128 | 35.8 MiB, 105 |
+| **Clone, request to first guest instruction** (`S`) | **7.0 ms** (4.1–10.4) | **5.7 ms** (3.7–9.1) |
+| **Clone, request to first line** | **8.2 ms** (4.7–11.3) | **6.6 ms** (4.6–10.3) |
+| Clone, request to exit status | 24.7 ms | 25.7 ms |
 
 The 50-clone test makes 50 clones one after another and then 50 at once,
 each running and ending a small program, in about half a second each way
@@ -687,9 +711,10 @@ in a debug build.
 
 Where a clone's time goes (`HELLOVM_LOG=debug` on the template logs it
 per clone): rebuilding the app processes takes 3.8–5.5 ms of it, that is
-a fresh app process plus one injected `mmap` per memory area (two ptrace
-stops each, roughly 30–40 µs on this VM) for the 128 areas of this
-program; the fork of K' and its set-up (Landlock domain, console) take
+a fresh app process plus the injected `mmap`s (two ptrace stops each,
+roughly 30–40 µs on this VM): one per extent of the snapshot (125 for the
+128 areas of this program on bookworm; the template logs the number) and
+an anonymous one for each area that is not a single extent; the fork of K' and its set-up (Landlock domain, console) take
 tens of microseconds; the rest is the request, the `S` frame and the
 guest's own work. Fewer, larger areas would make it faster; so would
 batching the injected `mmap`s, which the current one-syscall-per-stop

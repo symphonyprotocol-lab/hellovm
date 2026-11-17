@@ -571,3 +571,121 @@ fn a_clone_is_as_confined_as_its_template_and_cannot_reach_a_sibling() {
         eprintln!("Landlock ABI {abi} < 6 does not scope signals: {line}");
     }
 }
+
+/// The bytes the host has allocated for the template's snapshot file, read
+/// through `/proc` (`None` where the test may not look into the template's
+/// kernel process).
+fn snapshot_allocated(template: &Template) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let fds = std::fs::read_dir(format!("/proc/{}/fd", template.pid())).ok()?;
+    for fd in fds.flatten() {
+        let target = std::fs::read_link(fd.path()).ok()?;
+        if target.to_string_lossy().contains("hellovm-snapshot") {
+            return Some(std::fs::metadata(fd.path()).ok()?.blocks() * 512);
+        }
+    }
+    None
+}
+
+/// Clones share the snapshot file read-only. Memory that was zero in the
+/// template (here a 32 MiB buffer nobody touched) must not come from the
+/// file: the host would allocate each page of it in the file at a clone's
+/// first touch, for all clones and for as long as the template lives.
+#[test]
+fn clones_do_not_grow_the_snapshot() {
+    if !require_python() {
+        return;
+    }
+    let program = r#"
+import os, sys
+big = bytearray(32 << 20)
+print("template ready", flush=True)
+code = open("/dev/hellovm-clone", "rb").read()
+exec(compile(code, "<clone>", "exec"))
+"#;
+    let template = Template::start(&["/usr/bin/python3", "-c", program], &[]);
+    let (stored, _) = ready(&template);
+    assert!(stored < 24 << 20, "the zero buffer was stored: {stored}");
+    let before = snapshot_allocated(&template);
+    for _ in 0..3 {
+        let run = template.run(
+            b"print(sum(big[::4096]))\nbig[:] = b'x' * len(big)\nprint(big.count(b'x'))",
+            b"",
+        );
+        assert_eq!(run.stdout, format!("0\n{}\n", 32 << 20), "{run:?}");
+        assert_eq!(run.status, Status::Exited(0));
+    }
+    match (before, snapshot_allocated(&template)) {
+        (Some(before), Some(after)) => {
+            assert_eq!(before, stored, "the file holds what the template stored");
+            assert_eq!(after, before, "clones grew the snapshot file");
+        }
+        _ => eprintln!("note: cannot look at the template's snapshot file through /proc"),
+    }
+}
+
+/// A connection that never sends its request is answered and dropped, so
+/// it does not hold one of the template's connection slots.
+#[test]
+fn an_idle_connection_is_dropped() {
+    use hellovm::warm::Frame;
+    use std::io::Write;
+    if !require_python() {
+        return;
+    }
+    let template = python_template();
+    ready(&template);
+    let mut idle = std::os::unix::net::UnixStream::connect(&template.socket).unwrap();
+    // Half a header, then silence.
+    idle.write_all(b"HVMC\x01C").unwrap();
+    let start = Instant::now();
+    idle.set_read_timeout(Some(
+        hellovm::warm::REQUEST_TIMEOUT + Duration::from_secs(20),
+    ))
+    .unwrap();
+    // Meanwhile the template serves others.
+    let run = template.run(b"print('served')", b"");
+    assert_eq!(run.stdout, "served\n", "{run:?}");
+    match Frame::read_from(&mut idle).unwrap() {
+        Some(Frame::Error(why)) => assert!(why.contains("no complete request"), "{why}"),
+        other => panic!("expected an error frame, got {other:?}"),
+    }
+    assert!(start.elapsed() >= hellovm::warm::REQUEST_TIMEOUT - Duration::from_secs(1));
+    assert_eq!(Frame::read_from(&mut idle).unwrap(), None, "closed");
+}
+
+/// Without Landlock nothing fences the clones of one template from each
+/// other, so `--sandbox require` refuses to be a template (and
+/// `best-effort` says so).
+#[test]
+fn require_refuses_a_template_whose_clones_would_not_be_fenced() {
+    if !require_python() {
+        return;
+    }
+    let argv = ["/usr/bin/python3", "-c", PYTHON_TEMPLATE];
+    let no_landlock = [("HELLOVM_TEST_NO_LANDLOCK", "1")];
+    let mut template = Template::start_with_env(&argv, &["--sandbox", "require"], &no_landlock);
+    assert!(template.ready().is_err(), "{}", template.output());
+    assert!(!template.wait().success());
+    // The output is collected on other threads.
+    let start = Instant::now();
+    while !template.output().contains("Landlock") && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = template.output();
+    assert!(output.contains("Landlock"), "{output}");
+    assert!(
+        !output.contains("template ready"),
+        "the program ran: {output}"
+    );
+
+    let template = Template::start_with_env(&argv, &[], &no_landlock);
+    ready(&template);
+    let output = template.output();
+    assert!(
+        output.contains("would not be fenced from each other"),
+        "{output}"
+    );
+    let run = template.run(b"print('one tenant')", b"");
+    assert_eq!(run.stdout, "one tenant\n", "{run:?}");
+}

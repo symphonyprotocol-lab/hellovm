@@ -560,6 +560,7 @@ impl<H: Host> Kernel<H> {
                             } else {
                                 Sharing::Private
                             },
+                            zero: v.zero,
                         })
                         .collect();
                     spaces.push((

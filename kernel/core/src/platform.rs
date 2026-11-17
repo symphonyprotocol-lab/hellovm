@@ -464,6 +464,9 @@ pub struct FrozenArea {
     pub end: GuestAddr,
     pub prot: Prot,
     pub sharing: Sharing,
+    /// The area holds only zeros (see `mm::Vma::zero`): the platform need
+    /// not read it.
+    pub zero: bool,
 }
 
 /// One address space of a sandbox being frozen ([`Platform::freeze`]): the

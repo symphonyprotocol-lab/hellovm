@@ -87,6 +87,7 @@ const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-
 
 /// How long hellovm waits, after the program ends, for outbound bytes the
 /// sandbox already wrote to be delivered.
+#[cfg(target_os = "linux")]
 const EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Exit status when the program was killed by `--timeout`.
@@ -447,6 +448,7 @@ fn harden(
     image: &mut hellovm_host::ImageDir,
     egress: Option<PathBuf>,
     fds: Result<usize, String>,
+    warm: bool,
 ) -> Result<(Option<PathBuf>, bool), Box<dyn std::error::Error>> {
     #[cfg(feature = "insecure-test-hooks")]
     let (tcp_port, learn, skip_landlock) = (
@@ -469,6 +471,7 @@ fn harden(
         tcp_port,
         learn,
         skip_landlock,
+        warm,
         fds,
     })?;
     if let Some(dir) = hardened.image {
@@ -513,7 +516,7 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
         host.set_splice_endpoint(addr);
     }
     let image = host.image_mut().expect("the host has the image");
-    if let (Some(path), _) = harden(options, image, egress, fds)? {
+    if let (Some(path), _) = harden(options, image, egress, fds, false)? {
         host.set_egress(path);
     }
     #[cfg(feature = "insecure-test-hooks")]
@@ -595,7 +598,7 @@ fn run_session(
     let mut host = hellovm_host::CaptureHost::new(Some(image));
     hellovm_platform_seccomp::host_profile()?;
     let image = host.image_mut().expect("the host has the image");
-    let (egress, _) = harden(options, image, egress, fds)?;
+    let (egress, _) = harden(options, image, egress, fds, false)?;
     if let Some(addr) = options.splice_to {
         host.set_splice_endpoint(addr);
     }
