@@ -82,6 +82,11 @@ pub struct TemplateConfig {
     /// fail with `ENOSPC`.
     #[serde(default = "default_fs_limit")]
     pub fs_limit_mb: u64,
+    /// Most processes and threads a sandbox may have (each is a host
+    /// process, the sandbox's kernel process is one more); one over is
+    /// removed.
+    #[serde(default = "default_max_processes")]
+    pub max_processes: usize,
     /// The one tenant this template serves. A shared template (none) runs
     /// with `--sandbox require`, which needs Landlock to fence its clones
     /// from each other.
@@ -99,6 +104,14 @@ fn default_python() -> String {
 
 fn default_memory_limit() -> u64 {
     1024
+}
+
+/// Most host processes (guest processes and threads, plus the kernel
+/// process) a sandbox's limit may be.
+pub const MAX_PROCESSES: usize = 4096;
+
+fn default_max_processes() -> usize {
+    MAX_PROCESSES
 }
 
 fn default_fs_limit() -> u64 {
@@ -183,6 +196,12 @@ impl Config {
                 return Err(format!(
                     "template {}: a shared template (no tenant) must run with --sandbox require",
                     t.name
+                ));
+            }
+            if t.max_processes < 8 || t.max_processes > MAX_PROCESSES {
+                return Err(format!(
+                    "template {}: max_processes must be 8 to {}",
+                    t.name, MAX_PROCESSES
                 ));
             }
             if t.memory_limit_mb == 0 || t.fs_limit_mb == 0 {

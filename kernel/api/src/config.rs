@@ -32,6 +32,16 @@ pub struct Config {
     /// Seconds between two reconciliations with the nodes.
     #[serde(default = "default_reconcile")]
     pub reconcile_interval: f64,
+    /// Connections served at once from one IP address (of 256 in all), so
+    /// that one client, with a token or without, cannot take every
+    /// connection. Behind a reverse proxy every client has the proxy's
+    /// address: raise it there and limit per client in the proxy.
+    #[serde(default = "default_per_client")]
+    pub max_connections_per_client: usize,
+}
+
+fn default_per_client() -> usize {
+    32
 }
 
 fn default_idle() -> f64 {
@@ -135,6 +145,9 @@ impl Config {
             if !(value.is_finite() && value > 0.0 && value <= max) {
                 return Err(format!("{what} must be more than 0 and at most {max}"));
             }
+        }
+        if !(1..=256).contains(&config.max_connections_per_client) {
+            return Err("max_connections_per_client must be 1 to 256".into());
         }
         for (what, value) in [
             ("max_idle_timeout", config.max_idle_timeout),

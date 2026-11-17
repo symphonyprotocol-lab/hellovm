@@ -56,6 +56,15 @@ fn run(config_path: &str) -> Result<(), String> {
             config.hellovm.display()
         ));
     }
+    // Per sandbox: its control connection twice, the agent's two pipes and
+    // its log pipe. Per template: its process's two output pipes and the
+    // socket of a ping. Then the API's connections and noded's own files.
+    let limits = hellovm_control::http::Limits::default();
+    let fds = config.max_sandboxes as u64 * 5
+        + config.templates.len() as u64 * 4
+        + limits.max_connections as u64
+        + 64;
+    hellovm_control::ensure_fd_limit(fds)?;
     let egress = config
         .egress
         .as_deref()
@@ -108,6 +117,13 @@ fn run(config_path: &str) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     {
+        let node = Arc::clone(&node);
+        std::thread::Builder::new()
+            .name("memory".into())
+            .spawn(move || node.watch_memory())
+            .map_err(|e| e.to_string())?;
+    }
+    {
         let api = Arc::new(NodeApi {
             node: Arc::clone(&node),
             token,
@@ -115,11 +131,7 @@ fn run(config_path: &str) -> Result<(), String> {
         std::thread::Builder::new()
             .name("http".into())
             .spawn(move || {
-                if let Err(err) = hellovm_control::http::serve(
-                    listener,
-                    api,
-                    hellovm_control::http::Limits::default(),
-                ) {
+                if let Err(err) = hellovm_control::http::serve(listener, api, limits) {
                     log::error!("serving the node API: {err}");
                     STOP.store(true, Ordering::SeqCst);
                 }

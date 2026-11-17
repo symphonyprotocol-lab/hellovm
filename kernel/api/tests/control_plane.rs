@@ -55,6 +55,15 @@ fn sandboxes_through_the_api() {
             .any(|t| t["name"] == "python" && t["ready"] == json!(true)),
         "{templates}"
     );
+    // Nothing of the node's insides (process ids, restarts).
+    assert!(
+        templates["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t.as_object().unwrap().len() == 2),
+        "{templates}"
+    );
 
     // Create: request to ready (the agent in the clone answered).
     let started = Instant::now();
@@ -206,7 +215,60 @@ fn sandboxes_through_the_api() {
         json!({"python": "import errno\ntry:\n    with open('/tmp/huge', 'wb') as f:\n        for _ in range(300):\n            f.write(b'x' * (1 << 20))\nexcept OSError as e:\n    print(errno.errorcode[e.errno])", "timeout": 60}),
     );
     assert_eq!(r["stdout"], "ENOSPC\n", "{r}");
+    // With the layer full, a write or an edit that does not fit fails and
+    // leaves the file it was to replace as it was (and no temporary file).
+    let keep = format!("/v1/sandboxes/{id}/files?path=/tmp/keep/k.txt");
+    plane.sh(ACME, &id, "rm -f /tmp/huge; mkdir /tmp/keep");
+    assert_eq!(plane.call(ACME, "PUT", &keep, b"precious").status, 200);
+    plane.exec(
+        ACME,
+        &id,
+        json!({"python": "try:\n    with open('/tmp/huge', 'wb') as f:\n        for _ in range(300):\n            f.write(b'x' * (1 << 20))\nexcept OSError:\n    pass", "timeout": 60}),
+    );
+    let big = vec![b'y'; 4 << 20];
+    let r = plane.call(ACME, "PUT", &keep, &big);
+    assert_eq!((r.status, r.code().as_str()), (507, "no_space"));
+    let r = plane.call_json(
+        ACME,
+        "POST",
+        &format!("/v1/sandboxes/{id}/files/edit"),
+        json!({"path": "/tmp/keep/k.txt", "old": "precious", "new": "z".repeat(3 << 20)}),
+    );
+    assert_eq!((r.status, r.code().as_str()), (507, "no_space"));
+    assert_eq!(plane.call(ACME, "GET", &keep, b"").body, b"precious");
+    assert_eq!(plane.sh(ACME, &id, "ls -A /tmp/keep")["stdout"], "k.txt\n");
     plane.sh(ACME, &id, "rm -f /tmp/huge");
+    // An edit keeps the file's mode and goes through a symbolic link.
+    plane.sh(
+        ACME,
+        &id,
+        "chmod 750 /tmp/keep/k.txt; ln -s k.txt /tmp/keep/link",
+    );
+    let r = plane.call_json(
+        ACME,
+        "POST",
+        &format!("/v1/sandboxes/{id}/files/edit"),
+        json!({"path": "/tmp/keep/link", "old": "precious", "new": "edited"}),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = plane.sh(
+        ACME,
+        &id,
+        "cd /tmp/keep; cat k.txt; stat -c ' %a' k.txt; test -L link && echo link",
+    );
+    assert_eq!(r["stdout"], "edited 750\nlink\n", "{r}");
+    // A Python run with a timeout too short for it to start is killed
+    // like any other, and the sandbox goes on.
+    let r = plane.exec(
+        ACME,
+        &id,
+        json!({"python": "import time\ntime.sleep(30)", "timeout": 0.0005}),
+    );
+    assert_eq!(r["timed_out"], json!(true), "{r}");
+    assert_eq!(
+        plane.sh(ACME, &id, "echo still here")["stdout"],
+        "still here\n"
+    );
 
     // Egress: through the proxy, named by the sandbox's egress id.
     let r = plane.exec(
@@ -371,6 +433,7 @@ fn sandboxes_through_the_api() {
 fn idle_lifetime_and_memory_limits_remove_sandboxes() {
     let Some(plane) = Plane::start(PlaneOptions {
         memory_limit_mb: 300,
+        max_processes: 40,
         acme_max: 8,
     }) else {
         return;
@@ -425,6 +488,33 @@ fn idle_lifetime_and_memory_limits_remove_sandboxes() {
     assert!(gone(&hog));
     // Others are untouched.
     assert_eq!(plane.sh(ACME, &busy, "echo ok")["stdout"], "ok\n");
+    // The reason is still told after the API has reconciled with the node
+    // (every two seconds) and dropped the sandbox from what runs.
+    std::thread::sleep(Duration::from_secs(5));
+    let r = plane.call(ACME, "GET", &format!("/v1/sandboxes/{hog}"), b"");
+    assert_eq!((r.status, r.code().as_str()), (410, "sandbox_ended"));
+    assert!(String::from_utf8_lossy(&r.body).contains("memory"));
+    // Another tenant learns nothing of it.
+    let r = plane.call(BETA, "GET", &format!("/v1/sandboxes/{hog}"), b"");
+    assert_eq!(r.status, 404);
+
+    // Processes: more than the limit (40 here) and the sandbox is removed.
+    let forker = id_of(&plane.create(ACME, json!({})));
+    let r = plane.call_json(
+        ACME,
+        "POST",
+        &format!("/v1/sandboxes/{forker}/exec"),
+        json!({"command": "for i in $(seq 60); do sleep 60 & done; sleep 30", "timeout": 60}),
+    );
+    assert!(
+        matches!(r.status, 410 | 502),
+        "{} {}",
+        r.status,
+        String::from_utf8_lossy(&r.body)
+    );
+    let text = String::from_utf8_lossy(&r.body).into_owned();
+    assert!(text.contains("processes"), "{text}");
+    assert!(gone(&forker));
 }
 
 #[test]
@@ -552,6 +642,7 @@ fn bench_create_and_exec() {
     let Some(plane) = Plane::start(PlaneOptions {
         memory_limit_mb: 1024,
         acme_max: 64,
+        ..PlaneOptions::default()
     }) else {
         return;
     };

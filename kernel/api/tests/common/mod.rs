@@ -174,6 +174,7 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 pub struct PlaneOptions {
     pub memory_limit_mb: u64,
+    pub max_processes: usize,
     pub acme_max: usize,
 }
 
@@ -181,6 +182,7 @@ impl Default for PlaneOptions {
     fn default() -> PlaneOptions {
         PlaneOptions {
             memory_limit_mb: 512,
+            max_processes: 4096,
             acme_max: 3,
         }
     }
@@ -296,6 +298,7 @@ impl Plane {
                 "preload": ["json", "decimal", "hashlib", "sqlite3", "urllib.request"],
                 "memory_limit_mb": self.options.memory_limit_mb,
                 "fs_limit_mb": 256,
+                "max_processes": self.options.max_processes,
             });
             if let Some(tenant) = tenant {
                 t["tenant"] = json!(tenant);

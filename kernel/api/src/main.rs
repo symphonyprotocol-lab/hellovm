@@ -35,6 +35,12 @@ fn run(path: &str) -> Result<(), String> {
     let config = Config::parse(&text).map_err(|e| format!("{path}: {e}"))?;
     let tenants = config.tenants()?;
     let nodes = config.nodes()?;
+    let limits = hellovm_control::http::Limits {
+        max_connections_per_peer: config.max_connections_per_client,
+        ..Default::default()
+    };
+    // Each connection served may hold one more, to a node.
+    hellovm_control::ensure_fd_limit(limits.max_connections as u64 * 2 + 64)?;
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|e| format!("listen {}: {e}", config.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
@@ -59,6 +65,5 @@ fn run(path: &str) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     log::info!("listening on {addr}");
-    hellovm_control::http::serve(listener, api, hellovm_control::http::Limits::default())
-        .map_err(|e| format!("serving: {e}"))
+    hellovm_control::http::serve(listener, api, limits).map_err(|e| format!("serving: {e}"))
 }

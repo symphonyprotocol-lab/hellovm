@@ -2,12 +2,12 @@
 //! the agent in them, removed when asked, idle, too old, over their memory
 //! limit, or ended.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -100,6 +100,8 @@ pub struct Sandbox {
     busy: AtomicBool,
     memory: AtomicU64,
     memory_limit: u64,
+    /// Most host processes (guest processes and threads) it may have.
+    max_processes: usize,
     ready_ms: f64,
 }
 
@@ -157,17 +159,18 @@ pub struct Node {
     pub config: Config,
     pub templates: Vec<Arc<Template>>,
     sandboxes: Mutex<HashMap<SandboxId, Arc<Sandbox>>>,
-    /// Creations in progress, counted against `max_sandboxes`.
-    creating: AtomicUsize,
+    /// The ids being created, counted against `max_sandboxes` and taken
+    /// like those of the sandboxes that exist.
+    creating: Mutex<HashSet<SandboxId>>,
     ended: Mutex<VecDeque<Tombstone>>,
 }
 
-/// Counts a creation in progress.
-struct Creating<'a>(&'a AtomicUsize);
+/// An id being created.
+struct Creating<'a>(&'a Mutex<HashSet<SandboxId>>, SandboxId);
 
 impl Drop for Creating<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        lock(self.0).remove(&self.1);
     }
 }
 
@@ -177,7 +180,7 @@ impl Node {
             config,
             templates,
             sandboxes: Mutex::new(HashMap::new()),
-            creating: AtomicUsize::new(0),
+            creating: Mutex::new(HashSet::new()),
             ended: Mutex::new(VecDeque::new()),
         }
     }
@@ -296,18 +299,19 @@ impl Node {
         }
         let _creating = {
             let sandboxes = lock(&self.sandboxes);
-            if sandboxes.contains_key(&id) {
+            let mut creating = lock(&self.creating);
+            if sandboxes.contains_key(&id) || creating.contains(&id) {
                 return Err(ApiError::new(
                     409,
                     "exists",
                     "a sandbox with this id exists",
                 ));
             }
-            if sandboxes.len() + self.creating.load(Ordering::SeqCst) >= self.config.max_sandboxes {
+            if sandboxes.len() + creating.len() >= self.config.max_sandboxes {
                 return Err(ApiError::new(503, "node_full", "this node is full"));
             }
-            self.creating.fetch_add(1, Ordering::SeqCst);
-            Creating(&self.creating)
+            creating.insert(id);
+            Creating(&self.creating, id)
         };
         let internal = |what: &str, err: &dyn std::fmt::Display| {
             log::warn!("sandbox {id}: {what}: {err}");
@@ -357,6 +361,7 @@ impl Node {
             busy: AtomicBool::new(false),
             memory: AtomicU64::new(0),
             memory_limit: template.config.memory_limit_mb << 20,
+            max_processes: template.config.max_processes,
             ready_ms,
         });
         let info = sandbox.info(&self.config.node);
@@ -445,10 +450,9 @@ impl Node {
         drop(clone);
     }
 
-    /// Removes sandboxes past their lifetime, idle too long, or over their
-    /// memory limit. Runs for ever.
+    /// Removes sandboxes past their lifetime or idle too long. Runs for
+    /// ever, on a thread of its own: nothing a sandbox does delays it.
     pub fn reap(&self) {
-        let mut last_memory = Instant::now() - Duration::from_secs(10);
         loop {
             std::thread::sleep(Duration::from_millis(250));
             let sandboxes: Vec<Arc<Sandbox>> = lock(&self.sandboxes).values().cloned().collect();
@@ -461,23 +465,43 @@ impl Node {
                     self.remove(s.id, "it was idle too long");
                 }
             }
-            if last_memory.elapsed() >= Duration::from_secs(1) && !sandboxes.is_empty() {
-                last_memory = Instant::now();
-                let pids: Vec<u32> = sandboxes.iter().map(|s| s.kernel_pid).collect();
-                let usage = crate::memory::measure(&pids);
-                for s in &sandboxes {
-                    let bytes = usage.get(&s.kernel_pid).copied().unwrap_or(0);
-                    s.memory.store(bytes, Ordering::Relaxed);
-                    if bytes > s.memory_limit {
-                        self.remove(
-                            s.id,
-                            &format!(
-                                "its memory ({} MiB) went over the limit ({} MiB)",
-                                bytes >> 20,
-                                s.memory_limit >> 20
-                            ),
-                        );
-                    }
+        }
+    }
+
+    /// Measures every sandbox once a second and removes those over their
+    /// memory limit or with too many processes. Runs for ever, on a thread
+    /// of its own.
+    pub fn watch_memory(&self) {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let sandboxes: Vec<Arc<Sandbox>> = lock(&self.sandboxes).values().cloned().collect();
+            if sandboxes.is_empty() {
+                continue;
+            }
+            let pids: Vec<(u32, usize)> = sandboxes
+                .iter()
+                .map(|s| (s.kernel_pid, s.max_processes))
+                .collect();
+            let usage = crate::memory::measure(&pids);
+            for s in &sandboxes {
+                let usage = usage.get(&s.kernel_pid).copied().unwrap_or_default();
+                if usage.too_many {
+                    self.remove(
+                        s.id,
+                        &format!("it had more than {} processes and threads", s.max_processes),
+                    );
+                    continue;
+                }
+                s.memory.store(usage.bytes, Ordering::Relaxed);
+                if usage.bytes > s.memory_limit {
+                    self.remove(
+                        s.id,
+                        &format!(
+                            "its memory ({} MiB) went over the limit ({} MiB)",
+                            usage.bytes >> 20,
+                            s.memory_limit >> 20
+                        ),
+                    );
                 }
             }
         }

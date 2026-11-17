@@ -795,7 +795,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 
 | Method and path | Body | Answer |
 |---|---|---|
-| `GET /v1/templates` | | `{"templates": [{"name", "ready", "starts", "tenant", "pid"}]}` |
+| `GET /v1/templates` | | `{"templates": [{"name", "ready"}]}` |
 | `POST /v1/sandboxes` | `{"template", "idle_timeout"?, "lifetime"?}` (seconds) | `201`, the sandbox |
 | `GET /v1/sandboxes` | | `{"sandboxes": [...]}`, the caller's |
 | `GET /v1/sandboxes/{id}` | | `{"id", "tenant", "template", "node", "egress_id", "created_at", "last_used_at", "expires_at", "idle_timeout", "memory_bytes", "memory_limit_bytes", "ready_ms"}` |
@@ -849,15 +849,19 @@ creates the parent directories); only regular files are read or written
 (a FIFO or device is refused, never opened for blocking I/O); at most
 16 MiB. `edit_file` replaces exactly one occurrence of `old` by `new` in
 a UTF-8 file (all of them with `replace_all`) and says how many it
-replaced.
+replaced. Both write a new file next to the target and rename it over
+it (through symbolic links, keeping the mode), so a write that fails,
+for lack of space say, leaves the old contents.
 
 *Life cycle.* A sandbox is removed by `DELETE`, after `idle_timeout`
 seconds without a request (a running request is not idle), at the end
 of its `lifetime` however busy it is (both default and capped by the API
 configuration, at most a week), when its processes' private memory goes
-over the template's `memory_limit_mb`, or when its agent ends. Its node
-answers `410` with the reason for a while (4096 ended sandboxes), then
-`404`.
+over the template's `memory_limit_mb`, when it has more processes and
+threads than the template's `max_processes`, or when its agent ends. Its
+node answers `410` with the reason for a while (the node and the API each
+remember 4096 ended sandboxes), then `404`; a sandbox its tenant deleted
+is `404` at once.
 
 *Tenants.* A tenant is a bearer token in the API's configuration. Every
 request about a sandbox looks it up and checks the tenant before
@@ -948,11 +952,15 @@ is enforced without root:
 |---|---|---|
 | Writable layer (`fs_limit_mb`) | the kernel process (`hellovm --fs-limit`, kernel state every clone inherits) | `ENOSPC` |
 | Memory (`memory_limit_mb`) | `noded` sums the private memory (`RssAnon` + `RssShmem`) of the clone's kernel process and every process below it once a second, each address space once (`kcmp`), and removes the sandbox | the sandbox is removed; `410` with the reason |
+| Processes and threads (`max_processes`, default and at most 4096) | the same scan counts the host processes below the clone's kernel process (a guest process or thread is one each) | the sandbox is removed; `410` with the reason |
 | Time | per-exec `timeout`, idle timeout, lifetime | killed or removed |
 | Tasks, sockets, outbound flows | the kernel (2048 tasks, 4096 sockets) and the egress proxy (64 flows per sandbox) | `EAGAIN` and the like |
 | Sandboxes | per tenant (API) and per node (`max_sandboxes`) | `429`, `503` |
 
-The memory measurement is a poll, not a limit: a sandbox can go over it
+The scan runs on a thread of its own (idle timeouts and lifetimes do not
+wait for it) and costs a binary search per process, `kcmp` ordering the
+address spaces, so a sandbox with thousands of processes does not slow
+it for the others. The memory measurement is a poll, not a limit: a sandbox can go over it
 for up to a second (and so can the host's memory). It counts the
 template's snapshot pages a clone has read but not written as its own,
 so it overestimates by up to the snapshot's size (about 30 MiB) per
@@ -988,7 +996,15 @@ headers, CRLF only, no folded headers, `Content-Length` only (no
 `Transfer-Encoding`), bodies limited per route (4 MiB of JSON, 16 MiB
 for a file) and to 256 MiB across all connections being read at once,
 read within 60 s, at most 256 connections (one thread each; the next
-gets `503`), 30 s idle between keep-alive requests. JSON with unknown
+gets `503`), 30 s idle between keep-alive requests. A connection takes
+its slot before anyone has authenticated, so the API serves at most
+`max_connections_per_client` (default 32) from one IP address at once
+(`429` past it; behind a reverse proxy, raise it and limit there), and a
+response must be taken within 30 s plus its length at 64 KiB/s, or the
+connection is closed. Both services check at start that their open-file
+limit covers what their configuration can use (`noded`: five per sandbox
+of `max_sandboxes`, plus connections and templates), raise the soft
+limit if that is enough, and refuse to start otherwise. JSON with unknown
 fields is refused. The agent channel: see above. Logged text from a
 sandbox is bounded per line and per sandbox. Neither service dials an
 address a sandbox chose: `noded` connects only to its templates'

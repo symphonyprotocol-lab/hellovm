@@ -4,7 +4,7 @@
 //!
 //! | Method and path | Body | Answer |
 //! |---|---|---|
-//! | `GET /v1/templates` | | `{"templates": [TemplateStatus]}` |
+//! | `GET /v1/templates` | | `{"templates": [{"name": ..., "ready": ...}]}` |
 //! | `POST /v1/sandboxes` | `CreateSandbox` | `201` `SandboxInfo` |
 //! | `GET /v1/sandboxes` | | `SandboxList` |
 //! | `GET /v1/sandboxes/{id}` | | `SandboxInfo` |
@@ -143,6 +143,13 @@ impl Api {
     }
 
     fn templates(&self, tenant: &Tenant) -> Response {
+        // What a tenant may know of a template: not the node's process ids
+        // or how often it restarted.
+        #[derive(serde::Serialize)]
+        struct PublicTemplate {
+            name: String,
+            ready: bool,
+        }
         let mut templates: Vec<TemplateStatus> = Vec::new();
         for node in &self.nodes {
             let Ok(answer) = self.call(node, "GET", "/v1/node", None, b"", NODE_TIMEOUT) else {
@@ -160,6 +167,13 @@ impl Api {
             }
         }
         templates.sort_by(|a, b| a.name.cmp(&b.name));
+        let templates: Vec<PublicTemplate> = templates
+            .into_iter()
+            .map(|t| PublicTemplate {
+                name: t.name,
+                ready: t.ready,
+            })
+            .collect();
         Response::json(200, &serde_json::json!({ "templates": templates }))
     }
 
@@ -229,7 +243,15 @@ impl Api {
                 Ok(answer) if answer.status == 201 => {
                     let Ok(info) = serde_json::from_slice::<SandboxInfo>(&answer.body) else {
                         log::warn!("node {}: a malformed create answer", node.name);
-                        // It may run: the next reconciliation finds it.
+                        let target = format!("/v1/sandboxes/{id}");
+                        let _ = self.call(
+                            node,
+                            "DELETE",
+                            &target,
+                            Some(&tenant.name),
+                            b"",
+                            NODE_TIMEOUT,
+                        );
                         return error(502, "node_failed", "the node answered nonsense");
                     };
                     self.store.insert(Record {
@@ -244,7 +266,28 @@ impl Api {
                     last = answer.into_response();
                 }
                 Ok(answer) => return answer.into_response(),
-                Err(err) => last = Self::unreachable(node, &err),
+                // Nothing listens there: the node did not get the request.
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    last = Self::unreachable(node, &err);
+                }
+                Err(err) => {
+                    // The node may have made the sandbox without its
+                    // answer arriving. Offering the same id to another
+                    // node could make it twice, so placement stops here;
+                    // the sandbox is removed if the node can be told, and
+                    // otherwise the next reconciliation finds it (the
+                    // tenant sees it in its list and it counts).
+                    let target = format!("/v1/sandboxes/{id}");
+                    let _ = self.call(
+                        node,
+                        "DELETE",
+                        &target,
+                        Some(&tenant.name),
+                        b"",
+                        NODE_TIMEOUT,
+                    );
+                    return Self::unreachable(node, &err);
+                }
             }
         }
         last
@@ -277,7 +320,14 @@ impl Api {
         let Some(sandbox) = SandboxId::parse(id) else {
             return not_found();
         };
-        let Some(record) = self.store.get(&sandbox).filter(|r| r.tenant == tenant.name) else {
+        // A sandbox that ended is still asked about at its node, which
+        // remembers why it ended (`410`).
+        let Some(record) = self
+            .store
+            .get(&sandbox)
+            .or_else(|| self.store.ended(&sandbox))
+            .filter(|r| r.tenant == tenant.name)
+        else {
             return not_found();
         };
         let Some(node) = self.node(&record.node) else {
@@ -338,7 +388,9 @@ impl Api {
             answer.error_code().as_deref(),
             Some("sandbox_not_found" | "sandbox_ended" | "sandbox_failed")
         );
-        if gone || (method == "DELETE" && answer.status == 204) {
+        if method == "DELETE" && answer.status == 204 {
+            self.store.forget(&sandbox);
+        } else if gone {
             self.store.remove(&sandbox);
         }
         answer.into_response()

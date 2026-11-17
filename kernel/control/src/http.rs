@@ -9,15 +9,21 @@
 //! within [`Limits::body_timeout`], and all bodies being read at once share
 //! a byte budget ([`Limits::body_budget`]). At most
 //! [`Limits::max_connections`] connections are served at once, one thread
-//! each; the next one gets `503` and is closed. Lines end with CRLF only,
+//! each; the next one gets `503` and is closed. A connection takes its slot
+//! before anyone has authenticated, so one address gets at most
+//! [`Limits::max_connections_per_peer`] of them (the next gets `429`): a
+//! client without a token cannot take every slot by opening connections
+//! and saying nothing. A response must be taken at
+//! [`Limits::min_write_rate`] or faster after [`Limits::write_timeout`]. Lines end with CRLF only,
 //! header names are tokens, values have no control bytes, folded headers
 //! and duplicate `Content-Length` are refused. Connections are kept alive
 //! (HTTP/1.1) up to [`Limits::idle_timeout`] between requests.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -152,12 +158,21 @@ pub trait Handler: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct Limits {
     pub max_connections: usize,
+    /// Connections served at once from one IP address. The default is
+    /// `max_connections` (no separate limit): right for a service whose
+    /// only client is another service (`noded`, called by `api`); a
+    /// service open to tenants sets it lower.
+    pub max_connections_per_peer: usize,
     pub max_head: usize,
     pub max_headers: usize,
     pub head_timeout: Duration,
     pub body_timeout: Duration,
     pub idle_timeout: Duration,
+    /// A response must be written within this plus its length at
+    /// `min_write_rate`.
     pub write_timeout: Duration,
+    /// Bytes per second a client must take a response at.
+    pub min_write_rate: usize,
     pub max_requests_per_connection: usize,
     /// Bytes of request bodies held at once, across all connections.
     pub body_budget: usize,
@@ -167,12 +182,14 @@ impl Default for Limits {
     fn default() -> Limits {
         Limits {
             max_connections: 256,
+            max_connections_per_peer: 256,
             max_head: 16 * 1024,
             max_headers: 64,
             head_timeout: Duration::from_secs(10),
             body_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
+            min_write_rate: 64 * 1024,
             max_requests_per_connection: 1000,
             body_budget: 256 << 20,
         }
@@ -187,6 +204,11 @@ pub fn serve(listener: TcpListener, handler: Arc<dyn Handler>, limits: Limits) -
         limit: limits.body_budget,
     });
     let limits = Arc::new(limits);
+    let peers: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::default();
+    let refuse = |stream: &TcpStream, response: Response| {
+        let _ = write_response(stream, &response, false, Duration::from_secs(1));
+        let _ = stream.shutdown(Shutdown::Both);
+    };
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(conn) => conn,
@@ -207,23 +229,33 @@ pub fn serve(listener: TcpListener, handler: Arc<dyn Handler>, limits: Limits) -
         };
         if active.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
             active.fetch_sub(1, Ordering::SeqCst);
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-            let _ = write_response(
+            refuse(
                 &stream,
-                &Response::error(503, "busy", "too many connections"),
-                false,
+                Response::error(503, "busy", "too many connections"),
             );
-            let _ = stream.shutdown(Shutdown::Both);
             continue;
         }
         let guard = Active(Arc::clone(&active));
+        let Some(peer_guard) = PeerSlot::take(&peers, peer.ip(), limits.max_connections_per_peer)
+        else {
+            drop(guard);
+            refuse(
+                &stream,
+                Response::error(
+                    429,
+                    "too_many_connections",
+                    "too many connections from this address",
+                ),
+            );
+            continue;
+        };
         let handler = Arc::clone(&handler);
         let limits = Arc::clone(&limits);
         let budget = Arc::clone(&budget);
         let spawned = std::thread::Builder::new()
             .name("http-conn".into())
             .spawn(move || {
-                let _guard = guard;
+                let _guards = (guard, peer_guard);
                 connection(stream, peer, &*handler, &limits, &budget);
             });
         if let Err(err) = spawned {
@@ -238,6 +270,42 @@ struct Active(Arc<AtomicUsize>);
 impl Drop for Active {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Counts a connection against its peer address while it lives.
+struct PeerSlot {
+    peers: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl PeerSlot {
+    fn take(peers: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr, max: usize) -> Option<Self> {
+        let mut map = peers.lock().unwrap_or_else(|e| e.into_inner());
+        let count = map.entry(ip).or_insert(0);
+        if *count >= max {
+            if *count == 0 {
+                map.remove(&ip);
+            }
+            return None;
+        }
+        *count += 1;
+        Some(PeerSlot {
+            peers: Arc::clone(peers),
+            ip,
+        })
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut map = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -305,7 +373,10 @@ fn connection(
     budget: &Budget,
 ) {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(limits.write_timeout));
+    let write_time = |response: &Response| {
+        limits.write_timeout
+            + Duration::from_secs((response.body.len() / limits.min_write_rate.max(1)) as u64)
+    };
     // Bytes read past the end of the previous request.
     let mut pending: Vec<u8> = Vec::new();
     for served in 0..limits.max_requests_per_connection {
@@ -315,14 +386,16 @@ fn connection(
                 Ok(read) => read,
                 Err(ReadError::Closed) => return,
                 Err(ReadError::Reply(response)) => {
-                    let _ = write_response(&stream, &response, false);
+                    let _ = write_response(&stream, &response, false, write_time(&response));
                     let _ = stream.shutdown(Shutdown::Both);
                     return;
                 }
             };
         let keep_alive = keep_alive && served + 1 < limits.max_requests_per_connection;
         let response = handler.handle(request);
-        if write_response(&stream, &response, keep_alive).is_err() || !keep_alive {
+        if write_response(&stream, &response, keep_alive, write_time(&response)).is_err()
+            || !keep_alive
+        {
             let _ = stream.shutdown(Shutdown::Both);
             return;
         }
@@ -679,7 +752,15 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-fn write_response(stream: &TcpStream, response: &Response, keep_alive: bool) -> io::Result<()> {
+/// Writes `response`, all of it within `within`: a client that takes it
+/// too slowly loses the connection instead of keeping its thread.
+fn write_response(
+    stream: &TcpStream,
+    response: &Response,
+    keep_alive: bool,
+    within: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + within;
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
         response.status,
@@ -696,8 +777,24 @@ fn write_response(stream: &TcpStream, response: &Response, keep_alive: bool) -> 
     head.push_str("\r\n");
     let mut out = head.into_bytes();
     out.extend_from_slice(&response.body);
-    (&*stream).write_all(&out)?;
-    (&*stream).flush()
+    let mut rest = &out[..];
+    while !rest.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        stream.set_write_timeout(Some(left))?;
+        match (&*stream).write(rest) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => rest = &rest[n..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::ErrorKind::TimedOut.into())
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// A response the client read.
@@ -1013,6 +1110,76 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let refused = call(&addr, "GET", "/", &[], b"", Duration::from_secs(5), 1 << 20).unwrap();
         assert_eq!(refused.status, 503);
+    }
+
+    #[test]
+    fn one_address_cannot_take_every_connection() {
+        let addr = server(Limits {
+            max_connections: 8,
+            max_connections_per_peer: 2,
+            ..Limits::default()
+        });
+        // Two silent connections from this address: the third is refused
+        // although the server has room, and room comes back when one ends.
+        let held = [
+            TcpStream::connect(&addr).unwrap(),
+            TcpStream::connect(&addr).unwrap(),
+        ];
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Duration::from_secs(5);
+        let refused = call(&addr, "GET", "/", &[], b"", t, 1 << 20).unwrap();
+        assert_eq!(refused.status, 429);
+        drop(held);
+        let start = Instant::now();
+        loop {
+            let again = call(&addr, "GET", "/", &[], b"", t, 1 << 20).unwrap();
+            if again.status == 200 {
+                break;
+            }
+            assert!(start.elapsed() < t, "no room after the others left");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_client_that_does_not_read_its_answer_is_dropped() {
+        struct Big;
+        impl Handler for Big {
+            fn body_limit(&self, _: &str, _: &str) -> usize {
+                0
+            }
+            fn handle(&self, _: Request) -> Response {
+                Response::bytes(200, vec![b'x'; 64 << 20])
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let limits = Limits {
+            max_connections: 1,
+            write_timeout: Duration::from_millis(300),
+            min_write_rate: usize::MAX,
+            ..Limits::default()
+        };
+        std::thread::spawn(move || serve(listener, Arc::new(Big), limits));
+        let mut stuck = TcpStream::connect(&addr).unwrap();
+        stuck.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        // It never reads: the server gives up on it and its slot is free.
+        let start = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Ok(mut next) = TcpStream::connect(&addr) {
+                next.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+                let mut head = [0u8; 12];
+                if next.read_exact(&mut head).is_ok() && &head == b"HTTP/1.1 200" {
+                    break;
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the stuck client kept its slot"
+            );
+        }
+        drop(stuck);
     }
 
     #[test]

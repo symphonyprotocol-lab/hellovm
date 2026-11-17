@@ -10,7 +10,7 @@
 //! transaction, and reconciliation updating them from the nodes; the API
 //! then no longer needs every node's answer to know a tenant's count.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -45,17 +45,38 @@ pub trait Store: Send + Sync {
     fn release(&self, tenant: &str);
     fn insert(&self, record: Record);
     fn get(&self, id: &SandboxId) -> Option<Record>;
+    /// Forgets a sandbox that ended; it stays among the ended ones.
     fn remove(&self, id: &SandboxId) -> Option<Record>;
+    /// Forgets a sandbox its tenant deleted: nobody needs telling why it
+    /// is gone.
+    fn forget(&self, id: &SandboxId);
+    /// A sandbox that ended not long ago ([`ENDED`] are remembered): its
+    /// node can still say why.
+    fn ended(&self, id: &SandboxId) -> Option<Record>;
     fn of_tenant(&self, tenant: &str) -> Vec<Record>;
     /// Makes the records of `node` what it reported at `asked` (records
     /// inserted after that are kept: the node's list predates them).
     fn replace_node(&self, node: &str, asked: Instant, records: Vec<Record>);
 }
 
+/// Ended sandboxes remembered.
+pub const ENDED: usize = 4096;
+
 #[derive(Default)]
 struct Inner {
     records: HashMap<SandboxId, (Record, Instant)>,
     pending: HashMap<String, usize>,
+    /// Oldest first.
+    ended: VecDeque<Record>,
+}
+
+impl Inner {
+    fn end(&mut self, record: Record) {
+        if self.ended.len() >= ENDED {
+            self.ended.pop_front();
+        }
+        self.ended.push_back(record);
+    }
 }
 
 /// The store in this process's memory.
@@ -110,7 +131,23 @@ impl Store for MemoryStore {
     }
 
     fn remove(&self, id: &SandboxId) -> Option<Record> {
-        self.lock().records.remove(id).map(|(r, _)| r)
+        let mut inner = self.lock();
+        let (record, _) = inner.records.remove(id)?;
+        inner.end(record.clone());
+        Some(record)
+    }
+
+    fn forget(&self, id: &SandboxId) {
+        self.lock().records.remove(id);
+    }
+
+    fn ended(&self, id: &SandboxId) -> Option<Record> {
+        self.lock()
+            .ended
+            .iter()
+            .rev()
+            .find(|r| r.id == *id)
+            .cloned()
     }
 
     fn of_tenant(&self, tenant: &str) -> Vec<Record> {
@@ -124,9 +161,20 @@ impl Store for MemoryStore {
 
     fn replace_node(&self, node: &str, asked: Instant, records: Vec<Record>) {
         let mut inner = self.lock();
-        inner
+        let reported: std::collections::HashSet<SandboxId> = records.iter().map(|r| r.id).collect();
+        let gone: Vec<SandboxId> = inner
             .records
-            .retain(|_, (r, inserted)| r.node != node || *inserted > asked);
+            .iter()
+            .filter(|(id, (r, inserted))| {
+                r.node == node && *inserted <= asked && !reported.contains(id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in gone {
+            if let Some((record, _)) = inner.records.remove(&id) {
+                inner.end(record);
+            }
+        }
         for record in records.into_iter().filter(|r| r.node == node) {
             inner.records.entry(record.id).or_insert((record, asked));
         }
@@ -171,6 +219,8 @@ mod tests {
         let reported = record("b", "n");
         store.replace_node("n", asked, vec![reported.clone()]);
         assert_eq!(store.get(&old.id), None, "ended on the node");
+        assert_eq!(store.ended(&old.id), Some(old.clone()), "and remembered");
+        assert_eq!(store.ended(&newer.id), None);
         assert!(store.get(&newer.id).is_some(), "created after the question");
         assert!(store.get(&other_node.id).is_some(), "another node's");
         assert_eq!(store.get(&reported.id), Some(reported));

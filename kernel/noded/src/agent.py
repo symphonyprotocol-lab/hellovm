@@ -197,10 +197,14 @@ def supervise(pid, out_fd, err_fd, in_fd, stdin, timeout, max_output):
             break
         if status is None and now >= deadline:
             timed_out = True
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except OSError:
-                pass
+            # The group, and the process itself: a forked Python run may
+            # not have made its own group yet, and then only the second
+            # kill reaches it (and the wait below would never end).
+            for kill, target in ((os.killpg, pid), (os.kill, pid)):
+                try:
+                    kill(target, signal.SIGKILL)
+                except OSError:
+                    pass
             _, status = os.waitpid(pid, 0)
             ended_at = time.monotonic()
             continue
@@ -373,19 +377,50 @@ def read_file(path, limit):
 
 
 def write_file(path, data, make_dirs=True):
+    """Replaces the contents of `path` with `data`, or leaves the file as
+    it was: the data goes to a new file next to it, which then takes its
+    name. A write that fails part-way (no space left) must not cost the
+    file it was meant to replace."""
+    # Through symbolic links: the file they lead to is the one replaced.
+    path = os.path.realpath(path)
+    parent = os.path.dirname(path)
     if make_dirs:
-        parent = os.path.dirname(path)
         try:
             os.makedirs(parent, exist_ok=True)
         except OSError as err:
             raise os_failure(err, parent)
-    fd = open_file(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    mode = 0o644
     try:
-        write_all(fd, data)
+        st = os.stat(path)
+    except FileNotFoundError:
+        pass
     except OSError as err:
         raise os_failure(err, path)
-    finally:
-        os.close(fd)
+    else:
+        if stat.S_ISDIR(st.st_mode):
+            raise Failure("is_directory", f"{path} is a directory")
+        if not stat.S_ISREG(st.st_mode):
+            raise Failure("not_regular", f"{path} is not a regular file")
+        mode = stat.S_IMODE(st.st_mode)
+    temp = os.path.join(parent, f".{os.path.basename(path)}.{random.getrandbits(64):016x}.tmp")
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, mode)
+    except OSError as err:
+        raise os_failure(err, path)
+    try:
+        try:
+            write_all(fd, data)
+            # The mode asked for, whatever the umask made of it.
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+        os.replace(temp, path)
+    except OSError as err:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise os_failure(err, path)
 
 
 def op_read(request, body):
