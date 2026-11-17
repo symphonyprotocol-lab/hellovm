@@ -27,7 +27,8 @@ fn dns_query(id: u16, name: &str, qtype: u16, extra: &[u8]) -> Vec<u8> {
 /// Encodes one syscall the way `hellovm_fuzz::syscalls` decodes it.
 fn call(out: &mut Vec<u8>, arch: Arch, sysno: Sysno, args: &[Arg]) {
     let nr = arch.syscall_nr(sysno).unwrap() as u16;
-    out.push(2);
+    // Trap kind 12: a syscall by its raw number.
+    out.push(12);
     out.extend_from_slice(&nr.to_le_bytes());
     for i in 0..6 {
         match args.get(i).copied().unwrap_or(Arg::Small(0)) {
@@ -51,19 +52,38 @@ enum Arg {
     Raw(u64),
 }
 
-fn program(arch: Arch, memory: &[u8], calls: &[(Sysno, &[Arg])]) -> Vec<u8> {
+type Calls<'a> = &'a [(Sysno, &'a [Arg])];
+
+fn program(arch: Arch, memory: &[u8], calls: Calls<'_>) -> Vec<u8> {
+    program_with_children(arch, memory, calls, &[])
+}
+
+fn program_with_children(
+    arch: Arch,
+    memory: &[u8],
+    calls: Calls<'_>,
+    children: &[Calls<'_>],
+) -> Vec<u8> {
     let mut out = vec![u8::from(arch == Arch::Aarch64)];
     let blocks = memory.len().div_ceil(64);
     out.push(blocks as u8);
     let mut mem = memory.to_vec();
     mem.resize(blocks * 64, 0);
     out.extend_from_slice(&mem);
-    out.push(calls.len() as u8);
-    for (sysno, args) in calls {
-        call(&mut out, arch, *sysno, args);
+    for script in std::iter::once(calls)
+        .chain(children.iter().copied())
+        .take(4)
+    {
+        out.push(script.len() as u8);
+        for (sysno, args) in script {
+            call(&mut out, arch, *sysno, args);
+        }
     }
-    // The other scripts are empty.
-    out.extend_from_slice(&[0, 0, 0]);
+    // The remaining scripts are empty.
+    out.extend(std::iter::repeat_n(
+        0,
+        3usize.saturating_sub(children.len()),
+    ));
     out
 }
 
@@ -215,5 +235,110 @@ fn write_seed_corpus() {
             ),
         );
     }
-    let _ = SCRATCH;
+    for (arch, name) in [(Arch::X86_64, "x86_64"), (Arch::Aarch64, "aarch64")] {
+        // fork; the child writes and exits, the parent waits.
+        write(
+            "syscalls",
+            &format!("{name}-fork"),
+            &program_with_children(
+                arch,
+                b"child\n",
+                &[
+                    (Sysno::Clone, &[Arg::Small(17)]),
+                    (
+                        Sysno::Wait4,
+                        &[Arg::Raw(u64::MAX), Arg::Scratch(0x80), Arg::Small(0)],
+                    ),
+                    (Sysno::ExitGroup, &[Arg::Small(0)]),
+                ],
+                &[&[
+                    (
+                        Sysno::Write,
+                        &[Arg::Small(1), Arg::Scratch(0), Arg::Small(6)],
+                    ),
+                    (Sysno::Exit, &[Arg::Small(7)]),
+                ]],
+            ),
+        );
+        // A DNS query to the virtual resolver over UDP.
+        let mut memory = vec![0u8; 0x200];
+        memory[0x20..0x30].copy_from_slice(&[2, 0, 0, 53, 192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let query = dns_query(0x4242, "pypi.org", 1, &[]);
+        memory[0x100..0x100 + query.len()].copy_from_slice(&query);
+        write(
+            "syscalls",
+            &format!("{name}-dns"),
+            &program(
+                arch,
+                &memory,
+                &[
+                    (
+                        Sysno::Socket,
+                        &[Arg::Small(2), Arg::Small(2), Arg::Small(0)],
+                    ),
+                    (
+                        Sysno::Sendto,
+                        &[
+                            Arg::Small(3),
+                            Arg::Scratch(0x100),
+                            Arg::Small(query.len() as u8),
+                            Arg::Small(0),
+                            Arg::Scratch(0x20),
+                            Arg::Small(16),
+                        ],
+                    ),
+                    (
+                        Sysno::Recvfrom,
+                        &[Arg::Small(3), Arg::Scratch(0x180), Arg::Small(128)],
+                    ),
+                    (Sysno::Close, &[Arg::Small(3)]),
+                ],
+            ),
+        );
+        // A handler for SIGUSR1, the signal, and the return from it.
+        let mut memory = vec![0u8; 0x40];
+        memory[..8].copy_from_slice(&0x40_0100u64.to_le_bytes());
+        write(
+            "syscalls",
+            &format!("{name}-signal"),
+            &program(
+                arch,
+                &memory,
+                &[
+                    (
+                        Sysno::RtSigaction,
+                        &[
+                            Arg::Small(10),
+                            Arg::Scratch(0),
+                            Arg::Small(0),
+                            Arg::Small(8),
+                        ],
+                    ),
+                    (Sysno::Kill, &[Arg::Small(1), Arg::Small(10)]),
+                    (Sysno::RtSigreturn, &[]),
+                    (Sysno::Getpid, &[]),
+                ],
+            ),
+        );
+        // execve of a #! script whose interpreter is the program itself.
+        let mut memory = b"/bin/script\0".to_vec();
+        memory.resize(0x40, 0);
+        memory.extend_from_slice(&(SCRATCH).to_le_bytes());
+        memory.extend_from_slice(&0u64.to_le_bytes());
+        write(
+            "syscalls",
+            &format!("{name}-exec"),
+            &program(
+                arch,
+                &memory,
+                &[
+                    (
+                        Sysno::Execve,
+                        &[Arg::Scratch(0), Arg::Scratch(0x40), Arg::Small(0)],
+                    ),
+                    (Sysno::Getpid, &[]),
+                ],
+            ),
+        );
+    }
 }

@@ -288,7 +288,7 @@ impl Input<'_> {
         }
     }
 
-    fn trap(&mut self) -> Trap {
+    fn trap(&mut self, known: &[u64]) -> Trap {
         match self.byte() % 16 {
             0 => Trap::Interrupted,
             // The signals the seccomp platform reports as faults: the
@@ -298,8 +298,15 @@ impl Input<'_> {
                 code: i32::from(self.byte() as i8),
                 addr: Some(self.arg()),
             }),
-            _ => {
-                let nr = self.u64(2) % 512;
+            kind => {
+                // Mostly syscalls the kernel implements; sometimes any
+                // number at all.
+                let pick = self.u64(2);
+                let nr = if kind < 12 && !known.is_empty() {
+                    known[pick as usize % known.len()]
+                } else {
+                    pick % 512
+                };
                 let mut args = [0; 6];
                 for a in &mut args {
                     *a = self.arg();
@@ -322,10 +329,11 @@ pub fn syscalls(data: &[u8]) {
     let memory: Vec<u8> = (0..mem_len.min(SCRATCH_LEN))
         .map(|_| input.byte())
         .collect();
+    let known: Vec<u64> = (0..512).filter(|&nr| arch.sysno(nr).is_some()).collect();
     let mut scripts = Vec::new();
     for _ in 0..4 {
         let n = usize::from(input.byte() % 64);
-        scripts.push((0..n).map(|_| input.trap()).collect::<Vec<_>>());
+        scripts.push((0..n).map(|_| input.trap(&known)).collect::<Vec<_>>());
     }
     if std::env::var_os("HELLOVM_FUZZ_DEBUG").is_some() {
         for (i, script) in scripts.iter().enumerate() {
