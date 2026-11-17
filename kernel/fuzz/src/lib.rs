@@ -379,7 +379,10 @@ pub fn syscalls(data: &[u8]) {
     ]);
     host.stdin.extend(b"console input\n");
     let mut plat = MockPlatform::with_scripts(arch, &host, scripts);
-    let mut kernel = Kernel::new(host);
+    // The writable layer's limit bounds what file data can cost (one
+    // truncate can grow a file to it); the default 2 GiB is beyond the
+    // fuzzers' memory bound, so the target uses 64 MiB.
+    let mut kernel = Kernel::new(host).with_fs_limit(64 << 20);
     if kernel
         .exec(
             &mut plat,

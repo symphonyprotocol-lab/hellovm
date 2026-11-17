@@ -466,6 +466,19 @@ cd kernel/fuzz
 cargo test --release
 ```
 
+Last run (aarch64, nightly libFuzzer, 1 GiB RSS / 256 MiB single
+allocation / 10 s per input): every target 20 minutes, `syscalls` 30
+and then another 10 with four workers, after a first 9-minute round on
+the code before the U3 review fixes; and the stable runner with 200,000
+mutations per target. From 18 million (`sigreturn`) to 152 million
+(`shebang`) executions per target, and 6.2 million for `syscalls`. The
+only finding: one `truncate` grows an in-memory file to the writable
+layer's limit (2 GiB by default) in a single allocation. That is bounded
+by design (the growth is charged to the limit, and `ENOSPC` past it),
+but above the fuzzers' bound, so the `syscalls` target runs its sandbox
+with a 64 MiB layer limit; its input is in the corpus as
+`oom-truncate-past-the-fuzz-memory-bound`.
+
 The `syscalls` target only reports the faults the seccomp platform can
 report (`SIGILL`, `SIGTRAP`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, `SIGSYS`):
 the platform is trusted, the guest only chooses which fault it causes.
