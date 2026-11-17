@@ -211,6 +211,9 @@ pub(crate) enum WaitKind {
     /// A read of the clone point of a template: the template freezes, and
     /// the read completes only in its clones (see [`ClonePoint`]).
     ClonePoint,
+    /// A syscall that trapped while a template was freezing and was not
+    /// handled: a clone handles it as if it had just trapped.
+    NotStarted,
 }
 
 /// What reading `/dev/hellovm-clone` does.

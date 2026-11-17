@@ -14,8 +14,8 @@ use crate::host::{
     StreamStatus,
 };
 use crate::platform::{
-    AddressSpace, AddressSpaceInfo, AppMemory, Context, CpuInfo, Event, GuestAddr, Platform,
-    PlatformError, Prot, Resume, Sharing, SyscallTrap, TaskKey, Trap, Waker,
+    AddressSpace, AddressSpaceInfo, AppMemory, Context, CpuInfo, Event, FrozenSpace, GuestAddr,
+    Platform, PlatformError, Prot, Resume, Sharing, SyscallTrap, TaskKey, Trap, Waker,
 };
 
 const PAGE: u64 = 0x1000;
@@ -260,6 +260,12 @@ pub struct MockPlatform {
     next_key: TaskKey,
     queue: VecDeque<TaskKey>,
     clock: Rc<Cell<Duration>>,
+    /// What [`Platform::freeze`] captured: per space, the tasks' contexts
+    /// and a copy of the memory.
+    pub frozen: Option<Vec<(Vec<Context>, MockApp)>>,
+    /// `interrupt` does nothing: a running task's next scripted trap
+    /// arrives as it is (a syscall that traps while a template freezes).
+    pub ignore_interrupts: bool,
 }
 
 impl MockPlatform {
@@ -272,6 +278,8 @@ impl MockPlatform {
             next_key: 1,
             queue: VecDeque::new(),
             clock: Rc::clone(&host.clock),
+            frozen: None,
+            ignore_interrupts: false,
         }
     }
 
@@ -405,7 +413,11 @@ impl Platform for MockPlatform {
     }
 
     fn interrupt(&mut self, key: TaskKey) -> Result<(), PlatformError> {
+        let ignore = self.ignore_interrupts;
         let task = self.live(key)?;
+        if ignore {
+            return Ok(());
+        }
         if task.running {
             task.traps.push_front(Trap::Interrupted);
         }
@@ -445,6 +457,46 @@ impl Platform for MockPlatform {
 
     fn waker(&self) -> Waker {
         Waker::noop()
+    }
+
+    fn freeze(&mut self, spaces: &[FrozenSpace]) -> Result<(), PlatformError> {
+        let mut frozen = Vec::new();
+        for space in spaces {
+            let first = self.live(space.tasks[0])?.space;
+            let mut contexts = Vec::new();
+            for &key in &space.tasks {
+                let task = self.live(key)?;
+                assert!(!task.running, "freezing a running task");
+                contexts.push(task.context.clone());
+            }
+            frozen.push((contexts, self.spaces[first].clone()));
+        }
+        for space in spaces {
+            for &key in &space.tasks {
+                self.kill(key)?;
+            }
+        }
+        self.frozen = Some(frozen);
+        Ok(())
+    }
+
+    fn thaw(&mut self) -> Result<Vec<Vec<TaskKey>>, PlatformError> {
+        let frozen = self
+            .frozen
+            .take()
+            .ok_or(PlatformError::Unsupported("nothing frozen"))?;
+        let mut keys = Vec::new();
+        for (contexts, mem) in frozen {
+            self.spaces.push(mem);
+            let space = self.spaces.len() - 1;
+            keys.push(
+                contexts
+                    .into_iter()
+                    .map(|context| self.add_task(space, context))
+                    .collect(),
+            );
+        }
+        Ok(keys)
     }
 
     fn read(

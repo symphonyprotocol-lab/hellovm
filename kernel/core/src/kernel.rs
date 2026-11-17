@@ -619,14 +619,14 @@ impl<H: Host> Kernel<H> {
             return Ok(false);
         };
         match event.trap {
-            // Not handled here: the clone runs it, as if the thread had
+            // Not handled here: the clone handles it, as if the thread had
             // not reached the syscall yet.
             Trap::Syscall(trap) => {
                 let sysno = platform.arch().sysno(trap.nr);
                 self.st.thread_mut(tid).state = ThreadState::Parked(Parked {
                     trap,
                     sysno,
-                    kind: WaitKind::Retry,
+                    kind: WaitKind::NotStarted,
                     deadline: None,
                     restart: Restart::Always,
                     timed_out: false,
@@ -826,6 +826,12 @@ impl<H: Host> Kernel<H> {
                         self.ctx(platform, tid, None).resume(next)?;
                     } else if parked.kind == WaitKind::Retry && !stopped {
                         self.retry(platform, tid, parked)?;
+                    } else if parked.kind == WaitKind::NotStarted && !stopped {
+                        // As if it trapped now: its own timeouts start now.
+                        self.st.thread_mut(tid).state = ThreadState::Ready(Next::Continue);
+                        let (tid, action) =
+                            self.dispatch(platform, tid, None, parked.sysno, &parked.trap);
+                        self.complete(platform, tid, parked.sysno, &parked.trap, action, None)?;
                     }
                 }
                 ThreadState::Ready(_) => {}
@@ -1503,6 +1509,63 @@ mod tests {
         let child = plat.task(2);
         assert_eq!(child.returns, vec![2, 1]);
         assert!(kernel.st.procs.is_empty(), "everything was reaped");
+    }
+
+    #[test]
+    fn a_template_freezes_and_its_clone_runs_on() {
+        let arch = Arch::Aarch64;
+        let path = SCRATCH + 0x300;
+        let ts = SCRATCH + 0x200;
+        let init = vec![
+            sc(arch, Sysno::Openat, &[-100i64 as u64, path, 0, 0]),
+            sc(arch, Sysno::Clone, &[SIGCHLD as u64, 0, 0, 0, 0]),
+            // The clone point: the template freezes here.
+            sc(arch, Sysno::Read, &[3, SCRATCH, 16]),
+        ];
+        // Traps while the template freezes (interrupts are ignored): the
+        // clone must handle it as a new syscall, with its own timeout.
+        let child = vec![sc(arch, Sysno::Nanosleep, &[ts, 0])];
+        // The clone's tasks.
+        let init_after = vec![
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x20, 16]),
+            sc(arch, Sysno::Wait4, &[u64::MAX, SCRATCH + 0x40, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let child_after = vec![sc(arch, Sysno::ExitGroup, &[5])];
+        let mut timespec = 0u64.to_le_bytes().to_vec();
+        timespec.extend_from_slice(&5_000_000u64.to_le_bytes());
+        let (kernel, mut plat) = setup_scripts(
+            arch,
+            vec![init, child, init_after, child_after],
+            &[(path, b"/dev/hellovm-clone\0"), (ts, &timespec)],
+        );
+        let mut kernel = kernel.template();
+        plat.ignore_interrupts = true;
+        assert_eq!(kernel.run_template(&mut plat).unwrap(), TemplateEnd::Frozen);
+        assert!(plat.task(INIT).killed && plat.task(2).killed);
+        kernel.thaw(&mut plat, b"in".to_vec()).unwrap();
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        // The template's init, rebuilt as task 3: the clone point returned
+        // the input, then end of file; the child exited with 5.
+        assert_eq!(returns(&plat, 3), vec![2, 0, 2]);
+        assert_eq!(plat.mem(3).peek(SCRATCH, 2), b"in");
+        assert_eq!(
+            plat.mem(3).peek(SCRATCH + 0x40, 4),
+            (5u32 << 8).to_le_bytes()
+        );
+        // The child's sleep completed in the clone.
+        assert_eq!(returns(&plat, 4), vec![0]);
+        // Outside a template the clone point is at end of file.
+        let read = vec![
+            // O_RDWR: writes reach the device, which refuses them.
+            sc(arch, Sysno::Openat, &[-100i64 as u64, path, 2, 0]),
+            sc(arch, Sysno::Read, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Write, &[3, SCRATCH, 1]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (mut kernel, mut plat) = setup(arch, read, &[(path, b"/dev/hellovm-clone\0")]);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        assert_eq!(returns(&plat, INIT), vec![3, 0, -crate::errno::EINVAL]);
     }
 
     #[test]

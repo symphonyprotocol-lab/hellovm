@@ -182,7 +182,15 @@ impl Window {
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Window { ptr, len })
+        let window = Window { ptr, len };
+        // A process forked meanwhile (by another thread: tests run in
+        // parallel) must not inherit a writable shared mapping of the
+        // file, or sealing it fails with EBUSY until that process execs.
+        // SAFETY: advice on our own mapping.
+        if unsafe { libc::madvise(ptr, len, libc::MADV_DONTFORK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(window)
     }
 }
 
