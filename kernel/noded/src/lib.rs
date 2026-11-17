@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod output;
 #[cfg(target_os = "linux")]
 pub mod memory;
 #[cfg(target_os = "linux")]
