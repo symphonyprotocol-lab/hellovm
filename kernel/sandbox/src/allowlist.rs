@@ -5,7 +5,9 @@
 //! The measurement covers the kernel process's own threads (event loop,
 //! console reader, outbound-stream helpers, the `--timeout` watchdog) and
 //! the bootstrap of every app process up to its `execveat` of the stub,
-//! which runs the kernel's code. It was taken on aarch64; the x86_64 list
+//! which runs the kernel's code. It was taken on aarch64, with Debian
+//! bookworm's glibc 2.36 and with Ubuntu 26.04's glibc 2.43 (which adds
+//! `fstat`, the termios2 `ioctl`s and `MADV_GUARD_INSTALL`); the x86_64 list
 //! is the same calls by name (plus `poll`, which x86_64 glibc uses where
 //! aarch64 has only `ppoll`), type-checked but not measured.
 //!
@@ -105,6 +107,9 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
                 vec![
                     TCGETS as u32,
                     TCSETS as u32,
+                    // glibc 2.42+ (Ubuntu 26.04) tcgetattr/tcsetattr.
+                    TCGETS2 as u32,
+                    TCSETS2 as u32,
                     TIOCGWINSZ as u32,
                     FIONBIO as u32,
                 ],
@@ -120,6 +125,8 @@ pub fn entries(stub_fd: i32, tcp: bool) -> Vec<Entry> {
             )],
         ),
         allow(SYS_newfstatat),
+        // glibc 2.43 (Ubuntu 26.04) fstat; older ones use newfstatat.
+        allow(SYS_fstat),
         allow(SYS_statx),
         allow(SYS_readlinkat),
         allow(SYS_getdents64),
