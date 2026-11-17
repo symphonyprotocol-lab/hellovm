@@ -3,7 +3,7 @@
 use std::io;
 use std::mem;
 
-use crate::regs::{FpRegs, Regs};
+use crate::regs::{FpRegs, PacKeys, Regs};
 use crate::sys::{self, ptrace, ptrace_checked};
 
 /// Why a tracee stopped (or ended), as `waitpid` reports it.
@@ -219,6 +219,60 @@ impl Tracee {
         self.set_regset(sys::NT_PRFPREG, fp)
     }
 
+    /// The extended FP/SIMD state as the host's ptrace gives it: on x86_64
+    /// the XSAVE area (`NT_X86_XSTATE`: the upper halves of the AVX
+    /// registers, AVX-512), on aarch64 the SVE state (`NT_ARM_SVE`). `None`
+    /// where the host CPU has none; [`FpRegs`] is then everything.
+    pub fn xstate(&self) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = vec![0u8; sys::XSTATE_MAX];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        // SAFETY: GETREGSET writes at most `iov_len` bytes to `iov_base`
+        // and sets `iov_len` to what it wrote.
+        let got = unsafe {
+            ptrace_checked(
+                sys::PTRACE_GETREGSET,
+                self.pid,
+                sys::NT_XSTATE as usize,
+                &mut iov as *mut libc::iovec as usize,
+            )
+        };
+        match got {
+            Ok(()) => {
+                buf.truncate(iov.iov_len);
+                Ok(Some(buf))
+            }
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENODEV | libc::EIO)
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Sets what [`Tracee::xstate`] returned for a task of this host.
+    pub fn set_xstate(&self, state: &[u8]) -> io::Result<()> {
+        let mut iov = libc::iovec {
+            iov_base: state.as_ptr() as *mut libc::c_void,
+            iov_len: state.len(),
+        };
+        // SAFETY: SETREGSET reads `iov_len` bytes from `iov_base`.
+        unsafe {
+            ptrace_checked(
+                sys::PTRACE_SETREGSET,
+                self.pid,
+                sys::NT_XSTATE as usize,
+                &mut iov as *mut libc::iovec as usize,
+            )
+        }
+    }
+
     /// `tpidr_el0` (aarch64; on x86_64 the thread pointer is in [`Regs`]).
     #[cfg(target_arch = "aarch64")]
     pub fn tls(&self) -> io::Result<u64> {
@@ -230,6 +284,43 @@ impl Tracee {
     #[cfg(target_arch = "aarch64")]
     pub fn set_tls(&self, tls: u64) -> io::Result<()> {
         self.set_regset(sys::NT_ARM_TLS, &tls)
+    }
+
+    /// The pointer-authentication keys, or `None` where the host has no
+    /// pointer authentication or does not let a tracer read the keys
+    /// (Linux without `CONFIG_CHECKPOINT_RESTORE`).
+    #[cfg(target_arch = "aarch64")]
+    pub fn pac_keys(&self) -> io::Result<Option<PacKeys>> {
+        let mut keys = PacKeys::default();
+        let unavailable = |err: &io::Error| {
+            matches!(
+                err.raw_os_error(),
+                Some(libc::EINVAL | libc::ENODEV | libc::EIO)
+            )
+        };
+        match self.get_regset(sys::NT_ARM_PACA_KEYS, &mut keys.address) {
+            Ok(()) => {}
+            Err(err) if unavailable(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        self.get_regset(sys::NT_ARM_PACG_KEYS, &mut keys.generic)?;
+        Ok(Some(keys))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn pac_keys(&self) -> io::Result<Option<PacKeys>> {
+        Ok(None)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_pac_keys(&self, keys: &PacKeys) -> io::Result<()> {
+        self.set_regset(sys::NT_ARM_PACA_KEYS, &keys.address)?;
+        self.set_regset(sys::NT_ARM_PACG_KEYS, &keys.generic)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_pac_keys(&self, _keys: &PacKeys) -> io::Result<()> {
+        Ok(())
     }
 
     /// At a seccomp stop: makes the pending syscall a no-op, with every

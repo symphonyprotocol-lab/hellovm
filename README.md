@@ -12,7 +12,7 @@ The kernel lives in `kernel/`, a Rust workspace:
 | `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks, outbound streams to the egress proxy |
 | `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
 | `hellovm-sandbox` | `kernel/sandbox` | Least privilege for the kernel process itself (see **Hardening**) |
-| `hellovm` | `kernel/hellovm` | Command-line launcher |
+| `hellovm` | `kernel/hellovm` | Command-line launcher; warm-clone templates and clones, and the control protocol's client (`hellovm::warm`) |
 | `hellovm-egress` | `kernel/egress` | The egress proxy (`hellovm-egress` binary): default-deny domain allowlist, one per host |
 | `hellovm-egress-wire` | `kernel/egress-wire` | The flow header and hostname rule the kernel and the proxy share |
 | `hellovm-test-guest` | `kernel/test-guest` | Small test programs built at build time |
@@ -27,7 +27,7 @@ address space, and new tasks, are injected `mmap`, `munmap`, `mprotect` and
 `kernel/platform-seccomp/src/spawn.rs` is the full argument, including why
 an in-app stub plus user notification was rejected.
 
-What runs today (milestone U4): x86_64 and aarch64 Linux programs,
+What runs today (milestone U5a): x86_64 and aarch64 Linux programs,
 static or dynamically linked, with any number of processes and threads.
 A busybox shell runs external commands, pipelines, background jobs, traps
 and job control; dynamically linked glibc programs and CPython (with
@@ -61,6 +61,9 @@ Debian system.
 - **`/proc`**: `self`, `<pid>/{exe,cwd,fd,maps,stat,status,statm,cmdline,
   comm,task}`, `meminfo`, `cpuinfo`, `uptime`, `stat`, `loadavg`, `mounts`,
   `net/tcp`, `net/udp`; `ps` works.
+- **Warm clones**: a template sandbox loads its environment once (CPython
+  with its modules imported, say) and new sandboxes are forked from it in
+  a few milliseconds (see **Warm clones**).
 - **Terminal**: when hellovm runs on a terminal, the sandbox console is a
   terminal too (`/dev/console`, `/dev/tty`): line editing, echo, termios,
   window size, a foreground process group, and Ctrl-C, Ctrl-\ and Ctrl-Z
@@ -355,7 +358,7 @@ hellovm: debug: sandbox: resource limits: active (core 0, nofile 4096)
 hellovm: debug: sandbox: no_new_privs: active ()
 hellovm: debug: sandbox: Landlock: active (ABI 8: image read-only, no TCP, signals and abstract sockets scoped)
 hellovm: debug: sandbox: not dumpable: active ()
-hellovm: debug: sandbox: seccomp allowlist: active (58 syscalls, 281 instructions, 5 code ranges)
+hellovm: debug: sandbox: seccomp allowlist: active (62 syscalls, 305 instructions, 5 code ranges)
 ```
 
 *The seccomp allowlist.* App processes are forked from the kernel
@@ -369,7 +372,8 @@ the process if it is not on it; a syscall from anywhere else gets
 `SECCOMP_RET_TRACE`, which is what the app's own filter returns anyway
 (and in the kernel process, which nobody traces, `ENOSYS`). The platform
 reserves those code ranges in every app address space, so guest code
-never runs there. The allowlist (58 calls on aarch64) was measured with
+never runs there. The allowlist (62 calls on aarch64, 4 of them for warm
+clones, see **Warm clones**) was measured with
 `HELLOVM_SECCOMP_LEARN=FILE` (a test-hooks build), which records every
 syscall the kernel process makes and lets it continue, over the whole
 test suite, on Debian bookworm (glibc 2.36) and Ubuntu 26.04 (glibc
@@ -449,7 +453,8 @@ cover the host resolver (`getaddrinfo` reads `/etc/resolv.conf`,
 files must stay readable and its socket calls allowed); it needs the host
 network, so no network namespace.
 
-*Testing.* Every end-to-end test runs in a hardened kernel process: the
+*Testing.* Every end-to-end test runs in a hardened kernel process (the
+warm-clone templates too, and their clones): the
 in-process scenarios go through `hellovm --insecure-test-session` (a
 test hook that applies the same hardening, then runs programs on
 request), the rest run the binary. `kernel/hellovm/tests/hardening.rs`
@@ -464,6 +469,258 @@ on their own where the host has them. In the dev container and in an Ubuntu 26.0
 (Docker's default seccomp profile) the namespaces are skipped and every
 other layer is active; with `--security-opt seccomp=unconfined` all
 seven are.
+
+## Warm clones
+
+A template sandbox starts once and runs until its environment is loaded;
+new sandboxes are then made from it in a few milliseconds, each with the
+template's memory, processes and files as they were at that moment, and
+each isolated from the template and from the others.
+
+```sh
+hellovm --template /run/hellovm/py.sock --root / /usr/bin/python3 -c '
+import json, decimal, sqlite3          # the environment
+code = open("/dev/hellovm-clone", "rb").read()
+exec(code)' &
+hellovm --clone /run/hellovm/py.sock --ready
+echo '{"a": 1}' | hellovm --clone /run/hellovm/py.sock \
+  --input 'import sys; print(json.load(sys.stdin)["a"] + 1)'
+```
+
+**The clone point.** Every sandbox has a character device
+`/dev/hellovm-clone`. In an ordinary run a read returns end of file at
+once, so a template program also runs on its own. In a template, the
+first read is where the template freezes: the thread blocks in that read,
+and it returns only in the clones, each with the bytes its requester sent
+as input (`--input`, at most 64 KiB), then end of file. The guest chooses
+the moment, so it can get ready for it: flush its output, close its
+outbound connections, reseed what must differ (below). Writes to the
+device fail with `EINVAL`.
+
+**Using it.** `hellovm --template SOCKET [options] --root DIR PROGRAM...`
+runs `PROGRAM` as a template, hardened exactly like an ordinary run, with
+no console input (stdin is at end of file) and its output on hellovm's
+stdout and stderr. Once frozen it serves clones on the Unix socket
+`SOCKET`, which it creates (it must not exist) before it confines
+itself, until it is killed; its clones die with it. `--tty` and
+`--timeout` are refused for a template (a clone has no terminal; a
+clone's timeout is its requester's). `hellovm --clone SOCKET [--sandbox-id
+ID] [--input DATA] [--timeout SECONDS]` asks for a clone whose console is
+its own stdin, stdout and stderr, and exits with the clone's status (125 if
+none was made, 124 after `--timeout`, which kills the clone); `--ready`
+waits until the template is frozen. A node daemon speaks the protocol
+directly: one connection per request, the stdio fds passed with
+`SCM_RIGHTS`, answers `R` (ready), `S` (the clone runs: its sandbox id and
+kernel process id), `X` (exit status) or `E` (error text). Closing the
+connection kills the clone. `kernel/hellovm/src/warm.rs` documents the
+bytes and has a client (`hellovm::warm::WarmClone`). Who can connect to
+the socket can make clones: put it in a directory only the node daemon
+can reach. The socket file outlives the template (the confined template
+cannot remove it).
+
+**How a clone is made.** The template's kernel process (K) runs the
+guest as usual until a thread reads the clone point. From then on K
+resumes no thread: running threads are interrupted, a thread that traps
+in the meantime keeps its syscall for later (the clone runs it, as if the
+thread had not reached it yet; a signal that comes first restarts it),
+and when nothing runs K checks that the sandbox can be cloned (below).
+The platform then copies the memory of every address space into a
+memfd made before K confined itself: only the pages that are not all
+zero, appended one after the other as extents (runs of such pages; fewer
+than 128 KiB of zero pages between two runs are stored with them, so a
+fragmented heap does not become thousands of extents). An area the guest
+cannot read is made readable first; anonymous memory that was never
+writable (an address-space reservation, guard pages) is known to be zero
+and not read at all. It keeps every thread's registers, FP/SIMD state
+including the extended state (x86_64 XSAVE: AVX, AVX-512; aarch64 SVE),
+thread pointer and (aarch64) pointer-authentication keys, kills the
+app processes and seals the file (`F_SEAL_WRITE | F_SEAL_GROW |
+F_SEAL_SHRINK | F_SEAL_SEAL`): nobody, not even a compromised clone
+holding the fd, can change it again. Everything else, the kernel state
+(processes, pids, fd tables, pipes and their bytes, sockets, the writable
+layer, DNS bindings, signal state), stays as it is in K's memory. K then
+only serves its socket. For each request it forks itself; the child K' is
+the clone's kernel process and gets a copy-on-write copy of all that
+state from the host. K' enters a Landlock domain of its own (see
+**Hardening** below), makes the requester's fds its console, takes its
+sandbox id, and rebuilds the app processes: per address space a fresh app
+process (the normal bootstrap) in which K' injects, per area, an anonymous
+mapping and one `mmap(MAP_PRIVATE | MAP_FIXED)` of the memfd per extent,
+then `close` of the memfd, and one injected `clone(CLONE_VM)` per further
+thread; each task gets its registers back. The host shares the template's
+pages among all clones and copies a page only when a clone writes it.
+Memory that was zero in the template is anonymous memory in the clone and
+never mapped from the file: the host fills a hole of a memfd at the first
+touch through a private mapping, read or write, seals or not, so clones
+would otherwise grow the file they all share (a test compares the file's
+allocated size before and after clones that write 32 MiB of such memory). K' completes the parked read
+of the clone point with the input, reports `S` and runs the sandbox; K
+reaps K', watches the connection, and reports for a K' that dies without
+reporting itself. `kernel/platform-seccomp/src/snapshot.rs` and
+`Kernel::run_template` / `Kernel::thaw` are the details.
+
+Rejected designs:
+
+* *Fork the app processes, and K with them.* A forked K does not inherit
+  tracees. Handing the copies to K' needs `PTRACE_SEIZE` on the
+  allowlist and `PR_SET_PTRACER` in the copies (Yama), and every clone
+  would stay in the template's Landlock domain, where a compromised K'
+  could `ptrace`, read and kill its siblings' processes.
+* *Serialize the kernel state into a new kernel process.* Every core
+  structure would need an encoding and a parser for it in a privileged
+  process; `fork` copies all of it exactly, for free.
+* *One kernel process serving the template and its clones.* One parser
+  bug would reach every tenant.
+* *Copy the memory into each clone.* Tens of megabytes per clone instead
+  of shared pages.
+* *Freeze at a moment the driver picks.* The guest could not prepare
+  (buffered output, open connections, random state), and a template
+  frozen mid-computation is rarely what is wanted. The guest decides.
+
+**What a clone sees.** The same pids, memory, open files, current
+directories, pipes with their unread bytes, loopback sockets (listening,
+connected, queued connections and data), eventfds, signal handlers,
+masks and pending signals, interval timers, and writable layer as the
+template had. Blocked threads stay blocked in the same syscalls (a
+`futex`, a pipe read, `wait4`, `poll`, a sleep). Different per clone: the
+sandbox id (the requested one, else a random one; it names the clone's
+egress flows), the console, and anything read from the host afterwards
+(`getrandom` and `/dev/urandom` are read from the host per call). Clocks
+are the host's: deadlines that passed while the template waited (a
+sleep, an `alarm`) expire at once in the clone. Copied, and therefore the
+same in every clone until the guest changes it, is everything the guest
+derived before the freeze: the `AT_RANDOM` bytes and what libc made of
+them (stack protector canary, pointer guard), the pointer-authentication
+keys, CPython's hash seed and
+`random` state, any user-space PRNG. A template that needs those to
+differ must reseed after the clone point (`random.seed()`; the hash seed
+cannot be changed in a running CPython, so dictionaries iterate in the
+same order and hash flooding is the same in all clones). The virtual DNS
+table is copied too: names the template resolved keep their fake IPs
+(the guest may have cached them), and each clone's table evolves on its
+own from there. Output the template buffered and did not flush is
+written by every clone.
+
+**What can be cloned.** Any number of processes and threads, in any of
+the states above, zombies and stopped jobs (`tests/warm.rs` freezes one
+template in all of them at once). Register state: general registers, the
+basic FP/SIMD state, the extended state as the host's ptrace gives it
+(`NT_X86_XSTATE` on x86_64, `NT_ARM_SVE` on aarch64, so a thread
+interrupted in the middle of AVX or SVE code continues correctly; a
+thread in SME streaming mode or with ZA enabled is not supported), the
+thread pointer, and on aarch64 the
+pointer-authentication keys, which the clone's new processes must get from
+the template (Ubuntu builds glibc and CPython with `-mbranch-protection`:
+with new keys, returning through a frame the template signed is
+`SIGILL`). A host with pointer authentication whose kernel does not let a
+tracer set the keys (`CONFIG_CHECKPOINT_RESTORE`) cannot freeze. Checked
+and refused with the reason (the template answers every request with
+`E` and exits):
+
+| Not clonable | Why |
+|---|---|
+| An outbound connection through the egress proxy that is open (or one that is closed but still delivers bytes after 10 s) | a host connection, and the threads behind it, cannot be copied; close it before the clone point |
+| `MAP_SHARED` anonymous memory while there is more than one address space | it may be shared between processes, and a rebuilt process cannot share pages with another one; a single process may have it (it is copied) |
+| A terminal console | refused on the command line: a template has plain streams |
+| The program ends before its clone point | nothing to clone |
+
+Limits: 512 connections served at once per template; a request must be
+complete within 10 s of connecting (an idle connection gets `E` and is
+closed); 64 KiB of input; at most 1 TiB of stored pages (how much address
+space the template has mapped does not matter).
+
+**Hardening.** A clone's kernel process is a fork of the template's, so
+it has every layer the template has, the same way (the seccomp filter,
+`no_new_privs`, limits, namespaces, Landlock, not dumpable; the tests
+compare `/proc/PID/status` and `/proc/PID/limits` of both). In addition,
+before it creates its app processes, it puts itself into a Landlock
+domain nested in the template's (a ruleset with no rules: it denies
+nothing new on the filesystem but makes a new domain). Landlock refuses
+ptrace-level access, `process_vm_readv`/`writev` included, from one
+domain into a process outside it and its children, and with ABI 6
+signals: a compromised clone kernel process cannot read, write or kill
+the app processes of the template or of another clone (all of them run
+as the same user and would otherwise be reachable, since seccomp cannot
+tell pids apart), and they cannot reach it. A test has one clone's
+kernel process try both on a sibling clone's app process (test hook):
+refused, and with the nested domain left out, both succeed. Without
+Landlock on the host nothing fences the clones of one template from each
+other (they are forks, so they share its user namespace too, and a
+separate uid per tenant is not possible within one template):
+`--sandbox require` therefore refuses to start a template there, and
+`best-effort` warns that the template is fit for one tenant only.
+
+A clone starts with a copy of the template kernel process's memory, so
+that process keeps nothing of one request where another's clone would
+find it: the bytes of a request live in one buffer per connection that is
+never reallocated, is zeroed when the request has been handed to its
+clone or the connection ends, and the forked child zeroes the other
+connections' buffers before it does anything else.
+
+What `--template` adds to the allowlist, for templates and their clones
+only (a sandbox started without it gets the list without these; measured
+with `HELLOVM_SECCOMP_LEARN` over the whole suite, warm-clone tests
+included): `accept4` (`SOCK_CLOEXEC` only) and `recvmsg`
+(`MSG_CMSG_CLOEXEC` only) for the control socket, `fcntl(F_ADD_SEALS)`
+for sealing the snapshot, and `landlock_create_ruleset` and
+`landlock_restrict_self` (flags 0) for the clone's domain, which can only
+take rights away. The memfd is created and sized before the hardening, so
+`memfd_create` and `ftruncate` are not on the list; forking K' is the
+`clone` with `fork` flags that starting app processes already uses, and
+`PR_SET_PDEATHSIG` (clones die with the template) was already allowed.
+No layer is weakened. The app processes' residual host-syscall surface
+(see `spawn.rs`) gains, during the rebuild and before any guest code runs
+in the process, `mmap` of the snapshot memfd (only that fd, `MAP_PRIVATE
+| MAP_FIXED`, a range the platform checked) and `close` of it.
+
+The template is trusted more than a clone: everything a clone starts
+from comes from the template's kernel process, which ran the template's
+guest. A template program that compromised its kernel process would
+compromise every clone made from it. Templates should be built from
+programs and images the operator controls; the clones' guests never
+reach the template: after the fork, a clone shares no writable state with
+it (the snapshot is sealed; K' closes its copies of the listening socket,
+the other connections and their clones' pidfds at once); what K' keeps of
+the template's fds is the image directory (read-only), the egress socket
+directory, `/dev/urandom`, and hellovm's own stdin, stdout and stderr
+(its log lines go to stderr).
+
+**Measurements.** `kernel/hellovm/tests/warm_bench.rs` (`cargo test
+--release -p hellovm --test warm_bench -- --ignored --nocapture`) runs a
+CPython program that imports `asyncio`, `json`, `decimal`, `hashlib`,
+`http.client`, `email.parser`, `ssl`, `xml.etree.ElementTree`,
+`urllib.request`, `argparse`, `dataclasses`, `pathlib` and `sqlite3`,
+waits at the clone point and prints a line. Release build,
+on an Apple M3 Max in Docker Desktop (Linux 7.0.14-linuxkit, aarch64, 14
+CPUs), default seccomp profile (namespaces skipped, the other layers
+active), medians of 30 clones and 5 cold starts:
+
+| | Debian bookworm (CPython 3.11) | Ubuntu 26.04 (CPython 3.14) |
+|---|---|---|
+| Native `python3`, start to first line | 38.8 ms | 44.1 ms |
+| Cold `hellovm`, start to first line | 193.6 ms | 141.8 ms |
+| Template, start to frozen (once) | 222.5 ms | 176.3 ms |
+| Snapshot (stored pages, areas) | 29.9 MiB, 128 | 35.8 MiB, 105 |
+| **Clone, request to first guest instruction** (`S`) | **7.0 ms** (4.1–10.4) | **5.7 ms** (3.7–9.1) |
+| **Clone, request to first line** | **8.2 ms** (4.7–11.3) | **6.6 ms** (4.6–10.3) |
+| Clone, request to exit status | 24.7 ms | 25.7 ms |
+
+The 50-clone test makes 50 clones one after another and then 50 at once,
+each running and ending a small program, in about half a second each way
+in a debug build.
+
+Where a clone's time goes (`HELLOVM_LOG=debug` on the template logs it
+per clone): rebuilding the app processes takes 3.8–5.5 ms of it, that is
+a fresh app process plus the injected `mmap`s (two ptrace stops each,
+roughly 30–40 µs on this VM): one per extent of the snapshot (125 for the
+128 areas of this program on bookworm; the template logs the number) and
+an anonymous one for each area that is not a single extent; the fork of K' and its set-up (Landlock domain, console) take
+tens of microseconds; the rest is the request, the `S` frame and the
+guest's own work. Fewer, larger areas would make it faster; so would
+batching the injected `mmap`s, which the current one-syscall-per-stop
+injection does not do. A clone's exit takes longer than its
+start: CPython's finalization writes to most of its objects, and every
+first write to a page shared with the template is a copy.
 
 ## Fuzzing
 
@@ -571,7 +828,10 @@ server and a plain HTTP server as the outside, run the proxy in the test
 process, and use the host's `/` as the sandbox image, covering allowed,
 denied, SNI-mismatch, Host-mismatch, private and metadata cases, a proxy
 that is down, the audit lines, `pip install` from a local index and
-`git clone` from a local server. `HELLOVM_NET_E2E=1` also runs
+`git clone` from a local server. The warm-clone tests (`kernel/hellovm/tests/warm.rs`) also use the host's
+`/` with its CPython and busybox; `tests/warm_bench.rs` is the ignored
+benchmark of **Warm clones**.
+`HELLOVM_NET_E2E=1` also runs
 `live_pip_and_git`, a real `pip install` and `git clone` over the internet
 with an allowlist of `pypi.org`, `files.pythonhosted.org` and
 `github.com`; `run-e2e.sh` and CI never set it.

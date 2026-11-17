@@ -42,10 +42,22 @@ pub const PTRACE_EVENT_SECCOMP: i32 = 7;
 
 pub const NT_PRSTATUS: libc::c_long = 1;
 pub const NT_PRFPREG: libc::c_long = 2;
+/// The regset with the extended FP/SIMD state (`Tracee::xstate`).
+#[cfg(target_arch = "x86_64")]
+pub const NT_XSTATE: libc::c_long = 0x202; // NT_X86_XSTATE
+#[cfg(target_arch = "aarch64")]
+pub const NT_XSTATE: libc::c_long = 0x405; // NT_ARM_SVE
+/// More than any extended state is long (AVX-512 with AMX: 11 KiB; SVE
+/// with 2048-bit vectors: 9 KiB).
+pub const XSTATE_MAX: usize = 64 << 10;
 #[cfg(target_arch = "aarch64")]
 pub const NT_ARM_TLS: libc::c_long = 0x401;
 #[cfg(target_arch = "aarch64")]
 pub const NT_ARM_SYSTEM_CALL: libc::c_long = 0x404;
+#[cfg(target_arch = "aarch64")]
+pub const NT_ARM_PACA_KEYS: libc::c_long = 0x407;
+#[cfg(target_arch = "aarch64")]
+pub const NT_ARM_PACG_KEYS: libc::c_long = 0x408;
 
 /// `clone` flags the platform passes when it makes an app process fork.
 pub const CLONE_VM: u64 = 0x100;

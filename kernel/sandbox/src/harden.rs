@@ -25,6 +25,10 @@ pub struct Config<'a> {
     pub learn: Option<PathBuf>,
     /// Test hook: leave Landlock out, to test the other fences alone.
     pub skip_landlock: bool,
+    /// The process becomes a warm-clone template: it also needs the
+    /// syscalls that serve clone requests and that make a clone's own
+    /// Landlock domain (`allowlist`).
+    pub warm: bool,
     /// The outcome of [`close_inherited_fds`].
     pub fds: Result<usize, String>,
 }
@@ -336,7 +340,7 @@ fn install_seccomp(
     if learn.is_some() {
         return Err("HELLOVM_SECCOMP_LEARN needs the insecure-test-hooks feature".into());
     }
-    let entries = allowlist::entries(profile.stub_fd(), config.tcp_port.is_some());
+    let entries = allowlist::entries(profile.stub_fd(), config.tcp_port.is_some(), config.warm);
     let mut prog = filter::build(audit_arch(), code, filter::Judge::Allowlist(&entries))?;
     let fprog = libc::sock_fprog {
         len: prog.len() as libc::c_ushort,

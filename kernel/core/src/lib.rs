@@ -47,5 +47,5 @@ pub mod vfs;
 
 pub use arch::{Arch, Sysno};
 pub use kernel::{
-    ConsoleMode, ExitStatus, Kernel, KernelError, Outcome, SyscallRecord, RESOLV_CONF,
+    ConsoleMode, ExitStatus, Kernel, KernelError, Outcome, SyscallRecord, TemplateEnd, RESOLV_CONF,
 };

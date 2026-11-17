@@ -159,6 +159,10 @@ macro_rules! splice_host_methods {
         fn stream_close(&mut self, id: HostStreamId) {
             self.splice.close(id);
         }
+
+        fn settle_streams(&mut self, limit: Duration) -> bool {
+            self.splice.settle(limit)
+        }
     };
 }
 
@@ -172,6 +176,17 @@ struct Input {
     waker: Option<Waker>,
 }
 
+/// Where console input comes from.
+#[derive(Debug)]
+enum InputSource {
+    /// The process's stdin.
+    Stdin,
+    /// This file (a warm clone's stdin).
+    File(File),
+    /// Nothing: console input is at end of file (a warm-clone template).
+    Closed,
+}
+
 /// stdin, read by a helper thread.
 #[derive(Default)]
 struct StdinReader {
@@ -181,7 +196,7 @@ struct StdinReader {
 }
 
 impl StdinReader {
-    fn run(&self) {
+    fn run(&self, file: Option<File>) {
         let mut chunk = [0u8; 4096];
         loop {
             {
@@ -190,7 +205,10 @@ impl StdinReader {
                     input = self.room.wait(input).unwrap_or_else(|e| e.into_inner());
                 }
             }
-            let result = io::stdin().lock().read(&mut chunk);
+            let result = match &file {
+                Some(file) => (&*file).read(&mut chunk),
+                None => io::stdin().lock().read(&mut chunk),
+            };
             let done = !matches!(result, Ok(n) if n > 0)
                 && !matches!(&result, Err(e) if e.kind() == io::ErrorKind::Interrupted);
             let waker = {
@@ -216,9 +234,13 @@ impl StdinReader {
     }
 }
 
-/// Connects the sandbox console to the kernel process's stdio.
+/// Connects the sandbox console to the kernel process's stdio, or to
+/// other files ([`StdioHost::set_console`]).
 pub struct StdioHost {
     common: Common,
+    input: InputSource,
+    /// Output files instead of the process's stdout and stderr.
+    output: Option<(File, File)>,
     stdin: Option<Arc<StdinReader>>,
     /// Given to the stdin reader when it starts.
     waker: Option<Waker>,
@@ -241,6 +263,8 @@ impl StdioHost {
     pub fn new(image: Option<ImageDir>) -> StdioHost {
         StdioHost {
             common: Common::new(image),
+            input: InputSource::Stdin,
+            output: None,
             stdin: None,
             waker: None,
             splice: StreamTable::default(),
@@ -250,6 +274,22 @@ impl StdioHost {
     /// Sends every outbound flow to the egress proxy listening on `path`.
     pub fn set_egress(&mut self, path: impl Into<std::path::PathBuf>) {
         self.splice.set_endpoint(Endpoint::Egress(path.into()));
+    }
+
+    /// Console input is at end of file from the start (a warm-clone
+    /// template: its stdin belongs to no one, and no reader thread may
+    /// exist when the template's process is forked).
+    pub fn close_input(&mut self) {
+        self.input = InputSource::Closed;
+    }
+
+    /// Connects the console to these files instead of the process's own
+    /// stdio (a warm clone, in a fork of the template's process: the
+    /// template had no reader thread, see [`StdioHost::close_input`]).
+    pub fn set_console(&mut self, stdin: File, stdout: File, stderr: File) {
+        self.input = InputSource::File(stdin);
+        self.output = Some((stdout, stderr));
+        self.stdin = None;
     }
 
     /// Test hook: splice every issued-fake-IP TCP connect to `addr`, with
@@ -270,6 +310,10 @@ impl StdioHost {
     /// untouched for whoever comes next (the rest of a shell script, say).
     fn reader(&mut self) -> &Arc<StdinReader> {
         let waker = self.waker.clone();
+        let file = match &self.input {
+            InputSource::File(file) => file.try_clone().ok(),
+            _ => None,
+        };
         self.stdin.get_or_insert_with(|| {
             let reader = Arc::new(StdinReader::default());
             reader.input.lock().unwrap_or_else(|e| e.into_inner()).waker = waker;
@@ -278,7 +322,7 @@ impl StdioHost {
             // exits.
             std::thread::Builder::new()
                 .name("hellovm-stdin".into())
-                .spawn(move || thread_reader.run())
+                .spawn(move || thread_reader.run(file))
                 .expect("starting the stdin thread");
             reader
         })
@@ -287,18 +331,23 @@ impl StdioHost {
 
 impl Host for StdioHost {
     fn console_write(&mut self, stream: ConsoleStream, data: &[u8]) -> io::Result<usize> {
-        match stream {
-            ConsoleStream::Stdout => {
+        match (stream, &self.output) {
+            (ConsoleStream::Stdout, Some((out, _))) => (&*out).write_all(data)?,
+            (ConsoleStream::Stderr, Some((_, err))) => (&*err).write_all(data)?,
+            (ConsoleStream::Stdout, None) => {
                 let mut out = io::stdout().lock();
                 out.write_all(data)?;
                 out.flush()?;
             }
-            ConsoleStream::Stderr => io::stderr().lock().write_all(data)?,
+            (ConsoleStream::Stderr, None) => io::stderr().lock().write_all(data)?,
         }
         Ok(data.len())
     }
 
     fn console_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let InputSource::Closed = self.input {
+            return Ok(0);
+        }
         let reader = Arc::clone(self.reader());
         let mut input = reader.input.lock().unwrap_or_else(|e| e.into_inner());
         if input.buf.is_empty() {

@@ -119,7 +119,9 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 if partial > 0 {
                     // A blocking write that already moved data reports it.
                     context.set_ret(partial as i64);
-                } else if restart == Restart::IfSaRestart && action.flags & SA_RESTART != 0 {
+                } else if restart == Restart::Always
+                    || (restart == Restart::IfSaRestart && action.flags & SA_RESTART != 0)
+                {
                     context.restart_syscall(&trap);
                 } else {
                     self.report_sleep_left();

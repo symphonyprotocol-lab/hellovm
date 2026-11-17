@@ -478,6 +478,22 @@ impl StreamTable {
         true
     }
 
+    /// Waits at most `limit` until no stream is open and every helper of
+    /// a closed one has finished. Returns whether that happened. Unlike
+    /// [`StreamTable::drain`] it closes nothing.
+    pub fn settle(&mut self, limit: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if self.streams.is_empty() && self.live.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if !self.streams.is_empty() || start.elapsed() >= limit {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn shared(&self, id: HostStreamId) -> io::Result<Arc<Shared>> {
         self.streams
             .get(&id.0)

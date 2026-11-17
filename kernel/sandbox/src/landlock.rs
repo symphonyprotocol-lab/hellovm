@@ -187,3 +187,58 @@ pub fn restrict(image: BorrowedFd<'_>, tcp_port: Option<u16>) -> Result<Applied,
         scoped: scoped != 0,
     })
 }
+
+/// Puts the calling process into a new Landlock domain nested in its
+/// current one, restricting nothing more on the filesystem than the
+/// current one does (no rule needs adding, so no path is named). What it
+/// adds is the domain boundary itself: Landlock refuses ptrace-level
+/// access (attach, `process_vm_*`) from a domain to a process that is not
+/// in it or below it, and with ABI 6 also signals and abstract Unix
+/// sockets. A warm clone's kernel process calls this right after the fork,
+/// before it creates its app processes: the clone's processes are then in
+/// a domain of their own, which neither the template nor any other clone
+/// can reach, and the clone cannot reach theirs. Returns the ABI.
+pub fn nest() -> Result<i64, String> {
+    let abi = abi()?;
+    // Rights the current domain already denies everywhere (only reading
+    // the image is allowed): handling them again changes nothing, and a
+    // ruleset must handle something.
+    let mut fs = FS_ABI1 & !(FS_READ_FILE | FS_READ_DIR);
+    if abi >= 2 {
+        fs |= FS_REFER;
+    }
+    let scoped = if abi >= 6 {
+        SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL
+    } else {
+        0
+    };
+    let attr = RulesetAttr {
+        handled_access_fs: fs,
+        handled_access_net: 0,
+        scoped,
+    };
+    let size = match abi {
+        1..=3 => 8,
+        4 | 5 => 16,
+        _ => std::mem::size_of::<RulesetAttr>(),
+    };
+    // SAFETY: `attr` is valid for `size` bytes.
+    let ruleset =
+        unsafe { libc::syscall(SYS_CREATE_RULESET, &attr as *const RulesetAttr, size, 0u32) };
+    if ruleset < 0 {
+        return Err(format!(
+            "creating a Landlock ruleset: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: a new fd we own.
+    let ruleset = unsafe { OwnedFd::from_raw_fd(ruleset as i32) };
+    // SAFETY: plain syscall on our ruleset fd.
+    if unsafe { libc::syscall(SYS_RESTRICT_SELF, ruleset.as_raw_fd(), 0u32) } != 0 {
+        return Err(format!(
+            "enforcing the Landlock ruleset: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(abi)
+}

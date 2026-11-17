@@ -14,7 +14,7 @@ use crate::mm::{MAP_PRIVATE, MAP_TYPE};
 use crate::pipe::{ReadResult, WriteResult, PIPE_CAPACITY};
 use crate::platform::{GuestAddr, Platform};
 use crate::signal::{self, SigInfo};
-use crate::task::Restart;
+use crate::task::{ClonePoint, Restart, WaitKind};
 use crate::tty::InputState;
 use crate::vfs::{
     CreateTarget, Device, DirEntry, FileType, Ino, NewNode, Stat, Timespec, S_IFCHR, S_IFDIR,
@@ -329,6 +329,24 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                             .map_err(|e| Errno::from_host(&e))?;
                         len
                     }
+                    Some(Device::Clone) => match &mut self.st.clone_point {
+                        ClonePoint::Off => 0,
+                        ClonePoint::Template => {
+                            self.st.freeze_requested = true;
+                            return Err(self.park(
+                                WaitKind::ClonePoint,
+                                None,
+                                Restart::IfSaRestart,
+                            ));
+                        }
+                        ClonePoint::Clone(input) => {
+                            let n = len.min(input.len());
+                            for (dst, src) in buf.iter_mut().zip(input.drain(..n)) {
+                                *dst = src;
+                            }
+                            n
+                        }
+                    },
                     Some(Device::Fd(_) | Device::Unusable | Device::Tty { .. }) => {
                         return Err(Errno(ENXIO))
                     }
@@ -424,6 +442,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             }
             FileObject::Node(ino) => match self.vfs.device(ino) {
                 Some(Device::Full) => Err(Errno(ENOSPC)),
+                Some(Device::Clone) => Err(Errno(EINVAL)),
                 Some(Device::Fd(_) | Device::Unusable | Device::Tty { .. }) => Err(Errno(ENXIO)),
                 Some(_) => Ok(data.len()),
                 None => {

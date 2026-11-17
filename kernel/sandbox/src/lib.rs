@@ -64,6 +64,11 @@ mod limits;
 #[cfg(target_os = "linux")]
 mod ns;
 
+/// See `landlock::nest`: a nested Landlock domain for a warm clone's
+/// kernel process.
+#[cfg(target_os = "linux")]
+pub use landlock::nest as nest_landlock_domain;
+
 #[cfg(target_os = "linux")]
 pub use harden::{
     apply, close_inherited_fds, Config, Hardened, Layer, LayerReport, Refused, Report,

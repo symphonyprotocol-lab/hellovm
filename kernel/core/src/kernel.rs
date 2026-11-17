@@ -34,9 +34,13 @@ use crate::arch::{Arch, Sysno};
 use crate::errno::{Errno, MAX_ERRNO};
 use crate::fd::{Access, FileObject, OpenFile};
 use crate::host::{ConsoleStream, Host};
-use crate::platform::{Event, Platform, PlatformError, SyscallTrap, Trap};
+use crate::platform::{
+    Event, FrozenArea, FrozenSpace, Platform, PlatformError, Sharing, SyscallTrap, Trap,
+};
 use crate::syscall::{self, Action, Ctx};
-use crate::task::{Next, Parked, Process, State, Thread, ThreadState, Tid, WaitKind};
+use crate::task::{
+    ClonePoint, Next, Parked, Process, Restart, State, Thread, ThreadState, Tid, WaitKind,
+};
 use crate::tty::Console;
 use crate::vfs::{Ino, Timespec, Vfs};
 
@@ -71,6 +75,9 @@ pub enum KernelError {
     },
     /// `run` without a successful `exec`.
     NoProgram,
+    /// A template reached its clone point in a state that cannot be cloned
+    /// (see [`Kernel::run_template`]); the sandbox has been ended.
+    NotClonable(String),
 }
 
 impl fmt::Display for KernelError {
@@ -79,6 +86,7 @@ impl fmt::Display for KernelError {
             KernelError::Platform(err) => write!(f, "platform: {err}"),
             KernelError::Exec { path, reason, .. } => write!(f, "{path}: {reason}"),
             KernelError::NoProgram => f.write_str("no program loaded"),
+            KernelError::NotClonable(why) => write!(f, "the template cannot be cloned: {why}"),
         }
     }
 }
@@ -155,6 +163,17 @@ impl fmt::Display for SyscallRecord {
     }
 }
 
+/// How [`Kernel::run_template`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateEnd {
+    /// The template reached its clone point and is frozen: every task was
+    /// captured by [`Platform::freeze`] and ended. [`Kernel::thaw`] on a
+    /// copy of this kernel (and of the platform) makes a clone.
+    Frozen,
+    /// The first process ended before the clone point.
+    Exited(ExitStatus),
+}
+
 /// How the sandbox console appears to the guest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConsoleMode {
@@ -177,6 +196,10 @@ pub(crate) fn now<H: Host + ?Sized>(host: &mut H) -> Timespec {
     }
 }
 
+/// How long freezing a template waits for outbound connections the guest
+/// already closed to deliver their last bytes.
+const STREAM_SETTLE: Duration = Duration::from_secs(10);
+
 /// `/etc/resolv.conf` as the kernel presents it.
 pub const RESOLV_CONF: &[u8] =
     b"# Written by the hellovm kernel: virtual DNS is the sandbox's only resolver.\nnameserver 192.0.2.1\n";
@@ -193,6 +216,9 @@ pub struct Kernel<H> {
     console_mode: ConsoleMode,
     /// The platform's architecture, once a program was loaded.
     arch: Option<Arch>,
+    /// After [`Kernel::run_template`] froze the sandbox: the threads of
+    /// each frozen address space, in the order given to the platform.
+    frozen: Option<Vec<Vec<Tid>>>,
 }
 
 impl<H: Host> Kernel<H> {
@@ -211,6 +237,7 @@ impl<H: Host> Kernel<H> {
             cwd: root,
             console_mode: ConsoleMode::Streams,
             arch: None,
+            frozen: None,
         };
         kernel.present_resolv_conf();
         kernel
@@ -428,6 +455,242 @@ impl<H: Host> Kernel<H> {
         result
     }
 
+    /// Makes this sandbox a warm-clone template: a read of
+    /// `/dev/hellovm-clone` freezes it (see [`Kernel::run_template`]).
+    /// The console must be plain streams.
+    pub fn template(mut self) -> Self {
+        self.st.clone_point = ClonePoint::Template;
+        self
+    }
+
+    /// Runs a template (see [`Kernel::template`]) until a thread reads
+    /// `/dev/hellovm-clone`, its clone point, and freezes it there.
+    ///
+    /// From that read on no thread is resumed: running threads are
+    /// interrupted, and a thread that traps in the meantime keeps its
+    /// syscall (or fault) for later, as if it had not reached it yet. When
+    /// no thread runs, the sandbox is checked (see `clonable`) and the
+    /// platform captures every task and address space and ends the tasks
+    /// ([`Platform::freeze`]). Everything else (processes, files, pipes,
+    /// sockets, the writable layer) stays in this kernel as it is: a copy
+    /// of it, with a copy of the platform, becomes a clone with
+    /// [`Kernel::thaw`]. A template that cannot be cloned is ended and
+    /// [`KernelError::NotClonable`] says why.
+    pub fn run_template<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+    ) -> Result<TemplateEnd, KernelError> {
+        if self.st.procs.is_empty() {
+            return Err(KernelError::NoProgram);
+        }
+        if self.st.clone_point != ClonePoint::Template {
+            return Err(KernelError::NotClonable("not a template".into()));
+        }
+        self.host.set_console_waker(platform.waker());
+        let result = self.event_loop(platform);
+        if result.is_ok() && self.st.init_status.is_none() && self.st.freeze_requested {
+            let frozen = self.clonable().and_then(|spaces| {
+                let tids = spaces.iter().map(|(tids, _)| tids.clone()).collect();
+                let spaces: Vec<FrozenSpace> = spaces.into_iter().map(|(_, s)| s).collect();
+                platform
+                    .freeze(&spaces)
+                    .map(|()| tids)
+                    .map_err(|err| format!("capturing the app processes: {err}"))
+            });
+            match frozen {
+                Ok(tids) => {
+                    self.frozen = Some(tids);
+                    return Ok(TemplateEnd::Frozen);
+                }
+                Err(why) => {
+                    self.end_all(platform);
+                    return Err(KernelError::NotClonable(why));
+                }
+            }
+        }
+        self.end_all(platform);
+        result.map(TemplateEnd::Exited)
+    }
+
+    /// Whether the stopped sandbox can be frozen: the address spaces to
+    /// capture, with the threads using each, or why not.
+    fn clonable(&mut self) -> Result<Vec<(Vec<Tid>, FrozenSpace)>, String> {
+        if self.st.console.tty.is_some() {
+            return Err("the console is a terminal".into());
+        }
+        let links = self.st.net.host_links();
+        if links > 0 {
+            return Err(format!(
+                "{links} outbound connection(s) through the egress proxy are open"
+            ));
+        }
+        if !self.host.settle_streams(STREAM_SETTLE) {
+            return Err(format!(
+                "outbound connections were still delivering bytes after {STREAM_SETTLE:?}"
+            ));
+        }
+        let mut spaces: Vec<(crate::task::MmId, Vec<Tid>, FrozenSpace)> = Vec::new();
+        for thread in self.st.threads.values() {
+            if thread.state == ThreadState::Running {
+                return Err(format!("thread {} is running", thread.tid));
+            }
+            let Some(mm) = self.st.proc(thread.pid).mm else {
+                continue;
+            };
+            match spaces.iter_mut().find(|(id, _, _)| *id == mm) {
+                Some((_, tids, space)) => {
+                    tids.push(thread.tid);
+                    space.tasks.push(thread.task);
+                }
+                None => {
+                    let areas = self
+                        .st
+                        .mms
+                        .get(mm)
+                        .mm
+                        .vmas()
+                        .iter()
+                        .filter(|v| v.kind != crate::mm::VmaKind::Reserved)
+                        .map(|v| FrozenArea {
+                            start: v.start,
+                            end: v.end,
+                            prot: v.prot,
+                            sharing: if v.kind == crate::mm::VmaKind::Shared {
+                                Sharing::Shared
+                            } else {
+                                Sharing::Private
+                            },
+                            zero: v.zero,
+                        })
+                        .collect();
+                    spaces.push((
+                        mm,
+                        vec![thread.tid],
+                        FrozenSpace {
+                            tasks: vec![thread.task],
+                            areas,
+                        },
+                    ));
+                }
+            }
+        }
+        let shared = spaces
+            .iter()
+            .any(|(_, _, s)| s.areas.iter().any(|a| a.sharing == Sharing::Shared));
+        if shared && spaces.len() > 1 {
+            return Err(
+                "MAP_SHARED memory exists while more than one address space does (it may be shared between processes)"
+                    .into(),
+            );
+        }
+        if !self
+            .st
+            .threads
+            .values()
+            .any(|t| t.parked().is_some_and(|p| p.kind == WaitKind::ClonePoint))
+        {
+            return Err("no thread is waiting at the clone point any more".into());
+        }
+        Ok(spaces.into_iter().map(|(_, t, s)| (t, s)).collect())
+    }
+
+    /// While a template freezes: interrupts the running threads and holds
+    /// whatever traps. Returns whether no thread runs any more.
+    fn stop_for_freeze<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+    ) -> Result<bool, KernelError> {
+        let mut running = false;
+        for thread in self.st.threads.values_mut() {
+            if thread.state == ThreadState::Running {
+                running = true;
+                if !thread.interrupt_sent {
+                    thread.interrupt_sent = true;
+                    platform.interrupt(thread.task)?;
+                }
+            }
+        }
+        if !running {
+            return Ok(true);
+        }
+        let Some(event) = platform.wait(None)? else {
+            return Ok(false);
+        };
+        let Some(&tid) = self.st.tasks.get(&event.task) else {
+            return Ok(false);
+        };
+        match event.trap {
+            // Not handled here: the clone handles it, as if the thread had
+            // not reached the syscall yet.
+            Trap::Syscall(trap) => {
+                let sysno = platform.arch().sysno(trap.nr);
+                self.st.thread_mut(tid).state = ThreadState::Parked(Parked {
+                    trap,
+                    sysno,
+                    kind: WaitKind::NotStarted,
+                    deadline: None,
+                    restart: Restart::Always,
+                    timed_out: false,
+                });
+            }
+            // The clone re-executes the instruction and faults again.
+            Trap::Fault(_) | Trap::Interrupted => {
+                let thread = self.st.thread_mut(tid);
+                thread.interrupt_sent = false;
+                thread.state = ThreadState::Ready(Next::Continue);
+            }
+            Trap::Gone => self.handle_event(platform, event)?,
+        }
+        Ok(false)
+    }
+
+    /// Makes this kernel, a copy of a template that
+    /// [`Kernel::run_template`] froze, a clone: `platform` (the matching
+    /// copy of the template's platform) rebuilds the tasks
+    /// ([`Platform::thaw`]), and the threads waiting at the clone point
+    /// read `input` and then end of file. [`Kernel::run`] then runs the
+    /// clone. Pids, files, pipes, sockets and the writable layer are the
+    /// template's, as they were when it froze.
+    pub fn thaw<P: Platform + ?Sized>(
+        &mut self,
+        platform: &mut P,
+        input: Vec<u8>,
+    ) -> Result<(), KernelError> {
+        let Some(frozen) = self.frozen.take() else {
+            return Err(KernelError::NotClonable("not a frozen template".into()));
+        };
+        let keys = platform.thaw()?;
+        if keys.len() != frozen.len() || keys.iter().zip(&frozen).any(|(k, t)| k.len() != t.len()) {
+            return Err(KernelError::Platform(PlatformError::Violation(
+                "the platform thawed other tasks than it froze".into(),
+            )));
+        }
+        self.st.tasks.clear();
+        for (tids, keys) in frozen.iter().zip(keys) {
+            for (&tid, key) in tids.iter().zip(keys) {
+                let thread = self.st.thread_mut(tid);
+                thread.task = key;
+                thread.interrupt_sent = false;
+                if let ThreadState::Parked(parked) = &mut thread.state {
+                    if parked.kind == WaitKind::ClonePoint {
+                        parked.kind = WaitKind::Retry;
+                    }
+                }
+                self.st.tasks.insert(key, tid);
+            }
+        }
+        self.st.clone_point = ClonePoint::Clone(input.into());
+        self.st.freeze_requested = false;
+        self.st.changed = true;
+        Ok(())
+    }
+
+    /// Names this sandbox to the egress proxy, like
+    /// [`Kernel::with_sandbox_id`] (for a clone).
+    pub fn set_sandbox_id(&mut self, id: u64) {
+        self.st.net.sandbox_id = id;
+    }
+
     fn ctx<'a, P: Platform + ?Sized>(
         &'a mut self,
         platform: &'a mut P,
@@ -459,6 +722,12 @@ impl<H: Host> Kernel<H> {
         loop {
             if let Some(status) = self.st.init_status {
                 return Ok(status);
+            }
+            if self.st.freeze_requested {
+                if self.stop_for_freeze(platform)? {
+                    return Ok(ExitStatus::Exited(0));
+                }
+                continue;
             }
             self.resume_ready(platform)?;
             if self.st.init_status.is_some() {
@@ -558,6 +827,12 @@ impl<H: Host> Kernel<H> {
                         self.ctx(platform, tid, None).resume(next)?;
                     } else if parked.kind == WaitKind::Retry && !stopped {
                         self.retry(platform, tid, parked)?;
+                    } else if parked.kind == WaitKind::NotStarted && !stopped {
+                        // As if it trapped now: its own timeouts start now.
+                        self.st.thread_mut(tid).state = ThreadState::Ready(Next::Continue);
+                        let (tid, action) =
+                            self.dispatch(platform, tid, None, parked.sysno, &parked.trap);
+                        self.complete(platform, tid, parked.sysno, &parked.trap, action, None)?;
                     }
                 }
                 ThreadState::Ready(_) => {}
@@ -1235,6 +1510,63 @@ mod tests {
         let child = plat.task(2);
         assert_eq!(child.returns, vec![2, 1]);
         assert!(kernel.st.procs.is_empty(), "everything was reaped");
+    }
+
+    #[test]
+    fn a_template_freezes_and_its_clone_runs_on() {
+        let arch = Arch::Aarch64;
+        let path = SCRATCH + 0x300;
+        let ts = SCRATCH + 0x200;
+        let init = vec![
+            sc(arch, Sysno::Openat, &[-100i64 as u64, path, 0, 0]),
+            sc(arch, Sysno::Clone, &[SIGCHLD as u64, 0, 0, 0, 0]),
+            // The clone point: the template freezes here.
+            sc(arch, Sysno::Read, &[3, SCRATCH, 16]),
+        ];
+        // Traps while the template freezes (interrupts are ignored): the
+        // clone must handle it as a new syscall, with its own timeout.
+        let child = vec![sc(arch, Sysno::Nanosleep, &[ts, 0])];
+        // The clone's tasks.
+        let init_after = vec![
+            sc(arch, Sysno::Read, &[3, SCRATCH + 0x20, 16]),
+            sc(arch, Sysno::Wait4, &[u64::MAX, SCRATCH + 0x40, 0, 0]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let child_after = vec![sc(arch, Sysno::ExitGroup, &[5])];
+        let mut timespec = 0u64.to_le_bytes().to_vec();
+        timespec.extend_from_slice(&5_000_000u64.to_le_bytes());
+        let (kernel, mut plat) = setup_scripts(
+            arch,
+            vec![init, child, init_after, child_after],
+            &[(path, b"/dev/hellovm-clone\0"), (ts, &timespec)],
+        );
+        let mut kernel = kernel.template();
+        plat.ignore_interrupts = true;
+        assert_eq!(kernel.run_template(&mut plat).unwrap(), TemplateEnd::Frozen);
+        assert!(plat.task(INIT).killed && plat.task(2).killed);
+        kernel.thaw(&mut plat, b"in".to_vec()).unwrap();
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        // The template's init, rebuilt as task 3: the clone point returned
+        // the input, then end of file; the child exited with 5.
+        assert_eq!(returns(&plat, 3), vec![2, 0, 2]);
+        assert_eq!(plat.mem(3).peek(SCRATCH, 2), b"in");
+        assert_eq!(
+            plat.mem(3).peek(SCRATCH + 0x40, 4),
+            (5u32 << 8).to_le_bytes()
+        );
+        // The child's sleep completed in the clone.
+        assert_eq!(returns(&plat, 4), vec![0]);
+        // Outside a template the clone point is at end of file.
+        let read = vec![
+            // O_RDWR: writes reach the device, which refuses them.
+            sc(arch, Sysno::Openat, &[-100i64 as u64, path, 2, 0]),
+            sc(arch, Sysno::Read, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Write, &[3, SCRATCH, 1]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (mut kernel, mut plat) = setup(arch, read, &[(path, b"/dev/hellovm-clone\0")]);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        assert_eq!(returns(&plat, INIT), vec![3, 0, -crate::errno::EINVAL]);
     }
 
     #[test]

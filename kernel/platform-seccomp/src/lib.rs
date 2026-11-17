@@ -24,6 +24,7 @@ mod app;
 mod filter;
 mod profile;
 mod regs;
+mod snapshot;
 mod spawn;
 mod stub;
 mod sys;

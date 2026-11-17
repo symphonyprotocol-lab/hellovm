@@ -175,12 +175,18 @@ impl Process {
 
 /// How a parked syscall is restarted when a signal handler interrupts it
 /// (Linux's `-ERESTARTSYS` and `-ERESTARTNOHAND`).
+// `IfSaRestart` names the flag it depends on (`SA_RESTART`).
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Restart {
     /// Restarted after a handler with `SA_RESTART`, else `EINTR`.
     IfSaRestart,
     /// Always `EINTR` after a handler.
     Never,
+    /// Always restarted after a handler: the syscall had not started (a
+    /// syscall that trapped while a template was being frozen, run in the
+    /// clone).
+    Always,
 }
 
 /// What a parked thread waits for.
@@ -202,6 +208,25 @@ pub(crate) enum WaitKind {
     /// The `vfork` child to exec or exit; only `SIGKILL` ends the wait
     /// early.
     Vfork(Pid),
+    /// A read of the clone point of a template: the template freezes, and
+    /// the read completes only in its clones (see [`ClonePoint`]).
+    ClonePoint,
+    /// A syscall that trapped while a template was freezing and was not
+    /// handled: a clone handles it as if it had just trapped.
+    NotStarted,
+}
+
+/// What reading `/dev/hellovm-clone` does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ClonePoint {
+    /// An ordinary sandbox: end of file at once, so a template program
+    /// also runs unchanged on its own.
+    #[default]
+    Off,
+    /// A template: the read parks and the sandbox freezes.
+    Template,
+    /// A clone: the clone's input, then end of file.
+    Clone(std::collections::VecDeque<u8>),
 }
 
 /// A parked syscall.
@@ -376,6 +401,10 @@ pub(crate) struct State {
     pub init_status: Option<ExitStatus>,
     /// The first process's current directory when it ended (held open).
     pub init_cwd: Option<Ino>,
+    pub clone_point: ClonePoint,
+    /// A thread of a template read the clone point: stop running threads
+    /// and freeze.
+    pub freeze_requested: bool,
 }
 
 impl State {
@@ -395,6 +424,8 @@ impl State {
             changed: false,
             init_status: None,
             init_cwd: None,
+            clone_point: ClonePoint::Off,
+            freeze_requested: false,
         }
     }
 

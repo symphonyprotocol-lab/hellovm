@@ -353,6 +353,16 @@ fn proto_key(proto: Proto) -> u8 {
 }
 
 impl Net {
+    /// Sockets connected (or connecting) to a host stream.
+    pub(crate) fn host_links(&self) -> usize {
+        self.sockets
+            .slots
+            .iter()
+            .flatten()
+            .filter(|s| matches!(s.link(), Some(Link::Host(_))))
+            .count()
+    }
+
     pub(crate) fn contains(&self, id: SockId) -> bool {
         self.sockets.slots.get(id).is_some_and(|s| s.is_some())
     }
