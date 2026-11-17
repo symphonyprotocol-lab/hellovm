@@ -590,7 +590,19 @@ impl Template {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        hellovm::warm::wait_ready(&self.socket)
+        // The socket file is there from `bind` on, a moment before the
+        // template listens on it.
+        loop {
+            match hellovm::warm::wait_ready(&self.socket) {
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ConnectionRefused
+                        && start.elapsed() < std::time::Duration::from_secs(1) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2))
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Waits for the template process to end.

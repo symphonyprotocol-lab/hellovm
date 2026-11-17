@@ -3143,6 +3143,33 @@ mod tests {
     }
 
     #[test]
+    fn exec_of_proc_self_exe_runs_the_program_again() {
+        let arch = Arch::Aarch64;
+        let (exe, stat, argv) = (SCRATCH + 0x10, SCRATCH + 0x40, SCRATCH + 0x80);
+        let first = vec![
+            // A file of /proc is not a program.
+            sc(arch, Sysno::Execve, &[stat, argv, 0]),
+            sc(arch, Sysno::Execve, &[exe, argv, 0]),
+        ];
+        let again = vec![sc(arch, Sysno::ExitGroup, &[7])];
+        let mut argv_bytes = Vec::new();
+        argv_bytes.extend_from_slice(&exe.to_le_bytes());
+        argv_bytes.extend_from_slice(&0u64.to_le_bytes());
+        let (mut kernel, mut plat) = setup_scripts(
+            arch,
+            vec![first, again],
+            &[
+                (exe, b"/proc/self/exe\0"),
+                (stat, b"/proc/self/stat\0"),
+                (argv, &argv_bytes),
+            ],
+        );
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(7));
+        assert_eq!(returns(&plat, INIT), vec![-crate::errno::EACCES]);
+        assert!(plat.task(2).started.is_some(), "/bin/prog was loaded again");
+    }
+
+    #[test]
     fn proc_is_generated_from_the_process_table() {
         let arch = Arch::Aarch64;
         let at_fdcwd = (-100i64) as u64;

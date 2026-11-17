@@ -224,7 +224,12 @@ fn run_once(t: &Template, hellovm: &Path, egress: Option<&Path>) -> io::Result<(
             break Err(format!("not ready after {START_TIMEOUT:?}"));
         }
         if t.socket.exists() {
-            break ping(&t.socket, START_TIMEOUT).map_err(|e| e.to_string());
+            match ping(&t.socket, START_TIMEOUT) {
+                // The socket file is there from `bind` on, a moment before
+                // the template listens on it: ask again.
+                Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {}
+                other => break other.map_err(|e| e.to_string()),
+            }
         }
         std::thread::sleep(Duration::from_millis(5));
     };

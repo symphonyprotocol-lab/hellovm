@@ -390,7 +390,18 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             // fexecve: not supported (the file has no path to load from).
             return Err(Errno(ENOENT));
         }
-        let start = self.start_dir_for(dirfd, &path)?;
+        // A path into /proc is answered by the kernel like every other
+        // use of it, never by whatever the image has there: a program that
+        // runs itself again through /proc/self/exe gets its own file (with
+        // the host's / as the image, the image's /proc/self is the kernel
+        // process).
+        let (start, path) = match self.proc_path(dirfd, &path) {
+            Some(comps) => {
+                let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+                (self.vfs.root(), self.proc_exec_path(comps, follow)?)
+            }
+            None => (self.start_dir_for(dirfd, &path)?, path),
+        };
         let mut total = 0;
         let argv = self.read_string_array(argv_addr, &mut total)?;
         let envp = self.read_string_array(envp_addr, &mut total)?;
@@ -401,6 +412,29 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             })?;
         self.commit_exec(loaded);
         Ok(0)
+    }
+
+    /// The file a path inside `/proc` names for `execve`: only a link to a
+    /// file of the VFS (`/proc/PID/exe`, `/proc/PID/fd/N`, `/proc/PID/cwd`
+    /// and links to those) can be executed.
+    fn proc_exec_path(&mut self, mut comps: Vec<Vec<u8>>, follow: bool) -> SysResult<Vec<u8>> {
+        for _ in 0..8 {
+            let (path, node) = self.proc_lookup(&comps)?;
+            let super::procfs::ProcNode::Link(target) = node else {
+                return Err(Errno(EACCES));
+            };
+            if !follow {
+                return Err(Errno(ELOOP));
+            }
+            let target = self.proc_follow(&path, &target);
+            match self.proc_path(super::AT_FDCWD, &target) {
+                Some(next) => comps = next,
+                None if target.first() == Some(&b'/') => return Ok(target),
+                // pipe:[n] and the like.
+                None => return Err(Errno(EACCES)),
+            }
+        }
+        Err(Errno(ELOOP))
     }
 
     /// Replaces the process image with a loaded program: from here on the

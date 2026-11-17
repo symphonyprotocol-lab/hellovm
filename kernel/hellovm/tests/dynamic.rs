@@ -82,11 +82,15 @@ fn proc_shows_the_sandbox_processes() {
     assert_eq!(fds, "0\n1\n2\n3\n4\n");
     let link = sh(&mut sb, "readlink /proc/self/fd/3 3</etc/passwd");
     assert_eq!(link, "/etc/passwd\n");
+    // (busybox runs `cat` by executing itself again through
+    // /proc/self/exe, so the file mapped is the shell's.)
     let maps = sh(&mut sb, "cat /proc/self/maps");
     assert!(
-        maps.contains("[stack]") && maps.contains("/bin/cat"),
+        maps.contains("[stack]") && maps.contains("/bin/sh"),
         "{maps}"
     );
+    let out = sb.run(&["/bin/cat", "/proc/self/maps"]);
+    assert!(out.stdout.contains("/bin/cat"), "{out:?}");
     let meminfo = sh(&mut sb, "head -1 /proc/meminfo");
     assert!(meminfo.starts_with("MemTotal:"), "{meminfo}");
     assert!(sh(&mut sb, "ls /").contains("proc\n"));
