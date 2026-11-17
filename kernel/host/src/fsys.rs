@@ -37,6 +37,8 @@ pub struct Stat {
     pub mtime_nsec: i64,
 }
 
+// The field types differ between Linux and macOS.
+#[allow(clippy::unnecessary_cast)]
 fn convert(st: &libc::stat) -> Stat {
     Stat {
         mode: st.st_mode as u32,

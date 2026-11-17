@@ -48,6 +48,8 @@ fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, what.to_string())
 }
 
+// `mode_t` is `u32` on Linux and `u16` on macOS.
+#[allow(clippy::unnecessary_cast)]
 fn kind(mode: u32) -> HostFileKind {
     match mode & libc::S_IFMT as u32 {
         m if m == libc::S_IFLNK as u32 => HostFileKind::Symlink,
@@ -152,7 +154,10 @@ impl ImageDir {
 
     pub fn read_link(&mut self, path: &ImagePath) -> io::Result<Vec<u8>> {
         let entry = self.lookup(path)?;
-        let name = entry.name.as_deref().ok_or_else(|| invalid("not a symlink"))?;
+        let name = entry
+            .name
+            .as_deref()
+            .ok_or_else(|| invalid("not a symlink"))?;
         fsys::read_link_at(entry.dir(), name)
     }
 

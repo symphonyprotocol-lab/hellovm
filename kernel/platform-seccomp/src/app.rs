@@ -19,8 +19,8 @@ use hellovm_core::platform::{
 };
 use hellovm_core::{Arch, Sysno};
 
-use crate::regs::{self, Regs, SYSCALL_INSN_LEN};
 use crate::profile;
+use crate::regs::{self, Regs, SYSCALL_INSN_LEN};
 use crate::spawn;
 use crate::stub;
 use crate::sys;
@@ -121,7 +121,8 @@ impl SeccompPlatform {
         let profile = profile::host_profile()?;
         let max_addr = profile.app_max_addr(page_size);
         let number = |sysno: Sysno| arch.syscall_nr(sysno).expect("generic syscall");
-        let mut reserved = vec![stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED];
+        let stub_range = stub::STUB_BASE..stub::STUB_BASE + stub::STUB_RESERVED;
+        let mut reserved = vec![stub_range];
         // App code must never run where the kernel process's own code is:
         // its seccomp filter tells the two apart by address (see `profile`).
         reserved.extend(
@@ -129,7 +130,9 @@ impl SeccompPlatform {
                 .code_ranges()
                 .iter()
                 .filter(|r| r.start < max_addr)
-                .map(|r| r.start & !(page_size - 1)..r.end.min(max_addr).next_multiple_of(page_size)),
+                .map(|r| {
+                    r.start & !(page_size - 1)..r.end.min(max_addr).next_multiple_of(page_size)
+                }),
         );
         let platform = SeccompPlatform {
             arch,
