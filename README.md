@@ -997,7 +997,7 @@ sockets, the API only to its configured nodes.
 **Dependencies.** `serde` and `serde_json` (with their derive macro's
 `syn`, `quote`, `proc-macro2`, `unicode-ident`, and `itoa`, `memchr`,
 `ryu`): the JSON of both APIs. Nothing else: the HTTP server and client
-are about 700 lines of strict, bounded code in `hellovm-control`, and
+are about 800 lines of strict, bounded code in `hellovm-control`, and
 one thread per connection (at most 256) is enough at this scale.
 Rejected for now: `tokio` with `hyper` or `axum` (dozens of crates and
 an async runtime for what a thread pool does), a hand-written JSON
