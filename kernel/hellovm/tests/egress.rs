@@ -22,14 +22,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use common::{TempDir, Watchdog};
-use hellovm_core::{ExitStatus, Kernel};
+use common::{Session, SessionOptions, TempDir};
+use hellovm_core::ExitStatus;
 use hellovm_egress::audit::{AuditSink, MemorySink};
 use hellovm_egress::policy::Policy;
 use hellovm_egress::resolve::Resolver;
 use hellovm_egress::{Config, Limits, Proxy, ProxyHandle};
-use hellovm_host::{CaptureHost, ImageDir};
-use hellovm_platform_seccomp::SeccompPlatform;
 
 const SANDBOX_ID: u64 = 0x00e9_7e55;
 
@@ -257,6 +255,11 @@ with open(os.path.join(root, "simple/index.html"), "w") as f:
 
 fn proxy(policy: &str, resolver: Resolver) -> (ProxyHandle, MemorySink, TempDir) {
     let dir = TempDir::new("egress-proxy");
+    let (handle, audit) = proxy_at(&dir.path().join("egress.sock"), policy, resolver);
+    (handle, audit, dir)
+}
+
+fn proxy_at(socket: &Path, policy: &str, resolver: Resolver) -> (ProxyHandle, MemorySink) {
     let mut p = Policy::new();
     p.add_file(policy).unwrap();
     let audit = MemorySink::default();
@@ -266,10 +269,7 @@ fn proxy(policy: &str, resolver: Resolver) -> (ProxyHandle, MemorySink, TempDir)
         audit: AuditSink::new(Box::new(audit.clone())),
         resolver,
     };
-    let handle = Proxy::bind(dir.path().join("egress.sock"), config)
-        .unwrap()
-        .spawn();
-    (handle, audit, dir)
+    (Proxy::bind(socket, config).unwrap().spawn(), audit)
 }
 
 struct GuestRun {
@@ -291,27 +291,23 @@ impl std::fmt::Display for GuestRun {
 /// Runs `argv` in a sandbox whose image is the host's `/`, with outbound
 /// flows sent to the proxy at `egress`.
 fn run_guest(egress: &Path, argv: &[&str], env: &[&str]) -> GuestRun {
-    let mut host = CaptureHost::new(Some(ImageDir::open("/").unwrap()));
-    host.set_egress(egress);
-    let mut kernel = Kernel::new(host).with_sandbox_id(SANDBOX_ID);
-    let argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
-    let mut envp = vec![
-        b"PATH=/usr/local/bin:/usr/bin:/bin".to_vec(),
-        b"HOME=/root".to_vec(),
-    ];
-    envp.extend(env.iter().map(|e| e.as_bytes().to_vec()));
-    let mut app = SeccompPlatform::new().expect("start the platform");
-    let _watchdog = Watchdog::start(app.killer());
-    kernel
-        .exec(&mut app, &argv[0], &argv, &envp)
+    let mut session = Session::start(
+        Path::new("/"),
+        &SessionOptions {
+            egress: Some(egress.to_path_buf()),
+            sandbox_id: Some(SANDBOX_ID),
+            ..SessionOptions::default()
+        },
+    );
+    let mut envp = vec!["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/root"];
+    envp.extend_from_slice(env);
+    let out = session
+        .run(argv, &envp, b"", Duration::from_secs(5))
         .unwrap_or_else(|err| panic!("exec {argv:?}: {err}"));
-    let status = kernel.run(&mut app).expect("run");
-    let host = kernel.host_mut();
-    host.drain_streams(Duration::from_secs(5));
     GuestRun {
-        status,
-        stdout: String::from_utf8_lossy(&host.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&host.stderr).into_owned(),
+        status: out.status,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
 }
 
@@ -492,6 +488,65 @@ except OSError as e:
     assert_eq!(out.status, ExitStatus::Exited(0), "{out}");
     assert!(out.stdout.contains("addr 198.51.100.1"), "{out}");
     assert!(out.stdout.contains("errno 111"), "{out}");
+}
+
+/// A proxy is restarted to change its policy, or after a crash. Sandboxes
+/// that were already running must reach the new one: their kernel process
+/// keeps the socket's directory, not the socket that was there at start-up.
+#[test]
+fn a_restarted_proxy_serves_sandboxes_that_were_already_running() {
+    if !require_all() {
+        return;
+    }
+    let outside = Outside::start();
+    let dir = TempDir::new("egress-restart");
+    let socket = dir.path().join("egress.sock");
+    let start = || {
+        proxy_at(
+            &socket,
+            POLICY,
+            Resolver::parse_test_table(&outside.table()).unwrap(),
+        )
+    };
+    let script = r#"
+import socket
+try:
+    with socket.create_connection(("web.test", 80), timeout=20) as s:
+        s.sendall(b"GET /hello.txt HTTP/1.1\r\nHost: web.test\r\nConnection: close\r\n\r\n")
+        data = b""
+        while chunk := s.recv(4096):
+            data += chunk
+    print("fetched", data.endswith(b"hello-outside\n"))
+except OSError as e:
+    print("errno", e.errno)
+"#;
+    let (first, _audit) = start();
+    let mut session = Session::start(
+        Path::new("/"),
+        &SessionOptions {
+            egress: Some(socket.clone()),
+            sandbox_id: Some(SANDBOX_ID),
+            ..SessionOptions::default()
+        },
+    );
+    let mut fetch = || {
+        let out = session
+            .run(
+                &["/usr/bin/python3", "-c", script],
+                &["PATH=/usr/bin:/bin"],
+                b"",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(out.status, ExitStatus::Exited(0));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(fetch(), "fetched True");
+    first.stop();
+    assert_eq!(fetch(), "errno 111");
+    let (_second, audit) = start();
+    assert_eq!(fetch(), "fetched True");
+    audit_line(&audit, "web.test", "ok");
 }
 
 #[test]

@@ -11,6 +11,7 @@ The kernel lives in `kernel/`, a Rust workspace:
 | `hellovm-core` | `kernel/core` | Syscall emulation: processes, threads, signals, pipes, ELF loading, memory map, filesystem, terminal, `/proc`, IPv4 sockets; independent of the host OS |
 | `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks, outbound streams to the egress proxy |
 | `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
+| `hellovm-sandbox` | `kernel/sandbox` | Least privilege for the kernel process itself (see **Hardening**) |
 | `hellovm` | `kernel/hellovm` | Command-line launcher |
 | `hellovm-egress` | `kernel/egress` | The egress proxy (`hellovm-egress` binary): default-deny domain allowlist, one per host |
 | `hellovm-egress-wire` | `kernel/egress-wire` | The flow header and hostname rule the kernel and the proxy share |
@@ -26,7 +27,7 @@ address space, and new tasks, are injected `mmap`, `munmap`, `mprotect` and
 `kernel/platform-seccomp/src/spawn.rs` is the full argument, including why
 an in-app stub plus user notification was rejected.
 
-What runs today (milestone U3): x86_64 and aarch64 Linux programs,
+What runs today (milestone U4): x86_64 and aarch64 Linux programs,
 static or dynamically linked, with any number of processes and threads.
 A busybox shell runs external commands, pipelines, background jobs, traps
 and job control; dynamically linked glibc programs and CPython (with
@@ -193,8 +194,12 @@ hellovm --egress /run/hellovm/egress.sock --root / /usr/bin/python3 -m pip insta
 
 The socket file's permissions are the proxy's access control: any process
 that can connect to it can open flows (under the allowlist). It is
-created with the proxy's umask; put it in a directory only the sandbox
-host processes can reach. `--sandbox-id` (16 hex digits or a decimal
+created with the proxy's umask; put it in a directory of its own that
+only the sandbox host processes can reach (a kernel process inside its
+namespaces keeps that directory, so that it finds the socket again after
+the proxy is restarted, and can see whatever else is in it). Run the
+proxy as a different user than the sandboxes where you can: the kernel
+then keeps a compromised sandbox host process from signalling it. `--sandbox-id` (16 hex digits or a decimal
 number; random by default) names the sandbox in every flow and audit
 line.
 
@@ -312,6 +317,209 @@ Both the aarch64 and the x86_64 builds have been tested end to end
 terminal). The x86_64 run is `kernel/dev/run-e2e.sh` on a native x86_64
 Linux host.
 
+## Hardening
+
+The kernel process (`hellovm`) parses guest-controlled bytes all the time
+(ELF files, syscall arguments, signal frames, DNS queries), so it is
+built on the assumption that one of those parsers has a bug. Before it
+reads anything from the guest, once the image directory is open and the
+egress socket path is known, it takes away everything it does not need
+(`kernel/sandbox`). The app processes are forked from it and inherit
+every layer except the seccomp allowlist's effect (see below), on top of
+their own filter.
+
+| Layer | What it does | Skipped when | Required by `--sandbox require` |
+|---|---|---|---|
+| Inherited fds | Every fd above 2 is closed first thing in `main` | never (`--sandbox off` only) | yes |
+| Namespaces | `unshare` of a user, mount, network and IPC namespace. The root becomes an empty read-only tmpfs that holds two bind mounts: the image directory, and the directory of the egress socket (the directory, so that a restarted proxy's new socket is found). The old root is detached and the image is served from an fd opened inside the new root, so no other host path can be named, not even with `..` from a directory fd. The network namespace has only a loopback that is down; every capability is dropped afterwards. Uid and gid are mapped to themselves. The whole sequence is first rehearsed in a forked child, because a process cannot leave a user namespace again: if the rehearsal fails, the layer is skipped and the process is untouched. A failure after a successful rehearsal stops hellovm in every mode (exit 125): it never runs guest code half-confined. | The rehearsal fails: `unshare(CLONE_NEWUSER)` is refused (Docker's default seccomp profile, `kernel.unprivileged_userns_clone=0`, `user.max_user_namespaces=0`), or it succeeds without capabilities and a later step is denied (AppArmor's `restrict_unprivileged_userns`, the default on Ubuntu 24.04 and later) | no |
+| Resource limits | `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 4096, `RLIMIT_MEMLOCK` 0, `RLIMIT_MSGQUEUE` 0 (soft and hard limits are lowered only, never raised) | `setrlimit` fails | yes |
+| `no_new_privs` | `PR_SET_NO_NEW_PRIVS` | never in practice | yes |
+| Landlock | Reading files and directories beneath the image directory is the only filesystem right; TCP bind and connect are denied (ABI 4+); signals and abstract Unix sockets are scoped to the kernel process's own domain, i.e. its app processes (ABI 6+). Landlock also stops ptrace and `process_vm_*` of processes outside the domain. | no Landlock in the host kernel (before 5.13, or not in `lsm=`), or the syscalls are refused | no, but one of Landlock and the namespaces is |
+| Not dumpable | `PR_SET_DUMPABLE` 0: no core dump, no ptrace attach and no `/proc/<pid>/mem` of the kernel process by other processes of the same user | never in practice | yes |
+| Seccomp | An allowlist of the syscalls the kernel process makes, with argument checks; anything else kills the process | `seccomp` refused or the code ranges cannot be read from `/proc/self/maps` at start-up | yes |
+
+`--sandbox best-effort` (the default) uses every layer the host allows
+and logs each skipped one with the reason: at info level when
+`--sandbox require` would still start, as a warning (shown by default)
+when it would not. In particular, on a host with neither namespaces nor
+Landlock the kernel process is not confined to the image at all, and
+every run says so.
+`--sandbox require` refuses to start (exit 125, listing the layers) when
+a required one is unavailable; `--sandbox off` uses none.
+`HELLOVM_LOG=debug` lists the active layers:
+
+```text
+hellovm: debug: sandbox: inherited fds closed: active (0 closed)
+hellovm: debug: sandbox: user/mount/network/IPC namespaces: active (user, mount, network, IPC)
+hellovm: debug: sandbox: resource limits: active (core 0, nofile 4096)
+hellovm: debug: sandbox: no_new_privs: active ()
+hellovm: debug: sandbox: Landlock: active (ABI 8: image read-only, no TCP, signals and abstract sockets scoped)
+hellovm: debug: sandbox: not dumpable: active ()
+hellovm: debug: sandbox: seccomp allowlist: active (58 syscalls, 281 instructions, 5 code ranges)
+```
+
+*The seccomp allowlist.* App processes are forked from the kernel
+process, so its filter is stacked under theirs, and seccomp's most
+severe verdict wins. A filter that killed every syscall the kernel never
+makes would kill the guest's emulated `open`. So the filter looks at the
+instruction pointer: a syscall made from the kernel process's own
+executable mappings (its binary, libc, the dynamic linker, the vDSO,
+recorded once at start-up) is checked against the allowlist and kills
+the process if it is not on it; a syscall from anywhere else gets
+`SECCOMP_RET_TRACE`, which is what the app's own filter returns anyway
+(and in the kernel process, which nobody traces, `ENOSYS`). The platform
+reserves those code ranges in every app address space, so guest code
+never runs there. The allowlist (58 calls on aarch64) was measured with
+`HELLOVM_SECCOMP_LEARN=FILE` (a test-hooks build), which records every
+syscall the kernel process makes and lets it continue, over the whole
+test suite, on Debian bookworm (glibc 2.36) and Ubuntu 26.04 (glibc
+2.43, which adds `fstat` and the termios2 `ioctl`s);
+`kernel/sandbox/learn-summary.py FILE` condenses the log. The x86_64
+list is the same calls by name, and CI measures it: the `test-x86_64`
+job runs the end-to-end tests once with `HELLOVM_SECCOMP_LEARN=FILE`
+(`cargo test -p hellovm --no-fail-fast`) and then
+checks the recording against the allowlist
+(`HELLOVM_SECCOMP_LEARNED=FILE cargo test -p hellovm-sandbox measured`),
+which names any call the list lacks. Do the same after changing what the
+kernel process does.
+Arguments are checked where they decide what a call reaches: `socket`
+only `AF_UNIX` streams, `clone` only thread and fork flags (no
+namespaces; `clone3` fails with `ENOSYS` so glibc falls back), `ptrace`
+only the requests of a tracer of its own children (no `PTRACE_ATTACH`
+or `PTRACE_SEIZE`), `openat` read-only without `O_CREAT`, `mmap` and
+`mprotect` never executable, `execveat` only of the stub memfd, `kill`,
+`tgkill` and `pidfd_send_signal` only the signals the platform sends,
+`prctl`, `ioctl` and `fcntl` only the operations used.
+
+*What it does not stop.* The kernel process drives its app processes
+with ptrace and makes them execute `mmap`, `munmap`, `mprotect` and
+`clone` for it; code that takes over the kernel process completely can
+make an app process execute any syscall, or fork a child of its own and
+trace it. Against that, the layers the app processes inherit
+(namespaces, Landlock, resource limits) are the fence; seccomp shrinks
+the host kernel's surface, turns a kernel bug that makes a stray syscall
+into a dead process, and keeps an exploit from simply calling `socket`
+or `open`. Without the mount namespace a pathname Unix socket other than
+the egress socket can still be reached with `connect`: neither Landlock
+(before a Linux release that covers Unix `connect`) nor seccomp can check
+a socket path. Without the network namespace and Landlock's TCP rights,
+the seccomp `socket` rule is the network fence. `RLIMIT_NPROC` is per
+user across the host, so it is not set (the core caps a sandbox at 1024
+threads and 2048 tasks). There is no `RLIMIT_AS`: the app processes
+would inherit it and programs that reserve address space they never
+touch would fail, while it bounds virtual size, not memory in use; run
+each sandbox in a memory cgroup for that.
+
+Seccomp cannot tell one process id from another, and the kernel process
+needs `ptrace`, `process_vm_readv`/`writev` and `kill` for its own app
+processes. What stops a compromised kernel process from using them on
+other processes of its user: the user namespace and Landlock each refuse
+ptrace-level access (attach, reading or writing memory) to a process
+outside, so that holds wherever one of the two is active. Signals are
+only scoped by Landlock ABI 6 (Linux 6.12); on an older host a
+compromised kernel process can `SIGKILL` other processes of its user.
+Give each tenant its own uid, and the egress proxy another one.
+
+A new app process is emptied (stack, vDSO and whatever else the host
+mapped) with two `munmap`s by address range, since the confined kernel
+process cannot read `/proc/<pid>/maps`. Before it confines itself,
+hellovm starts one app process, clears it the same way and reads its
+maps: if anything of the host is left, it refuses to start.
+
+*Image directory.* The image is opened once and every lookup walks from
+that directory fd with `openat(O_NOFOLLOW | O_DIRECTORY)` per component,
+then `fstatat`/`readlinkat`/`openat` of the last one without following
+it. No symlink in the image, pointing inside or outside it, is ever
+followed on the host (the core resolves symlinks itself), FIFOs and
+device nodes are never opened, and a host-side change to the directory
+cannot make a lookup leave it. Recently used directories and files stay
+open (32 and 16), so a lookup does not walk from the root each time.
+
+*The egress proxy.* `hellovm-egress` makes itself non-dumpable with no
+core dumps at start-up, so that no other process of its user (a
+compromised sandbox host process, say) can attach to it or read or write
+its memory, where the allowlist lives. It is not hardened further yet.
+It parses the flow header and the first bytes of every flow (SNI,
+`Host`), so it would benefit from more of the same treatment:
+`no_new_privs` and an fd limit are trivial; Landlock would allow reading the
+policy file, writing the audit file and creating the listening socket
+(or take it already bound); a seccomp allowlist is possible but must
+cover the host resolver (`getaddrinfo` reads `/etc/resolv.conf`,
+`/etc/hosts`, `/etc/nsswitch.conf` and may load NSS modules, so those
+files must stay readable and its socket calls allowed); it needs the host
+network, so no network namespace.
+
+*Testing.* Every end-to-end test runs in a hardened kernel process: the
+in-process scenarios go through `hellovm --insecure-test-session` (a
+test hook that applies the same hardening, then runs programs on
+request), the rest run the binary. `kernel/hellovm/tests/hardening.rs`
+makes the hardened kernel process itself (`--insecure-fence-test`, a test
+hook) open `/etc/passwd`, connect a TCP socket, connect to a host
+abstract Unix socket, open `/etc/passwd` with `..` from every directory
+fd it holds, read its parent's memory, call `setns` and `PTRACE_ATTACH`
+its parent, and asserts each is refused or kills it; with `--sandbox
+off` each succeeds, as a control. The filesystem attempts are repeated
+with Landlock left out (a test hook), to show that the namespaces hold
+on their own where the host has them. In the dev container and in an Ubuntu 26.04 container
+(Docker's default seccomp profile) the namespaces are skipped and every
+other layer is active; with `--security-opt seccomp=unconfined` all
+seven are.
+
+## Fuzzing
+
+`kernel/fuzz` holds a fuzz target for everything that parses guest- or
+network-controlled bytes. It is its own Cargo workspace, excluded from
+`kernel/`'s, so the pinned stable toolchain and CI never build it.
+
+| Target | What it feeds | Property beyond "no panic, bounded time and memory" |
+|---|---|---|
+| `elf` | `elf::parse` and `elf::load` (both architectures, as program and as interpreter) | |
+| `dns` | the virtual DNS responder, with and without an egress proxy | a reply has the query's id, never grows past the query plus one answer, and a repeated query gets the same reply |
+| `wire` | the egress flow header (`Request::read_from`) and the verdict | a parsed header re-encodes to the same request |
+| `sniff` | the TLS ClientHello / HTTP `Host` sniffer, and prefixes of the input | a returned name appears in the input |
+| `policy` | the policy file and rule parser, then lookups | |
+| `vfs_path` | `resolve`, `resolve_parent`, `resolve_for_create`, `lookup` over an image with symlink loops, `..` above the root, absolute and empty targets | |
+| `shebang` | the `#!` line parser | the interpreter is non-empty and comes from the first line |
+| `sigreturn` | `rt_sigreturn` frame restore on both architectures | |
+| `syscalls` | arbitrary syscall numbers and arguments, faults and interrupts, for up to four tasks, with arbitrary guest memory, through the dispatcher and the mock platform (`hellovm_core::testutil`, feature `testutil`) | |
+
+With nightly and `cargo-fuzz` (libFuzzer):
+
+```sh
+cd kernel/fuzz
+cargo +nightly fuzz run syscalls --features libfuzzer -- -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10
+```
+
+On the stable toolchain, `tests/corpus.rs` runs every target over its
+corpus (`corpus/<target>/`: the seeds written by `tests/seeds.rs`, and
+the minimized input of every crash found) and then over seeded
+mutations of it, with at most 2 s and 256 MiB per input
+(`HELLOVM_FUZZ_ITERS`, default 2000 per target; `HELLOVM_FUZZ_TARGET`
+picks one; `HELLOVM_FUZZ_REPLAY=target:FILE` replays one input with a
+backtrace):
+
+```sh
+cd kernel/fuzz
+cargo test --release
+```
+
+Last run (aarch64, nightly libFuzzer, 1 GiB RSS / 256 MiB single
+allocation / 10 s per input): every target 20 minutes, `syscalls` 30
+and then another 10 with four workers, after a first 9-minute round on
+the code before the U3 review fixes; and the stable runner with 200,000
+mutations per target. From 18 million (`sigreturn`) to 152 million
+(`shebang`) executions per target, and 6.2 million for `syscalls`. The
+only finding: one `truncate` grows an in-memory file to the writable
+layer's limit (2 GiB by default) in a single allocation. That is bounded
+by design (the growth is charged to the limit, and `ENOSPC` past it),
+but above the fuzzers' bound, so the `syscalls` target runs its sandbox
+with a 64 MiB layer limit; its input is in the corpus as
+`oom-truncate-past-the-fuzz-memory-bound`.
+
+The `syscalls` target only reports the faults the seccomp platform can
+report (`SIGILL`, `SIGTRAP`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, `SIGSYS`):
+the platform is trusted, the guest only chooses which fault it causes.
+
 ## Building and testing
 
 Running sandboxed programs needs a **Linux** host: kernel 5.5 or newer on
@@ -372,7 +580,9 @@ Run a program in a sandbox whose root is an image directory. The program path
 is a path inside the sandbox; `--trace` lists every syscall the kernel
 handled, `--egress SOCKET` lets the sandbox reach the network through the
 egress proxy (see **Egress**), and `--timeout SECONDS` kills every process of a sandbox that runs
-longer (hellovm then exits with 124). When hellovm's stdin and stdout are a
+longer (hellovm then exits with 124). `--sandbox require|best-effort|off` picks how strictly
+hellovm hardens its own process (see **Hardening**; default
+`best-effort`). When hellovm's stdin and stdout are a
 terminal, the sandbox gets a terminal console (`--tty`/`--no-tty` override
 this), so an interactive shell works:
 

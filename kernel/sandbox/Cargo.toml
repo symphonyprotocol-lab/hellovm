@@ -1,0 +1,19 @@
+[package]
+name = "hellovm-sandbox"
+description = "Least privilege for the hellovm kernel process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[features]
+# Test-only: HELLOVM_SECCOMP_LEARN measurement mode. Off by default.
+insecure-test-hooks = []
+
+[dependencies]
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hellovm-platform-seccomp.workspace = true
+libc.workspace = true

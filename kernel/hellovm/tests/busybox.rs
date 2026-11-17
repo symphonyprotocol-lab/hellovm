@@ -365,7 +365,7 @@ fn the_in_memory_layer_is_limited() {
     let Some(busybox) = busybox() else { return };
     let image = image(&busybox);
     let mut sandbox = Sandbox::new(image.path());
-    sandbox.kernel.set_fs_limit(1 << 20);
+    sandbox.set_fs_limit(1 << 20);
     let out = sandbox.bb(&["dd", "if=/dev/zero", "of=/tmp/big", "bs=65536", "count=64"]);
     assert_ne!(out.code(), 0, "{out:?}");
     assert!(out.stderr.contains("No space left"), "{out:?}");

@@ -37,6 +37,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends busybox-static gcc libc6-dev python3 python3-pip git openssl
 
+      # The kernel process's seccomp allowlist kills it on a syscall that
+      # is not listed, and the list was drawn up on aarch64. Record what
+      # the kernel process really does here (nothing is enforced while
+      # recording, so a gap cannot fail this run; its result is ignored),
+      # then check the recording against the allowlist, which
+      # names every syscall it lacks. Before the e2e script: with a gap
+      # in the list that one only shows kernel processes dying of SIGSYS.
+      - name: The seccomp allowlist covers x86_64
+        working-directory: kernel
+        run: |
+          learn=$(mktemp)
+          HELLOVM_SECCOMP_LEARN="$learn" cargo test -p hellovm --no-fail-fast >/dev/null 2>&1 || true
+          echo "recorded $(wc -l <"$learn") syscalls"
+          HELLOVM_SECCOMP_LEARNED="$learn" \
+            cargo test -p hellovm-sandbox every_measured_syscall_is_allowed -- --nocapture
+
       - name: Run the x86_64 e2e script
         run: kernel/dev/run-e2e.sh
 

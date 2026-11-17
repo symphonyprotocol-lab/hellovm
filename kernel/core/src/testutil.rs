@@ -3,7 +3,7 @@
 //! in-memory host with an image tree and a clock the platform advances.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::time::Duration;
@@ -21,13 +21,21 @@ use crate::platform::{
 const PAGE: u64 = 0x1000;
 const RESERVED: u64 = 0xf_fff0_0000;
 
-type Pages = HashMap<u64, (Prot, Box<[u8; PAGE as usize]>)>;
+type Page = Box<[u8; PAGE as usize]>;
 
 /// An address space with memory that honours page protections like
 /// `process_vm_readv`/`writev` do.
+///
+/// Sparse, so that the cost of an operation does not depend on how much
+/// memory it covers (the fuzzers map, unmap and protect huge ranges):
+/// mappings are kept as ranges, and a page's contents exist only once
+/// something was written to it (others read as zeros).
 #[derive(Clone, Default)]
 pub struct MockApp {
-    pages: Pages,
+    /// Mapped ranges, start -> (end, protection); page-aligned, disjoint.
+    regions: BTreeMap<u64, (u64, Prot)>,
+    /// Pages that were written.
+    data: BTreeMap<u64, Page>,
 }
 
 impl MockApp {
@@ -49,23 +57,68 @@ impl MockApp {
     }
 
     pub fn is_mapped(&self, addr: GuestAddr) -> bool {
-        self.pages.contains_key(&(addr & !(PAGE - 1)))
+        self.prot(addr).is_some()
     }
 
     pub fn prot(&self, addr: GuestAddr) -> Option<Prot> {
-        self.pages.get(&(addr & !(PAGE - 1))).map(|(p, _)| *p)
+        let (_, &(end, prot)) = self.regions.range(..=addr).next_back()?;
+        (addr < end).then_some(prot)
     }
 
-    /// Maps and fills memory directly (test setup).
+    /// Sets `start..end` to `prot` (`None`: unmapped), splitting the ranges
+    /// it overlaps.
+    fn set(&mut self, start: u64, end: u64, prot: Option<Prot>) {
+        let overlapping: Vec<(u64, u64, Prot)> = self
+            .regions
+            .range(..end)
+            .rev()
+            .take_while(|(_, &(e, _))| e > start)
+            .map(|(&s, &(e, p))| (s, e, p))
+            .collect();
+        for (s, e, p) in overlapping {
+            self.regions.remove(&s);
+            if s < start {
+                self.regions.insert(s, (start, p));
+            }
+            if e > end {
+                self.regions.insert(end, (e, p));
+            }
+        }
+        if let Some(prot) = prot {
+            self.regions.insert(start, (end, prot));
+        }
+    }
+
+    /// Whether every page of `start..end` is mapped.
+    fn covered(&self, start: u64, end: u64) -> bool {
+        let mut at = start;
+        while at < end {
+            match self.regions.range(..=at).next_back() {
+                Some((_, &(e, _))) if e > at => at = e,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn drop_data(&mut self, start: u64, end: u64) {
+        let pages: Vec<u64> = self.data.range(start..end).map(|(&p, _)| p).collect();
+        for page in pages {
+            self.data.remove(&page);
+        }
+    }
+
+    /// Maps and fills memory directly (test setup). Pages that were not
+    /// mapped become read-write.
     pub fn poke(&mut self, addr: GuestAddr, data: &[u8]) {
         let start = addr & !(PAGE - 1);
         let end = (addr + data.len() as u64 + PAGE - 1) & !(PAGE - 1);
         for page in (start..end).step_by(PAGE as usize) {
-            self.pages
-                .entry(page)
-                .or_insert_with(|| (Prot::RW, Box::new([0; PAGE as usize])));
+            if !self.is_mapped(page) {
+                self.set(page, page + PAGE, Some(Prot::RW));
+            }
         }
-        self.access(addr, data.len(), Prot::NONE, |buf, off| {
+        self.access(addr, data.len(), Prot::NONE, true, |buf, off| {
             buf.copy_from_slice(&data[off..off + buf.len()])
         })
         .unwrap();
@@ -74,7 +127,7 @@ impl MockApp {
     /// Reads memory regardless of protection (test checks).
     pub fn peek(&mut self, addr: GuestAddr, len: usize) -> Vec<u8> {
         let mut out = vec![0; len];
-        self.access(addr, len, Prot::NONE, |buf, off| {
+        self.access(addr, len, Prot::NONE, false, |buf, off| {
             out[off..off + buf.len()].copy_from_slice(buf)
         })
         .unwrap();
@@ -86,31 +139,42 @@ impl MockApp {
         addr: GuestAddr,
         len: usize,
         need: Prot,
+        write: bool,
         mut f: impl FnMut(&mut [u8], usize),
     ) -> Result<(), PlatformError> {
-        let bad = PlatformError::BadAddress { addr, len };
+        let bad = || PlatformError::BadAddress { addr, len };
         let mut done = 0;
         while done < len {
-            let at = addr + done as u64;
+            let at = addr.checked_add(done as u64).ok_or_else(bad)?;
             let page = at & !(PAGE - 1);
             let off = (at - page) as usize;
             let n = (PAGE as usize - off).min(len - done);
-            let Some((prot, data)) = self.pages.get_mut(&page) else {
-                return Err(bad);
+            let Some(prot) = self.prot(page) else {
+                return Err(bad());
             };
             if !prot.contains(need) {
-                return Err(bad);
+                return Err(bad());
             }
-            f(&mut data[off..off + n], done);
+            if write {
+                let data = self
+                    .data
+                    .entry(page)
+                    .or_insert_with(|| Box::new([0; PAGE as usize]));
+                f(&mut data[off..off + n], done);
+            } else {
+                let mut zero = [0u8; PAGE as usize];
+                let data = self.data.get_mut(&page).map_or(&mut zero, |d| &mut **d);
+                f(&mut data[off..off + n], done);
+            }
             done += n;
         }
         Ok(())
     }
 
-    fn pages_of(addr: GuestAddr, len: u64) -> impl Iterator<Item = u64> {
+    fn range(addr: GuestAddr, len: u64) -> (u64, u64) {
         assert_eq!(addr % PAGE, 0);
         assert_eq!(len % PAGE, 0);
-        (addr..addr + len).step_by(PAGE as usize)
+        (addr, addr.checked_add(len).expect("range overflows"))
     }
 
     fn check(&self, addr: GuestAddr, len: u64) {
@@ -123,13 +187,13 @@ impl MockApp {
 
 impl AppMemory for MockApp {
     fn read(&mut self, addr: GuestAddr, buf: &mut [u8]) -> Result<(), PlatformError> {
-        self.access(addr, buf.len(), Prot::READ, |src, off| {
+        self.access(addr, buf.len(), Prot::READ, false, |src, off| {
             buf[off..off + src.len()].copy_from_slice(src)
         })
     }
 
     fn write(&mut self, addr: GuestAddr, data: &[u8]) -> Result<(), PlatformError> {
-        self.access(addr, data.len(), Prot::WRITE, |dst, off| {
+        self.access(addr, data.len(), Prot::WRITE, true, |dst, off| {
             dst.copy_from_slice(&data[off..off + dst.len()])
         })
     }
@@ -144,29 +208,27 @@ impl AddressSpace for MockApp {
         _sharing: Sharing,
     ) -> Result<(), PlatformError> {
         self.check(addr, len);
-        for page in Self::pages_of(addr, len) {
-            self.pages
-                .insert(page, (prot, Box::new([0; PAGE as usize])));
-        }
+        let (start, end) = Self::range(addr, len);
+        self.set(start, end, Some(prot));
+        self.drop_data(start, end);
         Ok(())
     }
 
     fn unmap(&mut self, addr: GuestAddr, len: u64) -> Result<(), PlatformError> {
         self.check(addr, len);
-        for page in Self::pages_of(addr, len) {
-            self.pages.remove(&page);
-        }
+        let (start, end) = Self::range(addr, len);
+        self.set(start, end, None);
+        self.drop_data(start, end);
         Ok(())
     }
 
     fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), PlatformError> {
         self.check(addr, len);
-        for page in Self::pages_of(addr, len) {
-            match self.pages.get_mut(&page) {
-                Some(entry) => entry.0 = prot,
-                None => return Err(PlatformError::BadAddress { addr, len: 0 }),
-            }
+        let (start, end) = Self::range(addr, len);
+        if !self.covered(start, end) {
+            return Err(PlatformError::BadAddress { addr, len: 0 });
         }
+        self.set(start, end, Some(prot));
         Ok(())
     }
 }

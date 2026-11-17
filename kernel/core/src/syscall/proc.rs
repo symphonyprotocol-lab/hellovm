@@ -144,7 +144,7 @@ fn read_executable<H: Host + ?Sized>(
 }
 
 /// Splits a `#!` line into the interpreter and its optional argument.
-fn parse_shebang(file: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), LoadError> {
+pub(crate) fn parse_shebang(file: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), LoadError> {
     let line = &file[2..file.len().min(SHEBANG_MAX)];
     let line = match line.iter().position(|&b| b == b'\n') {
         Some(end) => &line[..end],

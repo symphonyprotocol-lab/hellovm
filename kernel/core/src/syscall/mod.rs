@@ -17,7 +17,7 @@ mod futex;
 mod mem;
 mod misc;
 mod net;
-mod proc;
+pub(crate) mod proc;
 mod procfs;
 mod signal;
 mod tty;
