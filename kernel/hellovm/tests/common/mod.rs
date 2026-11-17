@@ -1,5 +1,6 @@
 //! Helpers shared by the end-to-end tests: temporary image directories and
-//! running a program from one under the seccomp platform.
+//! running a program from one under the seccomp platform, in a hardened
+//! kernel process ([`Session`]).
 //!
 //! `HELLOVM_REQUIRE_E2E=1` is the only value that turns a missing busybox,
 //! CPython or native test guest into a failure. Any other value keeps the
@@ -12,9 +13,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use hellovm_core::{ExitStatus, Kernel, KernelError};
-use hellovm_host::{CaptureHost, ImageDir};
-use hellovm_platform_seccomp::{AppKiller, SeccompPlatform};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+use hellovm::session::{self, Reply, Request, RunOutput};
+use hellovm_core::errno::Errno;
+use hellovm_core::{ExitStatus, KernelError, SyscallRecord};
 
 /// True only when `HELLOVM_REQUIRE_E2E` is exactly `1`.
 pub fn e2e_required() -> bool {
@@ -167,80 +170,205 @@ impl Drop for TempDir {
     }
 }
 
-/// Kills a sandbox that runs longer than a minute, so that a hanging test
-/// fails instead of blocking the run.
-pub struct Watchdog {
-    done: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+/// How long one program may run before the test kills its session, so
+/// that a hanging test fails instead of blocking the run.
+pub const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How a [`Session`] is started.
+#[derive(Clone, Debug, Default)]
+pub struct SessionOptions {
+    pub trace: bool,
+    pub egress: Option<PathBuf>,
+    pub splice: Option<std::net::SocketAddr>,
+    pub sandbox_id: Option<u64>,
 }
 
-impl Watchdog {
-    pub const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// One sandbox (one kernel, one filesystem) in its own hardened kernel
+/// process: `hellovm --insecure-test-session`, which applies exactly the
+/// hardening a normal `hellovm` run does (`--sandbox best-effort`) before
+/// it serves the programs the test runs. Every in-process scenario of the
+/// end-to-end tests goes through one, so each runs with least privilege.
+pub struct Session {
+    child: Option<Child>,
+    input: Option<ChildStdin>,
+    output: ChildStdout,
+}
 
-    pub fn start(killer: AppKiller) -> Watchdog {
+impl Session {
+    pub fn start(image: &Path, options: &SessionOptions) -> Session {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hellovm"));
+        command
+            .arg("--insecure-test-session")
+            .arg("--root")
+            .arg(image);
+        if options.trace {
+            command.arg("--trace");
+        }
+        if let Some(egress) = &options.egress {
+            command.arg("--egress").arg(egress);
+        }
+        if let Some(addr) = options.splice {
+            command.arg("--splice-to").arg(addr.to_string());
+        }
+        if let Some(id) = options.sandbox_id {
+            command.arg("--sandbox-id").arg(id.to_string());
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start hellovm --insecure-test-session");
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        Session {
+            child: Some(child),
+            input: Some(input),
+            output,
+        }
+    }
+
+    fn request(&mut self, request: Request) -> Reply {
+        let pid = self.child.as_ref().unwrap().id() as libc::pid_t;
         let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let thread_done = std::sync::Arc::clone(&done);
-        std::thread::spawn(move || {
+        let watchdog = std::thread::spawn(move || {
             let (lock, cvar) = &*thread_done;
             let guard = lock.lock().unwrap();
-            let (guard, timeout) = cvar
-                .wait_timeout_while(guard, Self::LIMIT, |d| !*d)
-                .unwrap();
+            let (guard, timeout) = cvar.wait_timeout_while(guard, LIMIT, |d| !*d).unwrap();
             if timeout.timed_out() && !*guard {
-                eprintln!(
-                    "watchdog: the sandbox ran for {:?}; killing it",
-                    Self::LIMIT
-                );
-                let _ = killer.kill();
+                eprintln!("watchdog: the sandbox ran for {LIMIT:?}; killing it");
+                // SAFETY: plain syscall; the child is not reaped before the
+                // session is dropped, so the pid still names it.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         });
-        Watchdog { done }
+        let reply = session::send(self.input.as_mut().unwrap(), &request.encode())
+            .and_then(|()| session::receive(&mut self.output));
+        {
+            let (lock, cvar) = &*done;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        watchdog.join().unwrap();
+        match reply {
+            Ok(Some(body)) => Reply::decode(&body).expect("decode a session reply"),
+            Ok(None) | Err(_) => {
+                let status = self
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .wait()
+                    .expect("wait for the session");
+                panic!("the hardened kernel process ended: {status}")
+            }
+        }
+    }
+
+    /// Runs `argv` with `env` and `stdin` as console input; waits up to
+    /// `drain` for outbound bytes afterwards.
+    pub fn run(
+        &mut self,
+        argv: &[&str],
+        env: &[&str],
+        stdin: &[u8],
+        drain: std::time::Duration,
+    ) -> Result<RunOutput, KernelError> {
+        let bytes = |list: &[&str]| -> Vec<Vec<u8>> {
+            list.iter().map(|a| a.as_bytes().to_vec()).collect()
+        };
+        match self.request(Request::Run {
+            argv: bytes(argv),
+            env: bytes(env),
+            stdin: stdin.to_vec(),
+            drain_ms: drain.as_millis() as u32,
+        }) {
+            Reply::Ran(out) => Ok(out),
+            Reply::ExecFailed {
+                path,
+                errno,
+                reason,
+            } => Err(KernelError::Exec {
+                path,
+                errno: Errno(errno),
+                reason,
+            }),
+            Reply::Failed(msg) => panic!("{argv:?}: {msg}"),
+            other => panic!("unexpected reply {other:?}"),
+        }
+    }
+
+    pub fn set_fs_limit(&mut self, bytes: u64) {
+        match self.request(Request::SetFsLimit(bytes)) {
+            Reply::Done => {}
+            other => panic!("unexpected reply {other:?}"),
+        }
+    }
+
+    pub fn issue_fake_ip(&mut self) -> Option<[u8; 4]> {
+        match self.request(Request::IssueFakeIp) {
+            Reply::FakeIp(ip) => ip,
+            other => panic!("unexpected reply {other:?}"),
+        }
     }
 }
 
-impl Drop for Watchdog {
+impl Drop for Session {
+    /// Ends the session like `hellovm` ends: closing its input makes the
+    /// kernel process deliver the outbound bytes its programs already wrote
+    /// (for at most 10 s) and exit. That happens in the background, as the
+    /// helpers of an in-process kernel used to keep delivering after it was
+    /// dropped; the process is killed if it is still there after 30 s.
     fn drop(&mut self) {
-        let (lock, cvar) = &*self.done;
-        *lock.lock().unwrap() = true;
-        cvar.notify_all();
+        drop(self.input.take());
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(30) {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
     }
 }
 
 /// The outcome of running a program.
+#[derive(Debug)]
 pub struct Run {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
-    pub kernel: Kernel<CaptureHost>,
-}
-
-impl std::fmt::Debug for Run {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Run")
-            .field("status", &self.status)
-            .field("stdout", &self.stdout)
-            .field("stderr", &self.stderr)
-            .finish()
-    }
+    /// Every syscall the program made.
+    pub trace: Vec<SyscallRecord>,
 }
 
 /// Runs `argv` (argv[0] is the path inside the sandbox) with `image` as the
 /// root, `stdin` as console input and a trace.
 pub fn try_run(image: &Path, argv: &[&str], stdin: &[u8]) -> Result<Run, KernelError> {
-    let mut host = CaptureHost::new(Some(ImageDir::open(image).unwrap()));
-    host.stdin.extend(stdin);
-    let mut kernel = Kernel::new(host).with_trace();
-    let mut app = SeccompPlatform::new().expect("start the platform");
-    let _watchdog = Watchdog::start(app.killer());
-    let argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
-    let envp = vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()];
-    kernel.exec(&mut app, &argv[0], &argv, &envp)?;
-    let status = kernel.run(&mut app)?;
-    let host = kernel.host();
+    let mut session = Session::start(
+        image,
+        &SessionOptions {
+            trace: true,
+            ..SessionOptions::default()
+        },
+    );
+    let out = session.run(
+        argv,
+        &["PATH=/bin", "HOME=/"],
+        stdin,
+        std::time::Duration::ZERO,
+    )?;
     Ok(Run {
-        status,
-        stdout: String::from_utf8_lossy(&host.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&host.stderr).into_owned(),
-        kernel,
+        status: out.status,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        trace: out.trace,
     })
 }
 
@@ -251,7 +379,7 @@ pub fn run(image: &Path, argv: &[&str]) -> Run {
 /// One sandbox (one kernel, one filesystem) running programs one after
 /// another, like the commands of a session.
 pub struct Sandbox {
-    pub kernel: Kernel<CaptureHost>,
+    session: Session,
 }
 
 /// What one program in a [`Sandbox`] did.
@@ -273,32 +401,31 @@ impl Output {
 
 impl Sandbox {
     pub fn new(image: &Path) -> Sandbox {
-        let host = CaptureHost::new(Some(ImageDir::open(image).unwrap()));
         Sandbox {
-            kernel: Kernel::new(host),
+            session: Session::start(image, &SessionOptions::default()),
         }
+    }
+
+    /// Limits the in-memory filesystem layer ([`hellovm_core::Kernel::set_fs_limit`]).
+    pub fn set_fs_limit(&mut self, bytes: u64) {
+        self.session.set_fs_limit(bytes);
     }
 
     /// Runs `argv` with `stdin` as console input.
     pub fn run_with_input(&mut self, argv: &[&str], stdin: &[u8]) -> Output {
-        let host = self.kernel.host_mut();
-        host.stdout.clear();
-        host.stderr.clear();
-        host.stdin.clear();
-        host.stdin.extend(stdin);
-        let mut app = SeccompPlatform::new().expect("start the platform");
-        let _watchdog = Watchdog::start(app.killer());
-        let argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
-        let envp = vec![b"PATH=/bin".to_vec(), b"HOME=/root".to_vec()];
-        self.kernel
-            .exec(&mut app, &argv[0], &argv, &envp)
+        let out = self
+            .session
+            .run(
+                argv,
+                &["PATH=/bin", "HOME=/root"],
+                stdin,
+                std::time::Duration::ZERO,
+            )
             .unwrap_or_else(|err| panic!("exec {argv:?}: {err}"));
-        let status = self.kernel.run(&mut app).expect("run");
-        let host = self.kernel.host();
         Output {
-            status,
-            stdout: String::from_utf8_lossy(&host.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&host.stderr).into_owned(),
+            status: out.status,
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
     }
 

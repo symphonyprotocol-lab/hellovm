@@ -22,14 +22,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use common::{TempDir, Watchdog};
-use hellovm_core::{ExitStatus, Kernel};
+use common::{Session, SessionOptions, TempDir};
+use hellovm_core::ExitStatus;
 use hellovm_egress::audit::{AuditSink, MemorySink};
 use hellovm_egress::policy::Policy;
 use hellovm_egress::resolve::Resolver;
 use hellovm_egress::{Config, Limits, Proxy, ProxyHandle};
-use hellovm_host::{CaptureHost, ImageDir};
-use hellovm_platform_seccomp::SeccompPlatform;
 
 const SANDBOX_ID: u64 = 0x00e9_7e55;
 
@@ -291,27 +289,23 @@ impl std::fmt::Display for GuestRun {
 /// Runs `argv` in a sandbox whose image is the host's `/`, with outbound
 /// flows sent to the proxy at `egress`.
 fn run_guest(egress: &Path, argv: &[&str], env: &[&str]) -> GuestRun {
-    let mut host = CaptureHost::new(Some(ImageDir::open("/").unwrap()));
-    host.set_egress(egress);
-    let mut kernel = Kernel::new(host).with_sandbox_id(SANDBOX_ID);
-    let argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
-    let mut envp = vec![
-        b"PATH=/usr/local/bin:/usr/bin:/bin".to_vec(),
-        b"HOME=/root".to_vec(),
-    ];
-    envp.extend(env.iter().map(|e| e.as_bytes().to_vec()));
-    let mut app = SeccompPlatform::new().expect("start the platform");
-    let _watchdog = Watchdog::start(app.killer());
-    kernel
-        .exec(&mut app, &argv[0], &argv, &envp)
+    let mut session = Session::start(
+        Path::new("/"),
+        &SessionOptions {
+            egress: Some(egress.to_path_buf()),
+            sandbox_id: Some(SANDBOX_ID),
+            ..SessionOptions::default()
+        },
+    );
+    let mut envp = vec!["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/root"];
+    envp.extend_from_slice(env);
+    let out = session
+        .run(argv, &envp, b"", Duration::from_secs(5))
         .unwrap_or_else(|err| panic!("exec {argv:?}: {err}"));
-    let status = kernel.run(&mut app).expect("run");
-    let host = kernel.host_mut();
-    host.drain_streams(Duration::from_secs(5));
     GuestRun {
-        status,
-        stdout: String::from_utf8_lossy(&host.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&host.stderr).into_owned(),
+        status: out.status,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
 }
 

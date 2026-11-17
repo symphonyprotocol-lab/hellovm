@@ -31,8 +31,7 @@ fn hello_world_output_goes_through_the_kernel() {
     assert_eq!(out.stdout, guest::HELLO_STDOUT);
     assert_eq!(out.stderr, guest::HELLO_STDERR);
     let trace: Vec<_> = out
-        .kernel
-        .trace()
+        .trace
         .iter()
         .map(|r| (r.sysno, r.args[0], r.outcome))
         .collect();
@@ -64,7 +63,7 @@ fn syscalls_are_emulated_not_forwarded() {
     // The guest exits with the negated getpid result: the sandbox pid 1, not
     // the host pid of the app process.
     let out = run(image.path(), &["/enosys"]);
-    let trace = out.kernel.trace();
+    let trace = &out.trace;
     assert_eq!(trace.len(), 2);
     assert_eq!(trace[0].sysno, Some(Sysno::Getpid));
     assert_eq!(trace[0].outcome, Outcome::Returned(1));
@@ -122,7 +121,7 @@ fn static_pie_with_glibc() {
     // The guest maps the big region itself and frees it with munmap
     // (see test-guest/c/pie.c), so this does not depend on malloc or on
     // compiler optimisation.
-    let calls: Vec<_> = out.kernel.trace().iter().filter_map(|r| r.sysno).collect();
+    let calls: Vec<_> = out.trace.iter().filter_map(|r| r.sysno).collect();
     assert!(calls.contains(&Sysno::Mmap), "{calls:?}");
     assert!(calls.contains(&Sysno::Munmap), "{calls:?}");
 }

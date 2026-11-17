@@ -21,10 +21,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use common::{require_guest, TempDir, Watchdog};
-use hellovm_core::{ExitStatus, Kernel, Sysno};
-use hellovm_host::{CaptureHost, ImageDir};
-use hellovm_platform_seccomp::SeccompPlatform;
+use common::{require_guest, Session, SessionOptions, TempDir};
+use hellovm_core::{ExitStatus, Sysno};
 use hellovm_test_guest as guest;
 
 fn image() -> TempDir {
@@ -57,31 +55,29 @@ struct GuestRun {
 }
 
 fn run_guest(root: &Path, args: &[&str], splice: Option<SocketAddr>, fake_ip: bool) -> GuestRun {
-    let mut host = CaptureHost::new(Some(ImageDir::open(root).unwrap()));
-    if let Some(addr) = splice {
-        host.set_splice_endpoint(addr);
-    }
-    let mut kernel = Kernel::new(host).with_trace();
-    let mut argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
+    let mut session = Session::start(
+        root,
+        &SessionOptions {
+            trace: true,
+            splice,
+            ..SessionOptions::default()
+        },
+    );
+    let mut argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     if fake_ip {
-        let ip = kernel.issue_fake_ip().expect("fake-IP pool");
-        let text = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
-        argv.push(text.into_bytes());
+        let ip = session.issue_fake_ip().expect("fake-IP pool");
+        argv.push(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
     }
-    let mut app = SeccompPlatform::new().expect("start the platform");
-    let _watchdog = Watchdog::start(app.killer());
-    let envp = vec![b"PATH=/bin".to_vec(), b"HOME=/root".to_vec()];
-    kernel
-        .exec(&mut app, &argv[0], &argv, &envp)
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = session
+        .run(&argv, &["PATH=/bin", "HOME=/root"], b"", Duration::ZERO)
         .unwrap_or_else(|err| panic!("exec {args:?}: {err}"));
-    let status = kernel.run(&mut app).expect("run");
-    let host = kernel.host();
     GuestRun {
-        status,
-        stdout: String::from_utf8_lossy(&host.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&host.stderr).into_owned(),
-        trace: kernel.trace().iter().map(|r| r.sysno).collect(),
-        flows: host.outbound_flows().to_vec(),
+        status: out.status,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        trace: out.trace.iter().map(|r| r.sysno).collect(),
+        flows: out.flows,
     }
 }
 
