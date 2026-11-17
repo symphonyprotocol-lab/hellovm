@@ -36,8 +36,12 @@ pub mod platform;
 pub mod signal;
 mod syscall;
 mod task;
-#[cfg(test)]
-mod testutil;
+#[cfg(any(test, feature = "testutil"))]
+#[doc(hidden)]
+pub mod testutil;
+#[cfg(feature = "testutil")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod tty;
 pub mod vfs;
 
