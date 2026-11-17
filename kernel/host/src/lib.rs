@@ -14,8 +14,10 @@
 //! `set_egress` (see `stream.rs`); with the `insecure-test-hooks` feature,
 //! `set_splice_endpoint` sends them to a loopback TCP address instead.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+#[allow(unsafe_code)]
+mod fsys;
 mod image;
 mod stream;
 
@@ -43,6 +45,9 @@ pub use image::ImageDir;
 struct Common {
     image: Option<ImageDir>,
     start: Instant,
+    /// `/dev/urandom`, opened once: a confined kernel process cannot open
+    /// it later.
+    urandom: Option<File>,
 }
 
 impl Common {
@@ -50,6 +55,14 @@ impl Common {
         Common {
             image,
             start: Instant::now(),
+            urandom: File::open("/dev/urandom").ok(),
+        }
+    }
+
+    fn random(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        match &mut self.urandom {
+            Some(file) => file.read_exact(buf),
+            None => random(buf),
         }
     }
 
@@ -100,7 +113,7 @@ macro_rules! common_host_methods {
         }
 
         fn random(&mut self, buf: &mut [u8]) -> io::Result<()> {
-            random(buf)
+            self.common.random(buf)
         }
 
         fn clock_realtime(&mut self) -> Duration {
