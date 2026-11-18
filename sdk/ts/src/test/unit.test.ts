@@ -431,12 +431,14 @@ describe("streams", () => {
   const full = output.join("");
   const ends = output.map((_, i) => output.slice(0, i + 1).join("").length);
 
-  async function scripted(options: { finish: boolean; dropPoll?: number }) {
-    const state = { cancelled: false, wake: [] as (() => void)[], polls: [] as number[] };
+  async function scripted(options: { finish: boolean; dropPoll?: number; startDelay?: number; together?: boolean }) {
+    const state = { cancelled: false, wake: [] as (() => void)[], polls: [] as number[], started: [] as Record<string, unknown>[] };
     let pollNo = 0;
     const server = await serve(async (req, conn) => {
       const status = (extra: Record<string, unknown>) => ({ exec_id: "ex-7", kind: "command", started_at: 1, ...extra });
       if (req.method === "POST" && req.path.endsWith("/execs")) {
+        state.started.push(JSON.parse(req.body.toString()) as Record<string, unknown>);
+        if (options.startDelay) await pause(options.startDelay);
         conn.json(201, status({ state: "running", cancel_requested: false, result: null }));
       } else if (req.method === "POST" && req.path.endsWith("/cancel")) {
         state.cancelled = true;
@@ -447,6 +449,11 @@ describe("streams", () => {
         state.polls.push(cursor);
         if (++pollNo === options.dropPoll) {
           conn.drop();
+          return;
+        }
+        if (options.together && cursor === 0) {
+          const events = output.map((data) => ({ type: "stdout", data }));
+          conn.json(200, { exec_id: "ex-7", state: "running", events, next_cursor: full.length, eof: false, result: null });
           return;
         }
         const end = ends.find((e) => e > cursor);
@@ -524,6 +531,53 @@ describe("streams", () => {
     await assert.rejects(running, AbortedError);
     await pause(100);
     assert.equal(second.state.cancelled, true);
+  });
+
+  test("an abort while the exec is being started still cancels it", async () => {
+    const { c, state } = await scripted({ finish: false, startDelay: 300 });
+    const controller = new AbortController();
+    const running = c.sandbox(SB).exec("sleep 100", { signal: controller.signal });
+    setTimeout(() => controller.abort(), 100);
+    await assert.rejects(running, AbortedError);
+    await pause(100);
+    assert.equal(state.started.length, 1);
+    assert.equal(state.cancelled, true);
+    // Aborted before anything was sent: nothing is started.
+    const before = new AbortController();
+    before.abort();
+    await assert.rejects(c.sandbox(SB).exec("sleep 100", { signal: before.signal }), AbortedError);
+    assert.equal(state.started.length, 1);
+  });
+
+  test("an exec too long for one request is started and followed", async () => {
+    const { c, state } = await scripted({ finish: true });
+    const r = await c.sandbox(SB).exec("make", { timeout: 900 });
+    assert.equal(r.stdout, full);
+    assert.deepEqual(state.started, [{ command: "make", timeout: 900 }]);
+    assert.ok(state.polls.length > 0);
+  });
+
+  test("a loop that stops early loses no event", async () => {
+    const { c } = await scripted({ finish: true, together: true });
+    const ex = await c.sandbox(SB).stream("x");
+    const texts: string[] = [];
+    for await (const e of ex) {
+      if (e.type === "stdout") texts.push(e.data);
+      break;
+    }
+    for await (const e of ex) if (e.type === "stdout") texts.push(e.data);
+    assert.deepEqual(texts, output);
+    assert.equal(ex.result?.stdout, full);
+  });
+
+  test("an abort after the end cancels nothing", async () => {
+    const { c, state } = await scripted({ finish: true });
+    const controller = new AbortController();
+    const r = await c.sandbox(SB).exec("x", { signal: controller.signal });
+    assert.equal(r.stdout, full);
+    controller.abort();
+    await pause(100);
+    assert.equal(state.cancelled, false);
   });
 
   test("close cuts a poll off without cancelling", async () => {

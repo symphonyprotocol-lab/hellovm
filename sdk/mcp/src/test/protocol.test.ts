@@ -173,6 +173,54 @@ describe("against a fake API", () => {
     assert.ok(!p.stderr.includes(TOKEN));
   });
 
+  test("reset_sandbox keeps a sandbox it could not delete, and only restarts Python in a fixed one", async () => {
+    const id = "sb-" + "ef".repeat(16);
+    const seen: string[] = [];
+    let deletes = 0;
+    const api = http.createServer((req, res) => {
+      seen.push(`${req.method} ${req.url}`);
+      const json = (status: number, value: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(value));
+      };
+      if (req.method === "POST" && req.url === "/v1/sandboxes") {
+        json(201, { id, tenant: "t", template: "python", node: "n", egress_id: "efefefefefefefef", created_at: 1, last_used_at: 1, expires_at: 1, idle_timeout: 600, memory_bytes: 0, memory_limit_bytes: 1, ready_ms: 1 });
+      } else if (req.method === "PUT") {
+        json(200, { bytes: 1 });
+      } else if (req.method === "POST" && req.url?.endsWith("/python/reset")) {
+        json(200, { had_state: true });
+      } else if (req.method === "DELETE" && deletes++ === 0) {
+        json(500, { error: { code: "internal", message: "try later" } });
+      } else {
+        res.writeHead(204);
+        res.end();
+      }
+    });
+    await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
+    after(() => api.close());
+    const url = `http://127.0.0.1:${(api.address() as AddressInfo).port}`;
+
+    const p = start({ HELLOVM_URL: url });
+    await p.call("write_file", { path: "/x", content: "y" });
+    const failed = await p.call("reset_sandbox", {});
+    assert.equal(failed.isError, true);
+    assert.match(text(failed), /500 internal/);
+    // The sandbox was not forgotten: the next reset deletes it, without creating another.
+    assert.match(text(await p.call("reset_sandbox", {})), /new, empty sandbox/);
+    assert.deepEqual(seen, ["POST /v1/sandboxes", `PUT /v1/sandboxes/${id}/files?path=%2Fx`, `DELETE /v1/sandboxes/${id}`, `DELETE /v1/sandboxes/${id}`]);
+    assert.equal(await p.close(), 0);
+
+    seen.length = 0;
+    const fixed = start({ HELLOVM_URL: url, HELLOVM_SANDBOX: id });
+    const list = await fixed.request("tools/list");
+    const tool = (list.result?.tools as { name: string; description: string }[]).find((t) => t.name === "reset_sandbox");
+    assert.match(tool?.description ?? "", /files and processes are kept/);
+    const r = await fixed.call("reset_sandbox", {});
+    assert.match(text(r), /interpreter was restarted.*files and processes are still there/);
+    assert.equal(await fixed.close(), 0);
+    assert.deepEqual(seen, [`POST /v1/sandboxes/${id}/python/reset`]);
+  });
+
   test("an unreachable API is a tool error", async () => {
     const closed = http.createServer();
     await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", resolve));

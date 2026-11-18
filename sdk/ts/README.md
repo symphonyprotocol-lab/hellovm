@@ -58,7 +58,10 @@ whole exchange (head and body), the body is read with a size cap (and
 refused by its `Content-Length` before reading), redirects are refused.
 Busy sandboxes are waited out (or thrown at once); only idempotent
 requests are retried after a failure without an answer, never create,
-exec, write, edit or reset; streams resume from their cursor. See the
+exec, write, edit or reset; streams resume from their cursor. An exec
+whose timeout is too long for one request (Node's `fetch` gives up on
+an answer after 300 s) is started and followed by polls, like one with
+a `signal`. See the
 Python SDK's README for the full rules.
 
 ## Building and testing

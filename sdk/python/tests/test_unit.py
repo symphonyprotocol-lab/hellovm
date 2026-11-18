@@ -424,10 +424,28 @@ class AgainstFake(unittest.TestCase):
             b"HTTP/1.1 2000 OK\r\nContent-Length: 0\r\n\r\n",
             b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n{}",
             b"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
+            # Digits to str.isdigit, not to int.
+            b"HTTP/1.1 200 OK\r\nContent-Length: \xb2\r\n\r\n",
+            b"HTTP/1.1 \xb2\xb2\xb2 OK\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+            b"HTTP/1.1 103 Early Hints\r\n\r\n" * 9 + b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
         ):
             server = self.serve(lambda req, conn, raw=raw: (conn.sock.sendall(raw), conn.drop()))
             with self.assertRaises(ResponseError, msg=repr(raw)):
                 self.client(server).list()
+
+    def test_interim_responses_are_skipped(self) -> None:
+        def handler(req: Request, conn: Conn) -> None:
+            body = json.dumps({"sandboxes": [info()]}).encode()
+            conn.sock.sendall(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n")
+            time.sleep(0.05)
+            conn.sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+
+        server = self.serve(handler)
+        client = self.client(server)
+        self.assertEqual([s.id for s in client.list()], [SB])
+        self.assertEqual([s.id for s in client.list()], [SB])
+        self.assertEqual(server.connections, 1)
 
     def test_large_writes_are_refused_before_sending(self) -> None:
         server = self.serve(lambda req, conn: conn.json(200, {"bytes": 0}))
@@ -497,6 +515,10 @@ class Streams(unittest.TestCase):
                 return
             cursor = int(q["cursor"])
             full = "".join(self.output)
+            if self.together and cursor == 0:
+                events = [{"type": "stdout", "data": s} for s in self.output]
+                conn.json(200, {"exec_id": "ex-7", "state": "running", "events": events, "next_cursor": len(full), "eof": False, "result": None})
+                return
             if cursor < len(full):
                 # One piece per poll.
                 for piece_end in range(1, len(full) + 1):
@@ -512,6 +534,8 @@ class Streams(unittest.TestCase):
                 conn.json(200, {"exec_id": "ex-7", "state": "running", "events": [], "next_cursor": cursor, "eof": False, "result": None})
 
     finish = True
+    #: Whether the first poll answers with all the output, as three events.
+    together = False
 
     def test_events_in_order_then_the_result(self) -> None:
         ex = self.client.sandbox(SB).stream("x")
@@ -532,6 +556,18 @@ class Streams(unittest.TestCase):
         self.assertEqual([e for e in rest if isinstance(e, OutputEvent)], [OutputEvent("stdout", s) for s in self.output[1:]])
         # The dropped poll and its retry asked for the same cursor.
         self.assertEqual([p["cursor"] for p in self.polls][1:3], ["4", "4"])
+
+    def test_a_loop_that_stops_early_loses_no_event(self) -> None:
+        self.together = True
+        ex = self.client.sandbox(SB).stream("x")
+        seen: list[Any] = []
+        for event in ex:
+            seen.append(event)
+            break
+        seen.extend(ex)
+        self.assertEqual(seen[:3], [OutputEvent("stdout", s) for s in self.output])
+        self.assertIsInstance(seen[-1], ResultEvent)
+        self.assertEqual(len(seen), 4)
 
     def test_cancel_from_another_thread_wakes_the_poll(self) -> None:
         self.finish = False

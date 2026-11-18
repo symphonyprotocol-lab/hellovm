@@ -65,21 +65,28 @@ export class SandboxHolder {
     return n;
   }
 
-  /** Deletes the sandbox (if the server made it). */
-  async reset(): Promise<boolean> {
+  /**
+   * Deletes the sandbox the server made (`deleted`; `none` if there is
+   * none yet), or, for a sandbox it was given, which is not its to
+   * delete, starts a fresh interpreter (`restarted`). A sandbox that
+   * could not be deleted is kept, so that it can be deleted later.
+   */
+  async reset(): Promise<"deleted" | "restarted" | "none"> {
+    if (this.#creating) await this.#creating.catch(() => {});
     const sandbox = this.#sandbox;
-    this.#sandbox = null;
-    this.#notice = null;
-    if (!sandbox) return false;
+    if (!sandbox) {
+      this.#notice = null;
+      return "none";
+    }
     if (this.config.sandbox) {
-      // Not ours to delete: start a fresh interpreter instead.
       await sandbox.resetPython();
-      this.#sandbox = sandbox;
-      return true;
+      return "restarted";
     }
     await sandbox.dispose(false);
+    if (this.#sandbox === sandbox) this.#sandbox = null;
+    this.#notice = null;
     log(`deleted sandbox ${sandbox.id}`);
-    return true;
+    return "deleted";
   }
 
   /** At exit. */
@@ -88,8 +95,12 @@ export class SandboxHolder {
     const sandbox = this.#sandbox;
     this.#sandbox = null;
     if (sandbox && !this.config.sandbox) {
-      await sandbox.dispose(false).catch((e: unknown) => log(`could not delete sandbox ${sandbox.id}: ${String(e)}`));
-      log(`deleted sandbox ${sandbox.id}`);
+      try {
+        await sandbox.dispose(false);
+        log(`deleted sandbox ${sandbox.id}`);
+      } catch (error) {
+        log(`could not delete sandbox ${sandbox.id}: ${redact(String(error), this.config.token)}`);
+      }
     }
   }
 }
@@ -261,15 +272,23 @@ export function buildServer(holder: SandboxHolder): McpServer {
   server.registerTool(
     "reset_sandbox",
     {
-      title: "Start over with a new sandbox",
-      description:
-        "Deletes the sandbox with all its files, processes and Python state; the next call gets a new, empty one.",
+      title: config.sandbox ? "Restart the Python interpreter" : "Start over with a new sandbox",
+      description: config.sandbox
+        ? "Restarts the sandbox's Python interpreter: its variables, imports and objects are lost. " +
+          "The sandbox itself is fixed for this server, so its files and processes are kept."
+        : "Deletes the sandbox with all its files, processes and Python state; the next call gets a new, empty one.",
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async () => {
       try {
-        const had = await holder.reset();
-        return { content: [{ type: "text", text: had ? "The sandbox was reset: the next call starts in a new, empty sandbox." : "There was no sandbox yet; the next call creates one." }] };
+        const text = {
+          deleted: "The sandbox was reset: the next call starts in a new, empty sandbox.",
+          restarted:
+            "The Python interpreter was restarted: its variables, imports and objects are gone. " +
+            "This server uses a fixed sandbox, which is not deleted: its files and processes are still there.",
+          none: "There was no sandbox yet; the next call creates one.",
+        }[await holder.reset()];
+        return { content: [{ type: "text", text }] };
       } catch (error) {
         return { content: [{ type: "text", text: redact(describe(error), config.token) }], isError: true };
       }

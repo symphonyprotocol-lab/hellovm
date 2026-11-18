@@ -31,6 +31,8 @@ from .errors import RequestTimeoutError, ResponseError, TransportError
 
 MAX_HEAD = 16 * 1024
 MAX_HEADERS = 64
+#: Interim (1xx) responses skipped before the final one.
+MAX_INTERIM = 8
 MAX_IDLE = 10.0
 MAX_POOL = 8
 
@@ -213,38 +215,19 @@ class Transport:
 
     def _read(self, sock: socket.socket, method: str, deadline: float) -> tuple[Response, bool]:
         buf = bytearray()
-        while True:
-            end = buf.find(b"\r\n\r\n")
-            if end >= 0:
+        for _ in range(MAX_INTERIM + 1):
+            status, keep, headers, buf = _read_head(sock, buf, deadline)
+            if status == 101:
+                raise ResponseError("the server switched protocols")
+            if not 100 <= status < 200:
                 break
-            if len(buf) > MAX_HEAD:
-                raise ResponseError("the response head is too large")
-            chunk = _recv(sock, deadline, 65536)
-            if not chunk:
-                raise TransportError("the connection closed before the response", maybe_sent=True)
-            buf += chunk
-        lines = bytes(buf[:end]).split(b"\r\n")
-        rest = bytes(buf[end + 4 :])
-        status_line = lines[0].decode("latin-1")
-        parts = status_line.split(" ", 2)
-        if len(parts) < 2 or not parts[0].startswith("HTTP/1.") or len(parts[1]) != 3 or not parts[1].isdigit():
-            raise ResponseError("malformed status line")
-        status = int(parts[1])
-        if len(lines) - 1 > MAX_HEADERS:
-            raise ResponseError("too many response headers")
-        headers: dict[str, str] = {}
-        for line in lines[1:]:
-            name, sep, value = line.decode("latin-1").partition(":")
-            if not sep or not name or name != name.strip():
-                raise ResponseError("malformed response header")
-            key = name.lower()
-            value = value.strip()
-            if key in headers and key in ("content-length", "transfer-encoding"):
-                raise ResponseError(f"repeated {key} header")
-            headers[key] = value
-        keep = headers.get("connection", "").lower() != "close" and parts[0] == "HTTP/1.1"
+            # An interim response (100 Continue, 103 Early Hints from a
+            # proxy): the final one follows on the same connection.
+        else:
+            raise ResponseError("too many interim responses")
+        rest = bytes(buf)
         limit = self.max_response_bytes
-        if method == "HEAD" or status in (204, 304) or 100 <= status < 200:
+        if method == "HEAD" or status in (204, 304):
             return Response(status, headers, b""), keep and not rest
         if "transfer-encoding" in headers:
             if headers["transfer-encoding"].lower() != "chunked":
@@ -261,7 +244,7 @@ class Transport:
                 if not chunk:
                     return Response(status, headers, bytes(stream)), False
                 stream += chunk
-        if not length_text.isdigit() or len(length_text) > 18:
+        if not _digits(length_text) or len(length_text) > 18:
             raise ResponseError("malformed Content-Length")
         length = int(length_text)
         if length > limit:
@@ -274,6 +257,50 @@ class Transport:
                 raise TransportError("the connection closed inside the response body", maybe_sent=True)
             got += chunk
         return Response(status, headers, bytes(got)), keep and not extra
+
+
+def _digits(text: str) -> bool:
+    """ASCII digits only (``str.isdigit`` also accepts digits ``int``
+    refuses, like ``\u00b2``)."""
+    return text.isascii() and text.isdigit()
+
+
+def _read_head(
+    sock: socket.socket, buf: bytearray, deadline: float
+) -> tuple[int, bool, dict[str, str], bytearray]:
+    """One response head, from ``buf`` and then the socket: its status,
+    whether the connection may be kept, its headers, and the bytes read
+    past it."""
+    while True:
+        end = buf.find(b"\r\n\r\n")
+        if end >= 0:
+            break
+        if len(buf) > MAX_HEAD:
+            raise ResponseError("the response head is too large")
+        chunk = _recv(sock, deadline, 65536)
+        if not chunk:
+            raise TransportError("the connection closed before the response", maybe_sent=True)
+        buf += chunk
+    lines = bytes(buf[:end]).split(b"\r\n")
+    status_line = lines[0].decode("latin-1")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[0].startswith("HTTP/1.") or len(parts[1]) != 3 or not _digits(parts[1]):
+        raise ResponseError("malformed status line")
+    status = int(parts[1])
+    if len(lines) - 1 > MAX_HEADERS:
+        raise ResponseError("too many response headers")
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        name, sep, value = line.decode("latin-1").partition(":")
+        if not sep or not name or name != name.strip():
+            raise ResponseError("malformed response header")
+        key = name.lower()
+        value = value.strip()
+        if key in headers and key in ("content-length", "transfer-encoding"):
+            raise ResponseError(f"repeated {key} header")
+        headers[key] = value
+    keep = headers.get("connection", "").lower() != "close" and parts[0] == "HTTP/1.1"
+    return status, keep, headers, buf[end + 4 :]
 
 
 def _read_chunked(sock: socket.socket, buf: bytes, deadline: float, limit: int) -> tuple[bytes, bytes]:

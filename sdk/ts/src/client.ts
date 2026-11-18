@@ -22,6 +22,12 @@ export const MAX_FILE = 16 << 20;
 export const DEFAULT_EXEC_TIMEOUT = 60;
 /** How much longer than the exec's timeout a request waits for its answer. */
 export const EXEC_MARGIN = 30;
+/**
+ * Longest a single request waits for an exec's answer, seconds. Node's
+ * `fetch` gives up on a response whose head has not come after 300 s, so
+ * an exec that may run longer is started and followed by polls instead.
+ */
+export const MAX_BLOCKING = 240;
 /** Longest a poll waits on the server (the API allows 30 s). */
 export const POLL_WAIT = 25;
 const POLL_MARGIN = 15;
@@ -94,6 +100,11 @@ interface RequestOptions {
   idempotent: boolean;
   poll?: boolean;
   signal?: AbortSignal | undefined;
+  /**
+   * `false`: the signal stops the waits between tries, but not a request
+   * in flight (whose answer is needed to know what to cancel).
+   */
+  abortInFlight?: boolean;
   goneAfterRetryOk?: boolean;
 }
 
@@ -171,9 +182,11 @@ export class Client {
     const started = Date.now();
     let failures = 0;
     let waits = 0;
+    const inFlight = o.abortInFlight === false ? undefined : o.signal;
     for (;;) {
       let response: HttpResponse;
       try {
+        if (o.signal?.aborted) throw new AbortedError("aborted", { maybeSent: false, cause: o.signal.reason });
         response = await send(this.#fetch, {
           method,
           url: `${this.#prefix}${target}`,
@@ -181,7 +194,7 @@ export class Client {
           body,
           timeout: o.timeout ?? this.timeout,
           maxBytes: this.maxResponseBytes,
-          signal: o.signal,
+          signal: inFlight,
         });
       } catch (error) {
         if (error instanceof AbortedError || !(error instanceof TransportError)) throw error;
@@ -326,12 +339,13 @@ export class Sandbox implements AsyncDisposable {
   }
 
   async #exec(request: Record<string, unknown>, signal?: AbortSignal): Promise<ExecResult> {
-    if (signal) {
-      // Cancellable: start it, then follow it, so that an abort can cancel it by id.
+    const timeout = Number(request.timeout ?? DEFAULT_EXEC_TIMEOUT) + EXEC_MARGIN;
+    if (signal || !(timeout <= MAX_BLOCKING)) {
+      // Start it, then follow it: an abort can cancel it by id, and no
+      // single request waits longer than a poll.
       const execution = await this.#start(request, undefined, signal);
       return execution.wait();
     }
-    const timeout = Number(request.timeout ?? DEFAULT_EXEC_TIMEOUT) + EXEC_MARGIN;
     const r = await this.client.request("POST", this.path("/exec"), { json: request, timeout, idempotent: false });
     return parseResult(parseJson(r.body));
   }
@@ -365,7 +379,16 @@ export class Sandbox implements AsyncDisposable {
     if (pollBytes !== undefined && !(pollBytes >= 1024 && pollBytes <= 1 << 20)) {
       throw new TypeError("pollBytes must be 1024 to 1048576");
     }
-    const r = await this.client.request("POST", this.path("/execs"), { json: request, expect: [201], idempotent: false, signal });
+    // An abort while this request is in flight does not cut it off: the
+    // exec may have started, and only its answer names what to cancel.
+    // The execution made from the answer cancels it at once.
+    const r = await this.client.request("POST", this.path("/execs"), {
+      json: request,
+      expect: [201],
+      idempotent: false,
+      signal,
+      abortInFlight: false,
+    });
     const status = parseStatus(parseJson(r.body));
     return new Execution(this, segment(status.execId, "exec id"), { pollBytes, signal });
   }
@@ -420,7 +443,8 @@ export class Sandbox implements AsyncDisposable {
  * A streamed exec: an `AsyncIterable` of its output as it comes, ending
  * with a `{type: "result"}` event. It follows the exec by long polls with
  * a byte cursor, so a dropped connection loses nothing (the next poll
- * resumes at {@link Execution.cursor}). `cancel()` cancels the exec in the
+ * resumes at {@link Execution.cursor}), and a loop that stops early can
+ * be followed by another, which goes on with the next event. `cancel()` cancels the exec in the
  * sandbox (the iteration then ends with the cancelled result); the
  * `signal` given when it started does the same and makes the iteration
  * throw an `AbortedError`; `close()` stops following without cancelling.
@@ -434,6 +458,9 @@ export class Execution implements AsyncIterable<StreamEvent>, AsyncDisposable {
   readonly #pollBytes: number | undefined;
   readonly #stop = new AbortController();
   readonly #signal: AbortSignal | undefined;
+  /** Events of the last poll not yet given to the loop (it may stop between two of them). */
+  readonly #pending: StreamEvent[] = [];
+  #onAbort: (() => void) | null = null;
   #iterating = false;
 
   constructor(
@@ -452,8 +479,17 @@ export class Execution implements AsyncIterable<StreamEvent>, AsyncDisposable {
         this.#stop.abort(this.#signal?.reason);
       };
       if (this.#signal.aborted) onAbort();
-      else this.#signal.addEventListener("abort", onAbort, { once: true });
+      else {
+        this.#onAbort = onAbort;
+        this.#signal.addEventListener("abort", onAbort, { once: true });
+      }
     }
+  }
+
+  /** The exec ended: an abort has nothing left to cancel. */
+  #release(): void {
+    if (this.#onAbort) this.#signal?.removeEventListener("abort", this.#onAbort);
+    this.#onAbort = null;
   }
 
   get done(): boolean {
@@ -464,7 +500,9 @@ export class Execution implements AsyncIterable<StreamEvent>, AsyncDisposable {
     if (this.#iterating) throw new Error("an execution is iterated by one loop at a time");
     this.#iterating = true;
     try {
-      while (this.result === null) {
+      for (;;) {
+        for (let event = this.#pending.shift(); event !== undefined; event = this.#pending.shift()) yield event;
+        if (this.result !== null) return;
         let poll: Poll;
         try {
           poll = await this.#poll();
@@ -472,10 +510,11 @@ export class Execution implements AsyncIterable<StreamEvent>, AsyncDisposable {
           if (error instanceof AbortedError && !this.#signal?.aborted) return; // close()
           throw error;
         }
-        for (const event of poll.events) yield event;
+        this.#pending.push(...poll.events);
         if (poll.eof && poll.result) {
           this.result = poll.result;
-          yield { type: "result", result: poll.result };
+          this.#release();
+          this.#pending.push({ type: "result", result: poll.result });
         }
       }
     } finally {
@@ -523,9 +562,9 @@ export class Execution implements AsyncIterable<StreamEvent>, AsyncDisposable {
     for await (const _ of this) {
       // discard
     }
+    if (this.result !== null) return this.result;
     if (this.#signal?.aborted) throw new AbortedError("aborted", { maybeSent: true, cause: this.#signal.reason });
-    if (this.result === null) throw new HellovmError("the execution was closed before it ended");
-    return this.result;
+    throw new HellovmError("the execution was closed before it ended");
   }
 
   /**
@@ -547,6 +586,7 @@ export class Execution implements AsyncIterable<StreamEvent>, AsyncDisposable {
     try {
       if (this.result === null) await this.cancel();
     } finally {
+      this.#release();
       this.close();
     }
   }

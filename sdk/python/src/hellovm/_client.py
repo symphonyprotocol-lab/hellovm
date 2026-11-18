@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import urllib.parse
+from collections import deque
 from collections.abc import Iterator, Mapping
 from types import TracebackType
 from typing import Any, Literal
@@ -485,8 +486,9 @@ class Execution:
 
     It follows the exec by long polls with a byte cursor, so a dropped
     connection loses nothing: the next poll resumes at :attr:`cursor`
-    (for up to ``resume_timeout`` seconds of failing polls). Iterate from
-    one thread; :meth:`cancel` and :meth:`close` may be called from any.
+    (for up to ``resume_timeout`` seconds of failing polls). A loop that
+    stops early can be followed by another, which goes on with the next
+    event. Iterate from one thread; :meth:`cancel` and :meth:`close` may be called from any.
 
     As a context manager it cancels the exec if it has not ended when the
     block is left, so that a block that stops early does not leave it
@@ -509,6 +511,9 @@ class Execution:
         self.resume_timeout = resume_timeout
         self._poll_bytes = poll_bytes
         self._abort = Abort()
+        #: Events of the last poll not yet given to the loop (it may stop
+        #: between two of them; the next loop goes on with these).
+        self._pending: deque[StreamEvent] = deque()
         self._iterating = False
         self._lock = threading.Lock()
 
@@ -525,19 +530,20 @@ class Execution:
                 raise RuntimeError("an execution is iterated by one loop at a time")
             self._iterating = True
         try:
-            while self.result is None:
-                if self._abort.aborted:
+            while True:
+                while self._pending:
+                    yield self._pending.popleft()
+                if self.result is not None or self._abort.aborted:
                     return
                 try:
                     poll = self._poll()
                 except AbortedError:
                     return
-                for event in poll.events:
-                    yield event
+                self._pending.extend(poll.events)
                 if poll.eof:
                     assert poll.result is not None
                     self.result = poll.result
-                    yield ResultEvent(poll.result)
+                    self._pending.append(ResultEvent(poll.result))
         finally:
             with self._lock:
                 self._iterating = False
