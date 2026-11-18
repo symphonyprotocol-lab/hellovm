@@ -88,6 +88,15 @@ fn sandboxes_through_the_api() {
     assert_eq!(r["timed_out"], false);
     assert_eq!(r["signal"], Value::Null);
 
+    // A request right after an answer never finds the sandbox still busy
+    // with the request that was answered.
+    let probe = "/v1/sandboxes/ID/files?path=/etc/hostname".replace("ID", &id);
+    for _ in 0..100 {
+        assert_eq!(plane.sh(ACME, &id, "true")["exit_code"], 0);
+        let r = plane.call(ACME, "GET", &probe, b"");
+        assert_ne!(r.status, 409, "{}", String::from_utf8_lossy(&r.body));
+    }
+
     // State between execs: files and background processes stay; the
     // shell's own state (cwd, variables) does not.
     plane.sh(

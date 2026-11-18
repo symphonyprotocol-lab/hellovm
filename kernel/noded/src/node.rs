@@ -400,6 +400,11 @@ impl Sandbox {
     }
 
     /// Takes one frame from the agent. An error is a protocol violation.
+    ///
+    /// An answer releases the sandbox before whoever waits for it can see
+    /// it (both under `ops`, which the next request needs to be sent):
+    /// a client that has its answer must never find the sandbox still
+    /// busy with the request it answers.
     fn on_frame(&self, frame: Frame) -> Result<(), String> {
         let mut ops = lock(&self.ops);
         let Some(flight) = ops.in_flight.as_mut() else {
@@ -418,9 +423,8 @@ impl Sandbox {
                 };
                 let slot = Arc::clone(slot);
                 ops.in_flight = None;
-                drop(ops);
-                slot.fill(answer);
                 self.release();
+                slot.fill(answer);
                 return Ok(());
             }
         };
@@ -454,9 +458,8 @@ impl Sandbox {
                 // It did not start (no such working directory, ...).
                 Some(Err(AgentError::Failed { code, message })) => {
                     ops.in_flight = None;
-                    drop(ops);
-                    exec.fail(&failed(code, message));
                     self.release();
+                    exec.fail(&failed(code, message));
                     Ok(())
                 }
                 _ => Err("an exec answer before it started".into()),
@@ -467,13 +470,12 @@ impl Sandbox {
                 }
                 let mut inner = lock(&exec.state);
                 let result = exec_result(&frame, &inner, &exec)?;
+                ops.in_flight = None;
+                self.release();
                 inner.result = Some(result);
                 inner.phase = Phase::Done;
                 drop(inner);
                 exec.changed.notify_all();
-                ops.in_flight = None;
-                drop(ops);
-                self.release();
                 Ok(())
             }
             _ => Err("a frame out of order".into()),
@@ -490,7 +492,7 @@ impl Sandbox {
         ops.failure = Some(error.clone());
         let flight = ops.in_flight.take();
         let latest = ops.latest.clone();
-        drop(ops);
+        self.release();
         match flight.map(|f| f.waiting) {
             Some(Waiting::Exec(exec)) => exec.fail(&error),
             Some(Waiting::Call { slot, .. }) => slot.fill(Err(error.clone())),
@@ -499,7 +501,6 @@ impl Sandbox {
         if let Some(exec) = latest {
             exec.fail(&error);
         }
-        self.release();
     }
 
     /// The latest exec, if it is `exec_id`.
