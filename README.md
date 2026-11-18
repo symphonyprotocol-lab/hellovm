@@ -1106,15 +1106,19 @@ reconciles the store as before. A node is
 |---|---|---|---|
 | `healthy` | answers | yes | served |
 | `draining` | answers, and says it drains | no | served, can be deleted |
-| `unreachable` | `unhealthy_after` failures in a row | no | `502 node_unreachable` at once |
+| `unreachable` | `unhealthy_after` failed probes in a row, or as many connections for requests that could not be made | no | `502 node_unreachable` at once |
 | `unknown` | not probed yet (only before the API serves) | no | |
 
-A failure is a probe that got no answer in time, a status or list that
-is not valid (malformed JSON, another node's name, numbers out of
-range, a body over its bound: 1 MiB for a status, 8 MiB for a list), or
-a request about a sandbox that got no answer (a connection that could
-not be made within 5 s, or none in time). Answered requests reset the
-count, so one slow answer does not flap a node. An unreachable node
+A failed probe is one that got no answer in time, or a status or list
+that is not valid (malformed JSON, another node's name, numbers out of
+range, a body over its bound: 1 MiB for a status, 8 MiB for a list); a
+good probe resets the count, so one slow answer does not flap a node,
+and answered requests do not (a node whose status cannot be had is not
+known, whatever else it answers). Requests count only when no
+connection could be made (within 5 s), on a count of their own that an
+answered request resets. A request that was sent and not answered in
+time is not counted: how long it takes is partly up to the sandbox, and
+one tenant must not make a node unreachable for the others. An unreachable node
 becomes healthy again after `healthy_after` good probes in a row (only
 probes bring it back), and its sandboxes are reconciled as they always
 are: those its `noded` still runs are served again, those that died
@@ -1133,9 +1137,11 @@ those that have it ready and room by what it knows, then the others
 loaded first, a node's load being the larger of its sandboxes over
 `max_sandboxes` and its memory in use over its limit; nodes of equal load
 in random order. A node that refuses (full, starting its template,
-draining) or cannot be connected to is followed by the next; one that
-may have made the sandbox (its answer was lost) ends the attempt, as
-before. Load reports lag by up to `reconcile_interval`, so the API
+draining) or cannot be connected to is followed by the next, until
+three have refused (the reports are at most a probe old, so the first
+choices are the ones with room if any has; a refusal that is none of
+those is logged as a warning); one that may have made the sandbox (its
+answer was lost) ends the attempt, as before. Load reports lag by up to `reconcile_interval`, so the API
 counts what it does itself at once: every creation in flight and every
 sandbox it placed are added to the node's reported count until a
 report asked after them arrives. Concurrent creates therefore spread
@@ -1144,8 +1150,12 @@ last report (a thundering herd), and one API needs no randomness to
 avoid that; the random tie-break is for nodes of equal load. When no
 node can take the sandbox the tenant gets `503 node_full` (no room or
 none healthy), `503 template_not_ready` (the template is ready on no
-node that takes sandboxes) or `404 template_not_found` (no node has
-it); the node's own error never reaches the tenant.
+node that takes sandboxes) or `404 template_not_found` (every node has
+reported and none has it; while a node has never reported, as after an
+API restart with that node down, an unknown template answers `503
+node_full`, since that node may have it); the node's own error never
+reaches the tenant. `GET /v1/sandboxes` asks only the nodes that have
+sandboxes of the tenant.
 
 *Exactness.* The tenant limit is counted by the API across all nodes
 under one lock, creations in progress included, so concurrent creates

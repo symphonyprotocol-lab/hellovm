@@ -427,7 +427,14 @@ enum Fake {
     /// A good status and list, inviting sandboxes, and a nonsense refusal
     /// of every create.
     Trap(&'static str),
+    /// A good status (draining, so it gets no sandbox) and a list with one
+    /// sandbox of `beta`; every request about that sandbox is read and the
+    /// connection closed without an answer.
+    Hangup(&'static str),
 }
+
+/// The sandbox the [`Fake::Hangup`] node lists.
+const HUNG: &str = "sb-abababababababababababababababab";
 
 fn fake_status(name: &str, max: u64) -> String {
     json!({
@@ -500,6 +507,25 @@ fn fake_answer(stream: &mut TcpStream, fake: Fake) {
             "/v1/sandboxes" => reply(stream, "200 OK", r#"{"sandboxes": []}"#),
             _ => reply(stream, "503 Service Unavailable", "\u{0}\u{1}nonsense"),
         },
+        Fake::Hangup(name) => match target.as_str() {
+            "/v1/node" => {
+                let mut status: Value = serde_json::from_str(&fake_status(name, 4096)).unwrap();
+                status["draining"] = json!(true);
+                status["sandboxes"] = json!(1);
+                reply(stream, "200 OK", &status.to_string());
+            }
+            "/v1/sandboxes" => {
+                let list = json!({"sandboxes": [{
+                    "id": HUNG, "tenant": "beta", "template": "python", "node": name,
+                    "egress_id": "abababababababab", "created_at": 1, "last_used_at": 1,
+                    "expires_at": u64::MAX, "idle_timeout": 600.0, "memory_bytes": 0,
+                    "memory_limit_bytes": 1, "ready_ms": 1.0,
+                }]});
+                reply(stream, "200 OK", &list.to_string());
+            }
+            // Read, and not answered.
+            _ => {}
+        },
     }
 }
 
@@ -537,6 +563,7 @@ fn nodes_that_answer_nonsense_cannot_hurt_the_api() {
         ("fake-absurd", Fake::Absurd),
         ("fake-silent", Fake::Silent),
         ("fake-trap", Fake::Trap("fake-trap")),
+        ("fake-hangup", Fake::Hangup("fake-hangup")),
     ];
     let extra_nodes = fakes
         .iter()
@@ -554,6 +581,21 @@ fn nodes_that_answer_nonsense_cannot_hurt_the_api() {
         assert_eq!(admin_node(&plane, name)["state"], "unreachable", "{name}");
     }
     assert_eq!(admin_node(&plane, "fake-trap")["state"], "healthy");
+    assert_eq!(admin_node(&plane, "fake-hangup")["state"], "draining");
+
+    // Requests about a sandbox that get no answer are that sandbox's
+    // trouble, however many: the node answers its probes and stays up, so
+    // one tenant cannot make a node unreachable for the others.
+    let hung = format!("/v1/sandboxes/{HUNG}");
+    for _ in 0..8 {
+        let answer = plane.call(BETA, "GET", &hung, b"");
+        assert_eq!(answer.status, 502, "{}", answer.json());
+        assert_eq!(answer.code(), "node_unreachable");
+        let reset = plane.call(BETA, "POST", &format!("{hung}/python/reset"), b"");
+        assert_eq!(reset.status, 502);
+    }
+    assert_eq!(admin_node(&plane, "fake-hangup")["state"], "draining");
+    assert_eq!(plane.call(ACME, "GET", &hung, b"").status, 404);
 
     // Every create goes to node-1: the trap is asked first (it reports no
     // load), refuses with nonsense, and the next node is asked.

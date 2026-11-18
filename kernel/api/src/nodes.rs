@@ -5,9 +5,14 @@
 //!
 //! A node is *healthy* (it answers and takes sandboxes), *draining* (it
 //! answers but takes no new sandboxes; it says so itself) or
-//! *unreachable* (it did not answer, or answered nonsense, `unhealthy_after`
-//! times in a row; it comes back after `healthy_after` good probes in a
-//! row). Before the first probe a node is *unknown* and gets nothing.
+//! *unreachable* (`unhealthy_after` probes in a row got no answer or
+//! nonsense, or as many connections for requests in a row could not be
+//! made; it comes back after `healthy_after` good probes in a row). Before
+//! the first probe a node is *unknown* and gets nothing.
+//!
+//! A request that was sent and got no answer in time says nothing of the
+//! node: how long a request takes is partly up to the sandbox it is for,
+//! so counting it would let one tenant make a node unreachable for all.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -35,14 +40,19 @@ pub struct HealthPolicy {
     pub healthy_after: u32,
 }
 
-/// The health state machine of one node. Probes (the periodic
-/// reconciliation) and requests that could not be completed are failures;
-/// only probes bring a node back.
+/// The health state machine of one node. Failed probes (the periodic
+/// reconciliation) and connections for requests that could not be made
+/// are counted, each kind on its own; only probes bring a node back.
 #[derive(Clone, Debug)]
 pub struct Health {
     pub reach: Reach,
-    /// Failures in a row (while up).
-    failures: u32,
+    /// Failed probes in a row (while up). Answered requests do not reset
+    /// it: a node whose status cannot be had is not known, whatever else
+    /// it answers.
+    probe_failures: u32,
+    /// Connections for requests that could not be made, in a row (while
+    /// up).
+    connect_failures: u32,
     /// Good probes in a row (while down).
     successes: u32,
     /// When `reach` last changed.
@@ -54,7 +64,8 @@ impl Default for Health {
     fn default() -> Health {
         Health {
             reach: Reach::Unknown,
-            failures: 0,
+            probe_failures: 0,
+            connect_failures: 0,
             successes: 0,
             since: SystemTime::now(),
             last_error: None,
@@ -66,7 +77,8 @@ impl Health {
     fn set(&mut self, reach: Reach) -> Option<(Reach, Reach)> {
         let before = self.reach;
         self.reach = reach;
-        self.failures = 0;
+        self.probe_failures = 0;
+        self.connect_failures = 0;
         self.successes = 0;
         self.since = SystemTime::now();
         Some((before, reach))
@@ -78,7 +90,8 @@ impl Health {
             // The first answer decides at once: nothing to smooth yet.
             Reach::Unknown => self.set(Reach::Up),
             Reach::Up => {
-                self.failures = 0;
+                self.probe_failures = 0;
+                self.connect_failures = 0;
                 None
             }
             Reach::Down => {
@@ -92,15 +105,19 @@ impl Health {
         }
     }
 
-    /// A probe or a request failed: no connection, no answer in time, or
-    /// an answer that is not what a node sends.
-    pub fn failed(&mut self, policy: &HealthPolicy, why: &str) -> Option<(Reach, Reach)> {
+    fn note(&mut self, why: &str) {
         self.last_error = Some(why.chars().take(256).collect());
+    }
+
+    /// A probe failed: no connection, no answer in time, or an answer that
+    /// is not what a node sends.
+    pub fn probe_failed(&mut self, policy: &HealthPolicy, why: &str) -> Option<(Reach, Reach)> {
+        self.note(why);
         match self.reach {
             Reach::Unknown => self.set(Reach::Down),
             Reach::Up => {
-                self.failures += 1;
-                if self.failures >= policy.unhealthy_after {
+                self.probe_failures += 1;
+                if self.probe_failures >= policy.unhealthy_after {
                     self.set(Reach::Down)
                 } else {
                     None
@@ -113,12 +130,26 @@ impl Health {
         }
     }
 
-    /// A request was answered: the node is not failing (a node that is
+    /// No connection could be made for a request. It counts while the node
+    /// is up only: a request that began before the node went down says
+    /// nothing of the probes since.
+    pub fn connect_failed(&mut self, policy: &HealthPolicy, why: &str) -> Option<(Reach, Reach)> {
+        if self.reach != Reach::Up {
+            return None;
+        }
+        self.note(why);
+        self.connect_failures += 1;
+        if self.connect_failures >= policy.unhealthy_after {
+            self.set(Reach::Down)
+        } else {
+            None
+        }
+    }
+
+    /// A request was answered: connections can be made (a node that is
     /// down comes back by probes only).
     pub fn answered(&mut self) {
-        if self.reach == Reach::Up {
-            self.failures = 0;
-        }
+        self.connect_failures = 0;
     }
 }
 
@@ -297,11 +328,12 @@ pub mod placement {
 /// Why no node can be asked to make a sandbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoPlace {
-    /// No node known to have the template (for this tenant).
+    /// Every node reported, and none has the template (for this tenant).
     UnknownTemplate,
     /// Known, but ready on no node that takes sandboxes.
     NotReady,
-    /// No node that takes sandboxes has room (or none is left to try).
+    /// No node that takes sandboxes has room (or none is left to try, or
+    /// the only nodes that might have the template never reported).
     Full,
 }
 
@@ -402,25 +434,42 @@ impl Nodes {
         }
     }
 
-    /// A probe asked at `asked` got this report.
-    pub fn reported(&self, i: usize, asked: Instant, load: Load) {
+    /// Node `i` gave this report to a question asked at `asked`: to a
+    /// probe (`probe`, which counts for its health) or to an operator's
+    /// request. A report older than the one kept (two questions answered
+    /// out of order) does not replace it.
+    pub fn reported(&self, i: usize, asked: Instant, load: Load, probe: bool) {
         let mut inner = self.lock();
         let state = &mut inner.0[i];
         let before = state.state();
-        state.health.probe_ok(&self.policy);
-        // Placements made before the question are in the report.
-        state.placed.retain(|at| *at >= asked);
-        state.load = Some(load);
-        state.reported_at = Some(asked);
+        if probe {
+            state.health.probe_ok(&self.policy);
+        }
+        if state.reported_at.is_none_or(|at| asked >= at) {
+            // Placements made before the question are in the report.
+            state.placed.retain(|at| *at >= asked);
+            state.load = Some(load);
+            state.reported_at = Some(asked);
+        }
         self.log_change(i, before, state);
     }
 
-    /// A probe or a request to node `i` failed.
+    /// A probe of node `i` failed, or it answered a request with what no
+    /// node sends.
     pub fn failed(&self, i: usize, why: &str) {
         let mut inner = self.lock();
         let state = &mut inner.0[i];
         let before = state.state();
-        state.health.failed(&self.policy, why);
+        state.health.probe_failed(&self.policy, why);
+        self.log_change(i, before, state);
+    }
+
+    /// No connection to node `i` could be made for a request.
+    pub fn connect_failed(&self, i: usize, why: &str) {
+        let mut inner = self.lock();
+        let state = &mut inner.0[i];
+        let before = state.state();
+        state.health.connect_failed(&self.policy, why);
         self.log_change(i, before, state);
     }
 
@@ -442,9 +491,13 @@ impl Nodes {
         let (states, rng) = &mut *inner;
         let mut candidates = Vec::new();
         let mut known = false;
+        let mut unreported = false;
         let mut ready_somewhere = false;
         for (i, state) in states.iter().enumerate() {
-            let Some(load) = &state.load else { continue };
+            let Some(load) = &state.load else {
+                unreported = true;
+                continue;
+            };
             let Some(t) = load.template(template, tenant) else {
                 continue;
             };
@@ -464,8 +517,12 @@ impl Nodes {
             });
         }
         let Some(&chosen) = placement::order(candidates, rng).first() else {
-            return Err(if !known {
+            // A node that never reported may have the template: only when
+            // every node has is the template known not to exist.
+            return Err(if !known && !unreported {
                 NoPlace::UnknownTemplate
+            } else if !known {
+                NoPlace::Full
             } else if !ready_somewhere {
                 NoPlace::NotReady
             } else {
@@ -551,9 +608,13 @@ mod tests {
         assert_eq!(h.probe_ok(&POLICY), Some((Reach::Unknown, Reach::Up)));
         let mut h = Health::default();
         assert_eq!(
-            h.failed(&POLICY, "refused"),
+            h.probe_failed(&POLICY, "refused"),
             Some((Reach::Unknown, Reach::Down))
         );
+        // A request decides nothing before the first probe.
+        let mut h = Health::default();
+        assert_eq!(h.connect_failed(&POLICY, "refused"), None);
+        assert_eq!(h.reach, Reach::Unknown);
     }
 
     #[test]
@@ -561,28 +622,72 @@ mod tests {
         let mut h = Health::default();
         h.probe_ok(&POLICY);
         // One or two slow answers do not flap it.
-        assert_eq!(h.failed(&POLICY, "slow"), None);
-        assert_eq!(h.failed(&POLICY, "slow"), None);
+        assert_eq!(h.probe_failed(&POLICY, "slow"), None);
+        assert_eq!(h.probe_failed(&POLICY, "slow"), None);
         assert_eq!(h.probe_ok(&POLICY), None);
-        assert_eq!(h.failed(&POLICY, "slow"), None);
-        h.answered();
-        assert_eq!(h.failed(&POLICY, "slow"), None);
-        assert_eq!(h.failed(&POLICY, "slow"), None);
+        assert_eq!(h.probe_failed(&POLICY, "slow"), None);
+        assert_eq!(h.probe_failed(&POLICY, "slow"), None);
         assert_eq!(h.reach, Reach::Up);
         // Three in a row do.
-        assert_eq!(h.failed(&POLICY, "gone"), Some((Reach::Up, Reach::Down)));
+        assert_eq!(
+            h.probe_failed(&POLICY, "gone"),
+            Some((Reach::Up, Reach::Down))
+        );
         assert_eq!(h.last_error.as_deref(), Some("gone"));
-        // Back after two good probes in a row; a failure between resets.
+        // Back after two good probes in a row; a failed probe between
+        // resets.
         assert_eq!(h.probe_ok(&POLICY), None);
-        assert_eq!(h.failed(&POLICY, "again"), None);
+        assert_eq!(h.probe_failed(&POLICY, "again"), None);
         assert_eq!(h.probe_ok(&POLICY), None);
         h.answered();
         assert_eq!(h.reach, Reach::Down, "requests do not bring it back");
         assert_eq!(h.probe_ok(&POLICY), Some((Reach::Down, Reach::Up)));
         // And the count starts afresh.
-        assert_eq!(h.failed(&POLICY, "x"), None);
-        assert_eq!(h.failed(&POLICY, "x"), None);
-        assert_eq!(h.failed(&POLICY, "x"), Some((Reach::Up, Reach::Down)));
+        assert_eq!(h.probe_failed(&POLICY, "x"), None);
+        assert_eq!(h.probe_failed(&POLICY, "x"), None);
+        assert_eq!(h.probe_failed(&POLICY, "x"), Some((Reach::Up, Reach::Down)));
+    }
+
+    #[test]
+    fn answered_requests_do_not_hide_failing_probes() {
+        let mut h = Health::default();
+        h.probe_ok(&POLICY);
+        assert_eq!(h.probe_failed(&POLICY, "no status"), None);
+        h.answered();
+        assert_eq!(h.probe_failed(&POLICY, "no status"), None);
+        h.answered();
+        assert_eq!(
+            h.probe_failed(&POLICY, "no status"),
+            Some((Reach::Up, Reach::Down))
+        );
+    }
+
+    #[test]
+    fn connections_that_fail_count_on_their_own() {
+        let mut h = Health::default();
+        h.probe_ok(&POLICY);
+        // An answered request, or a good probe, resets them.
+        assert_eq!(h.connect_failed(&POLICY, "refused"), None);
+        assert_eq!(h.connect_failed(&POLICY, "refused"), None);
+        h.answered();
+        assert_eq!(h.connect_failed(&POLICY, "refused"), None);
+        assert_eq!(h.connect_failed(&POLICY, "refused"), None);
+        assert_eq!(h.probe_ok(&POLICY), None);
+        // They do not add to failed probes.
+        assert_eq!(h.probe_failed(&POLICY, "slow"), None);
+        assert_eq!(h.connect_failed(&POLICY, "refused"), None);
+        assert_eq!(h.connect_failed(&POLICY, "refused"), None);
+        assert_eq!(h.reach, Reach::Up);
+        assert_eq!(
+            h.connect_failed(&POLICY, "refused"),
+            Some((Reach::Up, Reach::Down))
+        );
+        // While down, a request left from before does not delay the way
+        // back.
+        assert_eq!(h.probe_ok(&POLICY), None);
+        assert_eq!(h.connect_failed(&POLICY, "late"), None);
+        assert_eq!(h.last_error.as_deref(), Some("refused"));
+        assert_eq!(h.probe_ok(&POLICY), Some((Reach::Down, Reach::Up)));
     }
 
     #[test]
@@ -672,7 +777,7 @@ mod tests {
         let nodes = nodes(3);
         let asked = Instant::now();
         for i in 0..3 {
-            nodes.reported(i, asked, load(0, 4, 0, 1 << 30));
+            nodes.reported(i, asked, load(0, 4, 0, 1 << 30), true);
         }
         // Six creations in flight at once: two per node, not six on one.
         let mut count = [0; 3];
@@ -688,19 +793,64 @@ mod tests {
         assert_eq!(nodes.view(0).placed_since_report, 1);
         assert_eq!(nodes.view(0).in_flight, 0);
         let later = Instant::now();
-        nodes.reported(0, later, load(1, 4, 0, 1 << 30));
+        nodes.reported(0, later, load(1, 4, 0, 1 << 30), true);
         assert_eq!(nodes.view(0).placed_since_report, 0);
+    }
+
+    #[test]
+    fn an_older_report_does_not_replace_a_newer_one() {
+        let nodes = nodes(1);
+        let early = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let late = Instant::now();
+        let mut draining = load(0, 4, 0, 100);
+        draining.draining = true;
+        nodes.reported(0, early, load(0, 4, 0, 100), true);
+        // An operator drains it; a probe asked before that answers after.
+        nodes.reported(0, late, draining, false);
+        assert_eq!(nodes.view(0).state, "draining");
+        nodes.reported(0, early, load(0, 4, 0, 100), true);
+        assert_eq!(nodes.view(0).state, "draining");
+    }
+
+    #[test]
+    fn an_operators_report_is_not_a_probe() {
+        let nodes = nodes(1);
+        nodes.reported(0, Instant::now(), load(0, 4, 0, 100), true);
+        for _ in 0..3 {
+            nodes.failed(0, "gone");
+        }
+        nodes.reported(0, Instant::now(), load(0, 4, 0, 100), false);
+        nodes.reported(0, Instant::now(), load(0, 4, 0, 100), false);
+        assert_eq!(nodes.view(0).state, "unreachable");
+        nodes.reported(0, Instant::now(), load(0, 4, 0, 100), true);
+        nodes.reported(0, Instant::now(), load(0, 4, 0, 100), true);
+        assert_eq!(nodes.view(0).state, "healthy");
+    }
+
+    #[test]
+    fn a_template_is_unknown_only_when_every_node_reported() {
+        let nodes = nodes(2);
+        nodes.reported(0, Instant::now(), load(0, 4, 0, 100), true);
+        // The other node never answered: it may have the template.
+        nodes.failed(1, "refused");
+        assert_eq!(nodes.place("other", "acme", &[]), Err(NoPlace::Full));
+        nodes.reported(1, Instant::now(), load(0, 4, 0, 100), true);
+        assert_eq!(
+            nodes.place("other", "acme", &[]),
+            Err(NoPlace::UnknownTemplate)
+        );
     }
 
     #[test]
     fn placement_skips_full_draining_down_and_foreign() {
         let nodes = nodes(4);
         let now = Instant::now();
-        nodes.reported(0, now, load(4, 4, 0, 100)); // full
+        nodes.reported(0, now, load(4, 4, 0, 100), true); // full
         let mut draining = load(0, 4, 0, 100);
         draining.draining = true;
-        nodes.reported(1, now, draining);
-        nodes.reported(2, now, load(0, 4, 0, 100));
+        nodes.reported(1, now, draining, true);
+        nodes.reported(2, now, load(0, 4, 0, 100), true);
         for _ in 0..3 {
             nodes.failed(2, "refused");
         }
@@ -708,7 +858,7 @@ mod tests {
         assert_eq!(nodes.view(1).state, "draining");
         let mut own = load(0, 4, 0, 100);
         own.templates[0].tenant = Some("beta".into());
-        nodes.reported(3, now, own);
+        nodes.reported(3, now, own, true);
         // Only the full node is left: asked last (its report may be old).
         assert_eq!(nodes.place("python", "acme", &[]), Ok(0));
         assert_eq!(nodes.place("python", "acme", &[0]), Err(NoPlace::Full));
@@ -731,10 +881,10 @@ mod tests {
             ready: false,
             tenant: None,
         });
-        nodes.reported(0, now, a);
+        nodes.reported(0, now, a, true);
         let mut b = load(0, 4, 0, 100);
         b.templates[0].ready = false;
-        nodes.reported(1, now, b);
+        nodes.reported(1, now, b, true);
         assert_eq!(
             nodes.templates("acme"),
             vec![("extra".to_string(), false), ("python".to_string(), true)]

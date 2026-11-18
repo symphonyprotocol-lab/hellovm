@@ -43,7 +43,13 @@ const MAX_STATUS: usize = 1 << 20;
 /// Largest sandbox list read: 4096 sandboxes of under 1 KiB.
 const MAX_LIST: usize = 8 << 20;
 const NODE_TIMEOUT: Duration = Duration::from_secs(30);
+/// For requests the node itself waits up to 60 s on a sandbox's agent
+/// for (file operations, resetting the interpreter).
 const FILE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Most nodes that may refuse one creation before it is given up: the
+/// reports are at most a probe old, so the first few choices are the ones
+/// with room if any has.
+const MAX_REFUSALS: usize = 3;
 
 pub struct Api {
     pub config: Config,
@@ -117,11 +123,17 @@ impl Api {
         )
     }
 
-    /// A request to node `i` failed: logged, and counted against it.
+    /// A request to node `i` failed: logged, and counted against the node
+    /// if no connection could be made. A request that was sent and not
+    /// answered in time is not counted: how long it takes is partly up to
+    /// the sandbox, and one tenant must not make a node unreachable for
+    /// the others. The probes find a node that stopped answering.
     fn node_failed(&self, i: usize, err: &std::io::Error) {
         let name = &self.nodes.configs()[i].name;
         log::warn!("node {name}: {err}");
-        self.nodes.failed(i, &err.to_string());
+        if http::not_sent(err) {
+            self.nodes.connect_failed(i, &err.to_string());
+        }
     }
 
     /// Asks node `i` for its status and sandboxes, updates what is known
@@ -187,7 +199,7 @@ impl Api {
                 })
             })
             .collect();
-        self.nodes.reported(i, asked, load);
+        self.nodes.reported(i, asked, load, true);
         self.store.replace_node(&node.name, asked, records);
     }
 
@@ -312,12 +324,29 @@ impl Api {
                     self.nodes.answered(i);
                     self.nodes.done(i, false);
                     let code = answer.error_code().unwrap_or_default();
-                    log::debug!(
-                        "node {}: create refused: {} {code}",
+                    // What a node says in the ordinary course, and what
+                    // an operator should hear of.
+                    let expected = matches!(
+                        code.as_str(),
+                        "template_not_found" | "template_not_ready" | "node_full" | "node_draining"
+                    );
+                    let level = if expected {
+                        log::Level::Debug
+                    } else {
+                        log::Level::Warn
+                    };
+                    log::log!(
+                        level,
+                        "node {}: create refused: {} {:?}: {:?}",
                         node.name,
-                        answer.status
+                        answer.status,
+                        code.chars().take(64).collect::<String>(),
+                        answer.error_message().chars().take(256).collect::<String>()
                     );
                     answers.push(code);
+                    if answers.len() >= MAX_REFUSALS {
+                        return Self::no_place(NoPlace::Full, &answers);
+                    }
                 }
                 // Nothing was sent: the next node may be asked.
                 Err(err) if http::not_sent(&err) => {
@@ -401,36 +430,49 @@ impl Api {
 
     fn list(&self, tenant: &Tenant) -> Response {
         let target = format!("/v1/sandboxes?tenant={}", percent_encode(&tenant.name));
-        // Every node that answers, at once; an unreachable one is not asked
+        // The nodes that have sandboxes of this tenant, by the store
+        // (which knows every sandbox made here at once, and the others
+        // from the last probe), at once; an unreachable one is not asked
         // (its sandboxes are not listed while it is).
-        let lists: Vec<Option<SandboxList>> = std::thread::scope(|scope| {
-            let asks: Vec<_> = (0..self.nodes.configs().len())
-                .map(|i| {
-                    let target = &target;
-                    scope.spawn(move || {
-                        if !self.nodes.reachable(i) {
-                            return None;
-                        }
-                        let node = &self.nodes.configs()[i];
-                        match self.call_max(node, "GET", target, None, b"", NODE_TIMEOUT, MAX_LIST)
-                        {
-                            Ok(a) if a.status == 200 => {
-                                self.nodes.answered(i);
-                                serde_json::from_slice::<SandboxList>(&a.body).ok()
-                            }
-                            Ok(_) => None,
-                            Err(err) => {
-                                self.node_failed(i, &err);
-                                None
-                            }
-                        }
-                    })
-                })
-                .collect();
-            asks.into_iter().map(|a| a.join().ok().flatten()).collect()
-        });
+        let mut asked: Vec<usize> = self
+            .store
+            .of_tenant(&tenant.name)
+            .iter()
+            .filter_map(|r| self.nodes.index(&r.node))
+            .filter(|i| self.nodes.reachable(*i))
+            .collect();
+        asked.sort_unstable();
+        asked.dedup();
+        let ask = |i: usize| {
+            let node = &self.nodes.configs()[i];
+            match self.call_max(node, "GET", &target, None, b"", NODE_TIMEOUT, MAX_LIST) {
+                Ok(a) if a.status == 200 => {
+                    self.nodes.answered(i);
+                    serde_json::from_slice::<SandboxList>(&a.body).ok()
+                }
+                Ok(_) => None,
+                Err(err) => {
+                    self.node_failed(i, &err);
+                    None
+                }
+            }
+        };
+        let lists: Vec<(usize, Option<SandboxList>)> = match asked.as_slice() {
+            // The usual case needs no thread.
+            [i] => vec![(*i, ask(*i))],
+            _ => std::thread::scope(|scope| {
+                let ask = &ask;
+                let asks: Vec<_> = asked
+                    .iter()
+                    .map(|&i| (i, scope.spawn(move || ask(i))))
+                    .collect();
+                asks.into_iter()
+                    .map(|(i, a)| (i, a.join().ok().flatten()))
+                    .collect()
+            }),
+        };
         let mut sandboxes = Vec::new();
-        for (i, list) in lists.into_iter().enumerate() {
+        for (i, list) in lists {
             let node = &self.nodes.configs()[i].name;
             match list {
                 // Only what this node runs for this tenant.
@@ -519,7 +561,7 @@ impl Api {
             }
             ("POST", ["python", "reset"]) => (
                 format!("/v1/sandboxes/{sandbox}/python/reset"),
-                NODE_TIMEOUT,
+                FILE_TIMEOUT,
             ),
             ("GET" | "PUT", ["files"]) => {
                 let Some(path) = request.query("path") else {
@@ -650,7 +692,7 @@ impl Admin {
                     "admin: node={} draining={draining} (asked by an operator)",
                     node.name
                 );
-                api.nodes.reported(i, asked, load);
+                api.nodes.reported(i, asked, load, false);
                 Response::json(200, &api.nodes.view(i))
             }
             Ok(_) => error(502, "node_failed", "the node did not change"),
