@@ -800,7 +800,12 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 | `GET /v1/sandboxes` | | `{"sandboxes": [...]}`, the caller's |
 | `GET /v1/sandboxes/{id}` | | `{"id", "tenant", "template", "node", "egress_id", "created_at", "last_used_at", "expires_at", "idle_timeout", "memory_bytes", "memory_limit_bytes", "ready_ms"}` |
 | `DELETE /v1/sandboxes/{id}` | | `204` |
-| `POST /v1/sandboxes/{id}/exec` | `{"command"` or `"python", "timeout"?, "cwd"?, "env"?, "stdin"?, "max_output"?}` | `{"exit_code", "signal", "timed_out", "stdout", "stderr", "stdout_truncated", "stderr_truncated", "stdout_bytes", "stderr_bytes", "duration_ms"}` |
+| `POST /v1/sandboxes/{id}/exec` | `{"command"` or `"python", "stateful"?, "timeout"?, "cwd"?, "env"?, "stdin"?, "max_output"?}` | when it ended: `{"exec_id", "exit_code", "signal", "timed_out", "cancelled", "stdout", "stderr", "stdout_truncated", "stderr_truncated", "stdout_bytes", "stderr_bytes", "duration_ms"}`, and for a stateful call `"value"?, "error"?, "state_lost"` |
+| `POST /v1/sandboxes/{id}/execs` | the same | `201` once it started: `{"exec_id", "kind", "state": "running", "started_at", "cancel_requested", "result": null}` |
+| `GET /v1/sandboxes/{id}/execs` | | `{"execs": [...]}`: the latest exec, running or ended |
+| `GET /v1/sandboxes/{id}/execs/{exec}?cursor=&wait=&max_bytes=` | | `{"exec_id", "state", "events", "next_cursor", "eof", "result"}` |
+| `POST /v1/sandboxes/{id}/execs/{exec}/cancel` | | the exec, once it ended (or after 5 s) |
+| `POST /v1/sandboxes/{id}/python/reset` | | `{"had_state"}` |
 | `GET /v1/sandboxes/{id}/files?path=P` | | the file's bytes |
 | `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `{"bytes"}` |
 | `POST /v1/sandboxes/{id}/files/edit` | `{"path", "old", "new", "replace_all"?}` | `{"replacements"}` |
@@ -810,8 +815,8 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 | 400 | `bad_request`, `is_directory`, `not_regular`, `not_text` | malformed request; not a file; not UTF-8 (edit) |
 | 401 | `unauthorized` | no or unknown token |
 | 404 | `sandbox_not_found` | no such sandbox, **or another tenant's** (the same answer) |
-| 404 | `not_found`, `template_not_found` | no such file or working directory; no such template |
-| 409 | `busy` | the sandbox is running another request (one at a time) |
+| 404 | `not_found`, `template_not_found`, `exec_not_found` | no such file or working directory; no such template; no such exec (only the latest is kept) |
+| 409 | `busy` | the sandbox is running another request or exec (one at a time; reading, listing and cancelling an exec are not requests that take it) |
 | 410 | `sandbox_ended` | the node removed it and still remembers why (idle, lifetime, memory, its agent ended) |
 | 413 | `too_large` | a body or file over 16 MiB |
 | 422 | `no_match`, `ambiguous` | edit: `old` does not occur, or occurs more than once without `replace_all` |
@@ -823,7 +828,8 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 *exec.* `command` runs as `/bin/sh -c COMMAND`; `python` runs the
 source in a fork of the sandbox's warm interpreter, so the template's
 modules are already imported (`SystemExit` sets the exit code, an
-uncaught exception prints its traceback and exits 1). The working
+uncaught exception prints its traceback and exits 1); `python` with
+`"stateful": true` runs it in the sandbox's interpreter (below). The working
 directory is `/root` unless `cwd` says otherwise (relative paths in file
 operations are relative to it too); `env` adds variables; `stdin` is
 the command's input (otherwise it reads end of file). `timeout` (default
@@ -833,7 +839,75 @@ UTF-8 with invalid bytes replaced; each stream keeps at most
 `max_output` bytes (default 64 KiB, at most 1 MiB): the first and the
 last half, with `[... N bytes omitted ...]` between them, and
 `stdout_bytes` says how much there was. Limits: command, Python source
-and stdin 1 MiB each, 256 environment variables in 64 KiB.
+and stdin 1 MiB each, 256 environment variables in 64 KiB. Every exec has
+an id (`ex-N`, increasing per sandbox), and a cancelled one says
+`cancelled` (with `signal` 9).
+
+*Streaming and cancelling.* `POST .../execs` starts the same exec and
+answers as soon as it runs; its output is then read with a cursor, a
+byte position in its stdout and stderr interleaved in the order the
+agent read them:
+
+```text
+POST /v1/sandboxes/sb-.../execs  {"command": "make test", "timeout": 600}
+  -> 201 {"exec_id": "ex-4", "state": "running", ...}
+GET  /v1/sandboxes/sb-.../execs/ex-4?cursor=0&wait=30
+  -> {"state": "running", "events": [{"type": "stdout", "data": "cc -c a.c\n"},
+      {"type": "stderr", "data": "warning: ...\n"}], "next_cursor": 31, "eof": false, "result": null}
+GET  /v1/sandboxes/sb-.../execs/ex-4?cursor=31&wait=30
+  -> {"state": "done", "events": [...], "next_cursor": 2048, "eof": true, "result": {... "exit_code": 0}}
+```
+
+A poll answers as soon as there is output past `cursor`, the exec ended,
+or `wait` seconds (default 0, at most 30) passed; it returns at most
+`max_bytes` (default 256 KiB, 1 KiB to 1 MiB) and never splits a UTF-8
+character while the exec runs. A client follows an exec by polling with
+each answer's `next_cursor` until `eof`; any connection can poll, any
+number of times (a poll changes nothing), so a dropped connection loses
+no output. Order between the two streams is exact only for output
+written at different moments (two pipes are read; a PTY would make it
+one stream). Output not yet read is held by the node as the result is:
+the first `max_output` bytes and the last `max_output` bytes of both
+streams together; a cursor in the part dropped between them gets an
+`{"type": "omitted", "bytes": N}` event and then the rest. `result` is
+the same as `POST .../exec` answers, with each stream cut by itself.
+`POST .../execs/{exec}/cancel` kills the exec's process group (a
+stateful call is interrupted first, see below) and answers once it
+ended, at most 5 s later; it works from any connection, while polls
+wait (they are woken), for an exec started by `POST .../exec` too (its
+id is in `GET .../execs`), and a second cancel or one after the end
+changes nothing. A client that goes away does nothing to the exec: it
+runs to its end, its timeout or a cancel, and its output stays readable
+until the next exec of the sandbox starts (a sandbox keeps its latest
+exec only). A poll holds a connection for at most 30 s; an exec holds
+its sandbox for at most its timeout, and the sandbox's lifetime still
+applies.
+
+*Stateful Python.* `{"python": CODE, "stateful": true}` (on either
+endpoint) runs CODE in the sandbox's interpreter: a process forked from
+the warm interpreter on first use (so the template's modules are
+imported), which keeps its namespace between calls, like a notebook
+kernel: variables, imports, open files and objects, threads it started.
+The value of the code's last expression, when it ends in one that is
+not `None`, comes back as `value` (its `repr`, at most 16 KiB of
+characters, the middle cut; it is also `_`); an exception as `error`:
+`{"type", "message", "traceback"}` (the traceback shows the lines of
+the cells it went through, at most 16 KiB), with `exit_code` 1, and the
+state survives it. Its output streams like any exec's; `stdin` is
+`sys.stdin` for the call; `cwd` and `env` are refused (the interpreter
+has its own: change them with `os.chdir` and `os.environ`). At its
+timeout or on a cancel the interpreter gets `SIGINT`: code that can be
+interrupted stops with `KeyboardInterrupt` and the state is kept; code
+that does not stop within 2 s (a long call in C, an ignored `SIGINT`)
+is killed with its process group, the call says `InterpreterKilled` and
+`state_lost: true`, and the next call starts a fresh interpreter. An
+interpreter that ends by itself (`os._exit`, a crash) is reported the
+same way (`InterpreterExited`, with its status). `POST .../python/reset`
+kills it (`had_state` says whether there was one); the next call starts
+afresh. It is a process of the sandbox like any other: its memory and
+processes count against the sandbox's limits (going over removes the
+sandbox, as always), and it is separate per sandbox, so per tenant.
+Output written between calls by what a call left running is dropped.
 
 *State between requests.* Kept: the filesystem (the writable layer),
 processes started in the background that hold none of the command's
@@ -841,8 +915,8 @@ pipes (`nohup server >log 2>&1 &`; output written to the pipes after
 the command ended is dropped, 100 ms after it ended), and everything the
 template set up. Not kept: the shell's working directory, variables and
 functions (each `command` is a new shell), and the variables of a
-`python` run (each is a new fork). An interactive interpreter whose
-namespace survives between calls is a later step (SDK and MCP server).
+`python` run (each is a new fork): what is to persist goes to the
+stateful interpreter.
 
 Relative paths and the default working directory are the agent's home:
 `HOME` from the template's `env`, else `/root`. The user `noded` runs as
@@ -891,14 +965,30 @@ which `noded` creates as three pipes and passes with the clone request:
 requests come in on stdin, answers go out on stdout, the agent's own log
 on stderr (`noded` logs at most 64 KiB of it per sandbox). A frame is
 `[header length u32][body length u32][JSON header][body]`; the agent
-greets with its version once the clone runs, and each answer carries
-its request's id. The agent is the sandbox's first process, so it also
+greets with its version (2) once the clone runs, and each answer carries
+its request's id. `noded` sends one request at a time. An exec is
+answered `started` at once, then its output follows as `output` frames
+(at most 64 KiB each) as the agent reads it from the command's pipes,
+then its final answer (the status, and a stateful call's value and
+traceback; no output: `noded` keeps that, so the truncation rule is in
+one place). While an exec runs `noded` may send `cancel`, which is
+never answered. The sandbox's watch thread reads the agent's stdout all
+the time, through an incremental parser, and hands each frame to what
+it belongs to. The agent is the sandbox's first process, so it also
 reaps orphans. Its frames are untrusted: anything in the sandbox can
 write to `/dev/console`, so `noded` bounds every length before
-allocating (a 64 KiB header; a body no longer than the request can
-produce), has a deadline on every read and write, checks every field,
-and on any violation removes the sandbox (it can only have broken
-itself). Rejected:
+allocating (a 64 KiB header; a body no longer than what is outstanding
+can produce: nothing when nothing is, 64 KiB of output, a file read's
+16 MiB), wants a frame that started complete within 30 s and the next
+answer by its deadline (an exec's: its timeout plus 10 s), has a
+deadline on every write, takes a frame only for the request
+outstanding and in its order, checks every field, and on any violation
+removes the sandbox (it can only have broken itself). A guest that
+forges frames can lie about its own output and status, or end its own
+sandbox; it cannot make `noded` allocate past those bounds, block it,
+or reach another sandbox. The stateful interpreter is a child of the
+agent with pipes of its own (calls in, answers out, stdout, stderr),
+which the agent bounds the same way for its own sake. Rejected:
 
 * *Something in the kernel process.* A command runner and file server
   in the process that parses guest bytes would enlarge the most
@@ -911,6 +1001,42 @@ itself). Rejected:
   the agent's traffic well.
 * *A new `hellovm` (or clone) per exec.* State would not survive
   between execs, and each would pay the clone again.
+
+**Why long polling for streams.** Reading an exec's output by polling a
+cursor needs nothing new in the HTTP layer (requests and answers with a
+`Content-Length`, as before), and the API passes polls to the node like
+any request. A poll holds a connection for 30 s at most, at the API and
+at the node; any connection can resume where another stopped; a cancel
+is an ordinary request; a slow or absent reader costs a bounded buffer
+on the node and nothing else. The price: a round trip per batch of
+output (on loopback the first output of `echo hi` arrives 10 ms after
+the request, see below), and a little more traffic than a stream.
+Rejected: *a streamed response* (chunked NDJSON, or server-sent events)
+would hold a connection slot at both hops for the whole exec (up to an
+hour, from a pool of 256, 32 per client), needs streaming in the
+server, in the client and in the API's forwarding, notices a client
+that left only when a write fails, and loses output when a connection
+drops unless it adds a cursor anyway; server-sent events can be added
+later on the same cursor (it is the `Last-Event-ID`) for browsers.
+*Killing an exec whose client left*: that is what cancel is for, and
+it would make every network blip fatal to a long build. *WebSockets*: a
+second protocol to harden for what polls do. *Interactive stdin or a
+PTY* is not done; it would be a write endpoint taking bytes for the
+running exec (`POST .../execs/{exec}/stdin`, carried as an agent frame
+like `cancel`) and a `pty` flag that makes the agent run the command
+on a pseudo-terminal, whose single output stream fits the same cursor.
+
+**Why a forked worker for stateful Python.** The interpreter is a fork
+of the warm agent, so it starts with the template's modules in about
+8 ms and needs no new code in the image; it is a process of its own,
+so a timeout can interrupt it (`SIGINT`, which CPython turns into
+`KeyboardInterrupt` in the code running) or kill it without touching
+the agent, and its memory is the sandbox's. Rejected: *running calls in
+the agent itself* (a call that hangs or crashes would take the channel
+with it); *a Jupyter kernel* (ZeroMQ, a kernel spec and an image that
+has them, for what one pipe protocol does); *keeping the state by
+pickling the namespace between forks* (most objects do not pickle:
+open files, sockets, threads, modules).
 
 **How `api` and `noded` talk.** HTTP/1.1 with JSON, the same shapes as
 the public API (the node API is listed in `kernel/noded/src/server.rs`):
@@ -1011,7 +1137,12 @@ limit covers what their configuration can use (`noded`: five per sandbox
 of `max_sandboxes`, plus connections and templates), raise the soft
 limit if that is enough, and refuse to start otherwise. JSON with unknown
 fields is refused. The agent channel: see above. Logged text from a
-sandbox is bounded per line and per sandbox. Neither service dials an
+sandbox is bounded per line and per sandbox. An exec's held output is
+bounded by its `max_output` (at most 1 MiB): the result's two streams
+and the stream read with a cursor hold 4 × `max_output` at most, and a
+sandbox keeps one exec, so a node holds at most 4 MiB per sandbox for
+output (256 MiB with 64 sandboxes all at the largest `max_output`).
+Polls wait at most 30 s, cancels 5 s. Neither service dials an
 address a sandbox chose: `noded` connects only to its templates'
 sockets, the API only to its configured nodes.
 
@@ -1019,7 +1150,9 @@ sockets, the API only to its configured nodes.
 `syn`, `quote`, `proc-macro2`, `unicode-ident`, and `itoa`, `memchr`,
 `ryu`): the JSON of both APIs. Nothing else: the HTTP server and client
 are about 800 lines of strict, bounded code in `hellovm-control`, and
-one thread per connection (at most 256) is enough at this scale.
+one thread per connection (at most 256) is enough at this scale. Streamed
+execs and the stateful interpreter add no dependency (the agent uses
+only Python's standard library).
 Rejected for now: `tokio` with `hyper` or `axum` (dozens of crates and
 an async runtime for what a thread pool does), a hand-written JSON
 parser.
@@ -1031,7 +1164,18 @@ template of the host's `/` (shared when the host has Landlock, else one
 per tenant, with a note), and `hellovm-api` with two tenants, all
 talking HTTP on loopback. It covers authentication, create, `exec`
 (exit codes, stderr, stdin, cwd, env, timeouts, truncation, Python in the
-warm interpreter), state between execs, read, write and edit (binary
+warm interpreter), streamed execs (output before the end, stdout and
+stderr told apart and in order, a cancel from another connection while a
+poll waits, which kills the exec's background children and leaves the
+sandbox usable, a client gone mid-poll, a late reader of far more output
+than is held, a timeout while streaming, a request/response exec
+cancelled from another connection, bad polls and unknown execs, tenant
+isolation of every new route, a delete under a running exec), the
+stateful interpreter (variables and imports kept, values, tracebacks,
+stdin, interrupted on cancel and on timeout with its state kept, killed
+when it cannot be interrupted, ending by itself, reset, separate per
+sandbox and tenant and from the fresh-fork mode, its memory counted),
+state between execs, read, write and edit (binary
 data, missing files, directories, ambiguous and missing edits), the
 writable layer's limit, outbound HTTP through the proxy with the
 sandbox's id in the audit line and a refused name, one request at a
@@ -1040,9 +1184,13 @@ idle timeout, lifetime, the memory limit, a template killed and
 restarted, `noded` killed and restarted with stale sockets, the API
 restarted with sandboxes running, and a clean shutdown.
 `kernel/noded` has unit tests for the agent protocol (against the
-host's Python), garbage from a sandbox, configurations, memory
-measurement and stale sockets; `kernel/control` for HTTP parsing and
-limits.
+host's Python: execs, output frames, cancel, the stateful interpreter's
+state, interrupt, kill, end and reset), the frame parser (frames in any
+pieces, lengths over the bounds, frames when none may come), checking
+exec answers, the output buffers (head and tail, cursor reads, what a
+late reader is told, UTF-8 characters not split between reads),
+configurations, memory measurement and stale sockets; `kernel/control`
+for HTTP parsing and limits, exec requests and poll queries.
 
 **Measurements.** `cargo test --release -p hellovm-api --test
 control_plane bench_create_and_exec -- --ignored --nocapture`: the plane
@@ -1053,14 +1201,29 @@ aarch64, default seccomp profile), medians with the range:
 
 | | Debian bookworm (CPython 3.11) | Ubuntu 26.04 (CPython 3.14) |
 |---|---|---|
-| **Create, request to ready** (through the API) | **8.3 ms** (5.8–8.7) | **7.1 ms** (4.1–7.9) |
-| of that, on the node (clone request to the agent's greeting) | 8.0 ms | 6.8 ms |
-| `exec` of `echo hi` (`/bin/sh -c`) | 10.6 ms (8.3–11.4) | 12.9 ms (9.9–23.4) |
-| Create and first `exec`, together | 18.9 ms (14.3–20.1) | 19.9 ms (14.2–30.4) |
-| `exec` of Python (`json.dumps`, in a fork of the warm interpreter) | 4.9 ms (3.8–5.5) | 3.7 ms (2.6–4.1) |
-| `write_file` / `read_file`, 5 bytes | 0.8 / 1.0 ms | 0.8 / 0.6 ms |
-| `delete` | 0.3 ms | 0.2 ms |
-| For comparison: a cold `hellovm --root / python3 -c 'import json; ...'`, start to exit | 60.6 ms | 51.4 ms |
+| **Create, request to ready** (through the API) | **9.7 ms** (5.1–12.7) | **9.8 ms** (7.9–12.9) |
+| of that, on the node (clone request to the agent's greeting) | 9.3 ms | 9.4 ms |
+| `exec` of `echo hi` (`/bin/sh -c`) | 11.4 ms (7.6–16.0) | 14.5 ms (11.8–17.7) |
+| Create and first `exec`, together | 21.0 ms (12.8–28.3) | 24.8 ms (19.7–29.1) |
+| `exec` of Python (`json.dumps`, in a fork of the warm interpreter) | 5.6 ms (3.8–7.0) | 4.7 ms (3.8–5.6) |
+| **Streamed exec, request to first output** (`echo hi`: start, then a poll) | **9.5 ms** (5.7–12.3) | **10.4 ms** (8.9–11.7) |
+| Stateful Python, first call (starts the interpreter) | 11.5 ms (5.7–20.5) | 7.8 ms (4.5–9.3) |
+| **Stateful Python, a call** (`x += 1; x`, round trip) | **1.5 ms** (0.9–2.3) | **2.0 ms** (1.7–2.8) |
+| `write_file` / `read_file`, 5 bytes | 1.1 / 1.1 ms | 1.3 / 0.8 ms |
+| `delete` | 0.3 ms | 0.3 ms |
+| For comparison: a cold `hellovm --root / python3 -c 'import json; ...'`, start to exit | 60.5 ms | 48.2 ms |
+
+These were measured with streaming in place (every exec's output now
+goes from the agent to `noded` as it comes, and the watch thread hands
+answers to the request's thread), on a host under some load (a load
+average of 3): the earlier numbers of this table (8.3 / 7.1 ms to
+ready, 10.6 / 12.9 ms for `echo hi`, 4.9 / 3.7 ms for Python, 0.8 ms
+for a small file) are inside these ranges, and repeated runs differ by
+up to a third; what is new costs at most a few tenths of a millisecond
+per request (the hand-off between threads). A streamed exec's first
+output comes sooner than a request/response `exec` answers, which waits
+for the end. A stateful call is the fastest way to run Python: no fork,
+only the call's frames.
 
 The template preloads `json`, `decimal`, `hashlib`, `sqlite3` and
 `urllib.request`. A shell `exec` costs more than a Python one because
