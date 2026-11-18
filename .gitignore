@@ -1,2 +1,7 @@
 docs/
 /kernel/target/
+__pycache__/
+*.egg-info/
+node_modules/
+/sdk/ts/dist/
+/sdk/mcp/dist/

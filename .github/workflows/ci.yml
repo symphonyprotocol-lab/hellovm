@@ -14,7 +14,7 @@ jobs:
     name: test-x86_64
     runs-on: ubuntu-latest
     # A hung ptrace/sandbox test would otherwise hold the runner for 6 hours.
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -35,7 +35,7 @@ jobs:
       - name: Install distro e2e dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends busybox-static gcc libc6-dev python3 python3-pip git openssl
+          sudo apt-get install -y --no-install-recommends busybox-static gcc libc6-dev python3 python3-pip python3-venv git openssl
 
       # The kernel process's seccomp allowlist kills it on a syscall that
       # is not listed, and the list was drawn up on aarch64. Record what
@@ -57,6 +57,19 @@ jobs:
 
       - name: Run the x86_64 e2e script
         run: kernel/dev/run-e2e.sh
+
+      # The SDKs and the MCP server against a real plane, as the runner's
+      # user (not root); the dev-image job below runs them as root.
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Run the SDK and MCP e2e script
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mypy"
+          "$RUNNER_TEMP/mypy/bin/pip" install --quiet mypy==2.4.1
+          HELLOVM_REQUIRE_E2E=1 MYPY="$RUNNER_TEMP/mypy/bin/mypy" kernel/dev/run-sdk-e2e.sh
 
       # A4: missing busybox must fail when HELLOVM_REQUIRE_E2E=1, even if
       # /bin/busybox exists on the runner. A non-zero exit is not enough:
@@ -85,15 +98,17 @@ jobs:
   test-x86_64-dev-image:
     name: test-x86_64-dev-image
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       # Default Docker seccomp profile: ptrace of one's own child is allowed.
       # Do not pass --privileged or --security-opt seccomp=unconfined.
+      # As root; the SDK and MCP suites too (the image has Node.js).
       - name: Build the dev image and run e2e
         run: |
           docker build -t hellovm-dev kernel/dev
           docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/tmp/target \
-            hellovm-dev kernel/dev/run-e2e.sh
+            -e HELLOVM_REQUIRE_E2E=1 \
+            hellovm-dev sh -c 'kernel/dev/run-e2e.sh && kernel/dev/run-sdk-e2e.sh'

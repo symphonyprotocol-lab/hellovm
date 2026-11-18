@@ -1242,6 +1242,189 @@ the clone's start, and the agent's greeting from inside the sandbox. The
 first exec right after it is the earliest point a client sees its own
 command's output.
 
+## SDKs and MCP server
+
+Programs drive sandboxes through the SDKs; models drive them through
+the MCP server, which is built on the TypeScript SDK. All three use only
+the public API above.
+
+| Package | Path | |
+|---|---|---|
+| `hellovm` (Python) | `sdk/python` | Python 3.10+, standard library only, typed |
+| `hellovm` (TypeScript) | `sdk/ts` | Node.js 20+, ESM with declarations, built-in `fetch`, no runtime dependencies |
+| `hellovm-mcp` | `sdk/mcp` | MCP server on stdio, Node.js 20+ |
+
+Version 0.0.1 each, not published. Each has a README with its whole
+surface.
+
+```python
+from hellovm import Client
+
+client = Client("http://127.0.0.1:7070", token)
+with client.create() as sandbox:                       # deleted at the end of the block
+    print(sandbox.exec("uname -a", timeout=10).stdout)
+    sandbox.run("x = 21")                              # the stateful interpreter
+    print(sandbox.run("x * 2").value)                  # '42'
+    for event in sandbox.stream("make test", timeout=600):
+        print(event)                                   # stdout/stderr as it comes, then the result
+```
+
+```ts
+import { Client } from "hellovm";
+
+const client = new Client({ baseUrl: "http://127.0.0.1:7070", token });
+await client.withSandbox({}, async (sandbox) => {
+  console.log((await sandbox.exec("uname -a", { timeout: 10 })).stdout);
+  for await (const event of await sandbox.stream("make test", { timeout: 600 })) console.log(event);
+});
+```
+
+The two SDKs have the same surface (snake_case in Python, camelCase in
+TypeScript): a client from a base URL and a token; `create()` (a context
+manager in Python, `withSandbox` or `await using` in TypeScript, both
+deleting the sandbox however the block ends), `list`, `get`, `delete`;
+`exec(command, timeout=...)`, `python(code)` (a fresh fork) and `run(code)`
+(the stateful interpreter) returning a result with stdout, stderr, exit
+code, signal, `timed_out`, `cancelled`, the truncation flags and byte
+counts, and for stateful calls `value`, `error` (type, message,
+traceback) and `state_lost`; `stream(...)` yielding output events as they
+come and ending with the result, cancellable (from another thread in
+Python, by `cancel()` or an `AbortSignal` in TypeScript); `read_file`,
+`write_file`, `edit_file`; `reset_python`. Errors carry the API's
+status, code and message (`BusyError`, `SandboxEndedError` with its
+reason, ...).
+
+**Behaviour shared by both.** Every request has a deadline for the whole
+exchange and a bound on the answer (32 MiB by default; heads 16 KiB), so
+a server that stalls, trickles or sends too much costs a bounded wait and
+buffer; the Python SDK has its own small HTTP/1.1 client for that
+(`http.client` times out per socket operation, so a trickling server
+holds it forever), the TypeScript SDK wraps `fetch` with an abort timer
+and a capped body reader, and refuses redirects. A `409 busy` is waited
+out with backoff until `busy_timeout` (120 s) by default, or raised at
+once with `busy="raise"`. Requests are retried only where that cannot do
+something twice: any request whose connection could not be made; after
+a failure without an answer only idempotent ones (`GET`s, `DELETE`,
+cancel), never create, exec, starting a stream, write, edit or reset,
+which raise a transport error with `maybe_sent` instead; `503` until the
+busy deadline; `429 too_many_polls` for polls. Streams are long polls
+with the byte cursor: a dropped connection or a stalled poll resumes from
+the cursor and loses nothing. The SDKs keep no exec id but the one they
+started and are following (a sandbox keeps only its latest exec).
+
+**The MCP server.** `sdk/mcp` (`node sdk/mcp/dist/server.js`, after
+`npm ci && npm run build` in `sdk/ts` and then `sdk/mcp`) speaks MCP on
+stdio. Configuration is by environment: `HELLOVM_URL` and `HELLOVM_TOKEN`
+(required), `HELLOVM_TEMPLATE` (default `python`), `HELLOVM_IDLE_TIMEOUT`
+and `HELLOVM_LIFETIME` (seconds; the API's defaults otherwise),
+`HELLOVM_SANDBOX` (use an existing sandbox, never deleted by the server),
+`HELLOVM_MCP_TIMEOUT` and `HELLOVM_MCP_MAX_TIMEOUT` (a call's default and
+largest timeout, 60 and 600 s), `HELLOVM_MCP_MAX_OUTPUT` (bytes of each
+stream and of a file shown to the model, 16384). The token is never
+written to a tool result or the log (stderr); tool output is also
+scrubbed of it. A client configuration:
+
+```json
+{"mcpServers": {"hellovm": {"command": "node", "args": ["/path/to/hellovm/sdk/mcp/dist/server.js"],
+  "env": {"HELLOVM_URL": "http://127.0.0.1:7070", "HELLOVM_TOKEN": "..."}}}}
+```
+
+| Tool | Inputs | Result |
+|---|---|---|
+| `exec` | `command`, `timeout?` (s), `cwd?` | `Exit code: N` (or `Timed out after T s: the command was killed (signal 9).`), then stdout and stderr |
+| `python` | `code`, `timeout?`, `restart?` | `Value: ...` or `Raised Type: message` with the traceback, printed output, and a note when the interpreter's state was lost |
+| `read_file` | `path` | the text; a binary file is described, not shown |
+| `write_file` | `path`, `content` | bytes written |
+| `edit_file` | `path`, `old_text`, `new_text`, `replace_all?` | replacements made |
+| `reset_sandbox` | | a new, empty sandbox for the next call |
+
+Output longer than `HELLOVM_MCP_MAX_OUTPUT` is cut by the API's own rule
+(the first and last half, `[... N bytes omitted ...]` between) with a
+line saying so; a file read follows the same rule. A non-zero exit code
+or a Python exception is a result, not an error; a failure of the API
+(no such file, an ambiguous edit, busy past the deadline, a sandbox that
+could not be made) is a tool error (`isError`) with the API's code and
+message. A cancelled MCP request cancels its command in the sandbox.
+
+Decisions, and what was rejected:
+
+* *One implicit sandbox per server process*, made on the first call that
+  needs it and deleted when the server exits (stdin closes, `SIGTERM`);
+  if the server is killed, the sandbox's idle timeout reclaims it. A
+  model never handles ids, and one conversation's work stays in one
+  place. If the sandbox ended (idle timeout, lifetime, memory), the next
+  call gets a new one and its result starts with a note saying the old
+  files and state are gone; `reset_sandbox` starts over on purpose.
+  Rejected: *explicit create and delete tools with ids*, which a model
+  must thread through every call and forgets to delete, for a use (many
+  sandboxes in one conversation) that a program does better with the SDK.
+* *The stateful interpreter for `python`*, not a fresh fork: a model
+  works like in a notebook, building on earlier cells; `exec python3 -c`
+  remains for a fresh process.
+* *The official MCP TypeScript SDK* (`@modelcontextprotocol/server`
+  2.4.0, with `@modelcontextprotocol/core` and `zod`: three packages). It
+  implements the current revision (2026-07-28: stateless requests with
+  their version and capabilities in `_meta`, `server/discover`) and
+  still serves clients that open with the 2025 `initialize` handshake,
+  which most clients do today; the tests speak both by hand. Rejected:
+  implementing the protocol in the server (smaller, but two protocol
+  eras and their error codes would be ours to keep right); the Python
+  SDK's `mcp` package (pydantic, starlette, uvicorn, httpx and about
+  twenty more packages, several with native code, for a stdio server).
+  TypeScript is also where the server is shortest: tool schemas are
+  `zod` objects and results come straight from the TypeScript SDK.
+* *Text results*, the outcome first: what a model reads. No
+  `outputSchema`/`structuredContent`: programs that want structure use
+  an SDK.
+* *Timeouts*: 60 s by default, 600 s at most per call (configurable up
+  to the API's 3600 s), so a stuck command cannot hold the model;
+  longer work goes to the background (`nohup ... &`) and is checked on.
+
+Rejected for the SDKs: *server-sent events or a streamed response* (the
+API has none; see **Why long polling for streams**); *depending on older
+exec ids* (a sandbox keeps one); *an asyncio Python client* (it would
+need its own HTTP layer or a dependency to keep the deadline and size
+bounds; a thread per blocking call is enough for now); *`requests`,
+`httpx`, `undici` or `axios`* (the standard library and `fetch` suffice
+once bounded).
+
+**Dependencies.** Python SDK: none. TypeScript SDK: none at run time;
+`typescript` and `@types/node` to build. MCP server: the three packages
+above, and the TypeScript SDK. The dev image (`kernel/dev/Dockerfile`)
+adds Node.js 24 (the official build, checked against its SHA-256; Debian
+bookworm's own is too old) for these tests.
+
+**Tests.** `kernel/dev/run-sdk-e2e.sh` (from the repository root, after
+`run-e2e.sh`) type-checks the SDKs (`mypy --strict` when mypy is found,
+`tsc --strict` as the build), then runs `kernel/api/tests/sdk.rs`, whose
+three tests each start a whole plane (the one `control_plane.rs` uses:
+the real `hellovm`, `hellovm-noded` and `hellovm-api` with a warm CPython
+template and two tenants) and run one suite against it. They are
+`#[ignore]`d in a plain `cargo test`, which must not need Node.js. A
+missing Python 3.10+ or Node.js 20+ skips its part with a `SKIPPING`
+line, a failure with `HELLOVM_REQUIRE_E2E=1` (as CI sets: the native job
+runs it as the runner's user, the dev-image job as root). Covered, in
+both SDKs: every call's happy path; exit codes, stderr, stdin, cwd, env,
+timeouts and truncation; streams (output arriving before the command
+ends, in order across stdout and stderr, resumed after the connection is
+cut by a proxy, cancelled from another thread or task, an `AbortSignal`,
+leaving a stream early cancelling it, omitted output); the stateful
+interpreter (state kept, values, exceptions with tracebacks, stdin,
+reset, state lost, a timeout); files (binary round trips, text, edits,
+missing files, directories, non-text edits, the size limit); busy
+handling both ways; authentication failure; an ended sandbox (`410` with
+its reason); a second tenant seeing nothing; the context manager
+deleting the sandbox when the block raises. Unit tests without a plane:
+parsing, the retry rules, and a local fake server that stalls, trickles a
+head or a body, sends an endless or oversized body, drops connections
+(an exec or a write is never repeated, a read is), answers busy, `503`
+or `429`, or moves a cursor backwards. The MCP server: the handshake in
+both eras, the tool list and schemas, bad arguments, configuration
+errors, each tool's success and failure against a real plane,
+truncation, a timeout, a cancelled request, a sandbox that ended, the
+sandbox deleted at exit, and the token absent from everything the server
+wrote (also when a fake API echoes it).
+
 ## Fuzzing
 
 `kernel/fuzz` holds a fuzz target for everything that parses guest- or
