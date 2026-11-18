@@ -448,6 +448,7 @@ fn idle_lifetime_and_memory_limits_remove_sandboxes() {
         memory_limit_mb: 300,
         max_processes: 40,
         acme_max: 8,
+        ..PlaneOptions::default()
     }) else {
         return;
     };

@@ -541,6 +541,10 @@ pub struct Node {
     /// like those of the sandboxes that exist.
     creating: Mutex<HashSet<SandboxId>>,
     ended: Mutex<VecDeque<Tombstone>>,
+    /// Refusing new sandboxes (kept in this process only).
+    draining: AtomicBool,
+    /// What all sandboxes may hold together, in bytes.
+    memory_limit: u64,
 }
 
 /// An id being created.
@@ -555,21 +559,53 @@ impl Drop for Creating<'_> {
 impl Node {
     pub fn new(config: Config, templates: Vec<Arc<Template>>) -> Node {
         Node {
-            config,
-            templates,
             sandboxes: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashSet::new()),
             ended: Mutex::new(VecDeque::new()),
+            draining: AtomicBool::new(false),
+            memory_limit: match config.max_memory_mb {
+                Some(mb) => mb << 20,
+                None => crate::memory::host_memory().unwrap_or(u64::MAX),
+            },
+            config,
+            templates,
         }
     }
 
     pub fn status(&self) -> NodeStatus {
+        let (sandboxes, memory_bytes) = {
+            let sandboxes = lock(&self.sandboxes);
+            (sandboxes.len(), Self::memory_in_use(&sandboxes))
+        };
         NodeStatus {
             node: self.config.node.clone(),
             templates: self.templates.iter().map(|t| t.status()).collect(),
-            sandboxes: lock(&self.sandboxes).len(),
+            sandboxes,
+            creating: lock(&self.creating).len(),
             max_sandboxes: self.config.max_sandboxes,
+            memory_bytes,
+            memory_limit_bytes: self.memory_limit,
+            draining: self.draining.load(Ordering::SeqCst),
         }
+    }
+
+    fn memory_in_use(sandboxes: &HashMap<SandboxId, Arc<Sandbox>>) -> u64 {
+        sandboxes
+            .values()
+            .map(|s| s.memory.load(Ordering::Relaxed))
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Stops or resumes taking new sandboxes; those running are not
+    /// touched. Returns the status after the change.
+    pub fn set_draining(&self, draining: bool) -> NodeStatus {
+        if self.draining.swap(draining, Ordering::SeqCst) != draining {
+            log::info!(
+                "node state change: node={} draining={draining}",
+                self.config.node
+            );
+        }
+        self.status()
     }
 
     pub fn list(&self, tenant: Option<&str>) -> Vec<SandboxInfo> {
@@ -699,7 +735,16 @@ impl Node {
                     "a sandbox with this id exists",
                 ));
             }
-            if sandboxes.len() + creating.len() >= self.config.max_sandboxes {
+            if self.draining.load(Ordering::SeqCst) {
+                return Err(ApiError::new(
+                    503,
+                    "node_draining",
+                    "this node takes no new sandboxes",
+                ));
+            }
+            if sandboxes.len() + creating.len() >= self.config.max_sandboxes
+                || Self::memory_in_use(&sandboxes) >= self.memory_limit
+            {
                 return Err(ApiError::new(503, "node_full", "this node is full"));
             }
             creating.insert(id);

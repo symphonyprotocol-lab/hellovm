@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hellovm_api::config::Config;
-use hellovm_api::service::Api;
+use hellovm_api::nodes::{HealthPolicy, Nodes};
+use hellovm_api::service::{Admin, Api};
 use hellovm_api::store::MemoryStore;
 
 const USAGE: &str = "usage: hellovm-api --config FILE";
@@ -35,34 +36,75 @@ fn run(path: &str) -> Result<(), String> {
     let config = Config::parse(&text).map_err(|e| format!("{path}: {e}"))?;
     let tenants = config.tenants()?;
     let nodes = config.nodes()?;
+    let admin_token = config.admin_token(&tenants, &nodes)?;
     let limits = hellovm_control::http::Limits {
         max_connections_per_peer: config.max_connections_per_client,
         ..Default::default()
     };
-    // Each connection served may hold one more, to a node.
-    hellovm_control::ensure_fd_limit(limits.max_connections as u64 * 2 + 64)?;
+    // Operators are few: a handful of connections is plenty.
+    let admin_limits = hellovm_control::http::Limits {
+        max_connections: 16,
+        max_connections_per_peer: 16,
+        ..Default::default()
+    };
+    // Each connection served may hold one more, to a node; and every
+    // node is probed at once.
+    hellovm_control::ensure_fd_limit(
+        (limits.max_connections + admin_limits.max_connections) as u64 * 2
+            + nodes.len() as u64 * 2
+            + 64,
+    )?;
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|e| format!("listen {}: {e}", config.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let admin_listener = match &config.admin {
+        Some(admin) => Some(
+            std::net::TcpListener::bind(&admin.listen)
+                .map_err(|e| format!("admin listen {}: {e}", admin.listen))?,
+        ),
+        None => None,
+    };
     let interval = Duration::from_secs_f64(config.reconcile_interval);
+    let policy = HealthPolicy {
+        unhealthy_after: config.unhealthy_after,
+        healthy_after: config.healthy_after,
+    };
     let api = Arc::new(Api {
         config,
         tenants,
-        nodes,
+        nodes: Nodes::new(nodes, policy),
         store: Arc::new(MemoryStore::default()),
     });
-    // What runs already (after a restart of this service) is known before
-    // the first request is served.
+    // What runs already (after a restart of this service) and the state of
+    // every node are known before the first request is served.
     api.reconcile();
-    {
+    // Each node is probed on a thread of its own, so a slow one does not
+    // delay the others.
+    for i in 0..api.nodes.configs().len() {
         let api = Arc::clone(&api);
         std::thread::Builder::new()
-            .name("reconcile".into())
+            .name(format!("probe-{}", api.nodes.configs()[i].name))
             .spawn(move || loop {
                 std::thread::sleep(interval);
-                api.reconcile();
+                api.probe(i);
             })
             .map_err(|e| e.to_string())?;
+    }
+    if let (Some(listener), Some(token)) = (admin_listener, admin_token) {
+        let admin_addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let admin = Arc::new(Admin {
+            api: Arc::clone(&api),
+            token,
+        });
+        std::thread::Builder::new()
+            .name("admin".into())
+            .spawn(move || {
+                if let Err(err) = hellovm_control::http::serve(listener, admin, admin_limits) {
+                    log::error!("serving the admin API: {err}");
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        log::info!("admin API at {admin_addr}");
     }
     log::info!("listening on {addr}");
     hellovm_control::http::serve(listener, api, limits).map_err(|e| format!("serving: {e}"))

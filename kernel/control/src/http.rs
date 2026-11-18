@@ -837,9 +837,33 @@ impl ClientResponse {
     }
 }
 
+/// Longest wait for a connection to be made by [`call`].
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Marks an error of [`call`] that came before anything was sent: no
+/// connection could be made (refused, unreachable, timed out). Its kind is
+/// the connect error's.
+#[derive(Debug)]
+pub struct ConnectFailed(pub io::Error);
+
+impl std::fmt::Display for ConnectFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "connecting: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConnectFailed {}
+
+/// Whether `err`, from [`call`], means the request was certainly not sent.
+pub fn not_sent(err: &io::Error) -> bool {
+    err.get_ref().is_some_and(|e| e.is::<ConnectFailed>())
+}
+
 /// One request on a new connection to `addr` (`HOST:PORT`), with
-/// `Connection: close`. The whole exchange must finish within `timeout`;
-/// a response body longer than `max_body` is an error.
+/// `Connection: close`. The connection must be made within
+/// [`CONNECT_TIMEOUT`] (an error that [`not_sent`] recognises otherwise),
+/// and the whole exchange must finish within `timeout`; a response body
+/// longer than `max_body` is an error.
 pub fn call(
     addr: &str,
     method: &str,
@@ -850,10 +874,12 @@ pub fn call(
     max_body: usize,
 ) -> io::Result<ClientResponse> {
     let deadline = Instant::now() + timeout;
+    let connect_by = Instant::now() + timeout.min(CONNECT_TIMEOUT);
+    let failed = |err: io::Error| io::Error::new(err.kind(), ConnectFailed(err));
     let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{addr}: no address"));
     let mut stream = None;
-    for sock in addr.to_socket_addrs()? {
-        let left = deadline.saturating_duration_since(Instant::now());
+    for sock in addr.to_socket_addrs().map_err(failed)? {
+        let left = connect_by.saturating_duration_since(Instant::now());
         match TcpStream::connect_timeout(&sock, left.max(Duration::from_millis(1))) {
             Ok(s) => {
                 stream = Some(s);
@@ -862,7 +888,7 @@ pub fn call(
             Err(err) => last = err,
         }
     }
-    let stream = stream.ok_or(last)?;
+    let stream = stream.ok_or(last).map_err(failed)?;
     let _ = stream.set_nodelay(true);
     let mut head = format!(
         "{method} {target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n",

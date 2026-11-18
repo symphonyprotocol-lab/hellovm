@@ -25,24 +25,30 @@ use std::time::{Duration, Instant};
 use hellovm_control::http::{self, percent_encode, ClientResponse, Handler, Request, Response};
 use hellovm_control::ids::{token_eq, SandboxId};
 use hellovm_control::types::{
-    self, CreateSandbox, ExecRequest, NodeCreate, NodeStatus, PollQuery, SandboxInfo, SandboxList,
-    TemplateStatus,
+    self, CreateSandbox, DrainRequest, ExecRequest, NodeCreate, NodeStatus, PollQuery, SandboxInfo,
+    SandboxList,
 };
 
-use crate::config::{Config, Node, Tenant};
+use crate::config::{valid_name, Config, Node, Tenant};
+use crate::nodes::{check_status, NoPlace, Nodes};
 use crate::store::{Record, Store};
 
 /// The header naming the tenant to the node.
 const TENANT_HEADER: &str = "X-Hellovm-Tenant";
-/// Largest node answer read.
+/// Largest node answer read for a request about a sandbox (a file of
+/// 16 MiB is the largest).
 const MAX_NODE_ANSWER: usize = 24 << 20;
+/// Largest node status read: 256 templates of a few hundred bytes.
+const MAX_STATUS: usize = 1 << 20;
+/// Largest sandbox list read: 4096 sandboxes of under 1 KiB.
+const MAX_LIST: usize = 8 << 20;
 const NODE_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct Api {
     pub config: Config,
     pub tenants: Vec<Tenant>,
-    pub nodes: Vec<Node>,
+    pub nodes: Nodes,
     pub store: Arc<dyn Store>,
 }
 
@@ -68,10 +74,6 @@ impl Api {
         found
     }
 
-    fn node(&self, name: &str) -> Option<&Node> {
-        self.nodes.iter().find(|n| n.name == name)
-    }
-
     fn call(
         &self,
         node: &Node,
@@ -81,103 +83,136 @@ impl Api {
         body: &[u8],
         timeout: Duration,
     ) -> std::io::Result<ClientResponse> {
+        self.call_max(node, method, target, tenant, body, timeout, MAX_NODE_ANSWER)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_max(
+        &self,
+        node: &Node,
+        method: &str,
+        target: &str,
+        tenant: Option<&str>,
+        body: &[u8],
+        timeout: Duration,
+        max_answer: usize,
+    ) -> std::io::Result<ClientResponse> {
         let auth = format!("Bearer {}", node.token);
         let mut headers = vec![("Authorization", auth.as_str())];
         if let Some(tenant) = tenant {
             headers.push((TENANT_HEADER, tenant));
         }
         http::call(
-            &node.addr,
-            method,
-            target,
-            &headers,
-            body,
-            timeout,
-            MAX_NODE_ANSWER,
+            &node.addr, method, target, &headers, body, timeout, max_answer,
         )
     }
 
-    fn unreachable(node: &Node, err: &std::io::Error) -> Response {
-        log::warn!("node {}: {err}", node.name);
+    /// What a tenant is told about a sandbox whose node does not answer:
+    /// nothing about the node.
+    fn unreachable() -> Response {
         error(
             502,
             "node_unreachable",
-            &format!("node {} did not answer", node.name),
+            "the sandbox's node does not answer; try again later",
         )
     }
 
-    /// Asks every node for its sandboxes and makes the store agree. A node
-    /// that does not answer keeps its records.
-    pub fn reconcile(&self) {
-        for node in &self.nodes {
-            let asked = Instant::now();
-            let answer = self.call(node, "GET", "/v1/sandboxes", None, b"", NODE_TIMEOUT);
-            let list = match answer {
-                Ok(r) if r.status == 200 => serde_json::from_slice::<SandboxList>(&r.body),
-                Ok(r) => {
-                    log::warn!(
-                        "node {}: listing sandboxes: {}",
-                        node.name,
-                        r.error_message()
-                    );
-                    continue;
+    /// A request to node `i` failed: logged, and counted against it.
+    fn node_failed(&self, i: usize, err: &std::io::Error) {
+        let name = &self.nodes.configs()[i].name;
+        log::warn!("node {name}: {err}");
+        self.nodes.failed(i, &err.to_string());
+    }
+
+    /// Asks node `i` for its status and sandboxes, updates what is known
+    /// of it, and makes the store agree. A node that does not answer, or
+    /// answers nonsense, keeps its records and counts a failure.
+    pub fn probe(&self, i: usize) {
+        let node = &self.nodes.configs()[i];
+        let timeout = Duration::from_secs_f64(self.config.node_timeout);
+        let asked = Instant::now();
+        let status = self
+            .call_max(node, "GET", "/v1/node", None, b"", timeout, MAX_STATUS)
+            .map_err(|e| e.to_string())
+            .and_then(|r| match r.status {
+                200 => serde_json::from_slice::<NodeStatus>(&r.body)
+                    .map_err(|_| "a malformed status".to_string()),
+                status => Err(format!("status {status} for its status")),
+            })
+            .and_then(|status| check_status(status, &node.name));
+        let load = match status {
+            Ok(load) => load,
+            Err(why) => {
+                log::debug!("node {}: probe: {why}", node.name);
+                self.nodes.failed(i, &why);
+                return;
+            }
+        };
+        let list = self
+            .call_max(
+                node,
+                "GET",
+                "/v1/sandboxes",
+                None,
+                b"",
+                NODE_TIMEOUT,
+                MAX_LIST,
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|r| match r.status {
+                200 => serde_json::from_slice::<SandboxList>(&r.body)
+                    .map_err(|_| "a malformed sandbox list".to_string()),
+                status => Err(format!("status {status} for its sandboxes")),
+            });
+        let list = match list {
+            Ok(list) => list,
+            Err(why) => {
+                log::warn!("node {}: listing sandboxes: {why}", node.name);
+                self.nodes.failed(i, &why);
+                return;
+            }
+        };
+        let records = list
+            .sandboxes
+            .into_iter()
+            .filter_map(|s| {
+                if !valid_name(&s.tenant) || !valid_name(&s.template) {
+                    return None;
                 }
-                Err(err) => {
-                    log::debug!("node {}: {err}", node.name);
-                    continue;
-                }
-            };
-            let Ok(list) = list else {
-                log::warn!("node {}: a malformed sandbox list", node.name);
-                continue;
-            };
-            let records = list
-                .sandboxes
-                .into_iter()
-                .filter_map(|s| {
-                    Some(Record {
-                        id: SandboxId::parse(&s.id)?,
-                        tenant: s.tenant,
-                        node: node.name.clone(),
-                        template: s.template,
-                    })
+                Some(Record {
+                    id: SandboxId::parse(&s.id)?,
+                    tenant: s.tenant,
+                    node: node.name.clone(),
+                    template: s.template,
                 })
-                .collect();
-            self.store.replace_node(&node.name, asked, records);
-        }
+            })
+            .collect();
+        self.nodes.reported(i, asked, load);
+        self.store.replace_node(&node.name, asked, records);
+    }
+
+    /// Probes every node at once; returns when all answered or failed.
+    pub fn reconcile(&self) {
+        std::thread::scope(|scope| {
+            for i in 0..self.nodes.configs().len() {
+                scope.spawn(move || self.probe(i));
+            }
+        });
     }
 
     fn templates(&self, tenant: &Tenant) -> Response {
-        // What a tenant may know of a template: not the node's process ids
-        // or how often it restarted.
+        // What a tenant may know of a template: its name and whether a
+        // sandbox can be made of it now. Not the nodes it is on.
         #[derive(serde::Serialize)]
         struct PublicTemplate {
             name: String,
             ready: bool,
         }
-        let mut templates: Vec<TemplateStatus> = Vec::new();
-        for node in &self.nodes {
-            let Ok(answer) = self.call(node, "GET", "/v1/node", None, b"", NODE_TIMEOUT) else {
-                continue;
-            };
-            let Ok(status) = serde_json::from_slice::<NodeStatus>(&answer.body) else {
-                continue;
-            };
-            for t in status.templates {
-                let visible = t.tenant.as_ref().is_none_or(|only| *only == tenant.name);
-                if visible && !templates.iter().any(|o| o.name == t.name && o.ready) {
-                    templates.retain(|o| o.name != t.name);
-                    templates.push(t);
-                }
-            }
-        }
-        templates.sort_by(|a, b| a.name.cmp(&b.name));
-        let templates: Vec<PublicTemplate> = templates
+        let templates: Vec<PublicTemplate> = self
+            .nodes
+            .templates(&tenant.name)
             .into_iter()
-            .map(|t| PublicTemplate {
-                name: t.name,
-                ready: t.ready,
-            })
+            .map(|(name, ready)| PublicTemplate { name, ready })
             .collect();
         Response::json(200, &serde_json::json!({ "templates": templates }))
     }
@@ -239,26 +274,32 @@ impl Api {
             Ok(bytes) => bytes,
             Err(e) => return error(500, "internal", &e.to_string()),
         };
-        // Placement: the first node that takes it. A node that is full,
-        // starting its template or does not have it says so, and the next
-        // one is asked.
-        let mut last = error(404, "template_not_found", "no node has this template");
-        for node in &self.nodes {
+        // Placement (see `nodes`): the least loaded node that should take
+        // it, then the next, until one makes it. A node that answers did
+        // not make it unless it said `201`, so the next may be asked.
+        let mut tried: Vec<usize> = Vec::new();
+        let mut answers: Vec<String> = Vec::new();
+        loop {
+            let i = match self.nodes.place(&body.template, &tenant.name, &tried) {
+                Ok(i) => i,
+                Err(why) => return Self::no_place(why, &answers),
+            };
+            tried.push(i);
+            let node = &self.nodes.configs()[i];
             match self.call(node, "POST", "/v1/sandboxes", None, &create, NODE_TIMEOUT) {
                 Ok(answer) if answer.status == 201 => {
-                    let Ok(info) = serde_json::from_slice::<SandboxInfo>(&answer.body) else {
+                    self.nodes.answered(i);
+                    let info = serde_json::from_slice::<SandboxInfo>(&answer.body)
+                        .ok()
+                        .filter(|info| info.id == id.to_string());
+                    let Some(info) = info else {
                         log::warn!("node {}: a malformed create answer", node.name);
-                        let target = format!("/v1/sandboxes/{id}");
-                        let _ = self.call(
-                            node,
-                            "DELETE",
-                            &target,
-                            Some(&tenant.name),
-                            b"",
-                            NODE_TIMEOUT,
-                        );
-                        return error(502, "node_failed", "the node answered nonsense");
+                        self.nodes.done(i, false);
+                        self.nodes.failed(i, "a malformed create answer");
+                        self.made_maybe(i, tenant, id, &body.template);
+                        return error(502, "node_failed", "the sandbox could not be made");
                     };
+                    self.nodes.done(i, true);
                     self.store.insert(Record {
                         id,
                         tenant: tenant.name.clone(),
@@ -267,53 +308,138 @@ impl Api {
                     });
                     return Response::json(201, &info);
                 }
-                Ok(answer) if matches!(answer.status, 503 | 404) => {
-                    last = answer.into_response();
+                Ok(answer) => {
+                    self.nodes.answered(i);
+                    self.nodes.done(i, false);
+                    let code = answer.error_code().unwrap_or_default();
+                    log::debug!(
+                        "node {}: create refused: {} {code}",
+                        node.name,
+                        answer.status
+                    );
+                    answers.push(code);
                 }
-                Ok(answer) => return answer.into_response(),
-                // Nothing listens there: the node did not get the request.
-                Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    last = Self::unreachable(node, &err);
+                // Nothing was sent: the next node may be asked.
+                Err(err) if http::not_sent(&err) => {
+                    self.nodes.done(i, false);
+                    self.node_failed(i, &err);
                 }
                 Err(err) => {
                     // The node may have made the sandbox without its
                     // answer arriving. Offering the same id to another
-                    // node could make it twice, so placement stops here;
-                    // the sandbox is removed if the node can be told, and
-                    // otherwise the next reconciliation finds it (the
-                    // tenant sees it in its list and it counts).
-                    let target = format!("/v1/sandboxes/{id}");
-                    let _ = self.call(
-                        node,
-                        "DELETE",
-                        &target,
-                        Some(&tenant.name),
-                        b"",
-                        NODE_TIMEOUT,
-                    );
-                    return Self::unreachable(node, &err);
+                    // node could make it twice, so placement stops here.
+                    self.nodes.done(i, false);
+                    self.node_failed(i, &err);
+                    self.made_maybe(i, tenant, id, &body.template);
+                    return Self::unreachable();
                 }
             }
         }
-        last
+    }
+
+    /// Node `i` may have made sandbox `id` (its answer to the create was
+    /// lost or broken): it is removed if the node says so, and otherwise
+    /// kept in the store, where it counts against the tenant's limit until
+    /// the node's next list shows whether it exists (and the tenant sees it
+    /// then if it does).
+    fn made_maybe(&self, i: usize, tenant: &Tenant, id: SandboxId, template: &str) {
+        let node = &self.nodes.configs()[i];
+        let target = format!("/v1/sandboxes/{id}");
+        let deleted = self
+            .call(
+                node,
+                "DELETE",
+                &target,
+                Some(&tenant.name),
+                b"",
+                NODE_TIMEOUT,
+            )
+            .is_ok_and(|a| a.status == 204);
+        if !deleted {
+            self.store.insert(Record {
+                id,
+                tenant: tenant.name.clone(),
+                node: node.name.clone(),
+                template: template.to_string(),
+            });
+        }
+    }
+
+    /// The answer when no node made the sandbox. `answers` are the error
+    /// codes of the nodes that refused it.
+    fn no_place(why: NoPlace, answers: &[String]) -> Response {
+        let not_found = || error(404, "template_not_found", "no such template");
+        let not_ready = || {
+            error(
+                503,
+                "template_not_ready",
+                "the template is starting; try again shortly",
+            )
+        };
+        let full = || {
+            error(
+                503,
+                "node_full",
+                "no node can take a sandbox now; try again shortly",
+            )
+        };
+        if answers.is_empty() {
+            return match why {
+                NoPlace::UnknownTemplate => not_found(),
+                NoPlace::NotReady => not_ready(),
+                NoPlace::Full => full(),
+            };
+        }
+        if answers.iter().all(|c| c == "template_not_found") {
+            not_found()
+        } else if answers.iter().any(|c| c == "template_not_ready") {
+            not_ready()
+        } else {
+            full()
+        }
     }
 
     fn list(&self, tenant: &Tenant) -> Response {
-        let mut sandboxes = Vec::new();
         let target = format!("/v1/sandboxes?tenant={}", percent_encode(&tenant.name));
-        for node in &self.nodes {
-            let answer = self
-                .call(node, "GET", &target, None, b"", NODE_TIMEOUT)
-                .ok()
-                .filter(|a| a.status == 200)
-                .and_then(|a| serde_json::from_slice::<SandboxList>(&a.body).ok());
-            match answer {
+        // Every node that answers, at once; an unreachable one is not asked
+        // (its sandboxes are not listed while it is).
+        let lists: Vec<Option<SandboxList>> = std::thread::scope(|scope| {
+            let asks: Vec<_> = (0..self.nodes.configs().len())
+                .map(|i| {
+                    let target = &target;
+                    scope.spawn(move || {
+                        if !self.nodes.reachable(i) {
+                            return None;
+                        }
+                        let node = &self.nodes.configs()[i];
+                        match self.call_max(node, "GET", target, None, b"", NODE_TIMEOUT, MAX_LIST)
+                        {
+                            Ok(a) if a.status == 200 => {
+                                self.nodes.answered(i);
+                                serde_json::from_slice::<SandboxList>(&a.body).ok()
+                            }
+                            Ok(_) => None,
+                            Err(err) => {
+                                self.node_failed(i, &err);
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
+            asks.into_iter().map(|a| a.join().ok().flatten()).collect()
+        });
+        let mut sandboxes = Vec::new();
+        for (i, list) in lists.into_iter().enumerate() {
+            let node = &self.nodes.configs()[i].name;
+            match list {
+                // Only what this node runs for this tenant.
                 Some(list) => sandboxes.extend(
                     list.sandboxes
                         .into_iter()
-                        .filter(|s| s.tenant == tenant.name),
+                        .filter(|s| s.tenant == tenant.name && s.node == *node),
                 ),
-                None => log::warn!("node {}: no sandbox list", node.name),
+                None => log::debug!("node {node}: no sandbox list"),
             }
         }
         sandboxes.sort_by_key(|s| (s.created_at, s.id.clone()));
@@ -335,9 +461,13 @@ impl Api {
         else {
             return not_found();
         };
-        let Some(node) = self.node(&record.node) else {
+        let Some(i) = self.nodes.index(&record.node) else {
             return not_found();
         };
+        if !self.nodes.reachable(i) {
+            return Self::unreachable();
+        }
+        let node = &self.nodes.configs()[i];
         let method = request.method.as_str();
         let (target, timeout) = match (method, rest) {
             ("GET" | "DELETE", []) => (format!("/v1/sandboxes/{sandbox}"), NODE_TIMEOUT),
@@ -419,8 +549,14 @@ impl Api {
             &request.body,
             timeout,
         ) {
-            Ok(answer) => answer,
-            Err(err) => return Self::unreachable(node, &err),
+            Ok(answer) => {
+                self.nodes.answered(i);
+                answer
+            }
+            Err(err) => {
+                self.node_failed(i, &err);
+                return Self::unreachable();
+            }
         };
         // Gone on the node (ended, failed, removed): forget it here.
         let gone = matches!(
@@ -456,6 +592,105 @@ impl Handler for Api {
             ("POST", ["v1", "sandboxes"]) => self.create(tenant, &request),
             ("GET", ["v1", "sandboxes"]) => self.list(tenant),
             (_, ["v1", "sandboxes", id, rest @ ..]) => self.forward(tenant, id, &request, rest),
+            _ => error(404, "no_route", "no such endpoint"),
+        }
+    }
+}
+
+/// The operators' API, served on a listener of its own (`admin.listen`)
+/// with a token of its own; the tenants' listener does not route to it.
+///
+/// | Method and path | Answer |
+/// |---|---|
+/// | `GET /admin/v1/nodes` | `{"nodes": [NodeView]}` |
+/// | `GET /admin/v1/nodes/{name}` | `NodeView` |
+/// | `POST /admin/v1/nodes/{name}/drain` | `NodeView`, once the node drains |
+/// | `POST /admin/v1/nodes/{name}/undrain` | `NodeView`, once it takes sandboxes again |
+pub struct Admin {
+    pub api: Arc<Api>,
+    pub token: String,
+}
+
+impl Admin {
+    fn set_draining(&self, i: usize, draining: bool) -> Response {
+        let api = &self.api;
+        let node = &api.nodes.configs()[i];
+        let body = match serde_json::to_vec(&DrainRequest { draining }) {
+            Ok(body) => body,
+            Err(e) => return error(500, "internal", &e.to_string()),
+        };
+        let timeout = Duration::from_secs_f64(api.config.node_timeout);
+        let asked = Instant::now();
+        let answer = api.call_max(
+            node,
+            "POST",
+            "/v1/node/drain",
+            None,
+            &body,
+            timeout,
+            MAX_STATUS,
+        );
+        let status = match answer {
+            Ok(a) if a.status == 200 => serde_json::from_slice::<NodeStatus>(&a.body)
+                .map_err(|_| "a malformed status".to_string())
+                .and_then(|s| check_status(s, &node.name)),
+            Ok(a) => Err(format!(
+                "the node answered {}: {}",
+                a.status,
+                a.error_message()
+            )),
+            Err(err) => {
+                api.node_failed(i, &err);
+                Err(err.to_string())
+            }
+        };
+        match status {
+            Ok(load) if load.draining == draining => {
+                log::info!(
+                    "admin: node={} draining={draining} (asked by an operator)",
+                    node.name
+                );
+                api.nodes.reported(i, asked, load);
+                Response::json(200, &api.nodes.view(i))
+            }
+            Ok(_) => error(502, "node_failed", "the node did not change"),
+            Err(why) => error(
+                502,
+                "node_unreachable",
+                &format!("node {}: {why}", node.name),
+            ),
+        }
+    }
+}
+
+impl Handler for Admin {
+    fn body_limit(&self, _method: &str, _path: &str) -> usize {
+        4096
+    }
+
+    fn handle(&self, request: Request) -> Response {
+        if !request.bearer().is_some_and(|t| token_eq(t, &self.token)) {
+            return error(401, "unauthorized", "a valid admin token is required")
+                .with_header("WWW-Authenticate", "Bearer".into());
+        }
+        let nodes = &self.api.nodes;
+        let segments = request.segments();
+        match (request.method.as_str(), segments.as_slice()) {
+            ("GET", ["admin", "v1", "nodes"]) => {
+                let views: Vec<_> = (0..nodes.configs().len()).map(|i| nodes.view(i)).collect();
+                Response::json(200, &serde_json::json!({ "nodes": views }))
+            }
+            (method, ["admin", "v1", "nodes", name, rest @ ..]) => {
+                let Some(i) = nodes.index(name) else {
+                    return error(404, "node_not_found", "no such node");
+                };
+                match (method, rest) {
+                    ("GET", []) => Response::json(200, &nodes.view(i)),
+                    ("POST", ["drain"]) => self.set_draining(i, true),
+                    ("POST", ["undrain"]) => self.set_draining(i, false),
+                    _ => error(404, "no_route", "no such endpoint"),
+                }
+            }
             _ => error(404, "no_route", "no such endpoint"),
         }
     }

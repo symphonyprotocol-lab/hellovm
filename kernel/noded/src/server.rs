@@ -5,7 +5,8 @@
 //!
 //! | Method and path | Body | Answer |
 //! |---|---|---|
-//! | `GET /v1/node` | | `NodeStatus` |
+//! | `GET /v1/node` | | `NodeStatus` (templates, load, draining) |
+//! | `POST /v1/node/drain` | `DrainRequest` | `NodeStatus` |
 //! | `GET /v1/sandboxes` | | `SandboxList` (all tenants, or `?tenant=`) |
 //! | `POST /v1/sandboxes` | `NodeCreate` | `201` `SandboxInfo` |
 //! | `GET /v1/sandboxes/{id}` | | `SandboxInfo` |
@@ -24,7 +25,7 @@ use std::sync::Arc;
 
 use hellovm_control::http::{Handler, Request, Response};
 use hellovm_control::ids::token_eq;
-use hellovm_control::types::{self, PollQuery, SandboxList};
+use hellovm_control::types::{self, DrainRequest, PollQuery, SandboxList};
 use serde::de::DeserializeOwned;
 
 use crate::node::{ApiError, Node};
@@ -56,6 +57,10 @@ impl NodeApi {
         let node = &self.node;
         match (request.method.as_str(), segments.as_slice()) {
             ("GET", ["v1", "node"]) => Response::json(200, &node.status()),
+            ("POST", ["v1", "node", "drain"]) => respond(
+                200,
+                json_body::<DrainRequest>(request).map(|r| node.set_draining(r.draining)),
+            ),
             ("GET", ["v1", "sandboxes"]) => Response::json(
                 200,
                 &SandboxList {
