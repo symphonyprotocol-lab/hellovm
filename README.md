@@ -756,7 +756,8 @@ gate. When the API is deployed apart from the nodes (U6), `api` and
 `control` would move to a top-level `services/` workspace, with `noded`
 staying next to the kernel it drives.
 
-**Running it.** One egress proxy, one `noded` and one `api` per host here:
+**Running it.** One egress proxy and one `noded` per host, and one `api`
+for all of them (see **Scheduling** below for several nodes):
 
 ```sh
 hellovm-egress --listen /run/hellovm/egress/egress.sock --policy /etc/hellovm/egress.policy &
@@ -767,7 +768,7 @@ hellovm-api --config /etc/hellovm/api.json &
 ```json
 {"node": "node-1", "listen": "127.0.0.1:7071", "token_file": "/etc/hellovm/node.token",
  "hellovm": "/usr/local/bin/hellovm", "state_dir": "/run/hellovm-noded",
- "egress": "/run/hellovm/egress/egress.sock", "max_sandboxes": 64,
+ "egress": "/run/hellovm/egress/egress.sock", "max_sandboxes": 64, "max_memory_mb": 16384,
  "templates": [{"name": "python", "root": "/", "python": "/usr/bin/python3",
                 "preload": ["json", "decimal", "sqlite3"], "memory_limit_mb": 1024,
                 "fs_limit_mb": 1024}]}
@@ -778,7 +779,8 @@ hellovm-api --config /etc/hellovm/api.json &
  "tenants": [{"name": "acme", "token_file": "/etc/hellovm/acme.token", "max_sandboxes": 10}],
  "nodes": [{"name": "node-1", "addr": "127.0.0.1:7071", "token_file": "/etc/hellovm/node.token"}],
  "default_idle_timeout": 600, "max_idle_timeout": 86400,
- "default_lifetime": 3600, "max_lifetime": 86400}
+ "default_lifetime": 3600, "max_lifetime": 86400,
+ "admin": {"listen": "127.0.0.1:7079", "token_file": "/etc/hellovm/admin.token"}}
 ```
 
 Unknown fields in either file are errors. Tokens are at least 22
@@ -821,8 +823,8 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 | 413 | `too_large` | a body or file over 16 MiB |
 | 422 | `no_match`, `ambiguous` | edit: `old` does not occur, or occurs more than once without `replace_all` |
 | 429 | `tenant_limit` | the tenant has `max_sandboxes` already |
-| 502 | `sandbox_failed`, `node_unreachable` | the sandbox's agent broke (the sandbox is removed); the node does not answer |
-| 503 | `template_not_ready`, `node_full` | try again |
+| 502 | `sandbox_failed`, `node_unreachable` | the sandbox's agent broke (the sandbox is removed); the sandbox's node does not answer, or is marked unreachable (try again later) |
+| 503 | `template_not_ready`, `node_full` | the template is starting, or ready on no node that takes sandboxes; no node has room: try again |
 | 507 | `no_space` | the writable layer is full |
 
 *exec.* `command` runs as `/bin/sh -c COMMAND`; `python` runs the
@@ -1046,7 +1048,10 @@ open files, sockets, threads, modules).
 the public API (the node API is listed in `kernel/noded/src/server.rs`):
 `POST /v1/sandboxes` carries the id, tenant, template and the resolved
 timeouts the API chose. Each node has its own bearer token, which the
-API presents; every request about a sandbox also names its tenant. With
+API presents; every request about a sandbox also names its tenant.
+`GET /v1/node` reports the node's templates and load, and `POST
+/v1/node/drain` (`{"draining": true}` or `false`) stops or resumes its
+taking new sandboxes (see **Scheduling**). With
 many nodes, the node API needs TLS with a certificate per node (mutual
 TLS, so a node knows the API and the API knows the node), which is not
 done: the node API must listen on loopback or a private network until
@@ -1067,8 +1072,9 @@ reservation in the same transaction, and the reconciliation updating
 rows from the nodes. Listing and per-sandbox requests ask the node
 anyway, so what a client sees is fresh.
 
-**Restarts.** The API: nothing is lost; it rebuilds its store from the
-nodes before serving and running sandboxes keep their state (tested).
+**Restarts.** The API: nothing is lost; it rebuilds its store and what
+it knows of every node from the nodes before serving, and running
+sandboxes keep their state (tested, with three nodes too).
 `noded`: its templates die with it (`PR_SET_PDEATHSIG`) and their clones
 with them, so its sandboxes are gone; the next `noded` removes the
 stale sockets, starts the templates again, and the API drops the lost
@@ -1078,6 +1084,139 @@ that doubles up to 30 s), and its sandboxes are gone (tested). Keeping
 sandboxes across a `noded` restart would need the templates and the
 clones' control connections to outlive it (an fd store, re-adoption):
 not done.
+
+**Scheduling.** The API takes any number of nodes and places each new
+sandbox on one of them (`kernel/api/src/nodes.rs`).
+
+*What a node reports.* `GET /v1/node` on `noded`: its templates (name,
+ready, the tenant of a template that is not shared), `sandboxes` and
+`creating` (both count against its `max_sandboxes`), `memory_bytes` (the
+private memory of all its sandboxes, as last measured) and
+`memory_limit_bytes` (`max_memory_mb` in its configuration; by default
+the host's memory, `MemTotal`), and `draining`. `noded` refuses a
+create (`503`) when it is full by count, when its sandboxes hold
+`memory_limit_bytes` or more, and while it drains.
+
+*Node states.* The API probes every node every `reconcile_interval`,
+each on a thread of its own (a slow node does not delay the others):
+`GET /v1/node` within `node_timeout`, then its sandbox list, which
+reconciles the store as before. A node is
+
+| State | Meaning | New sandboxes | Its sandboxes |
+|---|---|---|---|
+| `healthy` | answers | yes | served |
+| `draining` | answers, and says it drains | no | served, can be deleted |
+| `unreachable` | `unhealthy_after` failures in a row | no | `502 node_unreachable` at once |
+| `unknown` | not probed yet (only before the API serves) | no | |
+
+A failure is a probe that got no answer in time, a status or list that
+is not valid (malformed JSON, another node's name, numbers out of
+range, a body over its bound: 1 MiB for a status, 8 MiB for a list), or
+a request about a sandbox that got no answer (a connection that could
+not be made within 5 s, or none in time). Answered requests reset the
+count, so one slow answer does not flap a node. An unreachable node
+becomes healthy again after `healthy_after` good probes in a row (only
+probes bring it back), and its sandboxes are reconciled as they always
+are: those its `noded` still runs are served again, those that died
+with it are dropped (`404`). The first probe decides at once. Every
+change is logged as one line:
+
+```text
+api: info: node state change: node=node-2 from=healthy to=unreachable error="connecting: Connection refused (os error 111)"
+api: info: node state change: node=node-2 from=unreachable to=healthy
+```
+
+*Placement.* Among the nodes that are healthy (not draining, not
+unreachable) and have the template, for this tenant, the API asks first
+those that have it ready and room by what it knows, then the others
+(whose report may be stale: the node decides); in each group the least
+loaded first, a node's load being the larger of its sandboxes over
+`max_sandboxes` and its memory in use over its limit; nodes of equal load
+in random order. A node that refuses (full, starting its template,
+draining) or cannot be connected to is followed by the next; one that
+may have made the sandbox (its answer was lost) ends the attempt, as
+before. Load reports lag by up to `reconcile_interval`, so the API
+counts what it does itself at once: every creation in flight and every
+sandbox it placed are added to the node's reported count until a
+report asked after them arrives. Concurrent creates therefore spread
+over the nodes instead of all going to the one that was emptiest at the
+last report (a thundering herd), and one API needs no randomness to
+avoid that; the random tie-break is for nodes of equal load. When no
+node can take the sandbox the tenant gets `503 node_full` (no room or
+none healthy), `503 template_not_ready` (the template is ready on no
+node that takes sandboxes) or `404 template_not_found` (no node has
+it); the node's own error never reaches the tenant.
+
+*Exactness.* The tenant limit is counted by the API across all nodes
+under one lock, creations in progress included, so concurrent creates
+on several nodes never exceed it (tested with 20 at once). A sandbox
+whose create answer was lost is kept in the store (it counts) unless
+its node confirms deleting it, until the node's next list shows whether
+it exists. The sandboxes of an unreachable node keep counting: deleting
+one answers `502` until the node is back, or the operator removes the
+node from the configuration. Not exact: an API that restarts while a
+node is unreachable does not know that node's sandboxes until it
+answers, so a tenant may then go over its limit by those (it cannot
+create more until it is under it again); and a tenant's sandbox list
+omits the sandboxes of unreachable nodes.
+
+*Templates across nodes.* `GET /v1/templates` answers from the last
+reports, not by asking every node: a template is listed when some node
+has it (for this tenant), and `ready` when it is ready on a node that
+takes sandboxes now, so a create of a template listed as ready is not
+refused for want of one (it may still be for want of room).
+
+*Draining.* `POST /admin/v1/nodes/{name}/drain` (below) tells the node,
+which refuses new sandboxes from then on; its sandboxes run to their
+end and are served and deleted as usual. `.../undrain` reverses it. The
+flag lives in the `noded` process: an API that restarts finds it there,
+and a restarted `noded` (which lost its sandboxes anyway) takes
+sandboxes again. To retire a host: drain it, wait until its sandboxes
+are gone (`report.sandboxes` is 0), stop it, and remove it from the
+configuration.
+
+*The admin API.* Served only when `admin` is configured, on a listener
+of its own (`admin.listen`: keep it on loopback or a private network),
+with a token of its own (`admin.token` or `admin.token_file`, which may
+not be a tenant's or a node's token). The tenants' listener does not
+route `/admin` at all (`404`), and the admin listener takes no tenant
+token (`401`), so a tenant can neither reach it nor learn of nodes
+through it. At most 16 connections.
+
+| Method and path | Answer |
+|---|---|
+| `GET /admin/v1/nodes` | `{"nodes": [NODE...]}` |
+| `GET /admin/v1/nodes/{name}` | `NODE`: `{"name", "addr", "state", "since", "last_error", "reported_ms_ago", "placed_since_report", "in_flight", "report"}` (`report`: the node's last status: counts, memory, `draining`, templates) |
+| `POST /admin/v1/nodes/{name}/drain` | `NODE`, once the node drains |
+| `POST /admin/v1/nodes/{name}/undrain` | `NODE`, once it takes sandboxes again |
+
+*Configuration.* In the API's file: `nodes` (each `name`, `addr`,
+`token` or `token_file`), `reconcile_interval` (seconds between probes,
+default 2), `node_timeout` (seconds a probe may take, default 5, at most
+60), `unhealthy_after` (default 3) and `healthy_after` (default 2), 1 to
+100 each, and `admin`. In `noded`'s: `max_sandboxes` and
+`max_memory_mb`. With the defaults a node that refuses connections is
+unreachable after about 6 s (three probes 2 s apart; sooner when
+requests to it fail), one that hangs after up to 21 s (each probe waits
+5 s), and either is healthy again about 4 s after it answers.
+
+Rejected: *the node pushing its load* (heartbeats to the API): the API
+would need a listener for nodes and to know the nodes anyway to reach
+them; polling also notices a node that died without a word. *Power of
+two random choices*: it fits many independent schedulers with stale
+views; one API that counts its own placements does better with the
+least loaded. *Placement by free memory alone*: sandboxes are small
+next to their limits, so count and memory both matter, and the larger
+fraction protects whichever runs out first. *Drain state in the API*:
+it would be lost on an API restart, which the nodes outlive; on the
+node, it is what the node does. *Admin routes on the tenants' listener*:
+one leaked or guessed path would be reachable from wherever tenants
+are; a separate listener can be firewalled. *Retrying a create on
+another node after an ambiguous failure*: it could make the sandbox
+twice. Not done (out of scope): moving running sandboxes between nodes,
+several API instances (their in-flight counts would not be shared; the
+tenant limit then needs a shared store), and TLS between the API and
+the nodes (see above).
 
 **Resource limits.** All clones of a template run in the template's
 cgroup: a clone runs before whoever asked for it learns its pid. What
@@ -1188,6 +1327,21 @@ time, tenant isolation for every endpoint, the tenant limit, delete,
 idle timeout, lifetime, the memory limit, a template killed and
 restarted, `noded` killed and restarted with stale sockets, the API
 restarted with sandboxes running, and a clean shutdown.
+`kernel/api/tests/scheduling.rs` runs three `noded`: creates spread by
+load, a full node skipped, draining and undraining (sandboxes on a
+draining node used and deleted), templates that only one node has, the
+tenant limit under 20 concurrent creates, a killed node marked
+unreachable (its sandboxes' `502`, which names nothing of the node,
+another tenant's `404`, creates elsewhere), the API restarted with all
+nodes up and with one down, the node back and the state converged, the
+admin API refusing no token, tenant, node and wrong tokens (and absent
+from the tenants' listener), and fake nodes answering garbage, a
+terabyte `Content-Length`, an endless body, another node's name,
+absurd numbers, nothing at all, or nonsense refusals of every create,
+with the API's memory under 64 MiB after. `kernel/api` has unit tests
+for the health state machine, the placement rule (order, ties, spread of
+creations in flight, full, draining, unreachable and foreign
+templates), checking reports, and its configuration.
 `kernel/noded` has unit tests for the agent protocol (against the
 host's Python: execs, output frames, cancel, the stateful interpreter's
 state, interrupt, kill, end and reset), the frame parser (frames in any
