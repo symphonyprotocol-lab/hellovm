@@ -66,9 +66,29 @@ fn node(built: &[&str]) -> bool {
     true
 }
 
+/// `node --test` and the compiled test files of a package (named, so that
+/// Node's own discovery does not also pick up the TypeScript sources).
+fn node_tests(dir: &str) -> Vec<String> {
+    let mut args = vec!["--test".to_string(), "--test-concurrency=1".to_string()];
+    let mut files: Vec<String> = std::fs::read_dir(repo().join(dir).join("dist/test"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".test.js"))
+                .map(|name| format!("dist/test/{name}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    assert!(!files.is_empty(), "no compiled tests in {dir}/dist/test");
+    args.extend(files);
+    args
+}
+
 /// Runs `program args` in `dir` against a fresh plane; panics with its
 /// output and the plane's logs if it fails.
-fn run_suite(what: &str, dir: &str, program: &str, args: &[&str], env: &[(&str, String)]) {
+fn run_suite(what: &str, dir: &str, program: &str, args: &[String], env: &[(&str, String)]) {
     let Some(plane) = Plane::start(PlaneOptions {
         acme_max: 12,
         ..PlaneOptions::default()
@@ -122,7 +142,7 @@ fn python_sdk() {
         "the Python SDK's tests",
         "sdk/python",
         python,
-        &["-m", "unittest", "discover", "-s", "tests", "-t", "tests", "-v"],
+        &["-m", "unittest", "discover", "-s", "tests", "-t", "tests", "-v"].map(String::from),
         &[("PYTHONPATH", repo().join("sdk/python/src").display().to_string())],
     );
 }
@@ -137,7 +157,7 @@ fn typescript_sdk() {
         "the TypeScript SDK's tests",
         "sdk/ts",
         "node",
-        &["--test", "--test-concurrency=1", "dist/test/"],
+        &node_tests("sdk/ts"),
         &[],
     );
 }
@@ -152,7 +172,7 @@ fn mcp_server() {
         "the MCP server's tests",
         "sdk/mcp",
         "node",
-        &["--test", "--test-concurrency=1", "dist/test/"],
+        &node_tests("sdk/mcp"),
         &[],
     );
 }
