@@ -38,6 +38,7 @@ LINGER = 0.1
 INTERRUPT_GRACE = 2.0
 MAX_VALUE = 16 * 1024
 MAX_TRACEBACK = 16 * 1024
+MAX_TYPE = 200
 MAX_WORKER_ANSWER = 1 << 20
 HOME = os.environ.get("HOME") or "/root"
 
@@ -564,7 +565,7 @@ def worker_main():
             except BaseException:
                 text, message = f"{type(err).__name__}\n", ""
             answer["error"] = {
-                "type": type(err).__name__,
+                "type": bounded(type(err).__name__, MAX_TYPE),
                 "message": bounded(message, MAX_VALUE),
                 "traceback": bounded(text, MAX_TRACEBACK),
             }
@@ -671,14 +672,19 @@ def run_stateful(request, body):
             message = "the interpreter ended; its state is lost"
         header.update(status_fields(status) if status is not None else {"exit_code": None, "signal": 9})
         error = {"type": kind, "message": message, "traceback": ""}
-    trace = b""
+    # The message and the traceback travel in the body like the value: a
+    # header is ASCII-escaped JSON, in which 16384 characters can be six
+    # times as many bytes, more than noded takes for a header.
+    message = trace = b""
     if error:
+        message = str(error.get("message") or "").encode()
         trace = str(error.get("traceback") or "").encode()
-        header["error"] = {"type": str(error.get("type")), "message": str(error.get("message"))}
+        header["error"] = {"type": str(error.get("type"))[:MAX_TYPE]}
+        header["message_len"] = len(message)
         header["traceback_len"] = len(trace)
     header["state_lost"] = lost
     header["duration_ms"] = (time.monotonic() - start) * 1000.0
-    return header, value + trace
+    return header, value + message + trace
 
 
 def op_reset(request, body):

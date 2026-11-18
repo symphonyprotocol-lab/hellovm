@@ -41,7 +41,10 @@ pub struct Config {
 }
 
 fn default_per_client() -> usize {
-    32
+    // Following an exec's output takes a connection per sandbox for up to
+    // 30 s at a time: room for a client with many sandboxes, and still
+    // half of all connections left for the others.
+    128
 }
 
 fn default_idle() -> f64 {

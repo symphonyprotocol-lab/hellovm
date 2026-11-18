@@ -300,7 +300,16 @@ mod tests {
         let _live = std::os::unix::net::UnixListener::bind(&live_path).unwrap();
         let other = dir.join("notes.sock");
         std::fs::write(&other, b"not a socket").unwrap();
-        assert_eq!(clean_dir(&dir).unwrap(), 1);
+        // Another test of this process may be starting a child right now:
+        // between its fork and its exec the child holds a copy of the
+        // listener just dropped, and the socket still answers. Only then.
+        let start = Instant::now();
+        let mut removed = clean_dir(&dir).unwrap();
+        while stale.exists() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+            removed += clean_dir(&dir).unwrap();
+        }
+        assert_eq!(removed, 1);
         assert!(!stale.exists());
         assert!(live_path.exists());
         assert!(other.exists());

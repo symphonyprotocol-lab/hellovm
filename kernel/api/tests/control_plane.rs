@@ -1020,6 +1020,29 @@ fn streamed_execs_and_cancel() {
     let r = plane.poll(ACME, &id, &exec, 0, 1.0);
     assert!(matches!(r.status, 404 | 410), "{}", r.status);
     assert_eq!(plane.delete(BETA, &other), 204);
+
+    // At most four polls wait on one exec at once: the next is refused,
+    // and has room again when one of them ends.
+    let quiet = id_of(&plane.create(ACME, json!({})));
+    let exec = plane.start_exec(ACME, &quiet, json!({"command": "sleep 30", "timeout": 60}));
+    let waiting: Vec<_> = (0..4)
+        .map(|_| {
+            let addr = plane.api_addr();
+            let target = format!("/v1/sandboxes/{quiet}/execs/{exec}?cursor=0&wait=20");
+            std::thread::spawn(move || common::api_call(&addr, ACME, "GET", &target, b"").unwrap())
+        })
+        .collect();
+    eventually(Duration::from_secs(10), "a fifth poll is taken", || {
+        let r = plane.poll(ACME, &quiet, &exec, 0, 0.0);
+        r.status == 429 && r.code() == "too_many_polls"
+    });
+    assert_eq!(plane.cancel(ACME, &quiet, &exec).status, 200);
+    for poll in waiting {
+        let r = poll.join().unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["state"], "done");
+    }
+    assert_eq!(plane.poll(ACME, &quiet, &exec, 0, 0.0).status, 200);
 }
 
 #[test]
@@ -1083,6 +1106,42 @@ fn stateful_python() {
     let r = plane.py(ACME, &id, "syntax error here");
     assert_eq!(r["error"]["type"], "SyntaxError");
     assert_eq!(plane.py(ACME, &id, "x")["value"], "42");
+
+    // A long message that is not ASCII, and a type with a very long name:
+    // bounded, told, and the sandbox and its state stay.
+    let r = plane.py(ACME, &id, "raise ValueError('\u{4e2d}' * 20000 + 'end')");
+    assert_eq!(r["error"]["type"], "ValueError", "{r}");
+    let message = r["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with('\u{4e2d}')
+            && message.ends_with("end")
+            && message.contains("characters omitted"),
+        "{} characters",
+        message.chars().count()
+    );
+    let r = plane.py(ACME, &id, "raise type('E' * 100000, (Exception,), {})('m')");
+    let kind = r["error"]["type"].as_str().unwrap();
+    assert!(
+        kind.starts_with("EEE") && kind.len() <= 400,
+        "{}",
+        kind.len()
+    );
+    assert_eq!(r["error"]["message"], "m");
+    assert_eq!(plane.py(ACME, &id, "x")["value"], "42");
+
+    // An interrupt that the code held off until it had ended (the timeout
+    // came while it blocked SIGINT) is not delivered to the next call.
+    let r = plane.exec(
+        ACME,
+        &id,
+        json!({"python": "import signal, time\nsignal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})\ntime.sleep(1.2)\nlate = 'done'", "stateful": true, "timeout": 0.4}),
+    );
+    assert_eq!(r["timed_out"], true, "{r}");
+    assert!(r.get("error").is_none_or(|e| e.is_null()), "{r}");
+    assert_eq!(r["state_lost"], false, "{r}");
+    let r = plane.py(ACME, &id, "late + str(x)");
+    assert_eq!(r["value"], "'done42'", "{r}");
+    assert!(r.get("error").is_none_or(|e| e.is_null()), "{r}");
 
     // Streamed and cancelled: interrupted, the state kept.
     let exec = plane.start_exec(

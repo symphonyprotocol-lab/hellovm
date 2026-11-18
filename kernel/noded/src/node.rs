@@ -18,7 +18,7 @@ use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -51,7 +51,7 @@ const EXEC_GRACE: Duration = Duration::from_secs(10);
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// Largest body of an exec's final answer: a stateful call's value and
 /// traceback (characters of up to 4 bytes).
-const MAX_FINAL_BODY: usize = 4 * (types::MAX_VALUE + types::MAX_TRACEBACK) + 4096;
+const MAX_FINAL_BODY: usize = 4 * (2 * types::MAX_VALUE + types::MAX_TRACEBACK) + 4096;
 /// Longest wait for a cancel frame to be written.
 const CANCEL_WRITE: Duration = Duration::from_secs(5);
 /// Longest idle timeout and lifetime a sandbox may have: a week.
@@ -160,6 +160,22 @@ pub struct Exec {
     timeout: Duration,
     state: Mutex<ExecInner>,
     changed: Condvar,
+    /// Polls waiting for its output now.
+    polls: AtomicUsize,
+}
+
+/// Most polls that may wait on one exec at once: each holds a connection
+/// (here and at the API) for up to the longest wait, and a tenant must not
+/// take the node's connections with polls of one exec.
+const MAX_POLLS: usize = 4;
+
+/// Counts a poll while it waits.
+struct Polling<'a>(&'a AtomicUsize);
+
+impl Drop for Polling<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct ExecInner {
@@ -1047,6 +1063,7 @@ impl Node {
                     result: None,
                 }),
                 changed: Condvar::new(),
+                polls: AtomicUsize::new(0),
             });
             made = Some(Arc::clone(&exec));
             Waiting::Exec(exec)
@@ -1131,6 +1148,15 @@ impl Node {
         let sandbox = self.get(id, tenant)?;
         let exec = sandbox.find_exec(exec_id)?;
         sandbox.touch();
+        if exec.polls.fetch_add(1, Ordering::SeqCst) >= MAX_POLLS {
+            exec.polls.fetch_sub(1, Ordering::SeqCst);
+            return Err(ApiError::new(
+                429,
+                "too_many_polls",
+                format!("at most {MAX_POLLS} polls of one exec at once"),
+            ));
+        }
+        let _polling = Polling(&exec.polls);
         let deadline = Instant::now() + Duration::from_secs_f64(query.wait);
         let mut inner = lock(&exec.state);
         loop {
@@ -1343,11 +1369,16 @@ fn exec_result(frame: &Frame, inner: &ExecInner, exec: &Exec) -> Result<ExecResu
     };
     if exec.kind == ExecKind::Stateful {
         let value_len = length("value_len")?;
+        let message_len = length("message_len")?;
         let traceback_len = length("traceback_len")?;
-        if value_len.checked_add(traceback_len) != Some(frame.body.len()) {
-            return Err("value and traceback lengths do not match the body".into());
+        let total = value_len
+            .checked_add(message_len)
+            .and_then(|n| n.checked_add(traceback_len));
+        if total != Some(frame.body.len()) {
+            return Err("value, message and traceback lengths do not match the body".into());
         }
-        let (value, traceback) = frame.body.split_at(value_len);
+        let (value, rest) = frame.body.split_at(value_len);
+        let (message, traceback) = rest.split_at(message_len);
         if answer.get("value_len").is_some_and(|v| !v.is_null()) {
             result.value = Some(clip(
                 &String::from_utf8_lossy(value),
@@ -1365,7 +1396,7 @@ fn exec_result(frame: &Frame, inner: &ExecInner, exec: &Exec) -> Result<ExecResu
                 };
                 Some(ExecError {
                     kind: clip(text("type")?, 200),
-                    message: clip(text("message")?, types::MAX_VALUE + 100),
+                    message: clip(&String::from_utf8_lossy(message), types::MAX_VALUE + 100),
                     traceback: clip(
                         &String::from_utf8_lossy(traceback),
                         types::MAX_TRACEBACK + 100,
@@ -1405,6 +1436,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             state: Mutex::new(inner(64)),
             changed: Condvar::new(),
+            polls: AtomicUsize::new(0),
         }
     }
 
@@ -1442,23 +1474,28 @@ mod tests {
         let stateful = exec(ExecKind::Stateful);
         let mut answer = good.clone();
         answer["value_len"] = json!(2);
+        answer["message_len"] = json!(3);
         answer["traceback_len"] = json!(5);
-        answer["error"] = json!({"type": "ValueError", "message": "m"});
+        answer["error"] = json!({"type": "ValueError"});
         answer["state_lost"] = json!(false);
-        let r = exec_result(&frame(answer.clone(), b"42Trace"), &held, &stateful).unwrap();
+        let r = exec_result(&frame(answer.clone(), b"42badTrace"), &held, &stateful).unwrap();
         assert_eq!(r.value.as_deref(), Some("42"));
         let error = r.error.unwrap();
         assert_eq!(
-            (error.kind.as_str(), error.traceback.as_str()),
-            ("ValueError", "Trace")
+            (
+                error.kind.as_str(),
+                error.message.as_str(),
+                error.traceback.as_str()
+            ),
+            ("ValueError", "bad", "Trace")
         );
         assert_eq!(r.state_lost, Some(false));
         // Lengths that do not add up, or that overflow.
-        assert!(exec_result(&frame(answer.clone(), b"42Trac"), &held, &stateful).is_err());
+        assert!(exec_result(&frame(answer.clone(), b"42badTrac"), &held, &stateful).is_err());
         answer["value_len"] = json!(u64::MAX);
-        assert!(exec_result(&frame(answer.clone(), b"42Trace"), &held, &stateful).is_err());
+        assert!(exec_result(&frame(answer.clone(), b"42badTrace"), &held, &stateful).is_err());
         answer["value_len"] = json!(2);
         answer["error"] = json!("nope");
-        assert!(exec_result(&frame(answer, b"42Trace"), &held, &stateful).is_err());
+        assert!(exec_result(&frame(answer, b"42badTrace"), &held, &stateful).is_err());
     }
 }

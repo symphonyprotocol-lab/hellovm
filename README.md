@@ -868,7 +868,9 @@ no output. Order between the two streams is exact only for output
 written at different moments (two pipes are read; a PTY would make it
 one stream). Output not yet read is held by the node as the result is:
 the first `max_output` bytes and the last `max_output` bytes of both
-streams together; a cursor in the part dropped between them gets an
+streams together, in at most 4096 runs of one stream each (output that
+switches between the streams more often than that is dropped in the
+middle the same way); a cursor in the part dropped between them gets an
 `{"type": "omitted", "bytes": N}` event and then the rest. `result` is
 the same as `POST .../exec` answers, with each stream cut by itself.
 `POST .../execs/{exec}/cancel` kills the exec's process group (a
@@ -879,7 +881,9 @@ id is in `GET .../execs`), and a second cancel or one after the end
 changes nothing. A client that goes away does nothing to the exec: it
 runs to its end, its timeout or a cancel, and its output stays readable
 until the next exec of the sandbox starts (a sandbox keeps its latest
-exec only). A poll holds a connection for at most 30 s; an exec holds
+exec only). A poll holds a connection for at most 30 s, and at most
+four polls wait on one exec at once (`429 too_many_polls` for the next);
+an exec holds
 its sandbox for at most its timeout, and the sandbox's lifetime still
 applies.
 
@@ -1129,7 +1133,8 @@ for a file) and to 256 MiB across all connections being read at once,
 read within 60 s, at most 256 connections (one thread each; the next
 gets `503`), 30 s idle between keep-alive requests. A connection takes
 its slot before anyone has authenticated, so the API serves at most
-`max_connections_per_client` (default 32) from one IP address at once
+`max_connections_per_client` (default 128: following an exec holds a
+connection per sandbox) from one IP address at once
 (`429` past it; behind a reverse proxy, raise it and limit there), and a
 response must be taken within 30 s plus its length at 64 KiB/s, or the
 connection is closed. Both services check at start that their open-file

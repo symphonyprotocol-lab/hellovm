@@ -100,7 +100,15 @@ impl Chunk {
     }
 }
 
-/// Both streams interleaved, the first and last `limit` bytes of them.
+/// Most chunks the head and the tail of a [`StreamLog`] keep each. A chunk
+/// is a run of one stream's output and costs an allocation: output that
+/// changes stream every byte must not cost many times its length.
+const MAX_CHUNKS: usize = 4096;
+
+/// Both streams interleaved, the first and last `limit` bytes of them (in
+/// at most [`MAX_CHUNKS`] runs each: a reader of output that switches
+/// streams more often than that is told what it missed, like one left
+/// behind).
 #[derive(Debug)]
 pub struct StreamLog {
     limit: usize,
@@ -149,6 +157,12 @@ impl StreamLog {
     }
 
     pub fn add(&mut self, stream: Stream, mut data: &[u8]) {
+        // The head is full by its bytes, or by its chunks unless this
+        // output continues its last one.
+        let continues = self.head.last().is_some_and(|l| l.stream == stream);
+        if self.head.len() >= MAX_CHUNKS && !continues && self.head_bytes < self.limit {
+            self.head_bytes = self.limit;
+        }
         let room = self.limit - self.head_bytes;
         if room > 0 && !data.is_empty() {
             let take = room.min(data.len());
@@ -189,6 +203,12 @@ impl StreamLog {
             }),
         }
         self.tail_bytes += data.len();
+        while self.tail.len() > MAX_CHUNKS {
+            match self.tail.pop_front() {
+                Some(front) => self.tail_bytes -= front.data.len(),
+                None => break,
+            }
+        }
         while self.tail_bytes > self.limit {
             let over = self.tail_bytes - self.limit;
             let Some(front) = self.tail.front_mut() else {
@@ -356,6 +376,42 @@ mod tests {
         assert!(r.events.is_empty());
         assert_eq!(r.next_cursor, 12);
         assert_eq!(log.read(99, 1024, false).next_cursor, 12);
+    }
+
+    #[test]
+    fn output_that_switches_streams_all_the_time_stays_small() {
+        let mut log = StreamLog::new(1 << 20);
+        for i in 0..100_000u32 {
+            let stream = if i % 2 == 0 {
+                Stream::Stdout
+            } else {
+                Stream::Stderr
+            };
+            log.add(stream, b"x");
+        }
+        assert_eq!(log.total(), 100_000);
+        assert!(log.head.len() <= MAX_CHUNKS && log.tail.len() <= MAX_CHUNKS);
+        // The start, what was dropped, the end: every byte accounted for.
+        let r = log.read(0, 1 << 20, true);
+        assert_eq!(r.next_cursor, 100_000);
+        let mut bytes = 0;
+        let mut omitted = 0;
+        for event in &r.events {
+            match event {
+                OutputEvent::Stdout { data } | OutputEvent::Stderr { data } => {
+                    bytes += data.len() as u64
+                }
+                OutputEvent::Omitted { bytes } => omitted += bytes,
+            }
+        }
+        assert_eq!(bytes, 2 * MAX_CHUNKS as u64);
+        assert_eq!(bytes + omitted, 100_000);
+        // One stream alone fills the head by its bytes, as before.
+        let mut log = StreamLog::new(8);
+        log.add(Stream::Stdout, b"0123");
+        log.add(Stream::Stdout, b"4567");
+        assert_eq!(log.read(0, 64, true).next_cursor, 8);
+        assert_eq!(log.head.len(), 1);
     }
 
     #[test]
