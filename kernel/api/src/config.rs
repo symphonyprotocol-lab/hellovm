@@ -6,7 +6,8 @@
 //!   "tenants": [{"name": "acme", "token_file": "/etc/hellovm/acme.token", "max_sandboxes": 10}],
 //!   "nodes": [{"name": "node-1", "addr": "127.0.0.1:7071", "token_file": "/etc/hellovm/node.token"}],
 //!   "default_idle_timeout": 600, "max_idle_timeout": 86400,
-//!   "default_lifetime": 3600, "max_lifetime": 86400
+//!   "default_lifetime": 3600, "max_lifetime": 86400,
+//!   "admin": {"listen": "127.0.0.1:7079", "token_file": "/etc/hellovm/admin.token"}
 //! }
 //! ```
 
@@ -38,6 +39,40 @@ pub struct Config {
     /// address: raise it there and limit per client in the proxy.
     #[serde(default = "default_per_client")]
     pub max_connections_per_client: usize,
+    /// Seconds a probe of a node (its status) may take.
+    #[serde(default = "default_node_timeout")]
+    pub node_timeout: f64,
+    /// Failures in a row (probes, or requests that got no answer) that
+    /// make a node unreachable.
+    #[serde(default = "default_unhealthy_after")]
+    pub unhealthy_after: u32,
+    /// Good probes in a row that make an unreachable node healthy again.
+    #[serde(default = "default_healthy_after")]
+    pub healthy_after: u32,
+    /// The operators' API, on a listener of its own; none: not served.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// `HOST:PORT`; keep it on loopback or a private network.
+    pub listen: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+}
+
+fn default_node_timeout() -> f64 {
+    5.0
+}
+fn default_unhealthy_after() -> u32 {
+    3
+}
+fn default_healthy_after() -> u32 {
+    2
 }
 
 fn default_per_client() -> usize {
@@ -105,7 +140,7 @@ fn load_token(
     Ok(token)
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -144,6 +179,7 @@ impl Config {
                 config.max_lifetime,
             ),
             ("reconcile_interval", config.reconcile_interval, 3600.0),
+            ("node_timeout", config.node_timeout, 60.0),
         ] {
             if !(value.is_finite() && value > 0.0 && value <= max) {
                 return Err(format!("{what} must be more than 0 and at most {max}"));
@@ -158,6 +194,14 @@ impl Config {
         ] {
             if !(value.is_finite() && value > 0.0 && value <= 7.0 * 86400.0) {
                 return Err(format!("{what} must be more than 0 and at most a week"));
+            }
+        }
+        for (what, value) in [
+            ("unhealthy_after", config.unhealthy_after),
+            ("healthy_after", config.healthy_after),
+        ] {
+            if !(1..=100).contains(&value) {
+                return Err(format!("{what} must be 1 to 100"));
             }
         }
         if config.nodes.is_empty() {
@@ -189,6 +233,23 @@ impl Config {
             });
         }
         Ok(out)
+    }
+
+    /// The admin token, if the admin API is configured. It may not be a
+    /// tenant's or a node's token.
+    pub fn admin_token(
+        &self,
+        tenants: &[Tenant],
+        nodes: &[Node],
+    ) -> Result<Option<String>, String> {
+        let Some(admin) = &self.admin else {
+            return Ok(None);
+        };
+        let token = load_token(&admin.token, &admin.token_file, "admin")?;
+        if tenants.iter().any(|t| t.token == token) || nodes.iter().any(|n| n.token == token) {
+            return Err("admin: the token is also a tenant's or a node's".into());
+        }
+        Ok(Some(token))
     }
 
     pub fn nodes(&self) -> Result<Vec<Node>, String> {
@@ -225,5 +286,28 @@ mod tests {
         let short = Config::parse(&base.replace("TOKEN_B", "short")).unwrap();
         assert!(short.tenants().is_err());
         assert!(Config::parse(&base.replace("\"listen\"", "\"bogus\":1,\"listen\"")).is_err());
+
+        let with = |extra: &str| {
+            Config::parse(&base.replace("\"listen\"", &format!("{extra},\"listen\"")))
+        };
+        let ok = ok.tenants().unwrap();
+        let admin =
+            with(r#""admin":{"listen":"127.0.0.1:0","token":"dddddddddddddddddddddddd"}"#).unwrap();
+        let nodes = admin.nodes().unwrap();
+        assert!(admin.admin_token(&ok, &nodes).unwrap().is_some());
+        let tenant_token =
+            with(r#""admin":{"listen":"127.0.0.1:0","token":"aaaaaaaaaaaaaaaaaaaaaaaa"}"#).unwrap();
+        assert!(tenant_token.admin_token(&ok, &nodes).is_err());
+        let node_token =
+            with(r#""admin":{"listen":"127.0.0.1:0","token":"nnnnnnnnnnnnnnnnnnnnnnnn"}"#).unwrap();
+        assert!(node_token.admin_token(&ok, &nodes).is_err());
+        assert!(with(r#""admin":{"listen":"127.0.0.1:0"}"#)
+            .unwrap()
+            .admin_token(&ok, &nodes)
+            .is_err());
+        assert!(with(r#""unhealthy_after":0"#).is_err());
+        assert!(with(r#""healthy_after":101"#).is_err());
+        assert!(with(r#""node_timeout":0"#).is_err());
+        assert_eq!(with(r#""unhealthy_after":5"#).unwrap().unhealthy_after, 5);
     }
 }

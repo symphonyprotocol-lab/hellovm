@@ -9,6 +9,7 @@
 //!   "state_dir": "/run/hellovm-noded",
 //!   "egress": "/run/hellovm/egress.sock",
 //!   "max_sandboxes": 64,
+//!   "max_memory_mb": 16384,
 //!   "templates": [
 //!     {"name": "python", "root": "/", "python": "/usr/bin/python3",
 //!      "preload": ["json", "decimal"], "memory_limit_mb": 1024,
@@ -43,6 +44,11 @@ pub struct Config {
     pub egress: Option<PathBuf>,
     #[serde(default = "default_max_sandboxes")]
     pub max_sandboxes: usize,
+    /// The private memory all sandboxes may hold together: no sandbox is
+    /// created while what they hold is at or over it. None: the host's
+    /// memory (`MemTotal`).
+    #[serde(default)]
+    pub max_memory_mb: Option<u64>,
     pub templates: Vec<TemplateConfig>,
 }
 
@@ -162,6 +168,9 @@ impl Config {
         if self.max_sandboxes == 0 || self.max_sandboxes > 4096 {
             return Err("max_sandboxes must be 1 to 4096".into());
         }
+        if self.max_memory_mb.is_some_and(|mb| mb == 0 || mb > 1 << 30) {
+            return Err("max_memory_mb must be 1 to 2^30".into());
+        }
         if self.templates.is_empty() {
             return Err("no templates".into());
         }
@@ -268,6 +277,19 @@ mod tests {
         ] {
             assert!(with(bad).is_err(), "{bad}");
         }
+        let memory = |mb: &str| {
+            Config::parse(
+                &BASE
+                    .replace("TEMPLATES", r#"{"name":"p","root":"/"}"#)
+                    .replace(
+                        "\"templates\"",
+                        &format!("\"max_memory_mb\":{mb},\"templates\""),
+                    ),
+            )
+        };
+        assert_eq!(memory("2048").unwrap().max_memory_mb, Some(2048));
+        assert!(memory("0").is_err());
+        assert!(memory("-1").is_err());
         let one =
             with(r#"{"name":"p","root":"/","tenant":"acme","sandbox":"best-effort"}"#).unwrap();
         assert_eq!(one.templates[0].sandbox_mode(), SandboxMode::BestEffort);

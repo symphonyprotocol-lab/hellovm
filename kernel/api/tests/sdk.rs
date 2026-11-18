@@ -11,6 +11,8 @@
 //! unbuilt package, skips a test with a message, or fails it when
 //! `HELLOVM_REQUIRE_E2E=1`.
 
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::path::{Path, PathBuf};

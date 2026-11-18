@@ -153,6 +153,24 @@ pub fn measure(roots: &[(u32, usize)]) -> HashMap<u32, Usage> {
     out
 }
 
+/// The host's memory (`MemTotal` of `/proc/meminfo`), in bytes.
+pub fn host_memory() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_mem_total(&text)
+}
+
+fn parse_mem_total(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kib: u64 = line
+        .trim_start_matches("MemTotal:")
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +243,15 @@ mod tests {
             let _ = kid.kill();
             let _ = kid.wait();
         }
+    }
+
+    #[test]
+    fn mem_total_is_parsed() {
+        assert_eq!(
+            parse_mem_total("MemFree: 1 kB\nMemTotal:       16384 kB\n"),
+            Some(16 << 20)
+        );
+        assert_eq!(parse_mem_total("MemTotal: lots\n"), None);
+        assert_eq!(parse_mem_total(""), None);
     }
 }

@@ -1,8 +1,8 @@
 //! A whole control plane on this host for the tests: an egress proxy (in
 //! this process, with a test name table pointing `web.test` at a local
-//! HTTP server), `hellovm-noded` keeping a CPython template of the host's
-//! `/` warm, and `hellovm-api` with two tenants, all as real processes
-//! talking HTTP on loopback.
+//! HTTP server), one or more `hellovm-noded` keeping a CPython template of
+//! the host's `/` warm, and `hellovm-api` with two tenants (and its admin
+//! API), all as real processes talking HTTP on loopback.
 //!
 //! The binaries are found next to this test's own (`cargo test
 //! --workspace` builds them all). `HELLOVM_REQUIRE_E2E=1` turns a missing
@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 pub const ACME: &str = "acme-token-0123456789abcdef0123456789";
 pub const BETA: &str = "beta-token-0123456789abcdef0123456789";
 pub const NODE_TOKEN: &str = "node-token-0123456789abcdef0123456789";
+pub const ADMIN_TOKEN: &str = "admin-token-0123456789abcdef0123456789";
 pub const WEB_BODY: &str = "hello-egress";
 
 pub fn e2e_required() -> bool {
@@ -176,6 +177,17 @@ pub struct PlaneOptions {
     pub memory_limit_mb: u64,
     pub max_processes: usize,
     pub acme_max: usize,
+    /// How many `noded` (`node-1`, `node-2`, ...).
+    pub nodes: usize,
+    /// `max_sandboxes` per node, by index (32 for those not given).
+    pub node_max_sandboxes: Vec<usize>,
+    /// A node that also has a template `extra` (acme's own).
+    pub extra_template_on: Option<usize>,
+    /// More nodes in the API's configuration: `(name, addr)`, with the
+    /// node token (fakes the test runs itself).
+    pub extra_nodes: Vec<(String, String)>,
+    /// Fields added to the API's configuration.
+    pub api_extra: Value,
 }
 
 impl Default for PlaneOptions {
@@ -184,15 +196,35 @@ impl Default for PlaneOptions {
             memory_limit_mb: 512,
             max_processes: 4096,
             acme_max: 3,
+            nodes: 1,
+            node_max_sandboxes: Vec::new(),
+            extra_template_on: None,
+            extra_nodes: Vec::new(),
+            api_extra: json!({}),
         }
     }
+}
+
+/// One `noded` of the plane.
+pub struct NodeProc {
+    pub name: String,
+    /// A fixed port: the API finds a restarted noded again.
+    pub port: u16,
+    pub service: Option<Service>,
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .unwrap()
+        .port()
 }
 
 pub struct Plane {
     pub dir: PathBuf,
     pub hellovm: PathBuf,
     pub noded_bin: PathBuf,
-    pub noded: Option<Service>,
+    pub nodes: Vec<NodeProc>,
     pub api: Option<Service>,
     pub audit: MemorySink,
     _proxy: ProxyHandle,
@@ -200,7 +232,8 @@ pub struct Plane {
     /// clones), or each tenant has its own.
     pub shared: bool,
     pub options: PlaneOptions,
-    node_port: u16,
+    /// The admin API's port (fixed, so a restarted API keeps it).
+    pub admin_port: u16,
 }
 
 /// A local HTTP server: answers every request with [`WEB_BODY`].
@@ -261,24 +294,32 @@ impl Plane {
                  (a shared template needs Landlock to fence its clones)"
             );
         }
+        let nodes = (0..options.nodes.max(1))
+            .map(|i| NodeProc {
+                name: format!("node-{}", i + 1),
+                port: free_port(),
+                service: None,
+            })
+            .collect();
         let mut plane = Plane {
             dir,
             hellovm,
             noded_bin,
-            noded: None,
+            nodes,
             api: None,
             audit,
             _proxy: proxy,
             shared,
             options,
-            node_port: std::net::TcpListener::bind("127.0.0.1:0")
-                .and_then(|l| l.local_addr())
-                .unwrap()
-                .port(),
+            admin_port: free_port(),
         };
-        plane.write_configs();
-        plane.start_noded();
-        plane.wait_templates(1);
+        for i in 0..plane.nodes.len() {
+            plane.write_node_config(i);
+            plane.start_node(i);
+        }
+        for i in 0..plane.nodes.len() {
+            plane.wait_templates_at(i, 1);
+        }
         plane.start_api();
         Some(plane)
     }
@@ -291,7 +332,7 @@ impl Plane {
         }
     }
 
-    fn write_configs(&self) {
+    fn write_node_config(&self, i: usize) {
         let template = |name: &str, tenant: Option<&str>| {
             let mut t = json!({
                 "name": name, "root": "/", "python": "/usr/bin/python3",
@@ -310,7 +351,7 @@ impl Plane {
             }
             t
         };
-        let templates = if self.shared {
+        let mut templates = if self.shared {
             vec![template("python", None)]
         } else {
             vec![
@@ -318,38 +359,84 @@ impl Plane {
                 template("python-beta", Some("beta")),
             ]
         };
+        if self.options.extra_template_on == Some(i) {
+            templates.push(template("extra", Some("acme")));
+        }
+        let node = &self.nodes[i];
         let noded = json!({
-            "node": "node-1",
-            // A fixed port: the API finds a restarted noded again.
-            "listen": format!("127.0.0.1:{}", self.node_port),
+            "node": node.name,
+            "listen": format!("127.0.0.1:{}", node.port),
             "token": NODE_TOKEN,
             "hellovm": self.hellovm,
-            "state_dir": self.dir.join("state"),
+            "state_dir": self.state_dir(i),
             "egress": self.dir.join("egress/egress.sock"),
-            "max_sandboxes": 32,
+            "max_sandboxes": self.options.node_max_sandboxes.get(i).copied().unwrap_or(32),
             "templates": templates,
         });
-        std::fs::write(self.dir.join("noded.json"), noded.to_string()).unwrap();
+        std::fs::write(self.node_config(i), noded.to_string()).unwrap();
     }
 
+    fn node_config(&self, i: usize) -> PathBuf {
+        match i {
+            0 => self.dir.join("noded.json"),
+            i => self.dir.join(format!("noded-{}.json", i + 1)),
+        }
+    }
+
+    /// Node `i`'s state directory (`state` for the first).
+    pub fn state_dir(&self, i: usize) -> PathBuf {
+        match i {
+            0 => self.dir.join("state"),
+            i => self.dir.join(format!("state-{}", i + 1)),
+        }
+    }
+
+    /// Starts the first node.
     pub fn start_noded(&mut self) {
-        let mut cmd = Command::new(&self.noded_bin);
-        cmd.arg("--config").arg(self.dir.join("noded.json"));
-        self.noded = Some(Service::start(cmd, "hellovm-noded"));
+        self.start_node(0);
     }
 
-    /// Writes the API's configuration for the current node address.
+    pub fn start_node(&mut self, i: usize) {
+        let mut cmd = Command::new(&self.noded_bin);
+        cmd.arg("--config").arg(self.node_config(i));
+        self.nodes[i].service = Some(Service::start(cmd, "hellovm-noded"));
+    }
+
+    /// Kills node `i` hard (its sandboxes die with it).
+    pub fn kill_node(&mut self, i: usize) {
+        if let Some(mut node) = self.nodes[i].service.take() {
+            node.kill();
+        }
+    }
+
+    /// Writes the API's configuration for the current node addresses.
     fn write_api_config(&self) {
-        let node = self.noded.as_ref().expect("noded runs");
-        let api = json!({
+        let mut nodes: Vec<Value> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                json!({"name": n.name, "addr": format!("127.0.0.1:{}", n.port), "token": NODE_TOKEN})
+            })
+            .collect();
+        for (name, addr) in &self.options.extra_nodes {
+            nodes.push(json!({"name": name, "addr": addr, "token": NODE_TOKEN}));
+        }
+        let mut api = json!({
             "listen": "127.0.0.1:0",
             "tenants": [
                 {"name": "acme", "token": ACME, "max_sandboxes": self.options.acme_max},
                 {"name": "beta", "token": BETA, "max_sandboxes": 2},
             ],
-            "nodes": [{"name": "node-1", "addr": node.addr, "token": NODE_TOKEN}],
+            "nodes": nodes,
             "reconcile_interval": 0.5,
+            "node_timeout": 2,
+            "admin": {"listen": format!("127.0.0.1:{}", self.admin_port), "token": ADMIN_TOKEN},
         });
+        if let Value::Object(extra) = &self.options.api_extra {
+            for (k, v) in extra {
+                api[k] = v.clone();
+            }
+        }
         std::fs::write(self.dir.join("api.json"), api.to_string()).unwrap();
     }
 
@@ -368,25 +455,38 @@ impl Plane {
         self.start_api();
     }
 
+    /// The first node.
     pub fn noded(&mut self) -> &mut Service {
-        self.noded.as_mut().expect("noded runs")
+        self.nodes[0].service.as_mut().expect("noded runs")
     }
 
     /// Everything the services logged, for failure messages.
     pub fn logs(&self) -> String {
-        format!(
-            "--- noded ---\n{}\n--- api ---\n{}",
-            self.noded.as_ref().map(|s| s.log()).unwrap_or_default(),
+        let mut out = String::new();
+        for node in &self.nodes {
+            out.push_str(&format!(
+                "--- noded {} ---\n{}\n",
+                node.name,
+                node.service.as_ref().map(|s| s.log()).unwrap_or_default()
+            ));
+        }
+        out.push_str(&format!(
+            "--- api ---\n{}",
             self.api.as_ref().map(|s| s.log()).unwrap_or_default()
-        )
+        ));
+        out
     }
 
-    /// Calls the node API directly.
+    /// Calls the first node's API directly.
     pub fn node_call(&self, method: &str, target: &str) -> Answer {
-        let node = self.noded.as_ref().expect("noded runs");
+        self.node_call_at(0, method, target)
+    }
+
+    /// Calls node `i`'s API directly.
+    pub fn node_call_at(&self, i: usize, method: &str, target: &str) -> Answer {
         let auth = format!("Bearer {NODE_TOKEN}");
         let r = http::call(
-            &node.addr,
+            &format!("127.0.0.1:{}", self.nodes[i].port),
             method,
             target,
             &[("Authorization", &auth)],
@@ -401,12 +501,28 @@ impl Plane {
         }
     }
 
-    /// Waits until every template is ready and `python` was started at
-    /// least `starts` times.
+    /// Calls the admin API with `token`.
+    pub fn admin_call(&self, token: &str, method: &str, target: &str) -> Answer {
+        api_call(
+            &format!("127.0.0.1:{}", self.admin_port),
+            token,
+            method,
+            target,
+            b"",
+        )
+        .unwrap_or_else(|e| panic!("admin {method} {target}: {e}\n{}", self.logs()))
+    }
+
+    /// Waits until every template of the first node is ready and `python`
+    /// was started at least `starts` times.
     pub fn wait_templates(&self, starts: u64) -> Value {
+        self.wait_templates_at(0, starts)
+    }
+
+    pub fn wait_templates_at(&self, i: usize, starts: u64) -> Value {
         let start = Instant::now();
         loop {
-            let status = self.node_call("GET", "/v1/node").json();
+            let status = self.node_call_at(i, "GET", "/v1/node").json();
             let templates = status["templates"].as_array().unwrap();
             if templates.iter().all(|t| {
                 t["ready"] == json!(true)
@@ -589,7 +705,9 @@ pub fn api_call(
 impl Drop for Plane {
     fn drop(&mut self) {
         self.api = None;
-        self.noded = None;
+        for node in &mut self.nodes {
+            node.service = None;
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

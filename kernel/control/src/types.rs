@@ -439,13 +439,30 @@ pub struct TemplateStatus {
     pub pid: Option<u32>,
 }
 
-/// `GET /v1/node`: what a node offers.
+/// `GET /v1/node`: what a node offers, and its load.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeStatus {
     pub node: String,
     pub templates: Vec<TemplateStatus>,
+    /// Sandboxes running.
     pub sandboxes: usize,
+    /// Sandboxes being created (they count against `max_sandboxes`).
+    pub creating: usize,
     pub max_sandboxes: usize,
+    /// The private memory of all its sandboxes, as last measured.
+    pub memory_bytes: u64,
+    /// What its sandboxes may use together: no sandbox is created while
+    /// `memory_bytes` is at or over it.
+    pub memory_limit_bytes: u64,
+    /// Whether it refuses new sandboxes (its sandboxes run on).
+    pub draining: bool,
+}
+
+/// `POST /v1/node/drain`: stop or resume taking new sandboxes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DrainRequest {
+    pub draining: bool,
 }
 
 #[cfg(test)]
