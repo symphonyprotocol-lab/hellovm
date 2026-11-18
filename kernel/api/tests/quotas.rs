@@ -577,6 +577,86 @@ fn nonsense_answer(stream: &mut TcpStream, name: &str, step: &AtomicU64) {
     );
 }
 
+/// A fake node that "restarts" after its second list: its `boot` changes
+/// and its numbering of ended sandboxes starts again at 1. Before, one
+/// sandbox of beta ended as seq 5 (2 ms of CPU); after, another as seq 1
+/// (3 ms), listed only to `ended_after=0`.
+fn restarting_node(name: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let lists = Arc::new(AtomicU64::new(0));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let lists = Arc::clone(&lists);
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let target = head.split(' ').nth(1).unwrap_or("").to_string();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let ended = |id: &str, seq: u64, cpu: u64| {
+                    json!({"id": id, "tenant": "beta", "template": "python", "seq": seq,
+                           "created_at": now, "ended_at": now, "memory_limit_bytes": 1,
+                           "usage": {"run_ms": 1, "cpu_ms": cpu, "memory_byte_seconds": 0,
+                                     "egress_sent_bytes": 0, "egress_received_bytes": 0}})
+                };
+                let body = if target == "/v1/node" {
+                    json!({
+                        "node": name, "templates": [], "sandboxes": 0, "creating": 0,
+                        "max_sandboxes": 8, "memory_bytes": 0, "memory_limit_bytes": 1u64 << 30,
+                        "draining": true, "cpus": 1,
+                    })
+                } else if let Some(after) = target.strip_prefix("/v1/sandboxes?ended_after=") {
+                    if lists.fetch_add(1, Ordering::SeqCst) < 2 {
+                        json!({"sandboxes": [], "ended": [ended(U, 5, 2)], "boot": 1})
+                    } else if after == "0" {
+                        json!({"sandboxes": [], "ended": [ended(T, 1, 3)], "boot": 2})
+                    } else {
+                        json!({"sandboxes": [], "ended": [], "boot": 2})
+                    }
+                } else {
+                    json!({"sandboxes": []})
+                };
+                let body = body.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn a_node_that_restarts_is_asked_from_its_first_ended_sandbox() {
+    let Some(plane) = Plane::start(PlaneOptions {
+        extra_nodes: vec![("fake-restart".into(), restarting_node("fake-restart"))],
+        ..PlaneOptions::default()
+    }) else {
+        return;
+    };
+    eventually(
+        Duration::from_secs(10),
+        "both ended sandboxes counted",
+        || usage(&plane, BETA)["usage"]["cpu_ms"] == 5,
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(usage(&plane, BETA)["usage"]["cpu_ms"], 5, "each once");
+}
+
 #[test]
 fn absurd_and_decreasing_counters_are_bounded() {
     let Some(plane) = Plane::start(PlaneOptions {

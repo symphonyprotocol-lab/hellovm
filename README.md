@@ -1317,7 +1317,7 @@ A node is not trusted to report sense:
 | a value beyond 2^53 | taken as 2^53 |
 | a sandbox first seen with another tenant or node, or of a tenant not in the configuration | ignored |
 | an ended sandbox listed again, or a `seq` not past the last one taken | ignored |
-| a node whose `boot` changed (it restarted, its sandboxes died) | its sandboxes are ended (`lost`) with what was counted |
+| a node whose `boot` changed (it restarted, its sandboxes died) | its sandboxes are ended (`lost`) with what was counted, and its ended sandboxes are asked for from the first again |
 | a sandbox its node has not listed, live or ended, for 60 s while it answered | the same |
 
 Each of these counts in `odd_reports` (admin). A node that lies can
@@ -1583,7 +1583,7 @@ from the tenants' listener), and fake nodes answering garbage, a
 terabyte `Content-Length`, an endless body, another node's name,
 absurd numbers, nothing at all, or nonsense refusals of every create,
 with the API's memory under 64 MiB after. `kernel/api/tests/quotas.rs`
-(about 25 s, its plane's periods 15 s long): CPU and egress budgets used
+(8 tests, about 30 s, its plane's periods 15 s long): CPU and egress budgets used
 up by real work and refused at create and exec (with `Retry-After`)
 while reads, polls, cancels, files, resets and deletes work and a
 running exec ends normally, another tenant untouched, and both back at
@@ -1596,7 +1596,8 @@ the proxy and ended (the deltas adding up to the final counters, CPU,
 memory and egress counted), and an API restart mid-period (the totals
 unchanged, nothing counted twice); a fake node reporting absurd,
 decreasing and out-of-range counters, a sandbox claimed for another
-tenant and an ended one listed again; the delete of a sandbox on a
+tenant and an ended one listed again; a fake node that restarts (its
+ended sandboxes asked for from the first again); the delete of a sandbox on a
 stopped (`SIGSTOP`) node, its slot used at once, an API restart before
 the node is back, and the delete done then, the sandbox never listed
 again; and a node configured to start drained, undrained and restarted.
