@@ -23,6 +23,17 @@ pub const MAX_ENV_BYTES: usize = 64 * 1024;
 pub const MAX_PATH: usize = 4096;
 /// Largest JSON request body.
 pub const MAX_JSON: usize = 4 << 20;
+/// Longest a poll of an exec's output waits for something new, in
+/// seconds.
+pub const MAX_POLL_WAIT: f64 = 30.0;
+/// Default, smallest and largest output a poll returns, in bytes.
+pub const DEFAULT_POLL_BYTES: usize = 256 * 1024;
+pub const MIN_POLL_BYTES: usize = 1024;
+pub const MAX_POLL_BYTES: usize = 1 << 20;
+/// Most characters of a stateful call's value (`repr`) and of its
+/// traceback; longer ones keep their start and end.
+pub const MAX_VALUE: usize = 16 * 1024;
+pub const MAX_TRACEBACK: usize = 16 * 1024;
 
 /// `POST /v1/sandboxes` (public API).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -79,9 +90,11 @@ pub struct SandboxList {
     pub sandboxes: Vec<SandboxInfo>,
 }
 
-/// `POST /v1/sandboxes/{id}/exec`. Exactly one of `command` (run by
-/// `/bin/sh -c`) and `python` (run by the sandbox's warm interpreter in a
-/// fresh fork of it) is given.
+/// `POST /v1/sandboxes/{id}/exec` and `POST /v1/sandboxes/{id}/execs`.
+/// Exactly one of `command` (run by `/bin/sh -c`) and `python` is given.
+/// `python` runs in a fresh fork of the sandbox's warm interpreter, or,
+/// with `stateful`, in the sandbox's interpreter whose namespace persists
+/// between calls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecRequest {
@@ -104,6 +117,10 @@ pub struct ExecRequest {
     /// Bytes kept per stream; the rest is cut from the middle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output: Option<usize>,
+    /// With `python`: run it in the sandbox's long-lived interpreter, whose
+    /// variables, imports and objects persist between calls.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stateful: bool,
 }
 
 impl ExecRequest {
@@ -120,6 +137,18 @@ impl ExecRequest {
                 }
             }
             _ => return Err("give exactly one of `command` and `python`".into()),
+        }
+        if self.stateful {
+            if self.python.is_none() {
+                return Err("`stateful` goes with `python`".into());
+            }
+            if self.cwd.is_some() || self.env.is_some() {
+                return Err(
+                    "a stateful call runs in the interpreter's own working directory and \
+                     environment (change them with os.chdir and os.environ): no `cwd` or `env`"
+                        .into(),
+                );
+            }
         }
         let timeout = self.timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
         if !(timeout.is_finite() && timeout > 0.0 && timeout <= MAX_EXEC_TIMEOUT) {
@@ -180,11 +209,19 @@ pub fn check_path(path: &str) -> Result<(), String> {
 /// What an exec did.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecResult {
-    /// The exit status, when the command exited.
+    /// The exec's id in its sandbox (`ex-N`).
+    #[serde(default)]
+    pub exec_id: String,
+    /// The exit status, when the command exited (a stateful call: 0, or 1
+    /// when it raised).
     pub exit_code: Option<i32>,
-    /// The signal that killed it, when one did (9 after a timeout).
+    /// The signal that killed it, when one did (9 after a timeout or a
+    /// cancel).
     pub signal: Option<i32>,
     pub timed_out: bool,
+    /// Ended by a cancel.
+    #[serde(default)]
+    pub cancelled: bool,
     /// Output decoded as UTF-8 (invalid bytes replaced). When longer than
     /// `max_output`, the middle is replaced by a line saying how many
     /// bytes were left out.
@@ -196,6 +233,175 @@ pub struct ExecResult {
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
     pub duration_ms: f64,
+    /// A stateful call: the `repr` of the value of the code's last
+    /// expression, when it ends in one whose value is not `None` (at most
+    /// [`MAX_VALUE`] characters, the middle cut).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// A stateful call: the exception it raised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ExecError>,
+    /// A stateful call: whether the interpreter's state (its namespace)
+    /// was lost, by this call or since the last one: the interpreter could
+    /// not be interrupted and was killed, or it ended. The next call starts
+    /// a fresh one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_lost: Option<bool>,
+}
+
+/// The exception a stateful call raised.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecError {
+    /// Its class name (`ZeroDivisionError`, `KeyboardInterrupt`).
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub message: String,
+    /// The formatted traceback (at most [`MAX_TRACEBACK`] characters, the
+    /// middle cut).
+    pub traceback: String,
+}
+
+/// Whether an exec runs or ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecState {
+    Running,
+    Done,
+}
+
+/// What an exec runs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecKind {
+    Command,
+    Python,
+    Stateful,
+}
+
+/// An exec as `POST .../execs`, `GET .../execs` and `.../cancel` describe
+/// it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecStatus {
+    pub exec_id: String,
+    pub kind: ExecKind,
+    pub state: ExecState,
+    /// Unix milliseconds.
+    pub started_at: u64,
+    /// Set once cancelled, until it ends.
+    pub cancel_requested: bool,
+    /// Once it ended.
+    pub result: Option<ExecResult>,
+}
+
+/// `GET /v1/sandboxes/{id}/execs`: the sandbox's latest exec, if any.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecList {
+    pub execs: Vec<ExecStatus>,
+}
+
+/// One piece of an exec's output stream, in the order it was produced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutputEvent {
+    Stdout {
+        data: String,
+    },
+    Stderr {
+        data: String,
+    },
+    /// Output that was not kept (nobody read it while it was held, and
+    /// more came after it): this many bytes.
+    Omitted {
+        bytes: u64,
+    },
+}
+
+/// `GET /v1/sandboxes/{id}/execs/{exec}?cursor=&wait=&max_bytes=`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecPoll {
+    pub exec_id: String,
+    pub state: ExecState,
+    /// The output after `cursor`, oldest first.
+    pub events: Vec<OutputEvent>,
+    /// The cursor of the next poll (a byte position in the exec's output).
+    pub next_cursor: u64,
+    /// The exec ended and `next_cursor` is the end of its output: nothing
+    /// more will come.
+    pub eof: bool,
+    /// Once it ended.
+    pub result: Option<ExecResult>,
+}
+
+/// `POST /v1/sandboxes/{id}/python/reset`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResetResult {
+    /// Whether there was an interpreter (and so state) to discard.
+    pub had_state: bool,
+}
+
+/// The query of a poll, checked: `cursor` (default 0), `wait` seconds
+/// (default 0, at most [`MAX_POLL_WAIT`]), `max_bytes` (default
+/// [`DEFAULT_POLL_BYTES`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PollQuery {
+    pub cursor: u64,
+    pub wait: f64,
+    pub max_bytes: usize,
+}
+
+impl PollQuery {
+    pub fn parse(
+        cursor: Option<&str>,
+        wait: Option<&str>,
+        max_bytes: Option<&str>,
+    ) -> Result<PollQuery, String> {
+        let cursor = match cursor {
+            None => 0,
+            Some(c) => c
+                .parse::<u64>()
+                .map_err(|_| "cursor must be a byte position".to_string())?,
+        };
+        let wait = match wait {
+            None => 0.0,
+            Some(w) => w
+                .parse::<f64>()
+                .ok()
+                .filter(|w| w.is_finite() && (0.0..=MAX_POLL_WAIT).contains(w))
+                .ok_or(format!("wait must be 0 to {MAX_POLL_WAIT} seconds"))?,
+        };
+        let max_bytes = match max_bytes {
+            None => DEFAULT_POLL_BYTES,
+            Some(m) => m
+                .parse::<usize>()
+                .ok()
+                .filter(|m| (MIN_POLL_BYTES..=MAX_POLL_BYTES).contains(m))
+                .ok_or(format!(
+                    "max_bytes must be {MIN_POLL_BYTES} to {MAX_POLL_BYTES}"
+                ))?,
+        };
+        Ok(PollQuery {
+            cursor,
+            wait,
+            max_bytes,
+        })
+    }
+
+    /// The query string that says the same.
+    pub fn to_query(&self) -> String {
+        format!(
+            "cursor={}&wait={}&max_bytes={}",
+            self.cursor, self.wait, self.max_bytes
+        )
+    }
+}
+
+/// An exec id: `ex-` and a decimal number.
+pub fn check_exec_id(id: &str) -> Option<u64> {
+    let n = id.strip_prefix("ex-")?;
+    if n.is_empty() || n.len() > 19 || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
 }
 
 /// `POST /v1/sandboxes/{id}/files/edit`: replace `old` by `new` in the
@@ -280,5 +486,57 @@ mod tests {
         };
         assert!(output.validate().is_err());
         assert!(serde_json::from_str::<ExecRequest>(r#"{"command":"x","bogus":1}"#).is_err());
+        let stateful = ExecRequest {
+            python: Some("x = 1".into()),
+            stateful: true,
+            ..ExecRequest::default()
+        };
+        assert!(stateful.validate().is_ok());
+        assert!(ExecRequest {
+            stateful: true,
+            ..ok.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ExecRequest {
+            cwd: Some("/tmp".into()),
+            ..stateful.clone()
+        }
+        .validate()
+        .is_err());
+        // `stateful: false` is the default and not written out.
+        assert_eq!(
+            serde_json::to_string(&ok).unwrap(),
+            r#"{"command":"echo hi"}"#
+        );
+    }
+
+    #[test]
+    fn poll_queries_are_checked() {
+        let q = PollQuery::parse(Some("12"), Some("1.5"), Some("2048")).unwrap();
+        assert_eq!((q.cursor, q.wait, q.max_bytes), (12, 1.5, 2048));
+        assert_eq!(q.to_query(), "cursor=12&wait=1.5&max_bytes=2048");
+        let d = PollQuery::parse(None, None, None).unwrap();
+        assert_eq!(
+            (d.cursor, d.wait, d.max_bytes),
+            (0, 0.0, DEFAULT_POLL_BYTES)
+        );
+        for (c, w, m) in [
+            (Some("-1"), None, None),
+            (Some("x"), None, None),
+            (None, Some("31"), None),
+            (None, Some("NaN"), None),
+            (None, Some("-0.5"), None),
+            (None, None, Some("10")),
+            (None, None, Some("99999999")),
+        ] {
+            assert!(PollQuery::parse(c, w, m).is_err(), "{c:?} {w:?} {m:?}");
+        }
+        assert_eq!(check_exec_id("ex-17"), Some(17));
+        for bad in ["ex-", "ex-1a", "17", "ex-99999999999999999999", "ex--1"] {
+            assert_eq!(check_exec_id(bad), None, "{bad}");
+        }
+        let event = serde_json::to_string(&OutputEvent::Omitted { bytes: 3 }).unwrap();
+        assert_eq!(event, r#"{"type":"omitted","bytes":3}"#);
     }
 }

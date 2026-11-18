@@ -473,6 +473,84 @@ impl Plane {
         self.exec(token, id, json!({ "command": command, "timeout": 30 }))
     }
 
+    /// Starts an exec (`POST .../execs`) and returns its exec id.
+    pub fn start_exec(&self, token: &str, id: &str, request: Value) -> String {
+        let r = self.call_json(token, "POST", &format!("/v1/sandboxes/{id}/execs"), request);
+        assert_eq!(
+            r.status,
+            201,
+            "{}\n{}",
+            String::from_utf8_lossy(&r.body),
+            self.logs()
+        );
+        let status = r.json();
+        assert_eq!(status["state"], "running", "{status}");
+        status["exec_id"].as_str().unwrap().to_string()
+    }
+
+    /// One poll of an exec's output.
+    pub fn poll(&self, token: &str, id: &str, exec: &str, cursor: u64, wait: f64) -> Answer {
+        self.call(
+            token,
+            "GET",
+            &format!("/v1/sandboxes/{id}/execs/{exec}?cursor={cursor}&wait={wait}"),
+            b"",
+        )
+    }
+
+    /// Reads an exec's output from `cursor` until `until` holds for the
+    /// events so far (or its end): the events and the last poll.
+    pub fn follow_until(
+        &self,
+        token: &str,
+        id: &str,
+        exec: &str,
+        mut until: impl FnMut(&[Value]) -> bool,
+    ) -> (Vec<Value>, Value) {
+        let start = Instant::now();
+        let mut cursor = 0;
+        let mut events = Vec::new();
+        loop {
+            let r = self.poll(token, id, exec, cursor, 10.0);
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let poll = r.json();
+            events.extend(poll["events"].as_array().unwrap().iter().cloned());
+            cursor = poll["next_cursor"].as_u64().unwrap();
+            if poll["eof"] == json!(true) || until(&events) {
+                return (events, poll);
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "the exec did not end: {poll}\n{}",
+                self.logs()
+            );
+        }
+    }
+
+    /// Reads all of an exec's output: the events and its result.
+    pub fn follow(&self, token: &str, id: &str, exec: &str) -> (Vec<Value>, Value) {
+        let (events, poll) = self.follow_until(token, id, exec, |_| false);
+        (events, poll["result"].clone())
+    }
+
+    pub fn cancel(&self, token: &str, id: &str, exec: &str) -> Answer {
+        self.call(
+            token,
+            "POST",
+            &format!("/v1/sandboxes/{id}/execs/{exec}/cancel"),
+            b"",
+        )
+    }
+
+    /// A stateful Python call run to its end.
+    pub fn py(&self, token: &str, id: &str, code: &str) -> Value {
+        self.exec(
+            token,
+            id,
+            json!({"python": code, "stateful": true, "timeout": 30}),
+        )
+    }
+
     pub fn delete(&self, token: &str, id: &str) -> u16 {
         self.call(token, "DELETE", &format!("/v1/sandboxes/{id}"), b"")
             .status
@@ -514,6 +592,32 @@ impl Drop for Plane {
         self.noded = None;
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The text of the events of one stream, joined.
+pub fn stream_text(events: &[Value], stream: &str) -> String {
+    events
+        .iter()
+        .filter(|e| e["type"] == stream)
+        .map(|e| e["data"].as_str().unwrap())
+        .collect()
+}
+
+/// The events as `(type, text)`, consecutive ones of a stream merged.
+pub fn merged(events: &[Value]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for e in events {
+        let kind = e["type"].as_str().unwrap().to_string();
+        let text = match e.get("data") {
+            Some(d) => d.as_str().unwrap().to_string(),
+            None => e["bytes"].to_string(),
+        };
+        match out.last_mut() {
+            Some((k, t)) if *k == kind && kind != "omitted" => t.push_str(&text),
+            _ => out.push((kind, text)),
+        }
+    }
+    out
 }
 
 /// Median, minimum and maximum of some durations, in ms.

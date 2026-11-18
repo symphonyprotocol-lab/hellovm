@@ -9,7 +9,12 @@
 //! | `GET /v1/sandboxes` | | `SandboxList` |
 //! | `GET /v1/sandboxes/{id}` | | `SandboxInfo` |
 //! | `DELETE /v1/sandboxes/{id}` | | `204` |
-//! | `POST /v1/sandboxes/{id}/exec` | `ExecRequest` | `ExecResult` |
+//! | `POST /v1/sandboxes/{id}/exec` | `ExecRequest` | `ExecResult` (runs it to its end) |
+//! | `POST /v1/sandboxes/{id}/execs` | `ExecRequest` | `201` `ExecStatus` (once started) |
+//! | `GET /v1/sandboxes/{id}/execs` | | `ExecList` (the latest exec) |
+//! | `GET /v1/sandboxes/{id}/execs/{exec}?cursor=&wait=&max_bytes=` | | `ExecPoll` |
+//! | `POST /v1/sandboxes/{id}/execs/{exec}/cancel` | | `ExecStatus` |
+//! | `POST /v1/sandboxes/{id}/python/reset` | | `ResetResult` |
 //! | `GET /v1/sandboxes/{id}/files?path=P` | | the bytes |
 //! | `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `WriteResult` |
 //! | `POST /v1/sandboxes/{id}/files/edit` | `EditRequest` | `EditResult` |
@@ -20,7 +25,7 @@ use std::time::{Duration, Instant};
 use hellovm_control::http::{self, percent_encode, ClientResponse, Handler, Request, Response};
 use hellovm_control::ids::{token_eq, SandboxId};
 use hellovm_control::types::{
-    self, CreateSandbox, ExecRequest, NodeCreate, NodeStatus, SandboxInfo, SandboxList,
+    self, CreateSandbox, ExecRequest, NodeCreate, NodeStatus, PollQuery, SandboxInfo, SandboxList,
     TemplateStatus,
 };
 
@@ -336,7 +341,7 @@ impl Api {
         let method = request.method.as_str();
         let (target, timeout) = match (method, rest) {
             ("GET" | "DELETE", []) => (format!("/v1/sandboxes/{sandbox}"), NODE_TIMEOUT),
-            ("POST", ["exec"]) => {
+            ("POST", [what @ ("exec" | "execs")]) => {
                 let exec: ExecRequest = match serde_json::from_slice(&request.body) {
                     Ok(exec) => exec,
                     Err(e) => {
@@ -347,11 +352,45 @@ impl Api {
                     Ok((timeout, _)) => timeout,
                     Err(m) => return error(400, "bad_request", &m),
                 };
+                // `exec` answers when it ended, `execs` when it started.
+                let timeout = if *what == "exec" {
+                    Duration::from_secs_f64(timeout) + NODE_TIMEOUT
+                } else {
+                    NODE_TIMEOUT
+                };
+                (format!("/v1/sandboxes/{sandbox}/{what}"), timeout)
+            }
+            ("GET", ["execs"]) => (format!("/v1/sandboxes/{sandbox}/execs"), NODE_TIMEOUT),
+            ("GET", ["execs", exec]) => {
+                if types::check_exec_id(exec).is_none() {
+                    return error(404, "exec_not_found", "no such exec");
+                }
+                let query = match PollQuery::parse(
+                    request.query("cursor"),
+                    request.query("wait"),
+                    request.query("max_bytes"),
+                ) {
+                    Ok(query) => query,
+                    Err(m) => return error(400, "bad_request", &m),
+                };
                 (
-                    format!("/v1/sandboxes/{sandbox}/exec"),
-                    Duration::from_secs_f64(timeout) + NODE_TIMEOUT,
+                    format!("/v1/sandboxes/{sandbox}/execs/{exec}?{}", query.to_query()),
+                    Duration::from_secs_f64(query.wait) + NODE_TIMEOUT,
                 )
             }
+            ("POST", ["execs", exec, "cancel"]) => {
+                if types::check_exec_id(exec).is_none() {
+                    return error(404, "exec_not_found", "no such exec");
+                }
+                (
+                    format!("/v1/sandboxes/{sandbox}/execs/{exec}/cancel"),
+                    NODE_TIMEOUT,
+                )
+            }
+            ("POST", ["python", "reset"]) => (
+                format!("/v1/sandboxes/{sandbox}/python/reset"),
+                NODE_TIMEOUT,
+            ),
             ("GET" | "PUT", ["files"]) => {
                 let Some(path) = request.query("path") else {
                     return error(400, "bad_request", "no ?path=");

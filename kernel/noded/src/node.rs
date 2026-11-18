@@ -1,36 +1,59 @@
 //! The sandboxes of one node: made from a warm template, reached through
 //! the agent in them, removed when asked, idle, too old, over their memory
 //! limit, or ended.
+//!
+//! Each sandbox has at most one operation outstanding at its agent (an
+//! exec, a file operation, a reset): taking it is `busy`, and a second
+//! one is refused (`409`). An exec holds the sandbox from its start until
+//! its final answer, whether or not anyone waits for it; reading its
+//! output, listing it and cancelling it never take the sandbox. The
+//! sandbox's watch thread reads everything the agent says as it comes
+//! (see `agent.rs`), passes output to the exec it belongs to, completes
+//! operations, and removes the sandbox when the agent breaks the protocol
+//! or misses a deadline.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
 use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use hellovm::warm::{Frame, WarmClone};
+use hellovm::warm::{Frame as WarmFrame, WarmClone};
 use hellovm_control::http::Response;
 use hellovm_control::ids::SandboxId;
 use hellovm_control::types::{
-    self, EditRequest, EditResult, ExecRequest, ExecResult, NodeCreate, NodeStatus, SandboxInfo,
+    self, EditRequest, EditResult, ExecError, ExecKind, ExecList, ExecPoll, ExecRequest,
+    ExecResult, ExecState, ExecStatus, NodeCreate, NodeStatus, PollQuery, ResetResult, SandboxInfo,
     WriteResult,
 };
 use hellovm_control::unix_ms;
 use serde_json::{json, Map, Value};
 
-use crate::agent::{Agent, AgentError};
+use crate::agent::{self, AgentError, Frame, FrameParser, Writer, FRAME_DEADLINE, OUTPUT_CHUNK};
 use crate::config::{valid_name, Config};
+use crate::output::{Capture, Stream, StreamLog};
 use crate::template::Template;
 
-/// How long a new clone may take to run and to greet.
+/// How long a new clone may take to run and to greet, and an exec to
+/// start.
 const START_DEADLINE: Duration = Duration::from_secs(15);
-/// Longest wait for a file operation's answer.
+/// Longest wait for a file operation's answer, and for a request to be
+/// written to the agent.
 const FILE_DEADLINE: Duration = Duration::from_secs(60);
-/// Extra time for an exec's answer past its timeout.
+/// Extra time for an exec's final answer past its timeout (a stateful
+/// call takes up to 2 s more to be interrupted, then killed).
 const EXEC_GRACE: Duration = Duration::from_secs(10);
+/// How long a cancel waits for the exec to end before it answers.
+const CANCEL_WAIT: Duration = Duration::from_secs(5);
+/// Largest body of an exec's final answer: a stateful call's value and
+/// traceback (characters of up to 4 bytes).
+const MAX_FINAL_BODY: usize = 4 * (2 * types::MAX_VALUE + types::MAX_TRACEBACK) + 4096;
+/// Longest wait for a cancel frame to be written.
+const CANCEL_WRITE: Duration = Duration::from_secs(5);
 /// Longest idle timeout and lifetime a sandbox may have: a week.
 pub const MAX_LIFETIME: f64 = 7.0 * 24.0 * 3600.0;
 /// Ended sandboxes remembered, to tell why they are gone.
@@ -39,7 +62,7 @@ const TOMBSTONES: usize = 4096;
 const LOG_BUDGET: usize = 64 * 1024;
 
 /// An error as the node API reports it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
     pub code: String,
@@ -62,6 +85,18 @@ impl ApiError {
     fn not_found() -> ApiError {
         ApiError::new(404, "sandbox_not_found", "no such sandbox")
     }
+
+    fn ended(reason: &str) -> ApiError {
+        ApiError::new(410, "sandbox_ended", format!("the sandbox ended: {reason}"))
+    }
+
+    fn failed_sandbox(why: &str) -> ApiError {
+        ApiError::new(
+            502,
+            "sandbox_failed",
+            format!("the sandbox failed and was removed: {why}"),
+        )
+    }
 }
 
 /// Maps an operation that failed inside the sandbox to a status.
@@ -72,6 +107,7 @@ fn failed(code: String, message: String) -> ApiError {
         "too_large" => 413,
         "no_match" | "ambiguous" => 422,
         "no_space" => 507,
+        "busy" => 409,
         "agent_error" | "io_error" => 500,
         _ => 400,
     };
@@ -80,6 +116,152 @@ fn failed(code: String, message: String) -> ApiError {
         code,
         message,
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Waits on `cond` until `done` holds or `deadline` passes.
+fn wait_until<'a, T>(
+    cond: &Condvar,
+    mut guard: MutexGuard<'a, T>,
+    deadline: Instant,
+    mut done: impl FnMut(&T) -> bool,
+) -> MutexGuard<'a, T> {
+    while !done(&guard) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        guard = cond
+            .wait_timeout(guard, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    guard
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Sent; the agent has not said it started.
+    Starting,
+    Running,
+    Done,
+}
+
+/// One exec: its output as it comes, then its result.
+pub struct Exec {
+    /// The agent request's id; the exec id is `ex-{number}`.
+    number: u64,
+    kind: ExecKind,
+    started_at: u64,
+    /// How long it may run.
+    timeout: Duration,
+    state: Mutex<ExecInner>,
+    changed: Condvar,
+    /// Polls waiting for its output now.
+    polls: AtomicUsize,
+}
+
+/// Most polls that may wait on one exec at once: each holds a connection
+/// (here and at the API) for up to the longest wait, and a tenant must not
+/// take the node's connections with polls of one exec.
+const MAX_POLLS: usize = 4;
+
+/// Counts a poll while it waits.
+struct Polling<'a>(&'a AtomicUsize);
+
+impl Drop for Polling<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct ExecInner {
+    phase: Phase,
+    /// It did not start, or the sandbox went away under it.
+    failure: Option<ApiError>,
+    stdout: Capture,
+    stderr: Capture,
+    log: StreamLog,
+    cancel_requested: bool,
+    result: Option<ExecResult>,
+}
+
+impl Exec {
+    fn exec_id(&self) -> String {
+        format!("ex-{}", self.number)
+    }
+
+    fn status(&self) -> ExecStatus {
+        let inner = lock(&self.state);
+        ExecStatus {
+            exec_id: self.exec_id(),
+            kind: self.kind,
+            state: if inner.phase == Phase::Done {
+                ExecState::Done
+            } else {
+                ExecState::Running
+            },
+            started_at: self.started_at,
+            cancel_requested: inner.cancel_requested,
+            result: inner.result.clone(),
+        }
+    }
+
+    fn update(&self, f: impl FnOnce(&mut ExecInner)) {
+        f(&mut lock(&self.state));
+        self.changed.notify_all();
+    }
+
+    fn fail(&self, error: &ApiError) {
+        self.update(|inner| {
+            if inner.phase != Phase::Done {
+                inner.phase = Phase::Done;
+                inner.failure = Some(error.clone());
+            }
+        });
+    }
+}
+
+/// Where the answer to a file operation or reset lands.
+#[derive(Default)]
+struct Slot {
+    answer: Mutex<Option<Result<Frame, ApiError>>>,
+    ready: Condvar,
+}
+
+impl Slot {
+    fn fill(&self, answer: Result<Frame, ApiError>) {
+        let mut slot = lock(&self.answer);
+        if slot.is_none() {
+            *slot = Some(answer);
+        }
+        self.ready.notify_all();
+    }
+}
+
+enum Waiting {
+    Exec(Arc<Exec>),
+    Call { slot: Arc<Slot>, max_body: usize },
+}
+
+/// The operation outstanding at the agent.
+struct InFlight {
+    id: u64,
+    /// When its next frame (an exec's `started`) or final answer is due.
+    deadline: Instant,
+    waiting: Waiting,
+}
+
+struct Ops {
+    next_id: u64,
+    in_flight: Option<InFlight>,
+    /// The latest exec that started (running or ended).
+    latest: Option<Arc<Exec>>,
+    /// The channel is gone: why.
+    failure: Option<ApiError>,
 }
 
 pub struct Sandbox {
@@ -96,7 +278,9 @@ pub struct Sandbox {
     kernel_pid: u32,
     /// The clone's control connection: shutting it down kills the clone.
     control: UnixStream,
-    agent: Mutex<Agent>,
+    writer: Mutex<Writer>,
+    ops: Mutex<Ops>,
+    /// An operation is outstanding (see `Ops::in_flight`).
     busy: AtomicBool,
     memory: AtomicU64,
     memory_limit: u64,
@@ -133,20 +317,213 @@ impl Sandbox {
     fn kill(&self) {
         let _ = self.control.shutdown(Shutdown::Write);
     }
-}
 
-/// Holds a sandbox for one operation: the agent serves one at a time.
-struct Busy<'a>(&'a Sandbox);
+    /// Takes the sandbox for one operation, or says it is busy.
+    fn take(&self) -> Result<(), ApiError> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(ApiError::new(
+                409,
+                "busy",
+                "the sandbox is running another request",
+            ));
+        }
+        self.touch();
+        Ok(())
+    }
 
-impl Drop for Busy<'_> {
-    fn drop(&mut self) {
-        self.0.touch();
-        self.0.busy.store(false, Ordering::SeqCst);
+    fn release(&self) {
+        self.touch();
+        self.busy.store(false, Ordering::SeqCst);
+    }
+
+    /// Sends a request for the sandbox, which the caller has taken:
+    /// `waiting` (given the request's id) is what its answer completes.
+    /// The sandbox is released when it is answered or fails (here, if the
+    /// request cannot be sent).
+    fn send(
+        &self,
+        mut head: Map<String, Value>,
+        body: &[u8],
+        deadline: Instant,
+        waiting: impl FnOnce(u64) -> Waiting,
+    ) -> Result<(), SendError> {
+        let id = {
+            let mut ops = lock(&self.ops);
+            if let Some(failure) = &ops.failure {
+                let failure = failure.clone();
+                drop(ops);
+                self.release();
+                return Err(SendError::Gone(failure));
+            }
+            let id = ops.next_id;
+            ops.next_id += 1;
+            ops.in_flight = Some(InFlight {
+                id,
+                deadline,
+                waiting: waiting(id),
+            });
+            id
+        };
+        head.insert("id".into(), json!(id));
+        let write_by = Instant::now() + FILE_DEADLINE;
+        match lock(&self.writer).send(&head, body, write_by) {
+            Ok(()) => Ok(()),
+            Err(AgentError::Broken(why)) => Err(SendError::Broken(why)),
+            Err(AgentError::Failed { message, .. }) => Err(SendError::Broken(message)),
+        }
+    }
+
+    /// The longest body the next frame from the agent may have; `None`
+    /// when no frame may come.
+    fn frame_limit(&self) -> Option<usize> {
+        let ops = lock(&self.ops);
+        let flight = ops.in_flight.as_ref()?;
+        Some(match &flight.waiting {
+            Waiting::Exec(exec) => {
+                if lock(&exec.state).phase == Phase::Starting {
+                    0
+                } else {
+                    OUTPUT_CHUNK.max(MAX_FINAL_BODY)
+                }
+            }
+            Waiting::Call { max_body, .. } => *max_body,
+        })
+    }
+
+    /// When the agent must have said something more.
+    fn deadline(&self) -> Option<Instant> {
+        lock(&self.ops).in_flight.as_ref().map(|f| f.deadline)
+    }
+
+    /// Takes one frame from the agent. An error is a protocol violation.
+    fn on_frame(&self, frame: Frame) -> Result<(), String> {
+        let mut ops = lock(&self.ops);
+        let Some(flight) = ops.in_flight.as_mut() else {
+            return Err("a frame when nothing was asked".into());
+        };
+        if frame.id() != Some(flight.id) {
+            return Err("a frame for another request".into());
+        }
+        let exec = match &flight.waiting {
+            Waiting::Exec(exec) => Arc::clone(exec),
+            Waiting::Call { slot, .. } => {
+                let answer = match frame.outcome() {
+                    Some(Ok(())) if frame.op().is_none() => Ok(frame),
+                    Some(Err(AgentError::Failed { code, message })) => Err(failed(code, message)),
+                    _ => return Err("an answer that is neither success nor failure".into()),
+                };
+                let slot = Arc::clone(slot);
+                ops.in_flight = None;
+                drop(ops);
+                slot.fill(answer);
+                self.release();
+                return Ok(());
+            }
+        };
+        let phase = lock(&exec.state).phase;
+        match (frame.op(), phase) {
+            (Some("started"), Phase::Starting) => {
+                flight.deadline = Instant::now() + exec.timeout + EXEC_GRACE;
+                ops.latest = Some(Arc::clone(&exec));
+                exec.update(|inner| inner.phase = Phase::Running);
+                Ok(())
+            }
+            (Some("output"), Phase::Running) => {
+                let stream = match frame.head.get("stream").and_then(Value::as_u64) {
+                    Some(1) => Stream::Stdout,
+                    Some(2) => Stream::Stderr,
+                    _ => return Err("output of no stream".into()),
+                };
+                if frame.body.len() > OUTPUT_CHUNK {
+                    return Err("an output frame too large".into());
+                }
+                exec.update(|inner| {
+                    match stream {
+                        Stream::Stdout => inner.stdout.add(&frame.body),
+                        Stream::Stderr => inner.stderr.add(&frame.body),
+                    }
+                    inner.log.add(stream, &frame.body);
+                });
+                Ok(())
+            }
+            (None, Phase::Starting) => match frame.outcome() {
+                // It did not start (no such working directory, ...).
+                Some(Err(AgentError::Failed { code, message })) => {
+                    ops.in_flight = None;
+                    drop(ops);
+                    exec.fail(&failed(code, message));
+                    self.release();
+                    Ok(())
+                }
+                _ => Err("an exec answer before it started".into()),
+            },
+            (None, Phase::Running) => {
+                if !matches!(frame.outcome(), Some(Ok(()))) {
+                    return Err("a failed exec after it started".into());
+                }
+                let mut inner = lock(&exec.state);
+                let result = exec_result(&frame, &inner, &exec)?;
+                inner.result = Some(result);
+                inner.phase = Phase::Done;
+                drop(inner);
+                exec.changed.notify_all();
+                ops.in_flight = None;
+                drop(ops);
+                self.release();
+                Ok(())
+            }
+            _ => Err("a frame out of order".into()),
+        }
+    }
+
+    /// The channel is gone: everything waiting fails with `error`, and no
+    /// request is sent any more. The first failure is the one kept.
+    fn fail(&self, error: ApiError) {
+        let mut ops = lock(&self.ops);
+        if ops.failure.is_some() {
+            return;
+        }
+        ops.failure = Some(error.clone());
+        let flight = ops.in_flight.take();
+        let latest = ops.latest.clone();
+        drop(ops);
+        match flight.map(|f| f.waiting) {
+            Some(Waiting::Exec(exec)) => exec.fail(&error),
+            Some(Waiting::Call { slot, .. }) => slot.fill(Err(error.clone())),
+            None => {}
+        }
+        if let Some(exec) = latest {
+            exec.fail(&error);
+        }
+        self.release();
+    }
+
+    /// The latest exec, if it is `exec_id`.
+    fn find_exec(&self, exec_id: &str) -> Result<Arc<Exec>, ApiError> {
+        let number = types::check_exec_id(exec_id);
+        lock(&self.ops)
+            .latest
+            .clone()
+            .filter(|e| Some(e.number) == number)
+            .ok_or_else(|| {
+                ApiError::new(
+                    404,
+                    "exec_not_found",
+                    "no such exec (a sandbox keeps only its latest)",
+                )
+            })
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+enum SendError {
+    /// The sandbox failed or was removed before.
+    Gone(ApiError),
+    /// Writing the request failed: the sandbox must go.
+    Broken(String),
 }
 
 struct Tombstone {
@@ -219,11 +596,7 @@ impl Node {
             .iter()
             .find(|t| t.id == id && tenant.is_none_or(|tenant| t.tenant == tenant))
         {
-            Some(t) => Err(ApiError::new(
-                410,
-                "sandbox_ended",
-                format!("the sandbox ended: {}", t.reason),
-            )),
+            Some(t) => Err(ApiError::ended(&t.reason)),
             None => Err(ApiError::not_found()),
         }
     }
@@ -237,6 +610,7 @@ impl Node {
         let Some(sandbox) = lock(&self.sandboxes).remove(&id) else {
             return false;
         };
+        sandbox.fail(ApiError::ended(reason));
         sandbox.kill();
         log::info!("sandbox {id} of {} removed: {reason}", sandbox.tenant);
         let mut ended = lock(&self.ended);
@@ -249,6 +623,23 @@ impl Node {
             reason: reason.to_string(),
         });
         true
+    }
+
+    /// The sandbox's agent broke the protocol, missed a deadline, or does
+    /// not take requests: whatever waits fails with `502`, and it goes.
+    fn agent_failed(&self, sandbox: &Sandbox, why: &str) -> ApiError {
+        let error = ApiError::failed_sandbox(why);
+        sandbox.fail(error.clone());
+        self.remove(sandbox.id, &format!("its agent failed: {why}"));
+        // Whichever failure came first (a removal for another reason, say).
+        lock(&sandbox.ops).failure.clone().unwrap_or(error)
+    }
+
+    fn send_failed(&self, sandbox: &Sandbox, err: SendError) -> ApiError {
+        match err {
+            SendError::Gone(error) => error,
+            SendError::Broken(why) => self.agent_failed(sandbox, &why),
+        }
     }
 
     pub fn delete(&self, id: &str, tenant: Option<&str>) -> Result<(), ApiError> {
@@ -336,11 +727,13 @@ impl Node {
         let run = clone
             .start()
             .map_err(|e| internal("starting the clone", &e))?;
-        let mut agent = Agent::new(OwnedFd::from(in_w), OwnedFd::from(out_r))
-            .map_err(|e| internal("the agent channel", &e))?;
-        agent
-            .hello(started + START_DEADLINE)
+        let from = OwnedFd::from(out_r);
+        agent::set_nonblocking(&from).map_err(|e| internal("the agent channel", &e))?;
+        let mut from = File::from(from);
+        agent::hello(&mut from, started + START_DEADLINE)
             .map_err(|e| internal("the agent's greeting", &e))?;
+        let writer =
+            Writer::new(OwnedFd::from(in_w)).map_err(|e| internal("the agent channel", &e))?;
         let control = clone
             .stream()
             .try_clone()
@@ -357,7 +750,13 @@ impl Node {
             last_used: Mutex::new((Instant::now(), unix_ms())),
             kernel_pid: run.pid,
             control,
-            agent: Mutex::new(agent),
+            writer: Mutex::new(writer),
+            ops: Mutex::new(Ops {
+                next_id: 1,
+                in_flight: None,
+                latest: None,
+                failure: None,
+            }),
             busy: AtomicBool::new(false),
             memory: AtomicU64::new(0),
             memory_limit: template.config.memory_limit_mb << 20,
@@ -370,9 +769,10 @@ impl Node {
             sandboxes.insert(id, Arc::clone(&sandbox));
         }
         let node = Arc::clone(self);
+        let watched = Arc::clone(&sandbox);
         let spawned = std::thread::Builder::new()
             .name("sandbox-watch".into())
-            .spawn(move || node.watch(id, clone, OwnedFd::from(err_r)));
+            .spawn(move || node.watch(watched, clone, OwnedFd::from(err_r), from));
         if let Err(err) = spawned {
             self.remove(id, "no thread to watch it");
             return Err(internal("watching the sandbox", &err));
@@ -386,12 +786,38 @@ impl Node {
         Ok(info)
     }
 
-    /// Follows a sandbox until it ends: its control connection reports the
-    /// end, its stderr (the agent's log) goes to noded's log, bounded.
-    fn watch(&self, id: SandboxId, clone: WarmClone, stderr: OwnedFd) {
+    /// Follows a sandbox until it ends: reads everything its agent says
+    /// (frames, as they come), passes its stderr (the agent's log) to
+    /// noded's log, bounded, enforces the agent's deadlines, and learns
+    /// from the control connection when the clone ended.
+    fn watch(&self, sandbox: Arc<Sandbox>, clone: WarmClone, stderr: OwnedFd, mut from: File) {
+        let id = sandbox.id;
         let mut logged = 0usize;
-        let mut stderr = Some(std::fs::File::from(stderr));
-        let reason = loop {
+        let mut stderr = Some(File::from(stderr));
+        let mut parser = FrameParser::new();
+        let mut chunk = vec![0u8; 1 << 16];
+        let ended = |clone: &WarmClone| {
+            let _ = clone
+                .stream()
+                .set_read_timeout(Some(Duration::from_secs(5)));
+            match WarmFrame::read_from(&mut clone.stream()) {
+                Ok(Some(WarmFrame::Exit(status))) => format!("its agent ended ({status:?})"),
+                Ok(Some(WarmFrame::Error(text))) => format!("the clone failed: {text}"),
+                Ok(Some(other)) => format!("unexpected {other:?} from the template"),
+                Ok(None) => "the template closed its connection".into(),
+                Err(err) => format!("its connection failed: {err}"),
+            }
+        };
+        // `Err` is the agent's fault (the sandbox failed); `Ok` an end.
+        let outcome: Result<String, String> = loop {
+            let now = Instant::now();
+            let mut due = now + Duration::from_secs(1);
+            if let Some(at) = sandbox.deadline() {
+                due = due.min(at);
+            }
+            if let Some(at) = parser.started() {
+                due = due.min(at + FRAME_DEADLINE);
+            }
             let mut polls = [
                 libc::pollfd {
                     fd: clone.stream().as_raw_fd(),
@@ -403,22 +829,31 @@ impl Node {
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: from.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
+            let ms = due
+                .saturating_duration_since(now)
+                .as_millis()
+                .clamp(1, 1000) as libc::c_int;
             // SAFETY: a valid array of pollfds.
-            let n = unsafe { libc::poll(polls.as_mut_ptr(), 2, 60_000) };
+            let n = unsafe { libc::poll(polls.as_mut_ptr(), 3, ms) };
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                break format!("watching failed: {err}");
+                break Ok(format!("watching failed: {err}"));
             }
             if polls[1].revents != 0 {
-                let mut chunk = [0u8; 4096];
-                match stderr.as_mut().map(|f| f.read(&mut chunk)) {
+                let mut log_chunk = [0u8; 4096];
+                match stderr.as_mut().map(|f| f.read(&mut log_chunk)) {
                     Some(Ok(n)) if n > 0 => {
                         if logged < LOG_BUDGET {
-                            let text = String::from_utf8_lossy(&chunk[..n]);
+                            let text = String::from_utf8_lossy(&log_chunk[..n]);
                             for line in text.lines().filter(|l| !l.is_empty()) {
                                 let line: String =
                                     line.chars().filter(|c| !c.is_control()).take(500).collect();
@@ -433,20 +868,61 @@ impl Node {
                     _ => stderr = None,
                 }
             }
+            if polls[2].revents != 0 {
+                match from.read(&mut chunk) {
+                    Ok(0) => break Ok(ended(&clone)),
+                    Ok(n) => {
+                        let mut data = &chunk[..n];
+                        let mut violation = None;
+                        while !data.is_empty() {
+                            match parser.push(&mut data, sandbox.frame_limit()) {
+                                Ok(Some(frame)) => {
+                                    if let Err(why) = sandbox.on_frame(frame) {
+                                        violation = Some(why);
+                                        break;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    violation = Some(err.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(why) = violation {
+                            break Err(why);
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(err) => break Err(format!("reading from it: {err}")),
+                }
+            }
             if polls[0].revents != 0 {
-                let _ = clone
-                    .stream()
-                    .set_read_timeout(Some(Duration::from_secs(5)));
-                break match Frame::read_from(&mut clone.stream()) {
-                    Ok(Some(Frame::Exit(status))) => format!("its agent ended ({status:?})"),
-                    Ok(Some(Frame::Error(text))) => format!("the clone failed: {text}"),
-                    Ok(Some(other)) => format!("unexpected {other:?} from the template"),
-                    Ok(None) => "the template closed its connection".into(),
-                    Err(err) => format!("its connection failed: {err}"),
-                };
+                break Ok(ended(&clone));
+            }
+            let now = Instant::now();
+            if parser
+                .started()
+                .is_some_and(|at| now >= at + FRAME_DEADLINE)
+            {
+                break Err("a frame not finished in time".into());
+            }
+            if sandbox.deadline().is_some_and(|at| now >= at) {
+                break Err("no answer in time".into());
             }
         };
-        self.remove(id, &reason);
+        match outcome {
+            Ok(reason) => {
+                self.remove(id, &reason);
+            }
+            Err(why) => {
+                self.agent_failed(&sandbox, &why);
+            }
+        }
         drop(clone);
     }
 
@@ -507,54 +983,49 @@ impl Node {
         }
     }
 
-    /// Runs `op` against the sandbox's agent: one operation at a time.
-    fn with_agent<T>(
+    /// One request that is not an exec: its answer.
+    fn call(
         &self,
         id: &str,
         tenant: Option<&str>,
-        op: impl FnOnce(&mut Agent) -> Result<T, AgentError>,
-    ) -> Result<T, ApiError> {
+        head: Map<String, Value>,
+        body: &[u8],
+        max_body: usize,
+    ) -> Result<Frame, ApiError> {
         let sandbox = self.get(id, tenant)?;
-        if sandbox
-            .busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(ApiError::new(
-                409,
-                "busy",
-                "the sandbox is running another request",
-            ));
+        sandbox.take()?;
+        let slot = Arc::new(Slot::default());
+        let deadline = Instant::now() + FILE_DEADLINE;
+        let waiting = {
+            let slot = Arc::clone(&slot);
+            move |_| Waiting::Call { slot, max_body }
+        };
+        if let Err(err) = sandbox.send(head, body, deadline, waiting) {
+            return Err(self.send_failed(&sandbox, err));
         }
-        sandbox.touch();
-        let _busy = Busy(&sandbox);
-        let result = op(&mut lock(&sandbox.agent));
-        match result {
-            Ok(value) => Ok(value),
-            Err(AgentError::Failed { code, message }) => Err(failed(code, message)),
-            Err(AgentError::Broken(why)) => {
-                // Removed meanwhile (deleted, over a limit): say why.
-                if let Err(err) = self.get(id, tenant) {
-                    if err.status == 410 {
-                        return Err(err);
-                    }
-                }
-                self.remove(sandbox.id, &format!("its agent failed: {why}"));
-                Err(ApiError::new(
-                    502,
-                    "sandbox_failed",
-                    format!("the sandbox failed and was removed: {why}"),
-                ))
+        let mut answer = wait_until(
+            &slot.ready,
+            lock(&slot.answer),
+            deadline + Duration::from_secs(5),
+            |a| a.is_some(),
+        );
+        match answer.take() {
+            Some(answer) => answer,
+            // The watch thread enforces the deadline; this is a backstop.
+            None => {
+                drop(answer);
+                Err(self.agent_failed(&sandbox, "no answer in time"))
             }
         }
     }
 
-    pub fn exec(
+    /// Starts an exec; returns once the agent started it.
+    pub fn start_exec(
         &self,
         id: &str,
         tenant: Option<&str>,
         request: &ExecRequest,
-    ) -> Result<ExecResult, ApiError> {
+    ) -> Result<Arc<Exec>, ApiError> {
         let (timeout, max_output) = request
             .validate()
             .map_err(|m| ApiError::new(400, "bad_request", m))?;
@@ -562,25 +1033,212 @@ impl Node {
         head.insert("op".into(), json!("exec"));
         head.insert("command".into(), json!(request.command));
         head.insert("python".into(), json!(request.python));
+        head.insert("stateful".into(), json!(request.stateful));
         head.insert("timeout".into(), json!(timeout));
-        head.insert("max_output".into(), json!(max_output));
         head.insert("cwd".into(), json!(request.cwd));
         head.insert("env".into(), json!(request.env));
         head.insert("has_stdin".into(), json!(request.stdin.is_some()));
         let stdin = request.stdin.as_deref().unwrap_or("").as_bytes();
-        let deadline = Instant::now() + Duration::from_secs_f64(timeout) + EXEC_GRACE;
-        // Both streams, each at most max_output plus the omission line.
-        let max_body = 2 * (max_output + 128);
-        let (answer, body) = self.with_agent(id, tenant, |agent| {
-            agent.call(head, stdin, deadline, max_body)
-        })?;
-        exec_result(&answer, &body).map_err(|why| {
-            ApiError::new(
-                502,
-                "sandbox_failed",
-                format!("a malformed exec answer: {why}"),
-            )
+        let kind = match (&request.command, request.stateful) {
+            (Some(_), _) => ExecKind::Command,
+            (None, false) => ExecKind::Python,
+            (None, true) => ExecKind::Stateful,
+        };
+        let sandbox = self.get(id, tenant)?;
+        sandbox.take()?;
+        let mut made = None;
+        let waiting = |number| {
+            let exec = Arc::new(Exec {
+                number,
+                kind,
+                started_at: unix_ms(),
+                timeout: Duration::from_secs_f64(timeout),
+                state: Mutex::new(ExecInner {
+                    phase: Phase::Starting,
+                    failure: None,
+                    stdout: Capture::new(max_output),
+                    stderr: Capture::new(max_output),
+                    log: StreamLog::new(max_output),
+                    cancel_requested: false,
+                    result: None,
+                }),
+                changed: Condvar::new(),
+                polls: AtomicUsize::new(0),
+            });
+            made = Some(Arc::clone(&exec));
+            Waiting::Exec(exec)
+        };
+        let deadline = Instant::now() + START_DEADLINE;
+        if let Err(err) = sandbox.send(head, stdin, deadline, waiting) {
+            return Err(self.send_failed(&sandbox, err));
+        }
+        let Some(exec) = made else {
+            return Err(ApiError::new(500, "internal", "no exec"));
+        };
+        let inner = wait_until(
+            &exec.changed,
+            lock(&exec.state),
+            deadline + Duration::from_secs(5),
+            |i| i.phase != Phase::Starting,
+        );
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        if inner.phase == Phase::Starting {
+            drop(inner);
+            return Err(self.agent_failed(&sandbox, "the exec did not start in time"));
+        }
+        drop(inner);
+        Ok(exec)
+    }
+
+    /// Runs an exec to its end.
+    pub fn exec(
+        &self,
+        id: &str,
+        tenant: Option<&str>,
+        request: &ExecRequest,
+    ) -> Result<ExecResult, ApiError> {
+        let exec = self.start_exec(id, tenant, request)?;
+        // The watch thread ends it by its deadline; the wait's own bound
+        // is a backstop.
+        let deadline = Instant::now() + exec.timeout + EXEC_GRACE + Duration::from_secs(5);
+        let inner = wait_until(&exec.changed, lock(&exec.state), deadline, |i| {
+            i.phase == Phase::Done
+        });
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        match &inner.result {
+            Some(result) => Ok(result.clone()),
+            None => Err(ApiError::new(
+                504,
+                "timeout",
+                "the exec did not end in time",
+            )),
+        }
+    }
+
+    pub fn start(
+        &self,
+        id: &str,
+        tenant: Option<&str>,
+        request: &ExecRequest,
+    ) -> Result<ExecStatus, ApiError> {
+        Ok(self.start_exec(id, tenant, request)?.status())
+    }
+
+    pub fn execs(&self, id: &str, tenant: Option<&str>) -> Result<ExecList, ApiError> {
+        let sandbox = self.get(id, tenant)?;
+        let latest = lock(&sandbox.ops).latest.clone();
+        Ok(ExecList {
+            execs: latest.map(|e| e.status()).into_iter().collect(),
         })
+    }
+
+    /// The output of an exec from `query.cursor` on; waits up to
+    /// `query.wait` for some, or for its end.
+    pub fn poll(
+        &self,
+        id: &str,
+        tenant: Option<&str>,
+        exec_id: &str,
+        query: PollQuery,
+    ) -> Result<ExecPoll, ApiError> {
+        let sandbox = self.get(id, tenant)?;
+        let exec = sandbox.find_exec(exec_id)?;
+        sandbox.touch();
+        if exec.polls.fetch_add(1, Ordering::SeqCst) >= MAX_POLLS {
+            exec.polls.fetch_sub(1, Ordering::SeqCst);
+            return Err(ApiError::new(
+                429,
+                "too_many_polls",
+                format!("at most {MAX_POLLS} polls of one exec at once"),
+            ));
+        }
+        let _polling = Polling(&exec.polls);
+        let deadline = Instant::now() + Duration::from_secs_f64(query.wait);
+        let mut inner = lock(&exec.state);
+        loop {
+            if let Some(failure) = &inner.failure {
+                return Err(failure.clone());
+            }
+            let done = inner.phase == Phase::Done;
+            let read = inner.log.read(query.cursor, query.max_bytes, done);
+            if !read.events.is_empty() || done || Instant::now() >= deadline {
+                let eof = done && read.next_cursor == inner.log.total();
+                return Ok(ExecPoll {
+                    exec_id: exec.exec_id(),
+                    state: if done {
+                        ExecState::Done
+                    } else {
+                        ExecState::Running
+                    },
+                    events: read.events,
+                    next_cursor: read.next_cursor,
+                    eof,
+                    result: inner.result.clone(),
+                });
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            inner = exec
+                .changed
+                .wait_timeout(inner, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// Cancels an exec: its process group is killed (a stateful call is
+    /// interrupted first). Waits up to [`CANCEL_WAIT`] for its end.
+    pub fn cancel(
+        &self,
+        id: &str,
+        tenant: Option<&str>,
+        exec_id: &str,
+    ) -> Result<ExecStatus, ApiError> {
+        let sandbox = self.get(id, tenant)?;
+        let exec = sandbox.find_exec(exec_id)?;
+        let first = {
+            let mut inner = lock(&exec.state);
+            let first = inner.phase != Phase::Done && !inner.cancel_requested;
+            if first {
+                inner.cancel_requested = true;
+            }
+            first
+        };
+        if first {
+            let head = match json!({"op": "cancel", "id": 0, "target": exec.number}) {
+                Value::Object(map) => map,
+                _ => Map::new(),
+            };
+            let sent = lock(&sandbox.writer).send(&head, b"", Instant::now() + CANCEL_WRITE);
+            if let Err(err) = sent {
+                return Err(self.agent_failed(&sandbox, &err.to_string()));
+            }
+        }
+        let inner = wait_until(
+            &exec.changed,
+            lock(&exec.state),
+            Instant::now() + CANCEL_WAIT,
+            |i| i.phase == Phase::Done,
+        );
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        drop(inner);
+        Ok(exec.status())
+    }
+
+    /// Discards the sandbox's stateful interpreter.
+    pub fn reset(&self, id: &str, tenant: Option<&str>) -> Result<ResetResult, ApiError> {
+        let frame = self.call(id, tenant, map(json!({"op": "reset"})), b"", 0)?;
+        let had_state = frame
+            .head
+            .get("had_state")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| ApiError::new(502, "sandbox_failed", "a malformed reset answer"))?;
+        Ok(ResetResult { had_state })
     }
 
     pub fn read_file(
@@ -591,11 +1249,7 @@ impl Node {
     ) -> Result<Vec<u8>, ApiError> {
         types::check_path(path).map_err(|m| ApiError::new(400, "bad_request", m))?;
         let head = map(json!({"op": "read", "path": path, "max_bytes": types::MAX_FILE}));
-        let deadline = Instant::now() + FILE_DEADLINE;
-        let (_, body) = self.with_agent(id, tenant, |agent| {
-            agent.call(head, b"", deadline, types::MAX_FILE)
-        })?;
-        Ok(body)
+        Ok(self.call(id, tenant, head, b"", types::MAX_FILE)?.body)
     }
 
     pub fn write_file(
@@ -610,8 +1264,7 @@ impl Node {
             return Err(ApiError::new(413, "too_large", "the file is too large"));
         }
         let head = map(json!({"op": "write", "path": path}));
-        let deadline = Instant::now() + FILE_DEADLINE;
-        self.with_agent(id, tenant, |agent| agent.call(head, data, deadline, 0))?;
+        self.call(id, tenant, head, data, 0)?;
         Ok(WriteResult {
             bytes: data.len() as u64,
         })
@@ -631,10 +1284,9 @@ impl Node {
             json!({"op": "edit", "path": request.path, "old": request.old,
             "new": request.new, "replace_all": request.replace_all, "max_bytes": types::MAX_FILE}),
         );
-        let deadline = Instant::now() + FILE_DEADLINE;
-        let (answer, _) =
-            self.with_agent(id, tenant, |agent| agent.call(head, b"", deadline, 0))?;
-        let replacements = answer
+        let frame = self.call(id, tenant, head, b"", 0)?;
+        let replacements = frame
+            .head
             .get("replacements")
             .and_then(Value::as_u64)
             .ok_or_else(|| ApiError::new(502, "sandbox_failed", "a malformed edit answer"))?;
@@ -657,8 +1309,15 @@ fn map(value: Value) -> Map<String, Value> {
     }
 }
 
-/// Builds the exec result from the agent's answer, checking every field.
-fn exec_result(answer: &Map<String, Value>, body: &[u8]) -> Result<ExecResult, String> {
+/// At most `limit` characters of `text`.
+fn clip(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+/// Builds an exec's result from the agent's final answer and the output
+/// held, checking every field.
+fn exec_result(frame: &Frame, inner: &ExecInner, exec: &Exec) -> Result<ExecResult, String> {
+    let answer = &frame.head;
     let int = |key: &str| -> Result<Option<i32>, String> {
         match answer.get(key) {
             None | Some(Value::Null) => Ok(None),
@@ -669,61 +1328,174 @@ fn exec_result(answer: &Map<String, Value>, body: &[u8]) -> Result<ExecResult, S
                 .ok_or_else(|| format!("{key} is not a small integer")),
         }
     };
-    let count = |key: &str| {
-        answer
-            .get(key)
-            .and_then(Value::as_u64)
-            .ok_or(format!("no {key}"))
-    };
     let flag = |key: &str| {
         answer
             .get(key)
             .and_then(Value::as_bool)
             .ok_or(format!("no {key}"))
     };
-    let split = count("stdout_len")? as usize;
-    if split > body.len() {
-        return Err("stdout_len past the body".into());
-    }
+    let length = |key: &str| -> Result<usize, String> {
+        match answer.get(key) {
+            None | Some(Value::Null) => Ok(0),
+            Some(v) => v
+                .as_u64()
+                .map(|n| n as usize)
+                .ok_or_else(|| format!("{key} is not a length")),
+        }
+    };
     let duration_ms = answer
         .get("duration_ms")
         .and_then(Value::as_f64)
         .filter(|d| d.is_finite() && *d >= 0.0)
         .ok_or("no duration_ms")?;
-    Ok(ExecResult {
+    let (stdout, stdout_truncated) = inner.stdout.result();
+    let (stderr, stderr_truncated) = inner.stderr.result();
+    let mut result = ExecResult {
+        exec_id: exec.exec_id(),
         exit_code: int("exit_code")?,
         signal: int("signal")?,
         timed_out: flag("timed_out")?,
-        stdout: String::from_utf8_lossy(&body[..split]).into_owned(),
-        stderr: String::from_utf8_lossy(&body[split..]).into_owned(),
-        stdout_truncated: flag("stdout_truncated")?,
-        stderr_truncated: flag("stderr_truncated")?,
-        stdout_bytes: count("stdout_bytes")?,
-        stderr_bytes: count("stderr_bytes")?,
+        cancelled: flag("cancelled")?,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_truncated,
+        stderr_truncated,
+        stdout_bytes: inner.stdout.total(),
+        stderr_bytes: inner.stderr.total(),
         duration_ms,
-    })
+        value: None,
+        error: None,
+        state_lost: None,
+    };
+    if exec.kind == ExecKind::Stateful {
+        let value_len = length("value_len")?;
+        let message_len = length("message_len")?;
+        let traceback_len = length("traceback_len")?;
+        let total = value_len
+            .checked_add(message_len)
+            .and_then(|n| n.checked_add(traceback_len));
+        if total != Some(frame.body.len()) {
+            return Err("value, message and traceback lengths do not match the body".into());
+        }
+        let (value, rest) = frame.body.split_at(value_len);
+        let (message, traceback) = rest.split_at(message_len);
+        if answer.get("value_len").is_some_and(|v| !v.is_null()) {
+            result.value = Some(clip(
+                &String::from_utf8_lossy(value),
+                types::MAX_VALUE + 100,
+            ));
+        }
+        result.error = match answer.get("error") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(error)) => {
+                let text = |key: &str| {
+                    error
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .ok_or(format!("error without {key}"))
+                };
+                Some(ExecError {
+                    kind: clip(text("type")?, 200),
+                    message: clip(&String::from_utf8_lossy(message), types::MAX_VALUE + 100),
+                    traceback: clip(
+                        &String::from_utf8_lossy(traceback),
+                        types::MAX_TRACEBACK + 100,
+                    ),
+                })
+            }
+            Some(_) => return Err("error is not an object".into()),
+        };
+        result.state_lost = Some(flag("state_lost")?);
+    } else if !frame.body.is_empty() {
+        return Err("a body in an exec's answer".into());
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn inner(limit: usize) -> ExecInner {
+        ExecInner {
+            phase: Phase::Running,
+            failure: None,
+            stdout: Capture::new(limit),
+            stderr: Capture::new(limit),
+            log: StreamLog::new(limit),
+            cancel_requested: false,
+            result: None,
+        }
+    }
+
+    fn exec(kind: ExecKind) -> Exec {
+        Exec {
+            number: 7,
+            kind,
+            started_at: 0,
+            timeout: Duration::from_secs(1),
+            state: Mutex::new(inner(64)),
+            changed: Condvar::new(),
+            polls: AtomicUsize::new(0),
+        }
+    }
+
+    fn frame(head: Value, body: &[u8]) -> Frame {
+        Frame {
+            head: map(head),
+            body: body.to_vec(),
+        }
+    }
+
     #[test]
     fn exec_answers_are_checked() {
-        let good = map(json!({"exit_code": 0, "signal": null, "timed_out": false,
-            "stdout_len": 3, "stdout_truncated": false, "stderr_truncated": false,
-            "stdout_bytes": 3, "stderr_bytes": 2, "duration_ms": 1.5}));
-        let r = exec_result(&good, b"out\xffe").unwrap();
+        let mut held = inner(1024);
+        held.stdout.add(b"out");
+        held.stderr.add(b"\xffe");
+        let good = json!({"exit_code": 0, "signal": null, "timed_out": false, "cancelled": false,
+            "duration_ms": 1.5});
+        let command = exec(ExecKind::Command);
+        let r = exec_result(&frame(good.clone(), b""), &held, &command).unwrap();
+        assert_eq!(r.exec_id, "ex-7");
         assert_eq!(r.stdout, "out");
         assert_eq!(r.stderr, "\u{fffd}e");
-        let mut past = good.clone();
-        past.insert("stdout_len".into(), json!(99));
-        assert!(exec_result(&past, b"x").is_err());
+        assert_eq!(r.stdout_bytes, 3);
+        assert!(r.value.is_none() && r.state_lost.is_none());
+        // A body where none belongs.
+        assert!(exec_result(&frame(good.clone(), b"x"), &held, &command).is_err());
         let mut huge = good.clone();
-        huge.insert("exit_code".into(), json!(1u64 << 40));
-        assert!(exec_result(&huge, b"out").is_err());
-        let mut missing = good;
-        missing.remove("timed_out");
-        assert!(exec_result(&missing, b"out").is_err());
+        huge["exit_code"] = json!(1u64 << 40);
+        assert!(exec_result(&frame(huge, b""), &held, &command).is_err());
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().remove("cancelled");
+        assert!(exec_result(&frame(missing, b""), &held, &command).is_err());
+
+        // Stateful: value and traceback split the body.
+        let stateful = exec(ExecKind::Stateful);
+        let mut answer = good.clone();
+        answer["value_len"] = json!(2);
+        answer["message_len"] = json!(3);
+        answer["traceback_len"] = json!(5);
+        answer["error"] = json!({"type": "ValueError"});
+        answer["state_lost"] = json!(false);
+        let r = exec_result(&frame(answer.clone(), b"42badTrace"), &held, &stateful).unwrap();
+        assert_eq!(r.value.as_deref(), Some("42"));
+        let error = r.error.unwrap();
+        assert_eq!(
+            (
+                error.kind.as_str(),
+                error.message.as_str(),
+                error.traceback.as_str()
+            ),
+            ("ValueError", "bad", "Trace")
+        );
+        assert_eq!(r.state_lost, Some(false));
+        // Lengths that do not add up, or that overflow.
+        assert!(exec_result(&frame(answer.clone(), b"42badTrac"), &held, &stateful).is_err());
+        answer["value_len"] = json!(u64::MAX);
+        assert!(exec_result(&frame(answer.clone(), b"42badTrace"), &held, &stateful).is_err());
+        answer["value_len"] = json!(2);
+        answer["error"] = json!("nope");
+        assert!(exec_result(&frame(answer, b"42badTrace"), &held, &stateful).is_err());
     }
 }

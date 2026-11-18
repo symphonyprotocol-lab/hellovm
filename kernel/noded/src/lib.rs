@@ -12,6 +12,7 @@ pub mod config;
 pub mod memory;
 #[cfg(target_os = "linux")]
 pub mod node;
+pub mod output;
 #[cfg(target_os = "linux")]
 pub mod server;
 #[cfg(target_os = "linux")]
