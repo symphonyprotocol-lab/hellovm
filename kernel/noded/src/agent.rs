@@ -434,7 +434,10 @@ mod tests {
         assert!(push(&frame("{}", b""), None).is_err());
         // A failure carries its code.
         let mut parser = FrameParser::new();
-        let mut data = &frame(r#"{"id":3,"ok":false,"code":"not_found","message":"m"}"#, b"")[..];
+        let mut data = &frame(
+            r#"{"id":3,"ok":false,"code":"not_found","message":"m"}"#,
+            b"",
+        )[..];
         let f = parser.push(&mut data, Some(0)).unwrap().unwrap();
         match f.outcome() {
             Some(Err(AgentError::Failed { code, .. })) => assert_eq!(code, "not_found"),
@@ -538,9 +541,7 @@ mod tests {
                         };
                         out.extend_from_slice(&frame.body);
                         answer.order.push(tag);
-                        answer
-                            .order
-                            .push_str(&String::from_utf8_lossy(&frame.body));
+                        answer.order.push_str(&String::from_utf8_lossy(&frame.body));
                         continue;
                     }
                     _ => {}
@@ -629,10 +630,11 @@ mod tests {
         assert_eq!(a.stdout, b"ABC True\n");
 
         // The stateful interpreter keeps its namespace.
-        let stateful = |code: &str| {
-            json!({"op": "exec", "python": code, "stateful": true, "timeout": 10.0})
-        };
-        let a = agent.call(stateful("import json\nx = 40\nprint('set')"), b"").unwrap();
+        let stateful =
+            |code: &str| json!({"op": "exec", "python": code, "stateful": true, "timeout": 10.0});
+        let a = agent
+            .call(stateful("import json\nx = 40\nprint('set')"), b"")
+            .unwrap();
         assert_eq!(a.stdout, b"set\n");
         assert_eq!(a.head["state_lost"], json!(false));
         assert!(a.head.get("value_len").is_none());
@@ -643,7 +645,10 @@ mod tests {
         assert_eq!(a.head["error"]["type"], json!("ZeroDivisionError"));
         assert_eq!(a.head["exit_code"], json!(1));
         let trace = String::from_utf8_lossy(&a.body);
-        assert!(trace.contains("ZeroDivisionError") && trace.contains("1/0"), "{trace}");
+        assert!(
+            trace.contains("ZeroDivisionError") && trace.contains("1/0"),
+            "{trace}"
+        );
         let a = agent.call(stateful("json.dumps(x)"), b"").unwrap();
         assert_eq!(a.body, b"'40'");
         // Interrupted at its timeout: the state survives.
@@ -699,7 +704,10 @@ mod tests {
             .call(json!({"op": "write", "path": "d/f.txt"}), b"hello world")
             .unwrap();
         let a = agent
-            .call(json!({"op": "read", "path": "d/f.txt", "max_bytes": 100}), b"")
+            .call(
+                json!({"op": "read", "path": "d/f.txt", "max_bytes": 100}),
+                b"",
+            )
             .unwrap();
         assert_eq!(a.body, b"hello world");
         let a = agent

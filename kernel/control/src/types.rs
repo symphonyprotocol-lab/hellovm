@@ -303,11 +303,17 @@ pub struct ExecList {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputEvent {
-    Stdout { data: String },
-    Stderr { data: String },
+    Stdout {
+        data: String,
+    },
+    Stderr {
+        data: String,
+    },
     /// Output that was not kept (nobody read it while it was held, and
     /// more came after it): this many bytes.
-    Omitted { bytes: u64 },
+    Omitted {
+        bytes: u64,
+    },
 }
 
 /// `GET /v1/sandboxes/{id}/execs/{exec}?cursor=&wait=&max_bytes=`.
@@ -499,7 +505,10 @@ mod tests {
         .validate()
         .is_err());
         // `stateful: false` is the default and not written out.
-        assert_eq!(serde_json::to_string(&ok).unwrap(), r#"{"command":"echo hi"}"#);
+        assert_eq!(
+            serde_json::to_string(&ok).unwrap(),
+            r#"{"command":"echo hi"}"#
+        );
     }
 
     #[test]
@@ -508,7 +517,10 @@ mod tests {
         assert_eq!((q.cursor, q.wait, q.max_bytes), (12, 1.5, 2048));
         assert_eq!(q.to_query(), "cursor=12&wait=1.5&max_bytes=2048");
         let d = PollQuery::parse(None, None, None).unwrap();
-        assert_eq!((d.cursor, d.wait, d.max_bytes), (0, 0.0, DEFAULT_POLL_BYTES));
+        assert_eq!(
+            (d.cursor, d.wait, d.max_bytes),
+            (0, 0.0, DEFAULT_POLL_BYTES)
+        );
         for (c, w, m) in [
             (Some("-1"), None, None),
             (Some("x"), None, None),

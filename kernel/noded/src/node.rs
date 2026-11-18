@@ -27,15 +27,15 @@ use hellovm_control::http::Response;
 use hellovm_control::ids::SandboxId;
 use hellovm_control::types::{
     self, EditRequest, EditResult, ExecError, ExecKind, ExecList, ExecPoll, ExecRequest,
-    ExecResult, ExecState, ExecStatus, NodeCreate, NodeStatus, PollQuery, ResetResult,
-    SandboxInfo, WriteResult,
+    ExecResult, ExecState, ExecStatus, NodeCreate, NodeStatus, PollQuery, ResetResult, SandboxInfo,
+    WriteResult,
 };
 use hellovm_control::unix_ms;
 use serde_json::{json, Map, Value};
 
 use crate::agent::{self, AgentError, Frame, FrameParser, Writer, FRAME_DEADLINE, OUTPUT_CHUNK};
 use crate::config::{valid_name, Config};
-use crate::output::{Capture, StreamLog, Stream};
+use crate::output::{Capture, Stream, StreamLog};
 use crate::template::Template;
 
 /// How long a new clone may take to run and to greet, and an exec to
@@ -397,9 +397,7 @@ impl Sandbox {
             Waiting::Call { slot, .. } => {
                 let answer = match frame.outcome() {
                     Some(Ok(())) if frame.op().is_none() => Ok(frame),
-                    Some(Err(AgentError::Failed { code, message })) => {
-                        Err(failed(code, message))
-                    }
+                    Some(Err(AgentError::Failed { code, message })) => Err(failed(code, message)),
                     _ => return Err("an answer that is neither success nor failure".into()),
                 };
                 let slot = Arc::clone(slot);
@@ -821,7 +819,10 @@ impl Node {
                     revents: 0,
                 },
             ];
-            let ms = due.saturating_duration_since(now).as_millis().clamp(1, 1000) as libc::c_int;
+            let ms = due
+                .saturating_duration_since(now)
+                .as_millis()
+                .clamp(1, 1000) as libc::c_int;
             // SAFETY: a valid array of pollfds.
             let n = unsafe { libc::poll(polls.as_mut_ptr(), 3, ms) };
             if n < 0 {
@@ -888,7 +889,10 @@ impl Node {
                 break Ok(ended(&clone));
             }
             let now = Instant::now();
-            if parser.started().is_some_and(|at| now >= at + FRAME_DEADLINE) {
+            if parser
+                .started()
+                .is_some_and(|at| now >= at + FRAME_DEADLINE)
+            {
                 break Err("a frame not finished in time".into());
             }
             if sandbox.deadline().is_some_and(|at| now >= at) {
@@ -1090,7 +1094,11 @@ impl Node {
         }
         match &inner.result {
             Some(result) => Ok(result.clone()),
-            None => Err(ApiError::new(504, "timeout", "the exec did not end in time")),
+            None => Err(ApiError::new(
+                504,
+                "timeout",
+                "the exec did not end in time",
+            )),
         }
     }
 
@@ -1440,7 +1448,10 @@ mod tests {
         let r = exec_result(&frame(answer.clone(), b"42Trace"), &held, &stateful).unwrap();
         assert_eq!(r.value.as_deref(), Some("42"));
         let error = r.error.unwrap();
-        assert_eq!((error.kind.as_str(), error.traceback.as_str()), ("ValueError", "Trace"));
+        assert_eq!(
+            (error.kind.as_str(), error.traceback.as_str()),
+            ("ValueError", "Trace")
+        );
         assert_eq!(r.state_lost, Some(false));
         // Lengths that do not add up, or that overflow.
         assert!(exec_result(&frame(answer.clone(), b"42Trac"), &held, &stateful).is_err());

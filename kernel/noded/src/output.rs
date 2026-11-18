@@ -177,7 +177,9 @@ impl StreamLog {
             return;
         }
         match self.tail.back_mut() {
-            Some(last) if last.stream == stream && last.end() == start && last.data.len() < 1 << 16 => {
+            Some(last)
+                if last.stream == stream && last.end() == start && last.data.len() < 1 << 16 =>
+            {
                 last.data.extend_from_slice(data)
             }
             _ => self.tail.push_back(Chunk {
@@ -368,7 +370,12 @@ mod tests {
         log.add(Stream::Stderr, b"456789");
         assert_eq!(log.total(), 130);
         // Held: the first 10 and the last 10 bytes.
-        let held: usize = log.head.iter().chain(log.tail.iter()).map(|c| c.data.len()).sum();
+        let held: usize = log
+            .head
+            .iter()
+            .chain(log.tail.iter())
+            .map(|c| c.data.len())
+            .sum();
         assert_eq!(held, 20);
         let r = log.read(0, 1024, false);
         assert_eq!(text(&r.events), "o:0123456789|[110]|o:0123|e:456789|");

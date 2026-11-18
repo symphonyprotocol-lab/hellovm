@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use hellovm_control::http::{self, percent_encode, ClientResponse, Handler, Request, Response};
 use hellovm_control::ids::{token_eq, SandboxId};
 use hellovm_control::types::{
-    self, CreateSandbox, ExecRequest, NodeCreate, NodeStatus, PollQuery, SandboxInfo,
-    SandboxList, TemplateStatus,
+    self, CreateSandbox, ExecRequest, NodeCreate, NodeStatus, PollQuery, SandboxInfo, SandboxList,
+    TemplateStatus,
 };
 
 use crate::config::{Config, Node, Tenant};
@@ -387,9 +387,10 @@ impl Api {
                     NODE_TIMEOUT,
                 )
             }
-            ("POST", ["python", "reset"]) => {
-                (format!("/v1/sandboxes/{sandbox}/python/reset"), NODE_TIMEOUT)
-            }
+            ("POST", ["python", "reset"]) => (
+                format!("/v1/sandboxes/{sandbox}/python/reset"),
+                NODE_TIMEOUT,
+            ),
             ("GET" | "PUT", ["files"]) => {
                 let Some(path) = request.query("path") else {
                     return error(400, "bad_request", "no ?path=");

@@ -654,6 +654,7 @@ fn bench_create_and_exec() {
     let (mut create, mut node, mut echo, mut python, mut first) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut write, mut read, mut delete) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut first_output, mut py_first, mut py_call) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..rounds {
         let started = Instant::now();
         let sandbox = plane.create(ACME, json!({}));
@@ -672,6 +673,20 @@ fn bench_create_and_exec() {
         );
         assert_eq!(r["stdout"], "[1]\n");
         python.push(ms(started));
+        // A streamed exec: from the request to its first output.
+        let started = Instant::now();
+        let exec = plane.start_exec(ACME, &id, json!({"command": "echo hi; sleep 0.2"}));
+        let (events, _) = plane.follow_until(ACME, &id, &exec, |e| !e.is_empty());
+        first_output.push(ms(started));
+        assert_eq!(common::stream_text(&events, "stdout"), "hi\n");
+        plane.follow(ACME, &id, &exec);
+        // The stateful interpreter: the first call starts it.
+        let started = Instant::now();
+        assert_eq!(plane.py(ACME, &id, "x = 1\nx")["value"], "1");
+        py_first.push(ms(started));
+        let started = Instant::now();
+        assert_eq!(plane.py(ACME, &id, "x += 1\nx")["value"], "2");
+        py_call.push(ms(started));
         let started = Instant::now();
         let path = format!("/v1/sandboxes/{id}/files?path=f.txt");
         assert_eq!(plane.call(ACME, "PUT", &path, b"hello").status, 200);
@@ -706,6 +721,12 @@ fn bench_create_and_exec() {
         ("exec `echo hi`", &mut echo),
         ("create + first exec", &mut first),
         ("exec python (warm fork)", &mut python),
+        ("streamed exec, request to first output", &mut first_output),
+        (
+            "stateful python, first call (starts the interpreter)",
+            &mut py_first,
+        ),
+        ("stateful python, a call", &mut py_call),
         ("write_file 5 bytes", &mut write),
         ("read_file 5 bytes", &mut read),
         ("delete", &mut delete),
@@ -767,15 +788,28 @@ fn streamed_execs_and_cancel() {
     let (events, poll) = plane.follow_until(ACME, &id, &exec, |events| {
         common::stream_text(events, "stdout").contains("first")
     });
-    eprintln!("MEASURE first output of a streamed exec (debug build): {:.1} ms", ms(started));
+    eprintln!(
+        "MEASURE first output of a streamed exec (debug build): {:.1} ms",
+        ms(started)
+    );
     assert_eq!(common::stream_text(&events, "stdout"), "first\n");
     assert_eq!(poll["state"], "running", "{poll}");
     assert_eq!(poll["eof"], false);
     // While it runs: one request at a time, but reading, listing and
     // cancelling are not requests that take the sandbox.
-    let busy = plane.call_json(ACME, "POST", &format!("/v1/sandboxes/{id}/exec"), json!({"command": "true"}));
+    let busy = plane.call_json(
+        ACME,
+        "POST",
+        &format!("/v1/sandboxes/{id}/exec"),
+        json!({"command": "true"}),
+    );
     assert_eq!((busy.status, busy.code().as_str()), (409, "busy"));
-    let busy = plane.call(ACME, "GET", &format!("/v1/sandboxes/{id}/files?path=x"), b"");
+    let busy = plane.call(
+        ACME,
+        "GET",
+        &format!("/v1/sandboxes/{id}/files?path=x"),
+        b"",
+    );
     assert_eq!(busy.status, 409);
     let listed = wait_exec_state(&plane, ACME, &id, "running");
     assert_eq!(listed["exec_id"], exec);
@@ -795,7 +829,10 @@ fn streamed_execs_and_cancel() {
     let r = plane.cancel(ACME, &id, &exec);
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let status = r.json();
-    eprintln!("MEASURE cancel to end (debug build): {:.1} ms", ms(cancelled_at));
+    eprintln!(
+        "MEASURE cancel to end (debug build): {:.1} ms",
+        ms(cancelled_at)
+    );
     assert_eq!(status["state"], "done", "{status}");
     let result = &status["result"];
     assert_eq!(result["cancelled"], true, "{status}");
@@ -807,13 +844,20 @@ fn streamed_execs_and_cancel() {
     let poll = r.json();
     assert_eq!(poll["eof"], true, "{poll}");
     assert_eq!(poll["result"]["cancelled"], true);
-    assert!(waited < Duration::from_secs(20), "the waiting poll was not woken");
+    assert!(
+        waited < Duration::from_secs(20),
+        "the waiting poll was not woken"
+    );
     assert!(started.elapsed() < Duration::from_secs(60));
     // Cancelling again changes nothing.
     assert_eq!(plane.cancel(ACME, &id, &exec).json()["result"], *result);
     // The sandbox is usable, and the background child is gone.
     eventually(Duration::from_secs(10), "the background child died", || {
-        plane.sh(ACME, &id, "kill -0 $(cat /tmp/bg) 2>/dev/null && echo alive || echo dead")["stdout"]
+        plane.sh(
+            ACME,
+            &id,
+            "kill -0 $(cat /tmp/bg) 2>/dev/null && echo alive || echo dead",
+        )["stdout"]
             == "dead\n"
     });
 
@@ -825,10 +869,15 @@ fn streamed_execs_and_cancel() {
     );
     let (events, result) = plane.follow(ACME, &id, &exec);
     let pairs = common::merged(&events);
-    let expect: Vec<(String, String)> = [("stdout", "a\n"), ("stderr", "b\n"), ("stdout", "c\n"), ("stderr", "d\n")]
-        .iter()
-        .map(|(k, t)| (k.to_string(), t.to_string()))
-        .collect();
+    let expect: Vec<(String, String)> = [
+        ("stdout", "a\n"),
+        ("stderr", "b\n"),
+        ("stdout", "c\n"),
+        ("stderr", "d\n"),
+    ]
+    .iter()
+    .map(|(k, t)| (k.to_string(), t.to_string()))
+    .collect();
     assert_eq!(pairs, expect);
     assert_eq!(result["exit_code"], 4);
     assert_eq!(result["stdout"], "a\nc\n");
@@ -869,7 +918,10 @@ fn streamed_execs_and_cancel() {
     let pairs = common::merged(&events);
     assert_eq!(pairs.len(), 3, "{pairs:?}");
     assert!(pairs[0].1.starts_with("1\n2\n3\n") && pairs[0].1.len() == 1000);
-    assert_eq!(pairs[1], ("omitted".to_string(), (total - 2000).to_string()));
+    assert_eq!(
+        pairs[1],
+        ("omitted".to_string(), (total - 2000).to_string())
+    );
     assert!(pairs[2].1.ends_with("299999\n300000\n") && pairs[2].1.len() == 1000);
     assert_eq!(result["stdout_bytes"], total);
     assert_eq!(result["stdout_truncated"], true);
@@ -903,13 +955,32 @@ fn streamed_execs_and_cancel() {
     assert_eq!(r.json()["cancelled"], true);
 
     // Bad polls, unknown execs; only the latest exec is kept.
-    let bad = plane.call(ACME, "GET", &format!("/v1/sandboxes/{id}/execs/{exec}?wait=31"), b"");
+    let bad = plane.call(
+        ACME,
+        "GET",
+        &format!("/v1/sandboxes/{id}/execs/{exec}?wait=31"),
+        b"",
+    );
     assert_eq!(bad.status, 400);
-    let bad = plane.call(ACME, "GET", &format!("/v1/sandboxes/{id}/execs/{exec}?max_bytes=1"), b"");
+    let bad = plane.call(
+        ACME,
+        "GET",
+        &format!("/v1/sandboxes/{id}/execs/{exec}?max_bytes=1"),
+        b"",
+    );
     assert_eq!(bad.status, 400);
     for unknown in ["ex-999999", "nope", "ex-1"] {
-        let r = plane.call(ACME, "GET", &format!("/v1/sandboxes/{id}/execs/{unknown}"), b"");
-        assert_eq!((r.status, r.code().as_str()), (404, "exec_not_found"), "{unknown}");
+        let r = plane.call(
+            ACME,
+            "GET",
+            &format!("/v1/sandboxes/{id}/execs/{unknown}"),
+            b"",
+        );
+        assert_eq!(
+            (r.status, r.code().as_str()),
+            (404, "exec_not_found"),
+            "{unknown}"
+        );
         assert_eq!(plane.cancel(ACME, &id, unknown).status, 404);
     }
 
@@ -924,12 +995,24 @@ fn streamed_execs_and_cancel() {
         ("POST", format!("/v1/sandboxes/{id}/execs")),
     ] {
         let r = plane.call(BETA, method, &target, b"{\"command\": \"true\"}");
-        assert_eq!((r.status, r.code().as_str()), (404, "sandbox_not_found"), "{method} {target}");
+        assert_eq!(
+            (r.status, r.code().as_str()),
+            (404, "sandbox_not_found"),
+            "{method} {target}"
+        );
     }
     // Nor through its own sandbox's id.
-    let r = plane.call(BETA, "GET", &format!("/v1/sandboxes/{other}/execs/{exec}"), b"");
+    let r = plane.call(
+        BETA,
+        "GET",
+        &format!("/v1/sandboxes/{other}/execs/{exec}"),
+        b"",
+    );
     assert_eq!(r.status, 404);
-    assert_eq!(plane.cancel(ACME, &id, &exec).json()["result"]["cancelled"], true);
+    assert_eq!(
+        plane.cancel(ACME, &id, &exec).json()["result"]["cancelled"],
+        true
+    );
 
     // Deleting a sandbox with an exec running ends the exec's readers.
     let exec = plane.start_exec(ACME, &id, json!({"command": "sleep 60"}));
@@ -949,19 +1032,28 @@ fn stateful_python() {
     // Variables and imports persist; the last expression is the value.
     let started = Instant::now();
     let r = plane.py(ACME, &id, "import json\nx = 41\nprint('set')");
-    eprintln!("MEASURE first stateful call (debug build, starts the interpreter): {:.1} ms", ms(started));
+    eprintln!(
+        "MEASURE first stateful call (debug build, starts the interpreter): {:.1} ms",
+        ms(started)
+    );
     assert_eq!(r["stdout"], "set\n", "{r}");
     assert_eq!(r["state_lost"], false);
     assert!(r.get("value").is_none(), "{r}");
     let started = Instant::now();
     let r = plane.py(ACME, &id, "x += 1\nx");
-    eprintln!("MEASURE stateful call round trip (debug build): {:.1} ms", ms(started));
+    eprintln!(
+        "MEASURE stateful call round trip (debug build): {:.1} ms",
+        ms(started)
+    );
     assert_eq!(r["value"], "42", "{r}");
     assert_eq!(r["exit_code"], 0);
     let r = plane.py(ACME, &id, "json.dumps({'x': x})");
     assert_eq!(r["value"], "'{\"x\": 42}'");
     // The template's modules are there, as in a fresh fork.
-    assert_eq!(plane.py(ACME, &id, "import sys\n'sqlite3' in sys.modules")["value"], "True");
+    assert_eq!(
+        plane.py(ACME, &id, "import sys\n'sqlite3' in sys.modules")["value"],
+        "True"
+    );
     // stdin is the call's.
     let r = plane.exec(
         ACME,
@@ -972,7 +1064,11 @@ fn stateful_python() {
     // A long value keeps its start and end.
     let r = plane.py(ACME, &id, "'a' * 100000 + 'z'");
     let value = r["value"].as_str().unwrap();
-    assert!(value.len() < 17_000 && value.starts_with("'aaa") && value.ends_with("az'"), "{}", value.len());
+    assert!(
+        value.len() < 17_000 && value.starts_with("'aaa") && value.ends_with("az'"),
+        "{}",
+        value.len()
+    );
     assert!(value.contains("characters omitted"));
 
     // An exception: its type and traceback; the state survives it.
@@ -980,7 +1076,10 @@ fn stateful_python() {
     assert_eq!(r["exit_code"], 1);
     assert_eq!(r["error"]["type"], "ZeroDivisionError", "{r}");
     let trace = r["error"]["traceback"].as_str().unwrap();
-    assert!(trace.contains("return 1/0") && trace.contains("ZeroDivisionError"), "{trace}");
+    assert!(
+        trace.contains("return 1/0") && trace.contains("ZeroDivisionError"),
+        "{trace}"
+    );
     let r = plane.py(ACME, &id, "syntax error here");
     assert_eq!(r["error"]["type"], "SyntaxError");
     assert_eq!(plane.py(ACME, &id, "x")["value"], "42");
@@ -1014,7 +1113,11 @@ fn stateful_python() {
     assert_eq!(plane.py(ACME, &id, "x + y")["value"], "43");
 
     // Code that cannot be interrupted: killed, restarted, state lost.
-    plane.py(ACME, &id, "import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)");
+    plane.py(
+        ACME,
+        &id,
+        "import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)",
+    );
     let started = Instant::now();
     let r = plane.exec(
         ACME,
@@ -1036,21 +1139,42 @@ fn stateful_python() {
 
     // Reset.
     plane.py(ACME, &id, "z = 3");
-    let reset = plane.call(ACME, "POST", &format!("/v1/sandboxes/{id}/python/reset"), b"");
+    let reset = plane.call(
+        ACME,
+        "POST",
+        &format!("/v1/sandboxes/{id}/python/reset"),
+        b"",
+    );
     assert_eq!(reset.status, 200);
     assert_eq!(reset.json()["had_state"], true);
     assert_eq!(plane.py(ACME, &id, "'z' in dir()")["value"], "False");
-    let reset = plane.call(ACME, "POST", &format!("/v1/sandboxes/{id}/python/reset"), b"");
+    let reset = plane.call(
+        ACME,
+        "POST",
+        &format!("/v1/sandboxes/{id}/python/reset"),
+        b"",
+    );
     assert_eq!(reset.json()["had_state"], true);
-    let reset = plane.call(ACME, "POST", &format!("/v1/sandboxes/{id}/python/reset"), b"");
+    let reset = plane.call(
+        ACME,
+        "POST",
+        &format!("/v1/sandboxes/{id}/python/reset"),
+        b"",
+    );
     assert_eq!(reset.json()["had_state"], false);
 
     // Separate per sandbox and per tenant; the fresh-fork mode is apart.
     plane.py(ACME, &id, "secret = 'acme'");
     let second = id_of(&plane.create(ACME, json!({})));
-    assert_eq!(plane.py(ACME, &second, "'secret' in dir()")["value"], "False");
+    assert_eq!(
+        plane.py(ACME, &second, "'secret' in dir()")["value"],
+        "False"
+    );
     let other = id_of(&plane.create(BETA, json!({})));
-    assert_eq!(plane.py(BETA, &other, "'secret' in dir()")["value"], "False");
+    assert_eq!(
+        plane.py(BETA, &other, "'secret' in dir()")["value"],
+        "False"
+    );
     let r = plane.exec(ACME, &id, json!({"python": "print('secret' in dir())"}));
     assert_eq!(r["stdout"], "False\n");
     assert_eq!(plane.py(ACME, &id, "secret")["value"], "'acme'");
@@ -1075,10 +1199,16 @@ fn stateful_python() {
     // Its memory counts in the sandbox's limit (512 MiB here).
     let r = plane.py(ACME, &id, "blob = bytearray(64 << 20)\nlen(blob)");
     assert_eq!(r["value"], "67108864");
-    eventually(Duration::from_secs(10), "the interpreter's memory counted", || {
-        let info = plane.call(ACME, "GET", &format!("/v1/sandboxes/{id}"), b"").json();
-        info["memory_bytes"].as_u64().unwrap() > 64 << 20
-    });
+    eventually(
+        Duration::from_secs(10),
+        "the interpreter's memory counted",
+        || {
+            let info = plane
+                .call(ACME, "GET", &format!("/v1/sandboxes/{id}"), b"")
+                .json();
+            info["memory_bytes"].as_u64().unwrap() > 64 << 20
+        },
+    );
 
     for (token, sandbox) in [(ACME, &id), (ACME, &second), (BETA, &other)] {
         assert_eq!(plane.delete(token, sandbox), 204);
