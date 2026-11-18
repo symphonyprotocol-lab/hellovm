@@ -37,7 +37,10 @@ fn version(program: &str, args: &[&str]) -> Option<Vec<u32>> {
 }
 
 fn python() -> Option<&'static str> {
-    match version("python3", &["-c", "import sys; print('%d.%d' % sys.version_info[:2])"]) {
+    match version(
+        "python3",
+        &["-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+    ) {
         Some(v) if v >= vec![3, 10] => Some("python3"),
         _ => {
             skip_or_fail("SDK e2e: python3 3.10 or later not found (install python3)");
@@ -121,17 +124,24 @@ fn run_suite(what: &str, dir: &str, program: &str, args: &[String], env: &[(&str
         );
     }
     eprintln!("{what}:\n{stdout}{stderr}");
-    for skipped in ["skipped=", "# skip "] {
-        if common::e2e_required() {
-            if let Some(line) = stdout
-                .lines()
-                .chain(stderr.lines())
-                .find(|l| l.contains(skipped) && !l.contains(&format!("{skipped}0")))
-            {
-                panic!("{what}: a required test was skipped: {line}");
-            }
+    if common::e2e_required() {
+        if let Some(line) = stdout.lines().chain(stderr.lines()).find(|l| skipped(l)) {
+            panic!("{what}: a required test was skipped: {line}");
         }
     }
+}
+
+/// Whether a line of a test runner's summary reports skipped tests:
+/// unittest's `OK (skipped=N)`, node's `ℹ skipped N` or `# skip N`.
+fn skipped(line: &str) -> bool {
+    let line = line.trim();
+    let count = match line.split("skipped=").nth(1) {
+        Some(rest) => rest.split(|c: char| !c.is_ascii_digit()).next(),
+        None => line
+            .strip_prefix("ℹ skipped ")
+            .or_else(|| line.strip_prefix("# skip ")),
+    };
+    count.is_some_and(|n| n.parse::<u64>().is_ok_and(|n| n > 0))
 }
 
 #[test]
@@ -142,8 +152,14 @@ fn python_sdk() {
         "the Python SDK's tests",
         "sdk/python",
         python,
-        &["-m", "unittest", "discover", "-s", "tests", "-t", "tests", "-v"].map(String::from),
-        &[("PYTHONPATH", repo().join("sdk/python/src").display().to_string())],
+        &[
+            "-m", "unittest", "discover", "-s", "tests", "-t", "tests", "-v",
+        ]
+        .map(String::from),
+        &[(
+            "PYTHONPATH",
+            repo().join("sdk/python/src").display().to_string(),
+        )],
     );
 }
 
@@ -165,7 +181,11 @@ fn typescript_sdk() {
 #[test]
 #[ignore = "needs Python and Node.js: run by kernel/dev/run-sdk-e2e.sh"]
 fn mcp_server() {
-    if !node(&["sdk/ts/dist/index.js", "sdk/mcp/dist/server.js", "sdk/mcp/dist/test"]) {
+    if !node(&[
+        "sdk/ts/dist/index.js",
+        "sdk/mcp/dist/server.js",
+        "sdk/mcp/dist/test",
+    ]) {
         return;
     }
     run_suite(
