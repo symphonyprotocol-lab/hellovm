@@ -1423,7 +1423,9 @@ the log's state.
 and memory are free), is listed no more, and answers `404`. The API
 keeps it among the deletes to do (at most 4096 per node; past that the
 delete answers `502 node_unreachable` as before) and writes a
-`delete_pending` record to the usage log before it answers. When the
+`delete_pending` record to the usage log before it answers (when the log
+cannot be written, the record waits in memory like any other, and the
+delete is still accepted). When the
 node answers a probe again, the API deletes it there (`delete_done`); a
 sandbox whose node no longer lists it needs nothing more. The node's
 list does not bring it back meanwhile: the reconciliation leaves out
