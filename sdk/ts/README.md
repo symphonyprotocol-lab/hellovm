@@ -35,7 +35,8 @@ the block too (`Symbol.asyncDispose`).
 | | |
 |---|---|
 | `new Client({baseUrl, token, timeout?, busy?, busyTimeout?, retries?, maxResponseBytes?, fetch?})` | seconds; `busy: "wait"` (default) or `"raise"` |
-| `templates()`, `list()`, `get(id)`, `sandbox(id)`, `delete(id)`, `create({template?, idleTimeout?, lifetime?})`, `withSandbox(options, fn)` | |
+| `templates()`, `list()`, `get(id)`, `sandbox(id)`, `delete(id)`, `create({template?, idleTimeout?, lifetime?})`, `withSandbox(options, fn)` | `delete` also succeeds when accepted for later (`202`) |
+| `usage(): TenantUsage` | the metering period (`periodStart`, `periodEnd`), `usage` (`runMs`, `cpuMs`, `memoryByteSeconds`, `egressSentBytes`, `egressReceivedBytes`), `sandboxes`, `memoryLimitBytes`, `quotas`, `exceeded`; `SandboxInfo.usage` has a sandbox's own counters |
 | `sandbox.exec(command, {timeout, cwd, env, stdin, maxOutput, signal})` | `ExecResult` when it ended; with a `signal` an abort cancels the command in the sandbox |
 | `sandbox.python(code, options)`, `sandbox.run(code, {timeout, stdin, maxOutput, signal})` | a fresh fork; the stateful interpreter (`value`, `error`, `stateLost`) |
 | `sandbox.stream(command, options)`, `sandbox.streamPython(code, {stateful, ...})` | an `Execution`: `AsyncIterable` of `{type: "stdout" \| "stderr", data}`, `{type: "omitted", bytes}`, then `{type: "result", result}`; `cancel()`, `close()`, `wait()`, `cursor`, `result`, `Symbol.asyncDispose` (cancels what has not ended) |
@@ -51,12 +52,16 @@ does the same and makes the iteration (or `exec()`) reject with an
 
 As in the Python SDK: `HellovmError`; `APIError` (`status`, `code`,
 `apiMessage`) with `AuthenticationError`, `NotFoundError`, `BusyError`,
-`SandboxEndedError` (`reason`), `EditError`, `LimitError`;
+`SandboxEndedError` (`reason`), `EditError`, `LimitError` (with
+`RateLimitError` and `BudgetExceededError`; `retryAfter` from
+`Retry-After`);
 `TransportError` (`maybeSent`) with `RequestTimeoutError` and
 `AbortedError`; `ResponseError`. Every request has one deadline for the
 whole exchange (head and body), the body is read with a size cap (and
 refused by its `Content-Length` before reading), redirects are refused.
-Busy sandboxes are waited out (or thrown at once); only idempotent
+Busy sandboxes are waited out (or thrown at once), `429 rate_limited`
+after its `Retry-After` until the busy deadline, `429 budget_exceeded`
+thrown at once; only idempotent
 requests are retried after a failure without an answer, never create,
 exec, write, edit or reset; streams resume from their cursor. An exec
 whose timeout is too long for one request (Node's `fetch` gives up on

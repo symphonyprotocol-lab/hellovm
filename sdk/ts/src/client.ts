@@ -1,4 +1,4 @@
-import { AbortedError, HellovmError, LimitError, ResponseError, TransportError, apiError } from "./errors.js";
+import { AbortedError, HellovmError, LimitError, ResponseError, TransportError, apiError, retryAfter } from "./errors.js";
 import { type Fetch, type HttpResponse, send, sleep } from "./http.js";
 import {
   type ExecResult,
@@ -7,12 +7,14 @@ import {
   type SandboxInfo,
   type StreamEvent,
   type Template,
+  type TenantUsage,
   parseJson,
   parsePoll,
   parseResult,
   parseSandbox,
   parseStatus,
   parseTemplate,
+  parseUsage,
 } from "./model.js";
 import * as retry from "./retry.js";
 
@@ -205,9 +207,9 @@ export class Client {
       }
       if (expect.includes(response.status)) return response;
       if (o.goneAfterRetryOk && failures > 0 && response.status === 404) return response;
-      const error = apiError(response.status, response.body);
+      const error = apiError(response.status, response.body, retryAfter(response.headers.get("retry-after")));
       if (retry.statusRetry(error.status, error.code, { busyWait: this.busy === "wait", poll: o.poll ?? false })) {
-        const pause = retry.delay(waits);
+        const pause = Math.max(retry.delay(waits), error.retryAfter ?? 0);
         if (Date.now() + pause * 1000 - started <= this.busyTimeout * 1000) {
           waits++;
           await sleep(pause * 1000, o.signal);
@@ -254,6 +256,11 @@ export class Client {
     return d.sandboxes.map(parseSandbox);
   }
 
+  /** This tenant's usage in the current metering period, its quotas, and the budgets it used up. */
+  async usage(): Promise<TenantUsage> {
+    return parseUsage(parseJson((await this.request("GET", "/v1/usage", { idempotent: true })).body));
+  }
+
   /** The sandbox, with its description fetched now. */
   async get(id: string): Promise<Sandbox> {
     const sandbox = this.sandbox(id);
@@ -266,10 +273,14 @@ export class Client {
     return new Sandbox(this, segment(id, "sandbox id"), null);
   }
 
-  /** Deletes a sandbox (a retry that finds it gone after a lost answer is success). */
+  /**
+   * Deletes a sandbox (a retry that finds it gone after a lost answer is
+   * success). When its node does not answer, the API accepts the delete
+   * (`202`) and does it on the node later; it is gone for this tenant at once.
+   */
   async delete(id: string): Promise<void> {
     await this.request("DELETE", `/v1/sandboxes/${segment(id, "sandbox id")}`, {
-      expect: [204, 200],
+      expect: [204, 202, 200],
       idempotent: true,
       goneAfterRetryOk: true,
     });

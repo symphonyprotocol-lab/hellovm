@@ -12,7 +12,12 @@ A request is tried again only when doing so cannot do something twice:
 * ``503`` (``template_not_ready``, ``node_full``, or the server's
   connection limit: nothing happened): any request, until the busy
   deadline;
-* ``429 too_many_polls``: polls only.
+* ``429 too_many_polls``: polls only;
+* ``429 rate_limited`` (refused before anything was done): any request,
+  after the answer's ``Retry-After``, until the busy deadline.
+
+``429 budget_exceeded`` is not retried: the budget comes back at the end
+of the period, usually far later than any deadline.
 """
 
 from __future__ import annotations
@@ -49,4 +54,6 @@ def status_retry(status: int, code: str, *, busy_wait: bool, poll: bool) -> bool
         return True
     if status == 429 and code == "too_many_polls":
         return poll
+    if status == 429 and code == "rate_limited":
+        return True
     return False

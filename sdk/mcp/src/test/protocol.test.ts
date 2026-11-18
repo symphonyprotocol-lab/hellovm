@@ -10,10 +10,11 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, describe, test } from "node:test";
 
-import type { ExecResult } from "hellovm";
+import { APIError, BudgetExceededError, type ExecResult, RateLimitError } from "hellovm";
 
 import { fromEnv } from "../config.js";
 import { formatExec, formatFile, formatPython, omission, redact, truncateBytes } from "../format.js";
+import { describe as describeError } from "../tools.js";
 import { MODERN, McpProcess, text } from "./client.js";
 
 const TOKEN = "mcp-secret-token-0123456789abcdef";
@@ -231,6 +232,17 @@ describe("against a fake API", () => {
     assert.equal(r.isError, true);
     assert.match(text(r), /Could not create a sandbox: Error: cannot connect to the API/);
     assert.ok(!p.stdout.includes(TOKEN) && !p.stderr.includes(TOKEN));
+  });
+});
+
+describe("errors for the model", () => {
+  test("quotas say what to do next", () => {
+    const budget = describeError(new BudgetExceededError(429, "budget_exceeded", "the cpu budget is used up", 120));
+    assert.match(budget, /^Error \(429 budget_exceeded\): the cpu budget is used up\n/);
+    assert.match(budget, /until the usage period ends \(in 120 s\)/);
+    assert.match(describeError(new RateLimitError(429, "rate_limited", "slow down", 2)), /wait 2 s before the next call/);
+    assert.match(describeError(new APIError(429, "memory_limit", "m")), /another one must be deleted first/);
+    assert.equal(describeError(new APIError(404, "not_found", "no such file")), "Error (404 not_found): no such file");
   });
 });
 

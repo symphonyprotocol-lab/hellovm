@@ -15,6 +15,7 @@ from typing import Any
 from hellovm import (
     APIError,
     AuthenticationError,
+    BudgetExceededError,
     BusyError,
     Client,
     EditError,
@@ -22,6 +23,7 @@ from hellovm import (
     NotFoundError,
     OmittedEvent,
     OutputEvent,
+    RateLimitError,
     RequestTimeoutError,
     ResponseError,
     ResultEvent,
@@ -29,7 +31,7 @@ from hellovm import (
     TransportError,
 )
 from hellovm import _model, _retry
-from hellovm.errors import api_error
+from hellovm.errors import api_error, retry_after
 
 from fakeserver import Conn, FakeServer, Request
 
@@ -54,6 +56,39 @@ def result(**over: Any) -> dict[str, Any]:
     }
     r.update(over)
     return r
+
+
+def counters(**over: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {
+        "run_ms": 10,
+        "cpu_ms": 3,
+        "memory_byte_seconds": 4,
+        "egress_sent_bytes": 1,
+        "egress_received_bytes": 5,
+    }
+    d.update(over)
+    return d
+
+
+def tenant_usage(**over: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {
+        "tenant": "acme",
+        "period": {"start": 1000, "end": 2000, "seconds": 1},
+        "usage": counters(),
+        "sandboxes": 1,
+        "memory_limit_bytes": 1 << 30,
+        "quotas": {
+            "max_sandboxes": 3,
+            "max_memory_bytes": None,
+            "requests_per_second": 2.5,
+            "request_burst": 10,
+            "cpu_seconds_per_period": 1.5,
+            "egress_bytes_per_period": None,
+        },
+        "exceeded": ["cpu"],
+    }
+    d.update(over)
+    return d
 
 
 def info(**over: Any) -> dict[str, Any]:
@@ -136,8 +171,22 @@ class Parsing(unittest.TestCase):
 
     def test_sandbox(self) -> None:
         self.assertEqual(_model.parse_sandbox(info()).ready_ms, 7.5)
+        self.assertIsNone(_model.parse_sandbox(info()).usage)
         with self.assertRaises(ResponseError):
             _model.parse_sandbox(info(created_at="1"))
+        u = _model.parse_sandbox(info(usage=counters(cpu_ms=7))).usage
+        assert u is not None
+        self.assertEqual((u.cpu_ms, u.egress_received_bytes), (7, 5))
+        with self.assertRaises(ResponseError):
+            _model.parse_sandbox(info(usage=counters(cpu_ms=-1)))
+
+    def test_usage(self) -> None:
+        u = _model.parse_usage(tenant_usage())
+        self.assertEqual((u.tenant, u.period_start, u.usage.cpu_ms, u.exceeded), ("acme", 1000, 3, ["cpu"]))
+        self.assertEqual((u.quotas.max_memory_bytes, u.quotas.requests_per_second), (None, 2.5))
+        for bad in (tenant_usage(exceeded="cpu"), tenant_usage(period=None), tenant_usage(usage={})):
+            with self.assertRaises(ResponseError):
+                _model.parse_usage(bad)
 
     def test_errors(self) -> None:
         e = api_error(409, b'{"error": {"code": "busy", "message": "the sandbox is busy"}}')
@@ -149,6 +198,16 @@ class Parsing(unittest.TestCase):
         self.assertIsInstance(api_error(401, b'{"error":{"code":"unauthorized","message":"x"}}'), AuthenticationError)
         self.assertIsInstance(api_error(422, b'{"error":{"code":"no_match","message":"x"}}'), EditError)
         self.assertIsInstance(api_error(429, b'{"error":{"code":"tenant_limit","message":"x"}}'), LimitError)
+        rate = api_error(429, b'{"error":{"code":"rate_limited","message":"x"}}', 2.0)
+        self.assertIsInstance(rate, RateLimitError)
+        self.assertEqual(rate.retry_after, 2.0)
+        budget = api_error(429, b'{"error":{"code":"budget_exceeded","message":"x"}}', 60.0)
+        self.assertIsInstance(budget, BudgetExceededError)
+        self.assertIsInstance(budget, LimitError)
+        self.assertIsInstance(api_error(429, b'{"error":{"code":"memory_limit","message":"x"}}'), LimitError)
+        self.assertEqual((retry_after("3"), retry_after(" 10 "), retry_after(None)), (3.0, 10.0, None))
+        for bad in ("-1", "1.5", "Wed, 21 Oct 2015 07:28:00 GMT", "9999999999"):
+            self.assertIsNone(retry_after(bad), bad)
         proxy = api_error(502, b"<html>bad gateway</html>" * 100)
         self.assertEqual(type(proxy), APIError)
         self.assertEqual(proxy.code, "http_error")
@@ -175,6 +234,8 @@ class Retry(unittest.TestCase):
         self.assertTrue(_retry.status_retry(429, "too_many_polls", busy_wait=False, poll=True))
         self.assertFalse(_retry.status_retry(429, "too_many_polls", busy_wait=True, poll=False))
         self.assertFalse(_retry.status_retry(429, "tenant_limit", busy_wait=True, poll=True))
+        self.assertTrue(_retry.status_retry(429, "rate_limited", busy_wait=False, poll=False))
+        self.assertFalse(_retry.status_retry(429, "budget_exceeded", busy_wait=True, poll=True))
         self.assertFalse(_retry.status_retry(500, "internal", busy_wait=True, poll=True))
 
 
@@ -253,6 +314,61 @@ class AgainstFake(unittest.TestCase):
             self.client(server, busy_timeout=0.4).sandbox(SB).write_file("a", b"x")
         self.assertLess(time.monotonic() - started, 3)
         self.assertGreater(len(calls), 2)
+
+    def test_rate_limited_waits_retry_after(self) -> None:
+        calls: list[float] = []
+
+        def handler(req: Request, conn: Conn) -> None:
+            calls.append(time.monotonic())
+            if len(calls) == 1:
+                conn.send(
+                    429,
+                    b'{"error": {"code": "rate_limited", "message": "slow down"}}',
+                    {"Retry-After": "1", "Content-Type": "application/json"},
+                )
+            else:
+                conn.json(200, {"templates": []})
+
+        client = self.client(self.serve(handler))
+        self.assertEqual(client.templates(), [])
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(calls[1] - calls[0], 0.9)
+        # Past the deadline: raised, with when to try again.
+        server = self.serve(
+            lambda req, conn: conn.send(
+                429, b'{"error": {"code": "rate_limited", "message": "x"}}', {"Retry-After": "5"}
+            )
+        )
+        with self.assertRaises(RateLimitError) as cm:
+            self.client(server, busy_timeout=1).templates()
+        self.assertEqual(cm.exception.retry_after, 5.0)
+
+    def test_budget_exceeded_is_raised_at_once(self) -> None:
+        calls = []
+
+        def handler(req: Request, conn: Conn) -> None:
+            calls.append(1)
+            conn.send(
+                429,
+                b'{"error": {"code": "budget_exceeded", "message": "the cpu budget is used up"}}',
+                {"Retry-After": "3600"},
+            )
+
+        with self.assertRaises(BudgetExceededError) as cm:
+            self.client(self.serve(handler)).create()
+        self.assertEqual((cm.exception.retry_after, len(calls)), (3600.0, 1))
+
+    def test_usage_and_an_accepted_delete(self) -> None:
+        def handler(req: Request, conn: Conn) -> None:
+            if req.path == "/v1/usage":
+                conn.json(200, tenant_usage())
+            else:
+                self.assertEqual(req.method, "DELETE")
+                conn.send(202)
+
+        client = self.client(self.serve(handler))
+        self.assertEqual(client.usage().quotas.cpu_seconds_per_period, 1.5)
+        client.delete(SB)
 
     def test_503_is_retried(self) -> None:
         calls = []

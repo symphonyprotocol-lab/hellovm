@@ -23,12 +23,14 @@ from ._model import (
     SandboxInfo,
     StreamEvent,
     Template,
+    TenantUsage,
     parse_json,
     parse_poll,
     parse_result,
     parse_sandbox,
     parse_status,
     parse_template,
+    parse_usage,
 )
 from .errors import (
     APIError,
@@ -39,6 +41,7 @@ from .errors import (
     SandboxEndedError,
     TransportError,
     api_error,
+    retry_after,
 )
 
 #: The API's limits the SDK checks before sending (so that a 17 MiB upload
@@ -164,9 +167,9 @@ class Client:
             if gone_after_retry_ok and failures and response.status == 404:
                 # A retried DELETE whose first try was carried out.
                 return response
-            error = api_error(response.status, response.body)
+            error = api_error(response.status, response.body, retry_after(response.headers.get("retry-after")))
             if _retry.status_retry(error.status, error.code, busy_wait=self.busy == "wait", poll=poll):
-                pause = _retry.delay(waits)
+                pause = max(_retry.delay(waits), error.retry_after or 0.0)
                 if time.monotonic() + pause - started <= self.busy_timeout:
                     waits += 1
                     _sleep(pause, abort)
@@ -212,6 +215,11 @@ class Client:
             raise ResponseError("sandboxes: expected a list")
         return [parse_sandbox(s) for s in items]
 
+    def usage(self) -> TenantUsage:
+        """This tenant's usage in the current metering period, its quotas,
+        and the budgets it used up."""
+        return parse_usage(self._json(self._request("GET", "/v1/usage", idempotent=True)))
+
     def get(self, sandbox_id: str) -> Sandbox:
         """The sandbox, with its description fetched now."""
         sandbox = self.sandbox(sandbox_id)
@@ -224,9 +232,11 @@ class Client:
 
     def delete(self, sandbox_id: str) -> None:
         """Deletes a sandbox. A retry of a delete whose first answer was
-        lost may find it gone already: that is success."""
+        lost may find it gone already: that is success. When its node does
+        not answer, the API accepts the delete (``202``) and does it on the
+        node later; the sandbox is gone for this tenant at once."""
         target = f"/v1/sandboxes/{_segment(sandbox_id, 'sandbox id')}"
-        self._request("DELETE", target, expect=(204, 200), idempotent=True, gone_after_retry_ok=True)
+        self._request("DELETE", target, expect=(204, 202, 200), idempotent=True, gone_after_retry_ok=True)
 
 
 def _sleep(seconds: float, abort: Abort | None) -> None:

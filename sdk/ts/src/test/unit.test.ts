@@ -13,19 +13,21 @@ import {
   AbortedError,
   APIError,
   AuthenticationError,
+  BudgetExceededError,
   BusyError,
   Client,
   EditError,
   LimitError,
   NotFoundError,
+  RateLimitError,
   RequestTimeoutError,
   ResponseError,
   SandboxEndedError,
   TransportError,
   type StreamEvent,
 } from "../index.js";
-import { apiError } from "../errors.js";
-import { parseEvent, parsePoll, parseResult, parseSandbox } from "../model.js";
+import { apiError, retryAfter } from "../errors.js";
+import { parseEvent, parsePoll, parseResult, parseSandbox, parseUsage } from "../model.js";
 import * as retry from "../retry.js";
 import { type Conn, FakeServer, type Request } from "./fakeserver.js";
 
@@ -46,6 +48,30 @@ function result(over: Record<string, unknown> = {}): Record<string, unknown> {
     stdout_bytes: 3,
     stderr_bytes: 0,
     duration_ms: 1.5,
+    ...over,
+  };
+}
+
+function counters(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return { run_ms: 10, cpu_ms: 3, memory_byte_seconds: 4, egress_sent_bytes: 1, egress_received_bytes: 5, ...over };
+}
+
+function tenantUsage(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    tenant: "acme",
+    period: { start: 1000, end: 2000, seconds: 1 },
+    usage: counters(),
+    sandboxes: 1,
+    memory_limit_bytes: 2 ** 30,
+    quotas: {
+      max_sandboxes: 3,
+      max_memory_bytes: null,
+      requests_per_second: 2.5,
+      request_burst: 10,
+      cpu_seconds_per_period: 1.5,
+      egress_bytes_per_period: null,
+    },
+    exceeded: ["cpu"],
     ...over,
   };
 }
@@ -144,6 +170,18 @@ describe("parsing", () => {
     assert.equal(parseSandbox(info()).readyMs, 7.5);
     assert.equal(parseSandbox(info()).egressId, "abababababababab");
     assert.throws(() => parseSandbox(info({ created_at: "1" })), ResponseError);
+    assert.equal(parseSandbox(info()).usage, null);
+    assert.equal(parseSandbox(info({ usage: counters({ cpu_ms: 7 }) })).usage?.cpuMs, 7);
+    assert.throws(() => parseSandbox(info({ usage: counters({ cpu_ms: -1 }) })), ResponseError);
+  });
+
+  test("usage", () => {
+    const u = parseUsage(tenantUsage());
+    assert.deepEqual([u.tenant, u.periodStart, u.usage.cpuMs, u.exceeded], ["acme", 1000, 3, ["cpu"]]);
+    assert.deepEqual([u.quotas.maxMemoryBytes, u.quotas.requestsPerSecond], [null, 2.5]);
+    for (const bad of [tenantUsage({ exceeded: "cpu" }), tenantUsage({ period: null }), tenantUsage({ usage: {} })]) {
+      assert.throws(() => parseUsage(bad), ResponseError);
+    }
   });
 
   test("errors", () => {
@@ -156,6 +194,14 @@ describe("parsing", () => {
     assert.ok(apiError(401, Buffer.from('{"error":{"code":"unauthorized","message":"x"}}')) instanceof AuthenticationError);
     assert.ok(apiError(422, Buffer.from('{"error":{"code":"no_match","message":"x"}}')) instanceof EditError);
     assert.ok(apiError(429, Buffer.from('{"error":{"code":"tenant_limit","message":"x"}}')) instanceof LimitError);
+    const rate = apiError(429, Buffer.from('{"error":{"code":"rate_limited","message":"x"}}'), 2);
+    assert.ok(rate instanceof RateLimitError);
+    assert.equal(rate.retryAfter, 2);
+    const budget = apiError(429, Buffer.from('{"error":{"code":"budget_exceeded","message":"x"}}'), 60);
+    assert.ok(budget instanceof BudgetExceededError && budget instanceof LimitError);
+    assert.ok(apiError(429, Buffer.from('{"error":{"code":"memory_limit","message":"x"}}')) instanceof LimitError);
+    assert.deepEqual([retryAfter("3"), retryAfter(" 10 "), retryAfter(null)], [3, 10, null]);
+    for (const bad of ["-1", "1.5", "Wed, 21 Oct 2015 07:28:00 GMT", "9999999999"]) assert.equal(retryAfter(bad), null, bad);
     const proxy = apiError(502, Buffer.from("<html>bad gateway</html>".repeat(100)));
     assert.equal(proxy.constructor, APIError);
     assert.equal(proxy.code, "http_error");
@@ -186,6 +232,8 @@ describe("retry rules", () => {
     assert.equal(retry.statusRetry(429, "too_many_polls", { busyWait: false, poll: true }), true);
     assert.equal(retry.statusRetry(429, "too_many_polls", { busyWait: true, poll: false }), false);
     assert.equal(retry.statusRetry(429, "tenant_limit", { busyWait: true, poll: true }), false);
+    assert.equal(retry.statusRetry(429, "rate_limited", { busyWait: false, poll: false }), true);
+    assert.equal(retry.statusRetry(429, "budget_exceeded", { busyWait: true, poll: true }), false);
     assert.equal(retry.statusRetry(500, "internal", { busyWait: true, poll: true }), false);
   });
 });
@@ -246,6 +294,43 @@ describe("against a fake server", () => {
     await assert.rejects(client(server, { busyTimeout: 0.4 }).sandbox(SB).writeFile("a", "x"), BusyError);
     assert.ok(Date.now() - started < 3000);
     assert.ok(calls > 2);
+  });
+
+  test("rate_limited waits Retry-After", async () => {
+    const calls: number[] = [];
+    const server = await serve((_req, conn) => {
+      calls.push(Date.now());
+      if (calls.length === 1) {
+        conn.send(429, '{"error": {"code": "rate_limited", "message": "slow down"}}', { "Retry-After": "1", "Content-Type": "application/json" });
+      } else {
+        conn.json(200, { templates: [] });
+      }
+    });
+    assert.deepEqual(await client(server).templates(), []);
+    assert.equal(calls.length, 2);
+    assert.ok((calls[1] ?? 0) - (calls[0] ?? 0) >= 900);
+    const always = await serve((_req, conn) => conn.send(429, '{"error": {"code": "rate_limited", "message": "x"}}', { "Retry-After": "5" }));
+    const error = await client(always, { busyTimeout: 1 }).templates().catch((e: unknown) => e);
+    assert.ok(error instanceof RateLimitError);
+    assert.equal(error.retryAfter, 5);
+  });
+
+  test("budget_exceeded is thrown at once", async () => {
+    let calls = 0;
+    const server = await serve((_req, conn) => {
+      calls++;
+      conn.send(429, '{"error": {"code": "budget_exceeded", "message": "used up"}}', { "Retry-After": "3600" });
+    });
+    const error = await client(server).create().catch((e: unknown) => e);
+    assert.ok(error instanceof BudgetExceededError);
+    assert.deepEqual([error.retryAfter, calls], [3600, 1]);
+  });
+
+  test("usage, and a delete accepted for later", async () => {
+    const server = await serve((req, conn) => (req.path === "/v1/usage" ? conn.json(200, tenantUsage()) : conn.send(202)));
+    const c = client(server);
+    assert.equal((await c.usage()).quotas.cpuSecondsPerPeriod, 1.5);
+    await c.delete(SB);
   });
 
   test("503 is retried", async () => {
