@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hellovm"
+version = "0.0.1"
+description = "Python SDK for hellovm sandboxes"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hellovm = ["py.typed"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
