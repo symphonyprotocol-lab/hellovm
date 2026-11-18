@@ -5,6 +5,7 @@
 //! hellovm-egress --listen PATH [--policy FILE]... [--allow RULE]...
 //!                [--audit FILE] [--max-flows N] [--max-flows-per-sandbox N]
 //!                [--idle-timeout SECONDS] [--connect-timeout SECONDS]
+//!                [--stats PATH --stats-token-file FILE]
 //! ```
 
 use std::fs::OpenOptions;
@@ -18,13 +19,17 @@ use hellovm_egress::{Config, Limits, Proxy};
 
 const USAGE: &str = "usage: hellovm-egress --listen PATH [--policy FILE]... [--allow RULE]... \
 [--audit FILE] [--max-flows N] [--max-flows-per-sandbox N] [--idle-timeout SECONDS] \
-[--connect-timeout SECONDS]\n\
+[--connect-timeout SECONDS] [--stats PATH --stats-token-file FILE]\n\
 RULE is NAME or *.SUFFIX, optionally :PORT[,PORT...] (default ports 80 and 443).\n\
-A policy file holds one `allow RULE` per line. Everything else is denied.";
+A policy file holds one `allow RULE` per line. Everything else is denied.\n\
+--stats serves the bytes relayed per kernel process to noded (keep PATH in a directory \
+of its own, apart from the flow socket's).";
 
 struct Options {
     listen: std::path::PathBuf,
     config: Config,
+    /// The stats socket and its token.
+    stats: Option<(std::path::PathBuf, String)>,
 }
 
 fn seconds(flag: &str, value: Option<String>) -> Result<Duration, String> {
@@ -51,6 +56,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
     let mut policy = Policy::new();
     let mut limits = Limits::default();
     let mut audit = None;
+    let mut stats = None;
+    let mut stats_token = None;
     let resolver = Resolver::System;
     #[cfg(feature = "insecure-test-hooks")]
     let mut resolver = resolver;
@@ -68,6 +75,20 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
             "--allow" => {
                 let rule = args.next().ok_or("--allow needs a rule")?;
                 policy.push(Rule::parse(&rule).map_err(|err| format!("--allow {err}"))?);
+            }
+            "--stats" => stats = Some(args.next().ok_or("--stats needs a path")?.into()),
+            "--stats-token-file" => {
+                let path = args.next().ok_or("--stats-token-file needs a file")?;
+                let token = std::fs::read_to_string(&path)
+                    .map_err(|err| format!("--stats-token-file {path}: {err}"))?
+                    .trim()
+                    .to_string();
+                if token.len() < 22 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+                    return Err(format!(
+                        "--stats-token-file {path}: the token must be at least 22 printable characters"
+                    ));
+                }
+                stats_token = Some(token);
             }
             "--audit" => audit = Some(args.next().ok_or("--audit needs a file")?),
             "--max-flows" => limits.max_flows = count(&arg, args.next())?,
@@ -87,6 +108,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
         }
     }
     let listen = listen.ok_or_else(|| format!("--listen is required\n{USAGE}"))?;
+    let stats = match (stats, stats_token) {
+        (Some(path), Some(token)) => Some((path, token)),
+        (None, None) => None,
+        _ => return Err("--stats and --stats-token-file go together".into()),
+    };
     let audit = match audit {
         None => AuditSink::stdout(),
         Some(path) => AuditSink::new(Box::new(
@@ -105,6 +131,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
             audit,
             resolver,
         },
+        stats,
     })
 }
 
@@ -130,6 +157,13 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Some((path, token)) = options.stats {
+        if let Err(err) = proxy.serve_stats(&path, token) {
+            eprintln!("hellovm-egress: --stats {}: {err}", path.display());
+            return ExitCode::from(1);
+        }
+        eprintln!("hellovm-egress: stats on {}", path.display());
+    }
     eprintln!("hellovm-egress: listening on {}", proxy.path().display());
     match proxy.serve() {
         Ok(()) => ExitCode::SUCCESS,

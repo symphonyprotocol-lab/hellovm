@@ -83,6 +83,7 @@ pub mod policy;
 pub mod proxy;
 pub mod resolve;
 pub mod sniff;
+pub mod usage;
 /// The flow header, shared with the kernel process.
 pub use hellovm_egress_wire as wire;
 pub use peer::seal_process;

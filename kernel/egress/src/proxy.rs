@@ -22,6 +22,7 @@ use crate::peer::peer_pid;
 use crate::policy::Policy;
 use crate::resolve::{Candidate, Resolver};
 use crate::sniff::{sniff, Sniff};
+use crate::usage::{Key, PeerBytes, Usage};
 use crate::wire::{Request, Status, WireError};
 
 /// Bounds on everything a guest can influence.
@@ -120,6 +121,8 @@ struct Shared {
     per_owner: Mutex<HashMap<Owner, usize>>,
     deny_log: Mutex<HashMap<Owner, DenyBucket>>,
     stop: AtomicBool,
+    /// Bytes relayed per connecting process.
+    usage: Arc<Usage>,
 }
 
 impl Shared {
@@ -201,12 +204,19 @@ impl Proxy {
                 per_owner: Mutex::new(HashMap::new()),
                 deny_log: Mutex::new(HashMap::new()),
                 stop: AtomicBool::new(false),
+                usage: Arc::new(Usage::default()),
             }),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Serves the bytes relayed per kernel process on the stats socket
+    /// `path` (see [`crate::usage`]), on a thread of its own.
+    pub fn serve_stats(&self, path: &Path, token: String) -> io::Result<()> {
+        crate::usage::serve_stats(Arc::clone(&self.shared.usage), path, token).map(|_| ())
     }
 
     /// Accepts flows until [`ProxyHandle::stop`] (or forever).
@@ -282,6 +292,11 @@ impl Proxy {
 impl ProxyHandle {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// As [`Proxy::serve_stats`].
+    pub fn serve_stats(&self, path: &Path, token: String) -> io::Result<()> {
+        crate::usage::serve_stats(Arc::clone(&self.shared.usage), path, token).map(|_| ())
     }
 
     /// Flows being handled right now.
@@ -486,7 +501,13 @@ fn flow(shared: &Shared, client: UnixStream, rec: &mut Record) {
     };
     rec.allowed = true;
     rec.reason = "ok";
-    relay(client, upstream, first, up_limit, limits, rec);
+    // Counted against the process that connected, which cannot choose
+    // its process id and start time (the header's sandbox id it can).
+    let counter = rec
+        .peer
+        .and_then(Key::of)
+        .and_then(|key| shared.usage.counter(key));
+    relay(client, upstream, first, up_limit, limits, rec, counter);
 }
 
 /// The candidates that may be dialed, in order, and the first blocked one.
@@ -664,6 +685,8 @@ fn pump<S: Half, D: Half>(
     mut src: S,
     mut dst: D,
     moved: &AtomicU64,
+    // The connecting process's counter for this direction.
+    counted: Option<&AtomicU64>,
     clock: &Clock,
     limits: &Limits,
     mut limit: Option<u64>,
@@ -696,6 +719,9 @@ fn pump<S: Half, D: Half>(
                     return;
                 }
                 moved.fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(counted) = counted {
+                    counted.fetch_add(n as u64, Ordering::Relaxed);
+                }
                 clock.touch();
                 if let Some(left) = &mut limit {
                     *left -= n as u64;
@@ -733,12 +759,18 @@ fn relay(
     up_limit: Option<u64>,
     limits: &Limits,
     rec: &mut Record,
+    counter: Option<Arc<PeerBytes>>,
 ) {
     let _ = upstream.set_write_timeout(Some(limits.idle_timeout));
     if upstream.write_all(&first).is_err() {
         rec.reason = "ok";
         let _ = client.shutdown(Shutdown::Both);
         return;
+    }
+    if let Some(counter) = &counter {
+        counter
+            .sent
+            .fetch_add(first.len() as u64, Ordering::Relaxed);
     }
     let up = Arc::new(AtomicU64::new(first.len() as u64));
     let down = Arc::new(AtomicU64::new(0));
@@ -752,13 +784,19 @@ fn relay(
         return;
     };
     let limits2 = limits.clone();
-    let (up2, clock2) = (Arc::clone(&up), Arc::clone(&clock));
+    let (up2, clock2, counter2) = (Arc::clone(&up), Arc::clone(&clock), counter.clone());
     let upward = thread::Builder::new()
         .name("egress-up".into())
-        .spawn(move || pump(client2, upstream2, &up2, &clock2, &limits2, up_limit));
+        .spawn(move || {
+            let counted = counter2.as_ref().map(|c| &c.sent);
+            pump(
+                client2, upstream2, &up2, counted, &clock2, &limits2, up_limit,
+            )
+        });
     match upward {
         Ok(upward) => {
-            pump(upstream, client, &down, &clock, limits, None);
+            let counted = counter.as_ref().map(|c| &c.received);
+            pump(upstream, client, &down, counted, &clock, limits, None);
             let _ = upward.join();
         }
         Err(_) => {
