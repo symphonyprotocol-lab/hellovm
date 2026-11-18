@@ -55,6 +55,13 @@ export async function send(fetchImpl: Fetch, req: HttpRequest): Promise<HttpResp
   const failed = (error: unknown, maybeSent: boolean): TransportError => {
     if (timedOut) return new RequestTimeoutError(`no complete answer within ${req.timeout} s`, { maybeSent: true, cause: error });
     if (req.signal?.aborted) return new AbortedError("aborted", { maybeSent, cause: req.signal.reason });
+    const cause = (error as { cause?: { message?: unknown } } | undefined)?.cause;
+    if (cause?.message === "bad port") {
+      return new TransportError(`fetch refuses the API's port (a port the Fetch standard blocks): run the API on another port`, {
+        maybeSent: false,
+        cause: error,
+      });
+    }
     const code = errorCode(error);
     const sent = maybeSent && !(code !== undefined && NOT_SENT.has(code));
     return new TransportError(`${sent ? "connection failed" : "cannot connect to the API"}: ${code ?? String(error)}`, {
