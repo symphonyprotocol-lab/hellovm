@@ -170,6 +170,8 @@ pub struct Template {
     pub ready: bool,
     /// The one tenant it serves, if not shared.
     pub tenant: Option<String>,
+    /// The memory limit of each of its sandboxes, in bytes.
+    pub memory_limit_bytes: Option<u64>,
 }
 
 /// A node's report, checked.
@@ -181,8 +183,16 @@ pub struct Load {
     pub memory_bytes: u64,
     pub memory_limit_bytes: u64,
     pub draining: bool,
+    /// Its CPUs (what a node that does not say is taken to have:
+    /// [`MAX_CPUS`]).
+    pub cpus: u32,
     pub templates: Vec<Template>,
 }
+
+/// Most CPUs a node may report.
+pub const MAX_CPUS: u32 = 65536;
+/// Largest memory limit of a sandbox a node may report (1 PiB).
+pub const MAX_SANDBOX_MEMORY: u64 = 1 << 50;
 
 /// Most templates a node may report.
 pub const MAX_TEMPLATES: usize = 256;
@@ -207,11 +217,16 @@ pub fn check_status(status: NodeStatus, name: &str) -> Result<Load, String> {
     if status.memory_limit_bytes == 0 {
         return Err("no memory limit".into());
     }
+    if status.cpus > MAX_CPUS {
+        return Err("too many CPUs".into());
+    }
     let mut templates: Vec<Template> = Vec::with_capacity(status.templates.len());
     for t in status.templates {
         if !valid_name(&t.name)
             || t.tenant.as_deref().is_some_and(|t| !valid_name(t))
             || templates.iter().any(|o| o.name == t.name)
+            || t.memory_limit_bytes
+                .is_some_and(|m| m == 0 || m > MAX_SANDBOX_MEMORY)
         {
             return Err("a malformed template".into());
         }
@@ -219,6 +234,7 @@ pub fn check_status(status: NodeStatus, name: &str) -> Result<Load, String> {
             name: t.name,
             ready: t.ready,
             tenant: t.tenant,
+            memory_limit_bytes: t.memory_limit_bytes,
         });
     }
     Ok(Load {
@@ -228,6 +244,11 @@ pub fn check_status(status: NodeStatus, name: &str) -> Result<Load, String> {
         memory_bytes: status.memory_bytes,
         memory_limit_bytes: status.memory_limit_bytes,
         draining: status.draining,
+        cpus: if status.cpus == 0 {
+            MAX_CPUS
+        } else {
+            status.cpus
+        },
         templates,
     })
 }
@@ -569,6 +590,28 @@ impl Nodes {
         out
     }
 
+    /// The memory limit of a sandbox of template `name` for `tenant`: the
+    /// largest any node reported (the node that makes it is not known
+    /// yet). `None` when no node said.
+    pub fn template_memory(&self, name: &str, tenant: &str) -> Option<u64> {
+        let inner = self.lock();
+        inner
+            .0
+            .iter()
+            .filter_map(|s| s.load.as_ref()?.template(name, tenant)?.memory_limit_bytes)
+            .max()
+    }
+
+    /// What node `i` can report in a given time (by its last report).
+    pub fn bounds(&self, i: usize) -> crate::meter::Bounds {
+        let inner = self.lock();
+        let load = inner.0[i].load.as_ref();
+        crate::meter::Bounds {
+            cpus: u64::from(load.map_or(MAX_CPUS, |l| l.cpus)),
+            memory_bytes: load.map_or(u64::MAX, |l| l.memory_limit_bytes),
+        }
+    }
+
     pub fn view(&self, i: usize) -> NodeView {
         let inner = self.lock();
         let state = &inner.0[i];
@@ -706,10 +749,12 @@ mod tests {
             memory_bytes: memory,
             memory_limit_bytes: limit,
             draining: false,
+            cpus: 4,
             templates: vec![Template {
                 name: "python".into(),
                 ready: true,
                 tenant: None,
+                memory_limit_bytes: Some(100),
             }],
         }
     }
@@ -880,6 +925,7 @@ mod tests {
             name: "extra".into(),
             ready: false,
             tenant: None,
+            memory_limit_bytes: Some(300),
         });
         nodes.reported(0, now, a, true);
         let mut b = load(0, 4, 0, 100);
@@ -889,6 +935,9 @@ mod tests {
             nodes.templates("acme"),
             vec![("extra".to_string(), false), ("python".to_string(), true)]
         );
+        assert_eq!(nodes.template_memory("extra", "acme"), Some(300));
+        assert_eq!(nodes.template_memory("python", "acme"), Some(100));
+        assert_eq!(nodes.template_memory("none", "acme"), None);
         assert_eq!(nodes.place("extra", "acme", &[]), Ok(0), "tried anyway");
         nodes.done(0, false);
         // Ready only on a node that went away: listed, not ready.
@@ -913,6 +962,7 @@ mod tests {
             memory_bytes: 0,
             memory_limit_bytes: 1,
             draining: false,
+            cpus: 4,
         }
     }
 
@@ -935,7 +985,19 @@ mod tests {
             starts: 1,
             tenant: None,
             pid: None,
+            memory_limit_bytes: Some(1 << 20),
         };
+        let mut s = status();
+        s.cpus = MAX_CPUS + 1;
+        assert!(check_status(s, "n0").is_err());
+        let mut s = status();
+        s.cpus = 0;
+        assert_eq!(check_status(s, "n0").unwrap().cpus, MAX_CPUS);
+        let mut s = status();
+        let mut huge = t("a");
+        huge.memory_limit_bytes = Some(u64::MAX);
+        s.templates = vec![huge];
+        assert!(check_status(s, "n0").is_err());
         let mut s = status();
         s.templates = vec![t("../x")];
         assert!(check_status(s, "n0").is_err());

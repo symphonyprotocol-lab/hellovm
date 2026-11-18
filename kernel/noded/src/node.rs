@@ -26,9 +26,9 @@ use hellovm::warm::{Frame as WarmFrame, WarmClone};
 use hellovm_control::http::Response;
 use hellovm_control::ids::SandboxId;
 use hellovm_control::types::{
-    self, EditRequest, EditResult, ExecError, ExecKind, ExecList, ExecPoll, ExecRequest,
-    ExecResult, ExecState, ExecStatus, NodeCreate, NodeStatus, PollQuery, ResetResult, SandboxInfo,
-    WriteResult,
+    self, EditRequest, EditResult, EndedSandbox, ExecError, ExecKind, ExecList, ExecPoll,
+    ExecRequest, ExecResult, ExecState, ExecStatus, NodeCreate, NodeStatus, PollQuery, ResetResult,
+    SandboxInfo, SandboxUsage, WriteResult,
 };
 use hellovm_control::unix_ms;
 use serde_json::{json, Map, Value};
@@ -58,6 +58,11 @@ const CANCEL_WRITE: Duration = Duration::from_secs(5);
 pub const MAX_LIFETIME: f64 = 7.0 * 24.0 * 3600.0;
 /// Ended sandboxes remembered, to tell why they are gone.
 const TOMBSTONES: usize = 4096;
+/// How long after a sandbox ended its egress bytes are still read before
+/// its usage is final (flows end when its kernel process does).
+const FINAL_AFTER: Duration = Duration::from_secs(2);
+/// Time allowed for a question to the egress proxy's stats socket.
+const STATS_TIMEOUT: Duration = Duration::from_millis(500);
 /// Bytes of a sandbox's agent log (its stderr) passed to noded's log.
 const LOG_BUDGET: usize = 64 * 1024;
 
@@ -287,6 +292,43 @@ pub struct Sandbox {
     /// Most host processes (guest processes and threads) it may have.
     max_processes: usize,
     ready_ms: f64,
+    /// When its kernel process started (clock ticks since boot): with its
+    /// pid, what the egress proxy counts its flows by.
+    kernel_start: Option<u64>,
+    counters: Mutex<Counters>,
+}
+
+/// What a sandbox used, as measured so far. Every field only grows.
+#[derive(Clone, Copy, Debug, Default)]
+struct Counters {
+    cpu_ms: u64,
+    memory_byte_seconds: u64,
+    /// Byte-milliseconds not yet a whole byte-second.
+    memory_rest: u64,
+    egress_sent_bytes: u64,
+    egress_received_bytes: u64,
+    /// The last memory measurement.
+    measured: Option<Instant>,
+}
+
+impl Counters {
+    /// A memory measurement of `bytes` at `now`: the time since the last
+    /// one is counted at this size.
+    fn memory(&mut self, bytes: u64, now: Instant) {
+        if let Some(last) = self.measured {
+            let ms = now.saturating_duration_since(last).as_millis();
+            let total = u128::from(bytes) * ms + u128::from(self.memory_rest);
+            let seconds = u64::try_from(total / 1000).unwrap_or(u64::MAX);
+            self.memory_byte_seconds = self.memory_byte_seconds.saturating_add(seconds);
+            self.memory_rest = (total % 1000) as u64;
+        }
+        self.measured = Some(now);
+    }
+
+    fn egress(&mut self, sent: u64, received: u64) {
+        self.egress_sent_bytes = self.egress_sent_bytes.max(sent);
+        self.egress_received_bytes = self.egress_received_bytes.max(received);
+    }
 }
 
 impl Sandbox {
@@ -309,6 +351,19 @@ impl Sandbox {
             memory_bytes: self.memory.load(Ordering::Relaxed),
             memory_limit_bytes: self.memory_limit,
             ready_ms: self.ready_ms,
+            usage: self.usage(Instant::now()),
+        }
+    }
+
+    /// What it used, with its run time counted until `until`.
+    fn usage(&self, until: Instant) -> SandboxUsage {
+        let c = *lock(&self.counters);
+        SandboxUsage {
+            run_ms: until.saturating_duration_since(self.created).as_millis() as u64,
+            cpu_ms: c.cpu_ms,
+            memory_byte_seconds: c.memory_byte_seconds,
+            egress_sent_bytes: c.egress_sent_bytes,
+            egress_received_bytes: c.egress_received_bytes,
         }
     }
 
@@ -530,7 +585,18 @@ enum SendError {
 struct Tombstone {
     id: SandboxId,
     tenant: String,
+    template: String,
     reason: String,
+    memory_limit: u64,
+    created_at: u64,
+    ended_at: u64,
+    /// Its kernel process, for the egress bytes still to come.
+    kernel: Option<(u32, u64)>,
+    removed: Instant,
+    usage: SandboxUsage,
+    /// Set once its usage is final ([`FINAL_AFTER`]): its place among the
+    /// sandboxes that ended.
+    seq: Option<u64>,
 }
 
 pub struct Node {
@@ -545,6 +611,14 @@ pub struct Node {
     draining: AtomicBool,
     /// What all sandboxes may hold together, in bytes.
     memory_limit: u64,
+    /// Chosen at random when this process started: tells the API that
+    /// `seq` numbering started again.
+    boot: u64,
+    /// The `seq` of the last sandbox whose usage became final.
+    last_seq: AtomicU64,
+    /// The egress proxy's stats socket and its token.
+    egress_stats: Option<(std::path::PathBuf, String)>,
+    ticks_per_second: u64,
 }
 
 /// An id being created.
@@ -562,11 +636,17 @@ impl Node {
             sandboxes: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashSet::new()),
             ended: Mutex::new(VecDeque::new()),
-            draining: AtomicBool::new(false),
+            draining: AtomicBool::new(config.start_drained),
             memory_limit: match config.max_memory_mb {
                 Some(mb) => mb << 20,
                 None => crate::memory::host_memory().unwrap_or(u64::MAX),
             },
+            boot: SandboxId::random()
+                .map(|id| id.egress_id())
+                .unwrap_or_else(|_| unix_ms()),
+            last_seq: AtomicU64::new(0),
+            egress_stats: config.egress_stats().ok().flatten(),
+            ticks_per_second: crate::memory::ticks_per_second(),
             config,
             templates,
         }
@@ -586,6 +666,9 @@ impl Node {
             memory_bytes,
             memory_limit_bytes: self.memory_limit,
             draining: self.draining.load(Ordering::SeqCst),
+            cpus: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1),
         }
     }
 
@@ -618,6 +701,31 @@ impl Node {
         list
     }
 
+    /// The sandboxes whose usage became final after `seq`, oldest first,
+    /// at most [`types::MAX_ENDED_PER_LIST`], and whether there are more;
+    /// and this process's boot number.
+    pub fn ended_after(&self, seq: u64) -> (Vec<EndedSandbox>, bool, u64) {
+        let ended = lock(&self.ended);
+        let mut out: Vec<EndedSandbox> = ended
+            .iter()
+            .filter(|t| t.seq.is_some_and(|s| s > seq))
+            .map(|t| EndedSandbox {
+                id: t.id.to_string(),
+                tenant: t.tenant.clone(),
+                template: t.template.clone(),
+                seq: t.seq.unwrap_or(0),
+                created_at: t.created_at,
+                ended_at: t.ended_at,
+                memory_limit_bytes: t.memory_limit,
+                usage: t.usage,
+            })
+            .collect();
+        out.sort_by_key(|e| e.seq);
+        let more = out.len() > types::MAX_ENDED_PER_LIST;
+        out.truncate(types::MAX_ENDED_PER_LIST);
+        (out, more, self.boot)
+    }
+
     /// The sandbox `id` of `tenant` (any tenant when `None`). Another
     /// tenant's sandbox is reported as missing, like one that never was.
     fn get(&self, id: &str, tenant: Option<&str>) -> Result<Arc<Sandbox>, ApiError> {
@@ -647,6 +755,7 @@ impl Node {
         let Some(sandbox) = lock(&self.sandboxes).remove(&id) else {
             return false;
         };
+        let removed = Instant::now();
         sandbox.fail(ApiError::ended(reason));
         sandbox.kill();
         log::info!("sandbox {id} of {} removed: {reason}", sandbox.tenant);
@@ -657,7 +766,17 @@ impl Node {
         ended.push_back(Tombstone {
             id,
             tenant: sandbox.tenant.clone(),
+            template: sandbox.template.clone(),
             reason: reason.to_string(),
+            memory_limit: sandbox.memory_limit,
+            created_at: sandbox.created_at,
+            ended_at: unix_ms(),
+            kernel: sandbox
+                .kernel_start
+                .map(|start| (sandbox.kernel_pid, start)),
+            removed,
+            usage: sandbox.usage(removed),
+            seq: None,
         });
         true
     }
@@ -808,6 +927,8 @@ impl Node {
             memory_limit: template.config.memory_limit_mb << 20,
             max_processes: template.config.max_processes,
             ready_ms,
+            kernel_start: crate::memory::stat_of(run.pid).map(|s| s.start),
+            counters: Mutex::new(Counters::default()),
         });
         let info = sandbox.info(&self.config.node);
         {
@@ -990,41 +1111,127 @@ impl Node {
         }
     }
 
-    /// Measures every sandbox once a second and removes those over their
-    /// memory limit or with too many processes. Runs for ever, on a thread
-    /// of its own.
-    pub fn watch_memory(&self) {
+    /// Measures every sandbox once a second (memory, processes, CPU time,
+    /// egress bytes) and removes those over their memory limit or with too
+    /// many processes; makes the usage of sandboxes that ended final. Runs
+    /// for ever, on a thread of its own.
+    pub fn watch_usage(&self) {
         loop {
             std::thread::sleep(Duration::from_secs(1));
-            let sandboxes: Vec<Arc<Sandbox>> = lock(&self.sandboxes).values().cloned().collect();
-            if sandboxes.is_empty() {
+            self.measure();
+            self.egress();
+            self.finalize();
+        }
+    }
+
+    fn measure(&self) {
+        let sandboxes: Vec<Arc<Sandbox>> = lock(&self.sandboxes).values().cloned().collect();
+        if sandboxes.is_empty() {
+            return;
+        }
+        let pids: Vec<(u32, usize)> = sandboxes
+            .iter()
+            .map(|s| (s.kernel_pid, s.max_processes))
+            .collect();
+        let usage = crate::memory::measure(&pids);
+        let now = Instant::now();
+        for s in &sandboxes {
+            let usage = usage.get(&s.kernel_pid).copied().unwrap_or_default();
+            if usage.too_many {
+                self.remove(
+                    s.id,
+                    &format!("it had more than {} processes and threads", s.max_processes),
+                );
                 continue;
             }
-            let pids: Vec<(u32, usize)> = sandboxes
+            s.memory.store(usage.bytes, Ordering::Relaxed);
+            {
+                let mut c = lock(&s.counters);
+                c.memory(usage.bytes, now);
+                // The processes that make up the sum change (one ends and
+                // its parent has not waited for it yet): never down.
+                let cpu_ms = usage.cpu_ticks.saturating_mul(1000) / self.ticks_per_second;
+                c.cpu_ms = c.cpu_ms.max(cpu_ms);
+            }
+            if usage.bytes > s.memory_limit {
+                self.remove(
+                    s.id,
+                    &format!(
+                        "its memory ({} MiB) went over the limit ({} MiB)",
+                        usage.bytes >> 20,
+                        s.memory_limit >> 20
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Reads the egress bytes of every sandbox, and of those that ended
+    /// whose usage is not final yet, from the egress proxy.
+    fn egress(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            use hellovm_egress::usage::{ask, Key};
+            let Some((socket, token)) = &self.egress_stats else {
+                return;
+            };
+            let sandboxes: Vec<Arc<Sandbox>> = lock(&self.sandboxes).values().cloned().collect();
+            let mut keys: Vec<Key> = sandboxes
                 .iter()
-                .map(|s| (s.kernel_pid, s.max_processes))
+                .filter_map(|s| {
+                    s.kernel_start.map(|start| Key {
+                        pid: s.kernel_pid,
+                        start,
+                    })
+                })
                 .collect();
-            let usage = crate::memory::measure(&pids);
+            keys.extend(
+                lock(&self.ended)
+                    .iter()
+                    .filter(|t| t.seq.is_none())
+                    .filter_map(|t| t.kernel.map(|(pid, start)| Key { pid, start })),
+            );
+            if keys.is_empty() {
+                return;
+            }
+            let answer = keys
+                .chunks(hellovm_egress::usage::MAX_KEYS)
+                .map(|chunk| ask(socket, token, chunk, STATS_TIMEOUT))
+                .collect::<io::Result<Vec<_>>>();
+            let bytes: HashMap<(u32, u64), (u64, u64)> = match answer {
+                Ok(answers) => answers
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, sent, received)| ((k.pid, k.start), (sent, received)))
+                    .collect(),
+                Err(err) => {
+                    log::debug!("egress stats {}: {err}", socket.display());
+                    return;
+                }
+            };
             for s in &sandboxes {
-                let usage = usage.get(&s.kernel_pid).copied().unwrap_or_default();
-                if usage.too_many {
-                    self.remove(
-                        s.id,
-                        &format!("it had more than {} processes and threads", s.max_processes),
-                    );
-                    continue;
+                if let Some(&(sent, received)) = s
+                    .kernel_start
+                    .and_then(|start| bytes.get(&(s.kernel_pid, start)))
+                {
+                    lock(&s.counters).egress(sent, received);
                 }
-                s.memory.store(usage.bytes, Ordering::Relaxed);
-                if usage.bytes > s.memory_limit {
-                    self.remove(
-                        s.id,
-                        &format!(
-                            "its memory ({} MiB) went over the limit ({} MiB)",
-                            usage.bytes >> 20,
-                            s.memory_limit >> 20
-                        ),
-                    );
+            }
+            for t in lock(&self.ended).iter_mut().filter(|t| t.seq.is_none()) {
+                if let Some(&(sent, received)) = t.kernel.and_then(|k| bytes.get(&k)) {
+                    t.usage.egress_sent_bytes = t.usage.egress_sent_bytes.max(sent);
+                    t.usage.egress_received_bytes = t.usage.egress_received_bytes.max(received);
                 }
+            }
+        }
+    }
+
+    /// Makes final the usage of sandboxes that ended [`FINAL_AFTER`] ago.
+    fn finalize(&self) {
+        let mut ended = lock(&self.ended);
+        for t in ended.iter_mut() {
+            if t.seq.is_none() && t.removed.elapsed() >= FINAL_AFTER {
+                t.seq = Some(self.last_seq.fetch_add(1, Ordering::SeqCst) + 1);
             }
         }
     }

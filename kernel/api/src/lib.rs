@@ -7,6 +7,9 @@
 //! chooses where a new sandbox goes. See the README, "Control plane".
 
 pub mod config;
+pub mod meter;
+pub mod meterlog;
 pub mod nodes;
+pub mod quota;
 pub mod service;
 pub mod store;

@@ -82,12 +82,68 @@ pub struct SandboxInfo {
     /// How long the request that made it took on the node, in ms (ready
     /// means the agent in the sandbox answered).
     pub ready_ms: f64,
+    /// What it used since it was made (every counter only grows).
+    #[serde(default)]
+    pub usage: SandboxUsage,
 }
+
+/// What one sandbox used since it was made, as its node measures it.
+/// Every counter only grows while the sandbox lives; a sandbox that ended
+/// keeps its last values.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxUsage {
+    /// Milliseconds it existed (wall-clock time from creation to now or
+    /// to its end).
+    pub run_ms: u64,
+    /// CPU time (user and system) of its kernel process and every process
+    /// below it, those that ended included, in ms.
+    pub cpu_ms: u64,
+    /// Its private memory integrated over time: bytes times seconds.
+    pub memory_byte_seconds: u64,
+    /// Bytes its outbound flows delivered upstream (sent by the guest).
+    pub egress_sent_bytes: u64,
+    /// Bytes its outbound flows delivered to it (received by the guest).
+    pub egress_received_bytes: u64,
+}
+
+/// A sandbox that ended, with its final usage (`GET /v1/sandboxes` on a
+/// node, with `?ended_after=`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EndedSandbox {
+    pub id: String,
+    pub tenant: String,
+    pub template: String,
+    /// Increases by one with every sandbox that ends on this node (since
+    /// it started: see [`SandboxList::boot`]).
+    pub seq: u64,
+    /// Unix milliseconds.
+    pub created_at: u64,
+    pub ended_at: u64,
+    pub memory_limit_bytes: u64,
+    pub usage: SandboxUsage,
+}
+
+/// Most ended sandboxes in one node answer.
+pub const MAX_ENDED_PER_LIST: usize = 1024;
 
 /// `GET /v1/sandboxes`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SandboxList {
     pub sandboxes: Vec<SandboxInfo>,
+    /// On a node, with `?ended_after=SEQ`: the sandboxes that ended with a
+    /// `seq` above it, oldest first, at most [`MAX_ENDED_PER_LIST`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<Vec<EndedSandbox>>,
+    /// With `ended`: whether more ended than it holds (ask again from the
+    /// last `seq`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ended_more: bool,
+    /// With `ended`: a random number the node chose when it started; a new
+    /// one means its `seq` numbering started again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<u64>,
 }
 
 /// `POST /v1/sandboxes/{id}/exec` and `POST /v1/sandboxes/{id}/execs`.
@@ -437,6 +493,9 @@ pub struct TemplateStatus {
     pub tenant: Option<String>,
     /// The template's `hellovm` process, while it runs.
     pub pid: Option<u32>,
+    /// A sandbox of it is removed when its private memory goes over this.
+    #[serde(default)]
+    pub memory_limit_bytes: Option<u64>,
 }
 
 /// `GET /v1/node`: what a node offers, and its load.
@@ -456,6 +515,51 @@ pub struct NodeStatus {
     pub memory_limit_bytes: u64,
     /// Whether it refuses new sandboxes (its sandboxes run on).
     pub draining: bool,
+    /// CPUs the node's sandboxes can use (bounds the CPU time it may
+    /// report).
+    #[serde(default)]
+    pub cpus: u32,
+}
+
+/// `GET /v1/usage` (public API): the caller's usage in the current
+/// period and its quotas.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TenantUsage {
+    pub tenant: String,
+    pub period: Period,
+    /// Summed over its sandboxes for the period so far.
+    pub usage: UsageTotals,
+    /// Its sandboxes now (those of unreachable nodes included).
+    pub sandboxes: usize,
+    /// The memory limits of its sandboxes now, summed.
+    pub memory_limit_bytes: u64,
+    pub quotas: Quotas,
+    /// The budgets it used up this period (`cpu`, `egress`): creating a
+    /// sandbox or starting an exec is refused until the period ends.
+    pub exceeded: Vec<String>,
+}
+
+/// A metering period: `[start, end)`, Unix milliseconds.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Period {
+    pub start: u64,
+    pub end: u64,
+    pub seconds: u64,
+}
+
+/// Usage summed over sandboxes and time: the same counters as one
+/// sandbox's.
+pub type UsageTotals = SandboxUsage;
+
+/// A tenant's quotas; `None`: no limit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Quotas {
+    pub max_sandboxes: usize,
+    pub max_memory_bytes: Option<u64>,
+    pub requests_per_second: Option<f64>,
+    pub request_burst: Option<u32>,
+    pub cpu_seconds_per_period: Option<f64>,
+    pub egress_bytes_per_period: Option<u64>,
 }
 
 /// `POST /v1/node/drain`: stop or resume taking new sandboxes.

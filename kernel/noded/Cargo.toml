@@ -20,3 +20,5 @@ serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hellovm.workspace = true
+# The client of the egress proxy's stats socket.
+hellovm-egress.workspace = true

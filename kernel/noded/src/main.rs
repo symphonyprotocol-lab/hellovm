@@ -50,6 +50,18 @@ fn run(config_path: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(config_path).map_err(|e| format!("{config_path}: {e}"))?;
     let config = Config::parse(&text).map_err(|e| format!("{config_path}: {e}"))?;
     let token = config.token()?;
+    if let Some((stats, _)) = config.egress_stats()? {
+        // Every kernel process sees the egress socket's directory.
+        if let Some(egress) = &config.egress {
+            if stats.parent() == egress.parent() {
+                return Err(
+                    "egress_stats: the stats socket must not be in the egress socket's \
+                     directory (every sandbox's kernel process can see that one)"
+                        .into(),
+                );
+            }
+        }
+    }
     if !config.hellovm.is_file() {
         return Err(format!(
             "hellovm binary {} not found",
@@ -119,8 +131,8 @@ fn run(config_path: &str) -> Result<(), String> {
     {
         let node = Arc::clone(&node);
         std::thread::Builder::new()
-            .name("memory".into())
-            .spawn(move || node.watch_memory())
+            .name("usage".into())
+            .spawn(move || node.watch_usage())
             .map_err(|e| e.to_string())?;
     }
     {
@@ -142,6 +154,12 @@ fn run(config_path: &str) -> Result<(), String> {
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+    }
+    if node.config.start_drained {
+        log::info!(
+            "node state change: node={} draining=true (start_drained)",
+            node.config.node
+        );
     }
     log::info!("node {} listening on {addr}", node.config.node);
     while !STOP.load(Ordering::SeqCst) {

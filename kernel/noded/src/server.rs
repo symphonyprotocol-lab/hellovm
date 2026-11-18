@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | `GET /v1/node` | | `NodeStatus` (templates, load, draining) |
 //! | `POST /v1/node/drain` | `DrainRequest` | `NodeStatus` |
-//! | `GET /v1/sandboxes` | | `SandboxList` (all tenants, or `?tenant=`) |
+//! | `GET /v1/sandboxes?tenant=&ended_after=` | | `SandboxList` (all tenants, or `?tenant=`; with `ended_after`, also the sandboxes whose usage became final since) |
 //! | `POST /v1/sandboxes` | `NodeCreate` | `201` `SandboxInfo` |
 //! | `GET /v1/sandboxes/{id}` | | `SandboxInfo` |
 //! | `DELETE /v1/sandboxes/{id}` | | `204` |
@@ -61,12 +61,25 @@ impl NodeApi {
                 200,
                 json_body::<DrainRequest>(request).map(|r| node.set_draining(r.draining)),
             ),
-            ("GET", ["v1", "sandboxes"]) => Response::json(
-                200,
-                &SandboxList {
+            ("GET", ["v1", "sandboxes"]) => {
+                let mut list = SandboxList {
                     sandboxes: node.list(request.query("tenant")),
-                },
-            ),
+                    ended: None,
+                    ended_more: false,
+                    boot: None,
+                };
+                if let Some(after) = request.query("ended_after") {
+                    let Ok(after) = after.parse::<u64>() else {
+                        return ApiError::new(400, "bad_request", "malformed ended_after")
+                            .response();
+                    };
+                    let (ended, more, boot) = node.ended_after(after);
+                    list.ended = Some(ended);
+                    list.ended_more = more;
+                    list.boot = Some(boot);
+                }
+                Response::json(200, &list)
+            }
             ("POST", ["v1", "sandboxes"]) => {
                 respond(201, json_body(request).and_then(|r| node.create(r)))
             }

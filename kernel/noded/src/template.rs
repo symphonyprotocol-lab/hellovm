@@ -59,6 +59,7 @@ impl Template {
             starts: self.starts.load(Ordering::SeqCst),
             tenant: self.config.tenant.clone(),
             pid: self.pid(),
+            memory_limit_bytes: Some(self.config.memory_limit_mb << 20),
         }
     }
 

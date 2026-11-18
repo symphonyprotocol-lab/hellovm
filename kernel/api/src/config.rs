@@ -52,6 +52,58 @@ pub struct Config {
     /// The operators' API, on a listener of its own; none: not served.
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    /// The metering period and log.
+    #[serde(default)]
+    pub metering: MeteringConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeteringConfig {
+    /// Seconds per period, aligned to multiples of it since the Unix
+    /// epoch (86400: UTC days). The per-period budgets start again at
+    /// every boundary.
+    #[serde(default = "default_period")]
+    pub period: u64,
+    /// The usage log's path prefix: records of a period go to
+    /// `LOG.YYYYMMDDTHHMMSSZ.jsonl` (the period's start), then `.1.jsonl`,
+    /// `.2.jsonl`... past `max_file_mb`. None: no log.
+    #[serde(default)]
+    pub log: Option<PathBuf>,
+    /// Seconds between two records of a running sandbox.
+    #[serde(default = "default_record_interval")]
+    pub interval: f64,
+    /// Size at which a log file is closed and the next one begun.
+    #[serde(default = "default_max_file_mb")]
+    pub max_file_mb: u64,
+    /// Most bytes read from the log at start-up.
+    #[serde(default = "default_max_read_mb")]
+    pub max_read_mb: u64,
+}
+
+impl Default for MeteringConfig {
+    fn default() -> MeteringConfig {
+        MeteringConfig {
+            period: default_period(),
+            log: None,
+            interval: default_record_interval(),
+            max_file_mb: default_max_file_mb(),
+            max_read_mb: default_max_read_mb(),
+        }
+    }
+}
+
+fn default_period() -> u64 {
+    86400
+}
+fn default_record_interval() -> f64 {
+    60.0
+}
+fn default_max_file_mb() -> u64 {
+    256
+}
+fn default_max_read_mb() -> u64 {
+    1024
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -105,6 +157,22 @@ pub struct TenantConfig {
     pub token_file: Option<PathBuf>,
     /// Sandboxes this tenant may have at once.
     pub max_sandboxes: usize,
+    /// The memory limits of its sandboxes together, in MiB.
+    #[serde(default)]
+    pub max_memory_mb: Option<u64>,
+    /// Requests per second, on average (a token bucket per tenant).
+    #[serde(default)]
+    pub requests_per_second: Option<f64>,
+    /// Requests at once above the average (the bucket's size; default:
+    /// two seconds' worth, at least 10).
+    #[serde(default)]
+    pub request_burst: Option<u32>,
+    /// CPU seconds its sandboxes may use per period.
+    #[serde(default)]
+    pub cpu_seconds_per_period: Option<f64>,
+    /// Egress bytes (sent and received) its sandboxes may move per period.
+    #[serde(default)]
+    pub egress_bytes_per_period: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +222,25 @@ pub struct Tenant {
     pub name: String,
     pub token: String,
     pub max_sandboxes: usize,
+    pub max_memory_bytes: Option<u64>,
+    /// `(per second, burst)`.
+    pub rate: Option<(f64, u32)>,
+    pub cpu_ms_per_period: Option<u64>,
+    pub egress_bytes_per_period: Option<u64>,
+}
+
+impl Tenant {
+    /// As the tenant is told of them.
+    pub fn quotas(&self) -> hellovm_control::types::Quotas {
+        hellovm_control::types::Quotas {
+            max_sandboxes: self.max_sandboxes,
+            max_memory_bytes: self.max_memory_bytes,
+            requests_per_second: self.rate.map(|(r, _)| r),
+            request_burst: self.rate.map(|(_, b)| b),
+            cpu_seconds_per_period: self.cpu_ms_per_period.map(|ms| ms as f64 / 1000.0),
+            egress_bytes_per_period: self.egress_bytes_per_period,
+        }
+    }
 }
 
 /// A node with its token loaded.
@@ -207,6 +294,16 @@ impl Config {
         if config.nodes.is_empty() {
             return Err("no nodes".into());
         }
+        let m = &config.metering;
+        if !(1..=366 * 86400).contains(&m.period) {
+            return Err("metering.period must be 1 to 31622400 seconds".into());
+        }
+        if !(m.interval.is_finite() && m.interval >= 1.0 && m.interval <= 86400.0) {
+            return Err("metering.interval must be 1 to 86400 seconds".into());
+        }
+        if !(1..=1 << 20).contains(&m.max_file_mb) || !(1..=1 << 20).contains(&m.max_read_mb) {
+            return Err("metering.max_file_mb and max_read_mb must be 1 to 2^20".into());
+        }
         Ok(config)
     }
 
@@ -226,10 +323,37 @@ impl Config {
             if out.iter().any(|o| o.token == token) {
                 return Err(format!("tenant {} has another tenant's token", t.name));
             }
+            let what = |field: &str| format!("tenant {}: {field}", t.name);
+            if t.max_memory_mb.is_some_and(|mb| mb == 0 || mb > 1 << 30) {
+                return Err(what("max_memory_mb must be 1 to 2^30"));
+            }
+            let rate = match (t.requests_per_second, t.request_burst) {
+                (None, None) => None,
+                (None, Some(_)) => return Err(what("request_burst needs requests_per_second")),
+                (Some(r), burst) => {
+                    if !(r.is_finite() && r > 0.0 && r <= 1e6) {
+                        return Err(what("requests_per_second must be more than 0, at most 1e6"));
+                    }
+                    let burst = burst.unwrap_or_else(|| ((2.0 * r).ceil() as u32).max(10));
+                    if !(1..=1_000_000).contains(&burst) {
+                        return Err(what("request_burst must be 1 to 1e6"));
+                    }
+                    Some((r, burst))
+                }
+            };
+            let cpu_ms_per_period = match t.cpu_seconds_per_period {
+                None => None,
+                Some(s) if (0.0..=1e12).contains(&s) => Some((s * 1000.0) as u64),
+                Some(_) => return Err(what("cpu_seconds_per_period must be 0 to 1e12")),
+            };
             out.push(Tenant {
                 name: t.name.clone(),
                 token,
                 max_sandboxes: t.max_sandboxes,
+                max_memory_bytes: t.max_memory_mb.map(|mb| mb << 20),
+                rate,
+                cpu_ms_per_period,
+                egress_bytes_per_period: t.egress_bytes_per_period,
             });
         }
         Ok(out)
@@ -309,5 +433,39 @@ mod tests {
         assert!(with(r#""healthy_after":101"#).is_err());
         assert!(with(r#""node_timeout":0"#).is_err());
         assert_eq!(with(r#""unhealthy_after":5"#).unwrap().unhealthy_after, 5);
+        assert!(with(r#""metering":{"period":0}"#).is_err());
+        assert!(with(r#""metering":{"interval":0.5}"#).is_err());
+        assert!(with(r#""metering":{"bogus":1}"#).is_err());
+        let m = with(r#""metering":{"period":3600,"log":"/tmp/u"}"#).unwrap();
+        assert_eq!(m.metering.period, 3600);
+
+        let base_ok = base.replace("TOKEN_B", "bbbbbbbbbbbbbbbbbbbbbbbb");
+        let quota = |extra: &str| {
+            let text = base_ok.replacen(
+                "\"max_sandboxes\":2}",
+                &format!("\"max_sandboxes\":2,{extra}}}"),
+                1,
+            );
+            Config::parse(&text).unwrap().tenants()
+        };
+        let t = quota(r#""max_memory_mb":1024,"requests_per_second":2.5,"cpu_seconds_per_period":1.5,"egress_bytes_per_period":99"#).unwrap();
+        assert_eq!(t[0].max_memory_bytes, Some(1 << 30));
+        assert_eq!(t[0].rate, Some((2.5, 10)));
+        assert_eq!(t[0].cpu_ms_per_period, Some(1500));
+        assert_eq!(t[0].egress_bytes_per_period, Some(99));
+        assert_eq!(t[1].rate, None);
+        assert_eq!(
+            quota(r#""requests_per_second":100"#).unwrap()[0].rate,
+            Some((100.0, 200))
+        );
+        for bad in [
+            r#""requests_per_second":0"#,
+            r#""request_burst":5"#,
+            r#""requests_per_second":1,"request_burst":0"#,
+            r#""max_memory_mb":0"#,
+            r#""cpu_seconds_per_period":-1"#,
+        ] {
+            assert!(quota(bad).is_err(), "{bad}");
+        }
     }
 }
