@@ -128,6 +128,35 @@ A blocking connect to a loopback address with no listener is `ECONNREFUSED`.
 The same connect on a non-blocking socket is `EINPROGRESS` with
 `SO_ERROR == ECONNREFUSED`.
 
+*Inbound connections (ingress).* The host side can open a connection to
+a TCP port a guest process listens on: a warm clone's requester hands
+its kernel process connected stream sockets over the clone's ingress
+channel (see **Warm clones**), each with a guest port; the API's ingress
+uses it (see **Ingress** in **Control plane**). The connection arrives
+at the guest NIC address, `192.0.2.2:PORT`: a listener on `0.0.0.0` or
+`192.0.2.2` gets it, one bound to `127.0.0.1` only does not (as on Linux,
+where loopback-only means not reachable from outside). Its peer, what
+`accept` and `getpeername` report, is the gateway `192.0.2.1` on a port
+of the ephemeral range, taken in turn: never a loopback address, which
+servers often trust without asking for credentials (Jupyter, debuggers,
+admin pages). The real client's address is in the HTTP headers the
+ingress adds. The kernel queues the connection on the listener's accept
+queue like an in-kernel one, or refuses it (no such listener, a full
+backlog, or 256 inbound connections already open in the sandbox), and
+the first byte the opener reads is the verdict: `A`, then the guest's
+bytes, or `R` and the end of the connection. From then on it is a host
+stream like an outbound one: 64 KiB buffered each way in the kernel
+process with back-pressure both ways, half-close both ways (the guest's
+`shutdown(SHUT_WR)` is a FIN to the opener and the opener's is EOF to the
+guest), a guest that closes the listener resets the connections still
+queued on it (the opener reads the end without a byte), and the end of
+the sandbox ends them all. The kernel process keeps at most 64 handed
+over and not yet taken, and 256 with helper threads (two each), apart
+from the 512 outbound ones; past either, the next is refused. Nothing a
+guest does can open one or learn more than a peer address and the bytes;
+the classification of guest connects is unchanged (`192.0.2.1` other
+than port 53 is still `ECONNREFUSED`).
+
 Unnamed `AF_UNIX` `socketpair` (`SOCK_STREAM` and `SOCK_DGRAM`) works.
 `socket(AF_UNIX)`, path-bound `AF_UNIX`, `AF_INET6`, and netlink
 (`AF_NETLINK`) return `EAFNOSUPPORT`. IPv6 and raw sockets are
@@ -536,7 +565,11 @@ its own stdin, stdout and stderr, and exits with the clone's status (125 if
 none was made, 124 after `--timeout`, which kills the clone); `--ready`
 waits until the template is frozen. A node daemon speaks the protocol
 directly: one connection per request, the stdio fds passed with
-`SCM_RIGHTS`, answers `R` (ready), `S` (the clone runs: its sandbox id and
+`SCM_RIGHTS` (and, with a flag, a fourth: the clone's ingress channel, a
+Unix stream socket whose other end the requester keeps; on it each
+message is a guest port, two bytes, with one connected socket attached,
+which the clone's kernel process takes as an inbound connection, see
+**Networking**), answers `R` (ready), `S` (the clone runs: its sandbox id and
 kernel process id), `X` (exit status) or `E` (error text). Closing the
 connection kills the clone. `kernel/hellovm/src/warm.rs` documents the
 bytes and has a client (`hellovm::warm::WarmClone`). Who can connect to
@@ -768,6 +801,10 @@ client --HTTP, tenant token--> hellovm-api --HTTP, node token--> hellovm-noded
                                                                     | fork per sandbox
                                                                     v
                     clone kernel process <-- console pipes: agent frames --> noded
+                                         <-- ingress channel: inbound connections -- noded
+
+HTTP client --PORT-SANDBOX.DOMAIN--> TLS proxy --> hellovm-api ingress listener
+     --TCP, handed over by noded--> clone kernel process --> the guest's accept()
 ```
 
 They live in `kernel/` because `noded` uses the warm-clone client of the
@@ -806,7 +843,8 @@ hellovm-api --config /etc/hellovm/api.json &
  "default_idle_timeout": 600, "max_idle_timeout": 86400,
  "default_lifetime": 3600, "max_lifetime": 86400,
  "admin": {"listen": "127.0.0.1:7079", "token_file": "/etc/hellovm/admin.token"},
- "metering": {"period": 86400, "log": "/var/lib/hellovm-api/usage"}}
+ "ingress": {"listen": "127.0.0.1:7080", "domain": "sandbox.example.com", "behind_proxy": true},
+ "metering": {"period": "month", "log": "/var/lib/hellovm-api/usage"}}
 ```
 
 Unknown fields in either file are errors. Tokens are at least 22
@@ -837,6 +875,10 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 | `GET /v1/sandboxes/{id}/files?path=P` | | the file's bytes |
 | `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `{"bytes"}` |
 | `POST /v1/sandboxes/{id}/files/edit` | `{"path", "old", "new", "replace_all"?}` | `{"replacements"}` |
+| `GET /v1/sandboxes/{id}/ingress` | | `{"token", "ports": [{"port", "public", "url"}]}` (see **Ingress**) |
+| `PUT /v1/sandboxes/{id}/ingress/ports/{port}` | `{"public"?}` | the same, with the port exposed (or `public` changed) |
+| `DELETE /v1/sandboxes/{id}/ingress/ports/{port}` | | the same, without it |
+| `POST /v1/sandboxes/{id}/ingress/token` | | the same, with a new token |
 | `GET /v1/usage` | | `{"tenant", "period", "usage", "sandboxes", "memory_limit_bytes", "quotas", "exceeded"}` (see **Quotas and metering**) |
 
 | Status | Code | When |
@@ -845,7 +887,9 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 | 401 | `unauthorized` | no or unknown token |
 | 404 | `sandbox_not_found` | no such sandbox, **or another tenant's** (the same answer) |
 | 404 | `not_found`, `template_not_found`, `exec_not_found` | no such file or working directory; no such template; no such exec (only the latest is kept) |
+| 404 | `ingress_disabled` | an ingress endpoint, on an API without `ingress` in its configuration |
 | 409 | `busy` | the sandbox is running another request or exec (one at a time; reading, listing and cancelling an exec are not requests that take it) |
+| 409 | `too_many_ports` | the sandbox has 16 ports exposed already |
 | 410 | `sandbox_ended` | the node removed it and still remembers why (idle, lifetime, memory, its agent ended) |
 | 413 | `too_large` | a body or file over 16 MiB |
 | 422 | `no_match`, `ambiguous` | edit: `old` does not occur, or occurs more than once without `replace_all` |
@@ -1080,7 +1124,12 @@ timeouts the API chose. Each node has its own bearer token, which the
 API presents; every request about a sandbox also names its tenant.
 `GET /v1/node` reports the node's templates and load, and `POST
 /v1/node/drain` (`{"draining": true}` or `false`) stops or resumes its
-taking new sandboxes (see **Scheduling**). With
+taking new sandboxes (see **Scheduling**). For ingress: `GET`, `PUT`,
+`DELETE .../ingress[/ports/{port}]` and `POST .../ingress/token` keep a
+sandbox's token and exposed ports, `POST .../ingress/connect?port=P`
+answers `200` and hands that very connection to the sandbox, and `POST
+/v1/node/touch` (`{"sandboxes": [ids]}`) restarts idle timeouts (see
+**Ingress**). With
 many nodes, the node API needs TLS with a certificate per node (mutual
 TLS, so a node knows the API and the API knows the node), which is not
 done: the node API must listen on loopback or a private network until
@@ -1231,7 +1280,7 @@ through it. At most 16 connections.
 | `GET /admin/v1/nodes/{name}` | `NODE`: `{"name", "addr", "state", "since", "last_error", "reported_ms_ago", "placed_since_report", "in_flight", "report"}` (`report`: the node's last status: counts, memory, `draining`, templates) |
 | `POST /admin/v1/nodes/{name}/drain` | `NODE`, once the node drains |
 | `POST /admin/v1/nodes/{name}/undrain` | `NODE`, once it takes sandboxes again |
-| `GET /admin/v1/usage` | `{"tenants": [USAGE...], "sandboxes_metered", "odd_reports", "deletes_waiting", "log"}` (`USAGE` as `GET /v1/usage` answers; `log`: `null` without one, else `{"path", "healthy", "last_error", "written", "backlog", "dropped"}`) |
+| `GET /admin/v1/usage` | `{"tenants": [USAGE...], "sandboxes_metered", "odd_reports", "deletes_waiting", "ingress_connections", "log"}` (`ingress_connections`: open now, `null` without ingress) (`USAGE` as `GET /v1/usage` answers; `log`: `null` without one, else `{"path", "healthy", "last_error", "written", "backlog", "dropped"}`) |
 | `GET /admin/v1/usage/{tenant}` | `USAGE` |
 
 *Configuration.* In the API's file: `nodes` (each `name`, `addr`,
@@ -1272,6 +1321,9 @@ refuses new work to a tenant over its quotas
 since it was made), `cpu_ms`, `memory_byte_seconds` and
 `egress_sent_bytes` / `egress_received_bytes`. Each counter only grows,
 lives as long as the sandbox, and keeps its last value when it ends.
+(`ingress_received_bytes` / `ingress_sent_bytes` are in the same `usage`
+object but counted by the API, which relays them: see **Ingress**; a
+node reports them as 0, and the API ignores what a node says of them.)
 
 * CPU time: the scan that measures memory once a second (see **Resource
   limits**) also reads `utime + stime + cutime + cstime` of the clone's
@@ -1346,8 +1398,10 @@ One JSON object per line:
 ```json
 {"v":1,"kind":"usage","ts":1794963600123,"period":1794960000,"tenant":"acme",
  "sandbox":"sb-...","node":"node-1","template":"python",
- "delta":{"run_ms":60000,"cpu_ms":1520,"memory_byte_seconds":2516582400,"egress_sent_bytes":812,"egress_received_bytes":40213},
- "total":{"run_ms":180000,"cpu_ms":4210,"memory_byte_seconds":7549747200,"egress_sent_bytes":812,"egress_received_bytes":40213},
+ "delta":{"run_ms":60000,"cpu_ms":1520,"memory_byte_seconds":2516582400,"egress_sent_bytes":812,"egress_received_bytes":40213,
+          "ingress_received_bytes":1204,"ingress_sent_bytes":88410},
+ "total":{"run_ms":180000,"cpu_ms":4210,"memory_byte_seconds":7549747200,"egress_sent_bytes":812,"egress_received_bytes":40213,
+          "ingress_received_bytes":3610,"ingress_sent_bytes":265230},
  "memory_bytes":41943040}
 ```
 
@@ -1357,6 +1411,7 @@ One JSON object per line:
 | `final` | it ended; `end`: `ended` (its node said so) or `lost` | what grew since its previous record |
 | `carry` | a period began, for every sandbox running | zero (`total` carries its counters into the new period) |
 | `delete_pending`, `delete_done` | a delete waits for an unreachable node, and was done | none |
+| `late` | ingress bytes counted after the sandbox's `final` record (its last connections ended as it did), or for one its node never reported (it ended before the next probe, a minute on) | those bytes; counted in the period's totals, nothing else |
 
 `ts` is when it was made (Unix ms), `period` the start of its period (Unix
 seconds), `total` the sandbox's counters as taken, `memory_bytes` its
@@ -1392,9 +1447,16 @@ zero and counts every running sandbox from its first report.
 | `cpu_seconds_per_period` | CPU time of its sandboxes in the period | creating a sandbox, starting an exec (`exec`, `execs`) | `429 budget_exceeded`, `Retry-After` until the period ends |
 | `egress_bytes_per_period` | egress bytes, sent and received, in the period | the same | the same |
 
-`metering.period` (seconds, default 86400) is aligned to multiples of
-itself since the Unix epoch, so a day is a UTC day and the budgets start
-again at midnight UTC. A tenant over a budget gets no new sandbox and no
+`metering.period` is a number of seconds (default 86400), aligned to
+multiples of itself since the Unix epoch, so a day is a UTC day and the
+budgets start again at midnight UTC; or `"month"`: calendar months in
+UTC, from the first of each month at 00:00 UTC to the next (28 to 31
+days). Everything follows the period's real bounds: the usage answers
+(`period.start`, `end`, and `seconds`, the length of this month),
+`Retry-After` of `budget_exceeded` (to the end of the month), the log's
+file names (`PREFIX.20261101T000000Z.jsonl` for November 2026), the
+`carry` records at the boundary, and the files read back at start-up (the
+current month's and the previous one's, tested). A tenant over a budget gets no new sandbox and no
 new exec; everything else works (reads, lists, polls, cancels, files,
 resetting the interpreter, deletes), and what runs is not stopped: a
 long exec or a busy background process can take a tenant past its
@@ -1415,10 +1477,12 @@ A tenant reads its own usage with `GET /v1/usage`:
 ```json
 {"tenant": "acme", "period": {"start": 1794960000000, "end": 1795046400000, "seconds": 86400},
  "usage": {"run_ms": 7260000, "cpu_ms": 41250, "memory_byte_seconds": 302003200000,
-           "egress_sent_bytes": 18233, "egress_received_bytes": 9120344},
+           "egress_sent_bytes": 18233, "egress_received_bytes": 9120344,
+           "ingress_received_bytes": 4096, "ingress_sent_bytes": 1048576},
  "sandboxes": 2, "memory_limit_bytes": 2147483648,
  "quotas": {"max_sandboxes": 10, "max_memory_bytes": 8589934592, "requests_per_second": 50.0,
-            "request_burst": 100, "cpu_seconds_per_period": 36000.0, "egress_bytes_per_period": 10737418240},
+            "request_burst": 100, "cpu_seconds_per_period": 36000.0, "egress_bytes_per_period": 10737418240,
+            "max_ingress_connections": 128},
  "exceeded": []}
 ```
 
@@ -1437,15 +1501,27 @@ node answers a probe again, the API deletes it there (`delete_done`); a
 sandbox whose node no longer lists it needs nothing more. The node's
 list does not bring it back meanwhile: the reconciliation leaves out
 sandboxes with a delete to do (tested). It runs on the node until then
-(its idle timeout and lifetime still apply), and what it uses is still
-its tenant's. An API that restarts before the node is back reads the
-deletes to do back from the log and does them (tested); without a log it
-does not know of them, and the sandbox shows again (and counts) once the
-node answers, until its tenant deletes it again or its idle timeout
-ends it.
+(its idle timeout and lifetime still apply), but from the moment the
+delete is accepted what it uses is not its tenant's: what it used up to
+the last report before the delete is counted (and recorded, in a `usage`
+record written with the `delete_pending` one), and from then on its
+node's reports move its counters without charging anything, until its
+`final` record (whose `delta` is what was counted before the delete and
+not yet recorded, usually nothing). Since the API cannot know when
+within the time its node did not answer the sandbox used what, the time
+between the last report and the delete is not charged either: a tenant
+pays at most for less than it used, by what one sandbox does in the time
+its node was unreachable before the delete. An API that restarts before
+the node is back reads the deletes to do back from the log and does them,
+and knows from the `delete_pending` record that the sandbox is not to be
+charged, also when the delete was done but its final report not yet
+taken (tested, with a sandbox burning CPU from before its delete to after
+its node was back: nothing of it charged). Without a log it does not
+know of them, and the sandbox shows again (and counts) once the node
+answers, until its tenant deletes it again or its idle timeout ends it.
 
 *Configuration.* `metering`: `period` (seconds, 1 to 366 days, default
-86400), `log` (none: no log), `interval` (seconds between records of a
+86400; or `"month"`), `log` (none: no log), `interval` (seconds between records of a
 running sandbox, 1 to 86400, default 60), `max_file_mb` (256),
 `max_read_mb` (1024). Per tenant: `max_memory_mb`,
 `requests_per_second` and `request_burst`, `cpu_seconds_per_period`,
@@ -1463,12 +1539,274 @@ or execs at its budget* (work would be lost at an arbitrary point; new
 work is what the budget refuses); *429 for budgets from the HTTP layer's
 per-address limit* (an address is not a tenant); *a rate limit before
 authentication* (unauthenticated requests would spend a tenant's
-budget); *months as periods* (fixed lengths keep the boundaries simple;
-a calendar month would be a period kind of its own).
+budget); *weeks or other calendar periods* (seconds and months are what
+billing needs; another kind is a variant of `Periods` in `meter.rs`).
+For a delete on an unreachable node, rejected: *charging until the node
+deletes it* (the tenant asked for it to stop; that the node did not
+answer is the operator's problem, and a node that is down for an hour
+would bill an hour of a sandbox nobody may use), *sharing the unknown
+time pro rata* (the counters are cumulative; any split of the gap is a
+guess, and a guess in the tenant's disfavour is the wrong default).
 Not exact: with several API instances each would count its own rate and
 reservations (one API is assumed, as for scheduling); usage is sampled,
 so a budget can be passed by what a tenant does in about two seconds,
 and by work that was running.
+
+**Ingress.** An HTTP client outside reaches a server listening in a
+sandbox at `PORT-SANDBOX.DOMAIN`, once the sandbox's tenant has exposed
+that port (`kernel/api/src/ingress/`). HTTP/1.1 only, WebSocket and other
+upgrades included; TLS is the reverse proxy's in front of the listener
+(no TLS code here).
+
+```sh
+curl -s -H "Authorization: Bearer $TOKEN" -X PUT http://127.0.0.1:7070/v1/sandboxes/sb-.../ingress/ports/8000
+  -> {"token": "...", "ports": [{"port": 8000, "public": false, "url": "https://8000-sb-....sandbox.example.com/"}]}
+curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "nohup python3 -m http.server 8000 >/dev/null 2>&1 &"}' \
+  http://127.0.0.1:7070/v1/sandboxes/sb-.../exec
+curl -s -H "X-Hellovm-Ingress-Token: ..." https://8000-sb-....sandbox.example.com/
+```
+
+*The path of a request.* The ingress listener (`ingress.listen`) is the
+API process's own, apart from the tenants' and the operators'. For each
+connection it reads the request head (32 KiB at most, within
+`head_timeout`), takes the port and sandbox from `Host`, finds the
+sandbox's node in the store, checks that the port is exposed and the
+token unless the port is public, takes a connection slot, and asks the
+node `POST /v1/sandboxes/{id}/ingress/connect?port=P` (node token,
+tenant). `noded` checks the port again, counts the request as use of the
+sandbox, answers `200` and then hands that TCP connection itself (the fd,
+by `SCM_RIGHTS`) to the sandbox's kernel process over the clone's ingress
+channel, and is done with it. The kernel process queues it on the guest's
+listener (see **Networking**) and writes the verdict byte; the API reads
+it, sends the rewritten request head, and relays the rest as bytes until
+the exchange ends. So bytes go client, TLS proxy, API, kernel process,
+guest: `noded` is on the path only for the hand-over, and holds nothing
+per connection.
+
+*Host names.* `PORT-SANDBOX.DOMAIN`, case-insensitive, an optional
+`:PORT` of the listener after it: `PORT` 1 to 65535 in decimal without a
+leading zero, `SANDBOX` a sandbox id exactly (`sb-` and 32 lowercase hex
+digits), `DOMAIN` exactly `ingress.domain`, nothing else (no trailing dot,
+no further label). Anything else is `404`. The wildcard name
+`*.DOMAIN` points at the reverse proxy, whose certificate covers it. Use
+a domain of its own, not one under the API's or any other site's: every
+sandbox is a site under it, and its guests write the pages. Better still
+list it in the Public Suffix List, so that browsers keep one sandbox's
+cookies from another's (see the cookie below for what is done without it).
+
+*The token.* Every sandbox has an ingress token (64 hex digits, random,
+made with the sandbox on its node, kept there in memory with the exposed
+ports, rotated by `POST .../ingress/token`). A request to a port that is
+not public must carry it, in one of three ways:
+
+* the header `X-Hellovm-Ingress-Token: TOKEN` (programs);
+* the cookie `hellovm_ingress_token` (`__Host-hellovm_ingress_token`
+  when `ingress.scheme` is `https`), which a browser gets by opening the
+  URL once with `?hellovm_ingress_token=TOKEN`: that request is answered
+  by the ingress itself with `303 See Other` to the same URL without the
+  parameter and `Set-Cookie: ...; Path=/; HttpOnly; SameSite=Lax`
+  (`; Secure` over `https`). The parameter is taken only on `GET` and
+  `HEAD` (`400` otherwise) and never forwarded. The cookie is host-only
+  (one port of one sandbox), `HttpOnly` keeps the guest's own pages from
+  reading it, and the `__Host-` prefix keeps another sandbox's guest from
+  setting one for this host with `Domain=`; every value of the cookie
+  that a request carries is tried (at most 16), so one forged by another
+  site still cannot hide the right one;
+* (a public port needs none).
+
+The token is compared in constant time, never logged and never forwarded:
+the header and the cookie are removed from the request the guest gets,
+and a cookie of that name the guest sets is removed from its answer. A
+rotated token works at once; connections already made go on.
+
+*Answers of the ingress itself*, a short text body and `Connection:
+close`:
+
+| Status | When |
+|---|---|
+| `400` | a malformed request head (below), the token parameter on a method other than `GET` or `HEAD`, or given twice |
+| `404` | a `Host` that is not one of the names above; no such sandbox, or one that ended or was deleted; a port that is not exposed; no token or a wrong one; a sandbox whose node cannot be asked and of which nothing is known yet. One answer for all, byte for byte: who does not have the token learns nothing, not even that the sandbox exists. |
+| `408`, `431` | the head did not arrive within `head_timeout`, or is larger than 32 KiB |
+| `303` | the token parameter, with the right token (above) |
+| `502` | (with the right token, or to a public port) the sandbox's node is unreachable or the hand-over failed, nothing listens on the port in the sandbox, or the guest's answer is not HTTP |
+| `503` | (likewise) the sandbox's or the tenant's connections are at their limit, `Retry-After: 1`; or the listener's (before anything is read) |
+| `504` | the guest did not answer within `idle_timeout` |
+
+"Another tenant's sandbox" does not arise at this listener, which has no
+tenant: a client has a sandbox's token or does not. The tenant endpoints
+(`GET`, `PUT`, `DELETE .../ingress...`) answer another tenant's sandbox
+with `404 sandbox_not_found`, like every other endpoint. The API keeps
+what each sandbox's node says of its ingress (filled on first use and on
+every change made through the API, forgotten with the sandbox), so that
+it can check a token while the node does not answer: then a request with
+the right token (or to a public port) is told `502`, and one without the
+same `404` as for no sandbox at all. What it cannot know (an API that
+restarted while the node was down) is `404` until the node answers.
+
+*Request heads* must be strict HTTP/1.0 or 1.1, or are refused (`400`)
+before anything reaches a node or the guest: CRLF line ends only, no
+control byte in a value but tab, header names of token characters directly
+followed by `:`, no folded lines, at most 100 headers, a request target in
+origin form (`/...`, no absolute form, no `*`), exactly one `Host`; at
+most one `Content-Length` (digits only) or one `Transfer-Encoding`, whose
+value is exactly `chunked` (not in an HTTP/1.0 request), never both; a
+`Connection` that names `Host`, `Content-Length`, `Transfer-Encoding` or
+`X-Forwarded-For` is refused. That leaves one reading of where a body
+ends, which is the one the ingress follows: it forwards exactly
+`Content-Length` bytes, or a chunked body up to its last chunk and
+trailers (its chunk sizes, extensions and trailers checked and bounded as
+they pass; it is relayed unchanged), and nothing after it. A second
+request smuggled after a body's end, or pipelined, never reaches the
+guest.
+
+*What the guest gets.* The request line and headers as sent, except:
+hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`,
+`Trailer`, `Upgrade`, `Proxy-Authorization`, and those `Connection`
+names) dropped; hellovm's own credentials removed: the token header and
+cookie, every `X-Hellovm-*` header, and an `Authorization` header whose
+credentials are any token of hellovm's (a tenant's, a node's, the
+admin's, or the sandbox's ingress token); `Forwarded`, `X-Real-IP` and
+the client's `X-Forwarded-*` dropped and replaced: `X-Forwarded-For` (the
+client's address; with `behind_proxy`, the proxy's list with the proxy's
+address appended), `X-Forwarded-Proto` (`ingress.scheme`; with
+`behind_proxy`, the proxy's when it is `http` or `https`) and
+`X-Forwarded-Host` (the `Host`); and `Connection: close` (or `Connection:
+Upgrade` with the `Upgrade` header, for an upgrade). The answer's head is
+checked the same way (a guest's answer that is not HTTP is a `502`),
+hop-by-hop headers dropped (but not its framing), the token cookie
+removed, `Connection: close` added; 1xx answers are passed on as they
+come (at most 16), and the body is relayed by its framing (none for
+`HEAD`, `204` and `304`; `Content-Length`, chunked, or to the guest's
+end).
+
+*One exchange per connection.* After the answer the connection ends
+(`Connection: close` both ways); a client opens a new one for the next
+request, and each is a new hand-over and a new connection in the guest.
+Rejected: *keep-alive* would need the ingress to know where every answer
+ends (chunked, `Content-Length`, `HEAD`, 1xx, a guest that gets it
+wrong) to read and check the next request on the same connection, and
+then to send it on the same guest connection, where a guest that
+misframes its answer desynchronizes the pairs; one exchange per
+connection costs a connection per request, and nothing can ride on a
+checked one. Browsers open more connections and are fine with it.
+Measured in `ingress.rs` (debug build, Docker Desktop on an Apple M3
+Max, loopback, Python's `ThreadingHTTPServer` in the guest): a `GET`
+from the client's connect to the end of the answer takes 2.1 ms
+(median of 50, 1.9 to 3.8 ms), all of it new connections, the hand-over
+and the guest's server; 32 MiB of answer take 0.39 s (about 80 MiB/s,
+the API's relay and the kernel process's stream both in debug builds).
+
+*Upgrades.* A request with `Connection: Upgrade` and one `Upgrade` is
+forwarded with them; if the guest answers `101`, both directions are
+then relayed as raw bytes, each half-closed when its side ends, until
+both have or a deadline passes. A `101` to a request that asked for no
+upgrade is a `502`.
+
+*Bodies* of any length stream both ways, at most 16 KiB held per
+direction in the API (and 64 KiB each way in the kernel process), with
+back-pressure: a client that does not read slows the guest's writes, and
+the other way round.
+
+*Deadlines and limits* (`ingress` in the API's configuration):
+
+| What | Default | Past it |
+|---|---|---|
+| The request head | 32 KiB, `head_timeout` 10 s | `431`, `408` (a client that sends nothing is closed without an answer) |
+| The node's hand-over and the verdict | connect 5 s, answer 10 s | `502` |
+| No byte either way | `idle_timeout` 60 s | `504` if the guest has not answered yet, else the connection ends |
+| A connection in all | `max_duration` 3600 s | it ends |
+| Connections at once | `max_connections` 512 in all, `max_connections_per_client` 64 from one address (not counted with `behind_proxy`), `max_connections_per_tenant` 128 (or the tenant's `max_ingress_connections`, at most that), `max_connections_per_sandbox` 32 | `503` |
+| Hand-overs in progress | 64 per node at once (each holds one of the node's 256 HTTP connections for its moment, so the node's probes always find one) | `503` |
+| Exposed ports | 16 per sandbox | `409 too_many_ports` |
+| Bytes held | 16 KiB per direction per connection in the API | back-pressure |
+
+Every read and write waits at most a second before the deadlines are
+looked at again, so a client or guest that is slow or silent holds a
+connection only until one of them passes. Each connection has two
+threads in the API (one per direction), so at most twice
+`max_connections` threads, and none in `noded` after the hand-over; the
+listener's slots are taken before anything is read and given back when
+the connection ends, the per-tenant and per-sandbox ones only once the
+request was found to be allowed (a client without the token cannot use
+up a tenant's slots; one with it, or anyone for a public port, only that
+sandbox's and tenant's). No lock is held across any I/O: the slot
+counters, the ingress cache and the byte counters are each taken for a
+moment. With the defaults a tenant may hold a quarter of all connections
+(128 of 512; keep `max_connections_per_tenant` below `max_connections`),
+so one tenant's load cannot take every connection; before authentication, a client is
+bounded by its address's limit and the head timeout. Behind a reverse
+proxy, all connections come from it: set `behind_proxy` (the per-address
+limit is then not applied; limit per client in the proxy). Ingress
+requests do not take from a tenant's `requests_per_second` bucket (its
+API requests are what that limits), and a tenant over a budget still
+serves through ingress what runs (budgets refuse new work only).
+
+A failed or timed-out ingress request never counts against its node's
+health (the hand-over is not one of the requests that can mark a node
+unreachable): a sandbox that does not listen, or answers slowly, is the
+sandbox's business; the probes find a node that stopped answering.
+
+*Use and idle timeouts.* Ingress is use of the sandbox: each hand-over
+restarts its idle timeout on the node, and a connection that moves bytes
+(a WebSocket, a long download) marks its sandbox as used at most once a
+second; the probe of each node (every `reconcile_interval`) then tells it
+`POST /v1/node/touch` with those sandboxes. A sandbox in use through
+ingress therefore stays (tested with only bytes on one upgraded
+connection for twice its idle timeout); its lifetime still applies.
+
+*Metering.* The API counts the bytes it relays, per connection, as they
+are written: `ingress_received_bytes` (delivered to the guest: the
+rewritten head, the body) and `ingress_sent_bytes` (delivered to the
+client from the guest: the rewritten answer head and the body); not the
+ingress's own answers, nor TLS or TCP framing. The guest cannot change
+them (they are not reported by anything in the sandbox, its kernel
+process included), and a node cannot either (a node's report of them is
+ignored). Once a second they are added to the sandbox's counters (in its
+`usage`, in `GET /v1/sandboxes[/{id}]`), its tenant's totals (`GET
+/v1/usage`) and the usage log's records like the other counters. There is
+no per-period ingress budget.
+
+*Why in the API process, and how it scales.* The API already knows which
+node runs each sandbox, whose it is and whether the node answers, and it
+already meters: ingress there needs no new service, configuration or
+channel, and its bytes are counted where they are added up. With several
+nodes one listener reaches all of them (it connects to the sandbox's node
+for each connection, tested with two); the bytes pass through the API
+host, which is the cost. To scale past one API host, the ingress part can
+run as a separate process of the same binary next to it (it needs the
+store's sandbox-to-node map and the nodes' tokens), or move to each node
+with the reverse proxy routing by sandbox, once the store is shared
+(several API instances are not supported yet, see **Scheduling**).
+Rejected: *a separate `ingress` binary now* (a second copy of the store
+and of the nodes' health, kept in step over a new channel, for one host);
+*`noded` relaying the bytes itself* (two copies on the node and two
+threads per connection there, where the fd hand-over costs none);
+*a Unix socket in the filesystem per sandbox for its kernel process to
+accept on* (a path every kernel process of the node could see, or a
+directory per sandbox mounted into its namespace: the ingress channel is
+an fd passed with the clone request, reachable by nothing else);
+*passing the client's connection into the sandbox without the API in
+between* (the API could not check the token, count the bytes or rewrite
+the head); *a loopback peer address in the guest* (`127.0.0.1` would
+make every outside client look local to servers that trust local
+clients); *the token in the path* (it would be forwarded and logged by
+the guest's server); *a cookie for the whole domain* (any sandbox's
+guest would get every sandbox's tokens).
+
+*Configuration.* In the API's file, `ingress`: `listen`, `domain`,
+`scheme` (`https` or `http`, default `https`), `url_port` (the port in
+the URLs answered, when not the scheme's own), `behind_proxy` (default
+`false`), the limits and deadlines above. Per tenant:
+`max_ingress_connections`. Without `ingress` nothing listens and the
+ingress endpoints answer `404 ingress_disabled`; `noded` always keeps the
+state (it costs a token and one socket pair per sandbox).
+
+*Not done:* HTTP/2 and HTTP/3 (the reverse proxy can speak them to
+clients and HTTP/1.1 here), raw TCP or UDP ingress, a port bound to
+`127.0.0.1` only in the guest (it must listen on `0.0.0.0`), TLS between
+the API and the nodes (see above), a per-period ingress budget, ingress
+through an API that restarted while a sandbox's node is unreachable (it
+does not know that sandbox until the node answers).
 
 **Resource limits.** All clones of a template run in the template's
 cgroup: a clone runs before whoever asked for it learns its pid. What
@@ -1481,6 +1819,7 @@ is enforced without root:
 | Processes and threads (`max_processes`, default and at most 4096) | the same scan counts the host processes below the clone's kernel process (a guest process or thread is one each) | the sandbox is removed; `410` with the reason |
 | Time | per-exec `timeout`, idle timeout, lifetime | killed or removed |
 | Tasks, sockets, outbound flows | the kernel (2048 tasks, 4096 sockets) and the egress proxy (64 flows per sandbox) | `EAGAIN` and the like |
+| Inbound connections | the kernel process (256 open, 64 waiting to be taken) and the API's ingress (per sandbox, per tenant, in all: see **Ingress**) | refused (`502`, `503`) |
 | Sandboxes | per tenant (API) and per node (`max_sandboxes`) | `429`, `503` |
 | Memory of a tenant's sandboxes, requests, CPU time and egress per period | per tenant (API: see **Quotas and metering**) | `429` |
 
@@ -1541,7 +1880,12 @@ sandbox keeps one exec, so a node holds at most 4 MiB per sandbox for
 output (256 MiB with 64 sandboxes all at the largest `max_output`).
 Polls wait at most 30 s, cancels 5 s. Neither service dials an
 address a sandbox chose: `noded` connects only to its templates'
-sockets, the API only to its configured nodes.
+sockets, the API only to its configured nodes; ingress reaches a guest
+only as an inbound connection to the sandbox its validated `Host` names,
+over that sandbox's ingress channel, never through a host socket of the
+guest's choosing. The ingress listener's own bounds are in **Ingress**.
+`noded`'s HTTP server may hand a connection over after its answer (the
+ingress hand-over), only when the client sent nothing past its request.
 
 **Dependencies.** `serde` and `serde_json` (with their derive macro's
 `syn`, `quote`, `proc-macro2`, `unicode-ident`, and `itoa`, `memchr`,
@@ -1610,8 +1954,51 @@ ended sandboxes asked for from the first again); the delete of a sandbox on a
 stopped (`SIGSTOP`) node, its slot used at once, an API restart before
 the node is back, and the delete done then, the sandbox never listed
 again; and a node configured to start drained, undrained and restarted.
-`kernel/api` has unit tests
-for the health state machine, the placement rule (order, ties, spread of
+`kernel/api/tests/ingress.rs` (4 tests, about 30 s; a Python HTTP
+server in each sandbox, real `noded` processes): the token required by
+default (missing, wrong, another sandbox's, in the header, the cookie and
+the query parameter's redirect, all refusals the same `404` as an unknown
+sandbox, an unexposed port, a bad name), a public port, an exposed port
+nothing listens on (`502`), another tenant's sandbox at both the
+listener and the API, what reaches the guest (no token, no hellovm
+cookie or `Authorization`, no hop-by-hop header, the forwarding headers)
+and what reaches the client (no forged token cookie), 8 MiB up chunked
+and by length (checked by SHA-256 in the guest) and 32 MiB down, an
+upgrade with bytes both ways and its half-close, a `101` to a plain
+request, hostile heads (conflicting `Content-Length` and
+`Transfer-Encoding`, two lengths, two encodings, two `Host`s, folded
+lines, bare LFs, an absolute target, 40 KiB of head, bad `Host`s) and a
+request smuggled after a chunked body or pipelined after a body, none of
+which reach the guest (its request log is read back), a head that
+arrives in pieces, rotation and unexposing taking effect at once, the
+port limit, ingress bytes metered for the sandbox and the tenant (and not
+the other tenant); a sandbox kept from its idle timeout by bytes on one
+upgraded connection and removed when they stop; the deadlines (a slow
+head `408`, a silent client closed, a guest that does not answer `504`,
+a client that stops in its body, `max_duration`) and the limits (per
+sandbox, per tenant, another tenant unaffected, the node still healthy);
+and two nodes behind one listener, one stopped (`SIGSTOP`): its
+sandboxes `502` with the token and `404` without, the other node's
+served, and back when it is. `quotas.rs` also covers months
+(`period.start` and `end` on the first of two months, `Retry-After` to
+the month's end, the month's log file, totals after a restart) and the
+delete of a sandbox on a stopped node charging nothing of what it burns
+afterwards (it fails, charging 14 s of CPU, without the change).
+`kernel/hellovm/tests/warm.rs` runs a clone serving TCP through its
+ingress channel: refused for no listener, a loopback-only one and port 0,
+both ways with the opener's FIN and the guest's half-close, the peer
+`192.0.2.1`, a megabyte to a slow reader, twenty at once, a connection
+queued when its listener closes, and one open when the sandbox ends. The
+kernel's unit tests (`hellovm-core`, against the mock host) cover the
+same and the limits: backlog, listener closed, 256 open at once, the
+sandbox's end; `hellovm-host` the verdict bytes, half-close and the
+queue's bound. `kernel/api` has unit tests
+for the host names, the strict parsing of request and response heads
+(smuggling attempts among them), the rewriting of both, tokens in the
+header, cookies and query, chunked bodies in any pieces and their bounds,
+the ingress counters in the meter, calendar months (leap years, the
+year's end) and a deleted sandbox charged nothing more (across a rebuild
+from the log), for the health state machine, the placement rule (order, ties, spread of
 creations in flight, full, draining, unreachable and foreign
 templates), checking reports, its configuration, the meter (counters
 that go down or jump, tenants and nodes that change, period roll-over
@@ -1723,7 +2110,11 @@ counts, and for stateful calls `value`, `error` (type, message,
 traceback) and `state_lost`; `stream(...)` yielding output events as they
 come and ending with the result, cancellable (from another thread in
 Python, by `cancel()` or an `AbortSignal` in TypeScript); `read_file`,
-`write_file`, `edit_file`; `reset_python`. Errors carry the API's
+`write_file`, `edit_file`; `reset_python`; for ingress `ingress()` (the
+token and the exposed ports with their URLs), `expose(port, public=...)`
+(the port with its URL), `unexpose(port)` and `rotate_ingress_token()`
+(`rotateIngressToken` in TypeScript), with ports checked before anything
+is sent and `409 too_many_ports` a `LimitError`. Errors carry the API's
 status, code and message (`BusyError`, `SandboxEndedError` with its
 reason, ...).
 
@@ -1774,6 +2165,8 @@ scrubbed of it. A client configuration:
 | `read_file` | `path` | the text; a binary file is described, not shown |
 | `write_file` | `path`, `content` | bytes written |
 | `edit_file` | `path`, `old_text`, `new_text`, `replace_all?` | replacements made |
+| `expose_port` | `port`, `public?` | the port's URL, and for a port that is not public how to send the ingress token (the header, or the URL with `?hellovm_ingress_token=` once in a browser) |
+| `unexpose_port` | `port` | the port is not reachable any more |
 | `reset_sandbox` | | a new, empty sandbox for the next call |
 
 Output longer than `HELLOVM_MCP_MAX_OUTPUT` is cut by the API's own rule
@@ -1855,13 +2248,17 @@ reset, state lost, a timeout); files (binary round trips, text, edits,
 missing files, directories, non-text edits, the size limit); busy
 handling both ways; authentication failure; an ended sandbox (`410` with
 its reason); a second tenant seeing nothing; the context manager
-deleting the sandbox when the block raises. Unit tests without a plane:
+deleting the sandbox when the block raises; ingress (a `python3 -m
+http.server` in the sandbox exposed, reached through the listener with
+the token and without it, made public, the token rotated, the port
+unexposed, its bytes metered). Unit tests without a plane:
 parsing, the retry rules, and a local fake server that stalls, trickles a
 head or a body, sends an endless or oversized body, drops connections
 (an exec or a write is never repeated, a read is), answers busy, `503`
 or `429`, or moves a cursor backwards. The MCP server: the handshake in
 both eras, the tool list and schemas, bad arguments, configuration
-errors, each tool's success and failure against a real plane,
+errors, each tool's success and failure against a real plane (the
+ingress tools too),
 truncation, a timeout, a cancelled request, a sandbox that ended, the
 sandbox deleted at exit, and the token absent from everything the server
 wrote (also when a fake API echoes it).
