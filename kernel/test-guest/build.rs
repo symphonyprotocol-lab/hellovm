@@ -8,8 +8,13 @@
 //! They are built for the target architecture with the C compiler driver
 //! (`cc`, or `$HELLOVM_GUEST_CC` when cross-compiling). C guests need the
 //! target's static libc, so they are only built natively; when
-//! cross-compiling their paths are empty. Only Linux targets build guests;
-//! elsewhere the crate is empty.
+//! cross-compiling their paths are empty.
+//!
+//! On macOS on Apple silicon (the HVF platform's host) the assembly guests
+//! and `HVF_GUESTS` are built as aarch64 Linux executables with the
+//! system's clang (`--target=aarch64-linux-gnu`) and the `rust-lld` of the
+//! Rust toolchain as the linker; there is no Linux libc there, so no C
+//! guests. Other targets build no guests and the crate is empty.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -19,6 +24,8 @@ const ASM_GUESTS: &[&str] = &["hello", "enosys"];
 const C_GUESTS: &[&str] = &["pie", "signals", "threads"];
 /// C guests linked dynamically against the build host's libc.
 const DYNAMIC_GUESTS: &[&str] = &["dynamic", "netcheck"];
+/// aarch64-only assembly guests for the HVF platform's tests (`asm/hvf`).
+const HVF_GUESTS: &[&str] = &["getpid_loop", "segv", "odd_regs", "spin"];
 
 fn build(cc: &str, name: &str, src: &Path, out: &Path, flags: &[&str]) {
     let output = Command::new(cc)
@@ -40,7 +47,13 @@ fn main() {
     println!("cargo:rerun-if-changed=asm");
     println!("cargo:rerun-if-changed=c");
     println!("cargo:rerun-if-env-changed=HELLOVM_GUEST_CC");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if os == "macos" && arch == "aarch64" {
+        build_for_hvf();
+        return;
+    }
+    if os != "linux" {
         return;
     }
     let native = env::var("TARGET") == env::var("HOST");
@@ -88,5 +101,53 @@ fn main() {
         let out = out_dir.join(guest);
         build(&cc, guest, &src, &out, &["-O2", "-lm"]);
         println!("cargo:rustc-env={var}={}", out.display());
+    }
+}
+
+/// The assembly guests, as aarch64 Linux executables, on a macOS host.
+fn build_for_hvf() {
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let sysroot = Command::new(&rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap_or_else(|err| panic!("running {rustc}: {err}"));
+    let sysroot = String::from_utf8(sysroot.stdout).expect("UTF-8 sysroot");
+    let host = env::var("HOST").unwrap();
+    let lld = PathBuf::from(sysroot.trim())
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin/gcc-ld/ld.lld");
+    if !lld.exists() {
+        panic!(
+            "no {} (the Rust toolchain's rust-lld) to link the test guests",
+            lld.display()
+        );
+    }
+    let cc = env::var("HELLOVM_GUEST_CC").unwrap_or_else(|_| "clang".into());
+    let fuse_ld = format!("-fuse-ld={}", lld.display());
+    let flags = [
+        "--target=aarch64-linux-gnu",
+        "-nostdlib",
+        "-static",
+        fuse_ld.as_str(),
+    ];
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let guests = ASM_GUESTS
+        .iter()
+        .map(|g| (g, manifest_dir.join("asm").join(format!("{g}.S"))))
+        .chain(
+            HVF_GUESTS
+                .iter()
+                .map(|g| (g, manifest_dir.join("asm/hvf").join(format!("{g}.S")))),
+        );
+    for (guest, src) in guests {
+        let out = out_dir.join(guest);
+        build(&cc, guest, &src, &out, &flags);
+        println!(
+            "cargo:rustc-env=HELLOVM_GUEST_{}={}",
+            guest.to_uppercase(),
+            out.display()
+        );
     }
 }
