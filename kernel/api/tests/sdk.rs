@@ -3,7 +3,8 @@
 //! with a warm CPython template, `hellovm-api` with two tenants) and runs
 //! one suite against it as a child process, which finds the plane in
 //! `HELLOVM_TEST_URL`, `HELLOVM_TEST_TOKEN`, `HELLOVM_TEST_TEMPLATE`,
-//! `HELLOVM_TEST_TOKEN_B` and `HELLOVM_TEST_TEMPLATE_B`.
+//! `HELLOVM_TEST_TOKEN_B`, `HELLOVM_TEST_TEMPLATE_B` and
+//! `HELLOVM_TEST_INGRESS` (the ingress listener's address).
 //!
 //! They are ignored by a plain `cargo test`, which must not need Node.js:
 //! `kernel/dev/run-sdk-e2e.sh` builds the TypeScript packages and runs
@@ -109,6 +110,7 @@ fn run_suite(what: &str, dir: &str, program: &str, args: &[String], env: &[(&str
         .env("HELLOVM_TEST_TEMPLATE", plane.template(ACME))
         .env("HELLOVM_TEST_TOKEN_B", BETA)
         .env("HELLOVM_TEST_TEMPLATE_B", plane.template(BETA))
+        .env("HELLOVM_TEST_INGRESS", plane.ingress_addr())
         .stdin(Stdio::null());
     for (k, v) in env {
         cmd.env(k, v);

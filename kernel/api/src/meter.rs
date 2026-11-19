@@ -40,25 +40,63 @@ const MAX_CLOSED: usize = 65536;
 /// (while the node answers) is taken as gone with what was counted.
 pub const LOST_AFTER: Duration = Duration::from_secs(60);
 
-/// The start of the period that holds `unix_secs`.
-pub fn period_start(unix_secs: u64, period: u64) -> u64 {
-    unix_secs - unix_secs % period.max(1)
+/// How time is cut into metering periods (`metering.period`): a fixed
+/// number of seconds, aligned to multiples of it since the Unix epoch, or
+/// calendar months in UTC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Periods {
+    Seconds(u64),
+    Months,
 }
 
-/// A period as the API reports it.
-pub fn period_view(start: u64, period: u64) -> Period {
-    Period {
-        start: start * 1000,
-        end: (start + period) * 1000,
-        seconds: period,
+impl From<u64> for Periods {
+    fn from(seconds: u64) -> Periods {
+        Periods::Seconds(seconds)
     }
 }
 
-/// `YYYYMMDDTHHMMSSZ` for a Unix time (UTC).
-pub fn utc_stamp(unix_secs: u64) -> String {
-    let days = (unix_secs / 86400) as i64;
-    let rem = unix_secs % 86400;
-    // Howard Hinnant's civil_from_days.
+impl Periods {
+    /// The start of the period that holds `unix_secs` (Unix seconds).
+    pub fn start_of(self, unix_secs: u64) -> u64 {
+        match self {
+            Periods::Seconds(p) => unix_secs - unix_secs % p.max(1),
+            Periods::Months => {
+                let (y, m, _) = civil_from_days((unix_secs / 86400) as i64);
+                (days_from_civil(y, m, 1).max(0) as u64) * 86400
+            }
+        }
+    }
+
+    /// The start of the period after the one that starts at `start`.
+    pub fn next(self, start: u64) -> u64 {
+        match self {
+            Periods::Seconds(p) => start.saturating_add(p.max(1)),
+            Periods::Months => {
+                let (y, m, _) = civil_from_days((start / 86400) as i64);
+                let (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+                (days_from_civil(y, m, 1).max(0) as u64) * 86400
+            }
+        }
+    }
+
+    /// The start of the period before the one that starts at `start`
+    /// (`None` before the epoch).
+    pub fn previous(self, start: u64) -> Option<u64> {
+        match self {
+            Periods::Seconds(p) => start.checked_sub(p.max(1)),
+            Periods::Months => {
+                let (y, m, _) = civil_from_days((start / 86400) as i64);
+                let (y, m) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
+                u64::try_from(days_from_civil(y, m, 1))
+                    .ok()
+                    .map(|d| d * 86400)
+            }
+        }
+    }
+}
+
+/// Howard Hinnant's civil_from_days: (year, month 1-12, day 1-31).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -67,7 +105,39 @@ pub fn utc_stamp(unix_secs: u64) -> String {
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
+    (yoe + era * 400 + i64::from(month <= 2), month, day)
+}
+
+/// Howard Hinnant's days_from_civil: days since 1970-01-01.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The start of the period that holds `unix_secs`.
+pub fn period_start(unix_secs: u64, period: impl Into<Periods>) -> u64 {
+    period.into().start_of(unix_secs)
+}
+
+/// The period that starts at `start` as the API reports it.
+pub fn period_view(start: u64, period: impl Into<Periods>) -> Period {
+    let end = period.into().next(start);
+    Period {
+        start: start * 1000,
+        end: end * 1000,
+        seconds: end - start,
+    }
+}
+
+/// `YYYYMMDDTHHMMSSZ` for a Unix time (UTC).
+pub fn utc_stamp(unix_secs: u64) -> String {
+    let rem = unix_secs % 86400;
+    let (year, month, day) = civil_from_days((unix_secs / 86400) as i64);
     format!(
         "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
         rem / 3600,
@@ -85,6 +155,10 @@ pub fn add(a: &Counters, b: &Counters) -> Counters {
         egress_received_bytes: a
             .egress_received_bytes
             .saturating_add(b.egress_received_bytes),
+        ingress_received_bytes: a
+            .ingress_received_bytes
+            .saturating_add(b.ingress_received_bytes),
+        ingress_sent_bytes: a.ingress_sent_bytes.saturating_add(b.ingress_sent_bytes),
     }
 }
 
@@ -137,6 +211,8 @@ pub fn grow(
         now.egress_received_bytes,
         bytes,
     );
+    // Ingress is counted by the API itself (`Meter::ingress`), never
+    // taken from a node: what the track has stays.
     (
         Counters {
             run_ms,
@@ -144,6 +220,8 @@ pub fn grow(
             memory_byte_seconds: mem,
             egress_sent_bytes: sent,
             egress_received_bytes: recv,
+            ingress_received_bytes: 0,
+            ingress_sent_bytes: 0,
         },
         Counters {
             run_ms: run_kept,
@@ -151,6 +229,8 @@ pub fn grow(
             memory_byte_seconds: mem_kept,
             egress_sent_bytes: sent_kept,
             egress_received_bytes: recv_kept,
+            ingress_received_bytes: before.ingress_received_bytes,
+            ingress_sent_bytes: before.ingress_sent_bytes,
         },
         odd,
     )
@@ -171,6 +251,10 @@ pub enum Kind {
     DeletePending,
     /// That delete was done (or the node no longer has it).
     DeleteDone,
+    /// Ingress bytes counted after its final record, or for a sandbox
+    /// never reported by its node (its connections ended as it did):
+    /// counted in the period's totals, nothing else.
+    Late,
 }
 
 /// One line of the usage log.
@@ -266,6 +350,9 @@ pub struct Rebuilt {
     pub lost: HashMap<SandboxId, (String, String, String, Counters, u64)>,
     /// Deletes not done: `(tenant, node)`.
     pub deletes: HashMap<SandboxId, (String, String)>,
+    /// Sandboxes with a delete accepted (done or not) and no final record:
+    /// what they use is not charged.
+    pub freed: HashSet<SandboxId>,
     pub records: u64,
     /// Lines that were not records (or of an unknown tenant).
     pub bad: u64,
@@ -298,8 +385,10 @@ impl Rebuilt {
                 }
                 if r.kind == Kind::Final {
                     self.baselines.remove(&id);
+                    let deleted = self.freed.remove(&id);
                     self.closed.insert(id);
-                    if r.end.as_deref() == Some("lost") && self.lost.len() < MAX_TRACKS {
+                    if r.end.as_deref() == Some("lost") && !deleted && self.lost.len() < MAX_TRACKS
+                    {
                         self.lost
                             .insert(id, (r.tenant, r.node, r.template, r.total, r.ts));
                     } else {
@@ -319,9 +408,18 @@ impl Rebuilt {
                 if self.deletes.len() < MAX_TRACKS {
                     self.deletes.insert(id, (r.tenant, r.node));
                 }
+                if self.freed.len() < MAX_TRACKS {
+                    self.freed.insert(id);
+                }
             }
             Kind::DeleteDone => {
                 self.deletes.remove(&id);
+            }
+            Kind::Late => {
+                if current {
+                    let t = self.totals.entry(r.tenant.clone()).or_default();
+                    *t = add(t, &r.delta);
+                }
             }
         }
     }
@@ -330,7 +428,7 @@ impl Rebuilt {
 /// The meter: per-tenant totals of the current period, and what is known
 /// of each sandbox.
 pub struct Meter {
-    period: u64,
+    period: Periods,
     /// The current period's start, Unix seconds.
     start: u64,
     totals: HashMap<String, Counters>,
@@ -350,14 +448,29 @@ pub struct Meter {
     started_ms: u64,
     max_lifetime_ms: u64,
     tenants: HashSet<String>,
+    /// Deleted by their tenant while their node did not answer: from then
+    /// on what they use moves their counters and is not charged.
+    free: HashSet<SandboxId>,
+    /// Ingress counted for sandboxes not tracked yet (made and used before
+    /// their node's next report): folded into their track when it comes.
+    early: HashMap<SandboxId, Early>,
     /// Samples that were not sense, since start.
     pub odd: u64,
+}
+
+/// Ingress of a sandbox not tracked yet.
+struct Early {
+    tenant: String,
+    node: String,
+    template: String,
+    counted: Counters,
+    since: Instant,
 }
 
 impl Meter {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        period: u64,
+        period: impl Into<Periods>,
         now_ms: u64,
         now: Instant,
         logged: bool,
@@ -365,9 +478,10 @@ impl Meter {
         tenants: Vec<String>,
         rebuilt: &Rebuilt,
     ) -> Meter {
+        let period = period.into();
         let mut meter = Meter {
             period,
-            start: period_start(now_ms / 1000, period),
+            start: period.start_of(now_ms / 1000),
             totals: rebuilt.totals.clone(),
             tracks: HashMap::new(),
             closed: HashSet::new(),
@@ -379,6 +493,8 @@ impl Meter {
             started_ms: now_ms,
             max_lifetime_ms,
             tenants: tenants.into_iter().collect(),
+            free: rebuilt.freed.clone(),
+            early: HashMap::new(),
             odd: 0,
         };
         for id in &rebuilt.closed {
@@ -422,6 +538,11 @@ impl Meter {
 
     pub fn period(&self) -> Period {
         period_view(self.start, self.period)
+    }
+
+    /// How periods are cut.
+    pub fn periods(&self) -> Periods {
+        self.period
     }
 
     fn close(&mut self, id: SandboxId) {
@@ -486,6 +607,29 @@ impl Meter {
         node: &str,
         done: bool,
     ) {
+        if !done && self.free.len() < MAX_TRACKS {
+            // From now on its use is not its tenant's: what it used up to
+            // the last report before the delete stays counted (and is
+            // recorded now, before the delete, so that a restart that reads
+            // the log back finds it), what it uses after (until its node
+            // deletes it) moves its counters only.
+            if let Some(mut t) = self.tracks.remove(id) {
+                if !is_zero(&t.pending) {
+                    let delta = std::mem::take(&mut t.pending);
+                    self.record(Kind::Usage, now_ms, id, &t, delta, None);
+                }
+                self.tracks.insert(*id, t);
+            }
+            self.free.insert(*id);
+        } else if !done {
+            log::warn!(
+                "sandbox {id}: too many deleted sandboxes are remembered ({MAX_TRACKS}); what \
+                 this one uses until its node deletes it is charged"
+            );
+        } else if !self.tracks.contains_key(id) {
+            // Done, and its node does not report it: nothing more comes.
+            self.free.remove(id);
+        }
         let record = Record {
             v: 1,
             kind: if done {
@@ -632,6 +776,8 @@ impl Meter {
             memory_byte_seconds: o.usage.memory_byte_seconds.min(MAX_COUNTER),
             egress_sent_bytes: o.usage.egress_sent_bytes.min(MAX_COUNTER),
             egress_received_bytes: o.usage.egress_received_bytes.min(MAX_COUNTER),
+            ingress_received_bytes: 0,
+            ingress_sent_bytes: 0,
         };
         let delta = match self.tracks.get_mut(&o.id) {
             Some(t) => {
@@ -645,11 +791,15 @@ impl Meter {
                     self.odd += 1;
                 }
                 t.total = kept;
-                t.pending = add(&t.pending, &delta);
                 t.memory_bytes = o.memory_bytes;
                 t.memory_limit = o.memory_limit;
                 t.at = now;
                 t.seen = now;
+                if self.free.contains(&o.id) {
+                    // Deleted: its counters move on, uncharged.
+                    return true;
+                }
+                t.pending = add(&t.pending, &delta);
                 delta
             }
             None => {
@@ -662,7 +812,9 @@ impl Meter {
                 // bounded by the time this meter counts, not only by the
                 // run time its node reports: the node is not trusted with
                 // its own bound.
-                let (delta, kept) = if o.created_at >= self.count_from() {
+                let (delta, kept) = if self.free.contains(&o.id) {
+                    (Counters::default(), usage)
+                } else if o.created_at >= self.count_from() {
                     let elapsed = usage
                         .run_ms
                         .min(self.max_lifetime_ms)
@@ -675,6 +827,17 @@ impl Meter {
                 } else {
                     (Counters::default(), usage)
                 };
+                // Ingress counted before it was tracked (in the totals
+                // already) joins its counters and its next record.
+                let (mut kept, mut pending) = (kept, delta);
+                if let Some(e) = self.early.remove(&o.id) {
+                    if e.tenant == o.tenant && e.node == node {
+                        kept = add(&kept, &e.counted);
+                        pending = add(&pending, &e.counted);
+                    } else {
+                        self.late(now_ms, &o.id, &e.tenant, &e.node, &e.template, e.counted);
+                    }
+                }
                 self.tracks.insert(
                     o.id,
                     Track {
@@ -682,7 +845,7 @@ impl Meter {
                         node: node.to_string(),
                         template: o.template.clone(),
                         total: kept,
-                        pending: delta,
+                        pending,
                         memory_bytes: o.memory_bytes,
                         memory_limit: o.memory_limit,
                         at: now,
@@ -699,11 +862,15 @@ impl Meter {
 
     /// Writes a sandbox's last record and forgets it.
     fn finish(&mut self, id: SandboxId, now_ms: u64, end: &str) {
+        // A deleted one is done with either way: if it was lost it is not
+        // kept to be counted on (it stays closed, and uncharged, should
+        // its node report it again).
+        let deleted = self.free.remove(&id);
         let mut lost = None;
         if let Some(t) = self.tracks.remove(&id) {
             let delta = t.pending;
             self.record(Kind::Final, now_ms, &id, &t, delta, Some(end));
-            if end == "lost" {
+            if end == "lost" && !deleted {
                 lost = Some(Lost {
                     tenant: t.tenant,
                     node: t.node,
@@ -730,7 +897,20 @@ impl Meter {
     /// every delete still to do are carried into the new one), and records
     /// what running sandboxes used when `flush` (every `interval`).
     pub fn tick(&mut self, now_ms: u64, flush: bool, deletes: &[(SandboxId, String, String)]) {
-        let start = period_start(now_ms / 1000, self.period);
+        let start = self.period.start_of(now_ms / 1000);
+        // Ingress of a sandbox its node never reported (it ended before
+        // the next probe): recorded on its own.
+        let stale: Vec<SandboxId> = self
+            .early
+            .iter()
+            .filter(|(_, e)| e.since.elapsed() >= LOST_AFTER)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some(e) = self.early.remove(&id) {
+                self.late(now_ms, &id, &e.tenant, &e.node, &e.template, e.counted);
+            }
+        }
         if start != self.start {
             self.flush(now_ms);
             self.start = start;
@@ -774,7 +954,7 @@ impl Meter {
     /// A tenant's totals for the period that holds `now_ms` (zero when the
     /// meter has not started that period yet).
     pub fn totals(&self, tenant: &str, now_ms: u64) -> Counters {
-        if period_start(now_ms / 1000, self.period) != self.start {
+        if self.period.start_of(now_ms / 1000) != self.start {
             return Counters::default();
         }
         self.totals.get(tenant).copied().unwrap_or_default()
@@ -791,8 +971,109 @@ impl Meter {
 
     /// Seconds until the period that holds `now_ms` ends.
     pub fn seconds_left(&self, now_ms: u64) -> u64 {
-        let start = period_start(now_ms / 1000, self.period);
-        (start + self.period).saturating_sub(now_ms / 1000).max(1)
+        let start = self.period.start_of(now_ms / 1000);
+        self.period.next(start).saturating_sub(now_ms / 1000).max(1)
+    }
+
+    /// Ingress bytes the API relayed for sandbox `id` (of `tenant`, on
+    /// `node`): `received` delivered to it, `sent` from it. Counted for
+    /// the tenant at once; added to the sandbox's counters and its next
+    /// record (or, when it has ended, a `late` record). Not counted for a
+    /// sandbox that was deleted, or that the meter knows with another
+    /// tenant or node.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingress(
+        &mut self,
+        now_ms: u64,
+        id: &SandboxId,
+        tenant: &str,
+        node: &str,
+        template: &str,
+        received: u64,
+        sent: u64,
+    ) {
+        if !self.tenants.contains(tenant) || self.free.contains(id) || received + sent == 0 {
+            return;
+        }
+        let delta = Counters {
+            ingress_received_bytes: received.min(MAX_COUNTER),
+            ingress_sent_bytes: sent.min(MAX_COUNTER),
+            ..Counters::default()
+        };
+        if let Some(t) = self.tracks.get_mut(id) {
+            if t.tenant != tenant || t.node != node {
+                self.odd += 1;
+                return;
+            }
+            t.total = add(&t.total, &delta);
+            t.pending = add(&t.pending, &delta);
+        } else if self.closed.contains(id) {
+            self.late(now_ms, id, tenant, node, template, delta);
+        } else {
+            let full = self.early.len() >= MAX_TRACKS;
+            match self.early.get_mut(id) {
+                Some(e) if e.tenant == tenant && e.node == node => {
+                    e.counted = add(&e.counted, &delta);
+                }
+                Some(_) => {
+                    self.odd += 1;
+                    return;
+                }
+                None if full => {
+                    self.late(now_ms, id, tenant, node, template, delta);
+                }
+                None => {
+                    self.early.insert(
+                        *id,
+                        Early {
+                            tenant: tenant.to_string(),
+                            node: node.to_string(),
+                            template: template.to_string(),
+                            counted: delta,
+                            since: Instant::now(),
+                        },
+                    );
+                }
+            }
+        }
+        let t = self.totals.entry(tenant.to_string()).or_default();
+        *t = add(t, &delta);
+    }
+
+    /// A `late` record of `delta`. The caller counts `delta` in the
+    /// tenant's totals, once: ingress that waited in `early` is in them
+    /// already.
+    fn late(
+        &mut self,
+        now_ms: u64,
+        id: &SandboxId,
+        tenant: &str,
+        node: &str,
+        template: &str,
+        delta: Counters,
+    ) {
+        let track = Track {
+            tenant: tenant.to_string(),
+            node: node.to_string(),
+            template: template.to_string(),
+            total: delta,
+            pending: Counters::default(),
+            memory_bytes: 0,
+            memory_limit: 0,
+            at: Instant::now(),
+            seen: Instant::now(),
+        };
+        self.record(Kind::Late, now_ms, id, &track, delta, None);
+    }
+
+    /// The ingress counted so far for sandbox `id`: (received, sent).
+    pub fn ingress_of(&self, id: &SandboxId) -> (u64, u64) {
+        let c = match (self.tracks.get(id), self.early.get(id)) {
+            (Some(t), _) => t.total,
+            (None, Some(e)) => e.counted,
+            (None, None) => Counters::default(),
+        };
+        (c.ingress_received_bytes, c.ingress_sent_bytes)
     }
 
     pub fn tracked(&self) -> usize {
@@ -816,6 +1097,7 @@ mod tests {
             memory_byte_seconds: run_ms / 1000 * 1000,
             egress_sent_bytes: sent,
             egress_received_bytes: sent / 2,
+            ..Counters::default()
         }
     }
 
@@ -862,6 +1144,332 @@ mod tests {
         assert_eq!(period_start(7, 1), 7);
         let p = period_view(T0 / 1000, 86400);
         assert_eq!((p.start, p.end), (T0, T0 + 86_400_000));
+    }
+
+    #[test]
+    fn calendar_months() {
+        let m = Periods::Months;
+        // 2026-11-18 is in November 2026.
+        let nov = 1_793_491_200; // 2026-11-01T00:00:00Z
+        assert_eq!(utc_stamp(nov), "20261101T000000Z");
+        assert_eq!(m.start_of(T0 / 1000), nov);
+        assert_eq!(m.start_of(nov), nov);
+        assert_eq!(m.start_of(nov - 1), m.previous(nov).unwrap());
+        assert_eq!(utc_stamp(m.previous(nov).unwrap()), "20261001T000000Z");
+        let dec = m.next(nov);
+        assert_eq!(utc_stamp(dec), "20261201T000000Z");
+        assert_eq!(dec - nov, 30 * 86400);
+        // Over the year's end, and February in leap and common years.
+        assert_eq!(utc_stamp(m.next(dec)), "20270101T000000Z");
+        assert_eq!(
+            utc_stamp(m.previous(m.next(dec)).unwrap()),
+            "20261201T000000Z"
+        );
+        let feb_2028 = m.start_of(1_833_000_000); // 2028-02-01..
+        assert_eq!(utc_stamp(feb_2028), "20280201T000000Z");
+        assert_eq!(m.next(feb_2028) - feb_2028, 29 * 86400);
+        let feb_2027 = m.previous(m.start_of(1_806_000_000)); // March 2027
+        assert_eq!(utc_stamp(feb_2027.unwrap()), "20270201T000000Z");
+        assert_eq!(m.next(feb_2027.unwrap()) - feb_2027.unwrap(), 28 * 86400);
+        assert_eq!(m.start_of(0), 0);
+        assert_eq!(m.previous(0), None);
+        let p = period_view(nov, m);
+        assert_eq!(
+            (p.start, p.end, p.seconds),
+            (nov * 1000, dec * 1000, 30 * 86400)
+        );
+        // A meter of months: the period, its end and the roll-over.
+        let now = Instant::now();
+        let mut meter = Meter::new(
+            m,
+            T0,
+            now,
+            true,
+            86_400_000,
+            vec!["a".into()],
+            &Rebuilt::default(),
+        );
+        assert_eq!(meter.period().start, nov * 1000);
+        assert_eq!(meter.seconds_left(T0), dec - T0 / 1000);
+        let x = SandboxId::random().unwrap();
+        meter.observe(
+            "n1",
+            T0,
+            now,
+            &BOUNDS,
+            vec![observed(x, "a", usage(1000, 10, 0), T0 - 1000)],
+            vec![],
+            1,
+            0,
+            true,
+        );
+        assert_eq!(meter.totals("a", T0).cpu_ms, 10);
+        meter.tick(dec * 1000 + 5, false, &[]);
+        assert_eq!(meter.period().start, dec * 1000);
+        assert_eq!(meter.totals("a", dec * 1000 + 5), Counters::default());
+        let recs = records(&mut meter);
+        assert_eq!(recs.last().unwrap().kind, Kind::Carry);
+        assert_eq!(recs.last().unwrap().period, dec);
+    }
+
+    /// Once a delete is accepted for a sandbox of an unreachable node, what
+    /// it uses is not charged: not when its node reports it again, not in
+    /// its final record, not after a restart that rebuilds from the log.
+    #[test]
+    fn a_deleted_sandbox_is_charged_nothing_more() {
+        let now = Instant::now();
+        let mut m = meter(T0 + 1000, now, true);
+        let x = SandboxId::random().unwrap();
+        let see = |m: &mut Meter, at_ms: u64, at: Instant, live, ended| {
+            m.observe("n1", at_ms, at, &BOUNDS, live, ended, 7, 0, true);
+        };
+        let t1 = now + Duration::from_secs(1);
+        see(
+            &mut m,
+            T0 + 2000,
+            t1,
+            vec![observed(x, "a", usage(2000, 500, 10), T0)],
+            vec![],
+        );
+        assert_eq!(m.totals("a", T0 + 2000).cpu_ms, 500);
+        // The node stops answering; the tenant deletes the sandbox.
+        m.note_delete(T0 + 3000, &x, "a", "n1", false);
+        // Its node is back and reports what it did meanwhile: not charged.
+        let t2 = now + Duration::from_secs(20);
+        see(
+            &mut m,
+            T0 + 21_000,
+            t2,
+            vec![observed(x, "a", usage(21_000, 9000, 900), T0)],
+            vec![],
+        );
+        assert_eq!(m.totals("a", T0 + 21_000).cpu_ms, 500);
+        assert_eq!(m.totals("a", T0 + 21_000).egress_sent_bytes, 10);
+        // Ingress to it is not charged either.
+        m.ingress(T0 + 21_000, &x, "a", "n1", "python", 100, 100);
+        assert_eq!(m.totals("a", T0 + 21_000).ingress_received_bytes, 0);
+        m.note_delete(T0 + 22_000, &x, "a", "n1", true);
+        // A restart between the delete being done and its final report
+        // still knows it is not to be charged.
+        let lines: Vec<String> = m.take_lines().into_iter().map(|l| l.text).collect();
+        let mut rebuilt = Rebuilt::default();
+        for l in &lines {
+            rebuilt.take(l, true, &|t| t == "a");
+        }
+        assert!(rebuilt.freed.contains(&x));
+        assert!(rebuilt.deletes.is_empty());
+        let mut m2 = Meter::new(
+            3600,
+            T0 + 23_000,
+            t2,
+            true,
+            86_400_000,
+            vec!["a".into(), "b".into()],
+            &rebuilt,
+        );
+        assert_eq!(m2.totals("a", T0 + 23_000).cpu_ms, 500);
+        let t3 = now + Duration::from_secs(25);
+        let mut end = observed(x, "a", usage(24_000, 9900, 950), T0);
+        end.memory_bytes = 0;
+        m2.observe(
+            "n1",
+            T0 + 25_000,
+            t3,
+            &BOUNDS,
+            vec![],
+            vec![end],
+            7,
+            1,
+            true,
+        );
+        assert_eq!(m2.totals("a", T0 + 25_000).cpu_ms, 500);
+        let recs = records(&mut m2);
+        let fin = recs.iter().find(|r| r.kind == Kind::Final).unwrap();
+        assert_eq!(fin.delta, Counters::default());
+        assert_eq!(m2.tracked(), 0);
+        // Without a sample after the restart either: a sandbox first seen
+        // while freed is not charged.
+        let y = SandboxId::random().unwrap();
+        let mut rebuilt = Rebuilt::default();
+        rebuilt.freed.insert(y);
+        let mut m3 = Meter::new(
+            3600,
+            T0 + 1000,
+            now,
+            true,
+            86_400_000,
+            vec!["a".into()],
+            &rebuilt,
+        );
+        see(
+            &mut m3,
+            T0 + 2000,
+            t1,
+            vec![observed(y, "a", usage(2000, 700, 0), T0 + 500)],
+            vec![],
+        );
+        assert_eq!(m3.totals("a", T0 + 2000).cpu_ms, 0);
+    }
+
+    /// Ingress bytes count for the tenant at once, join the sandbox's
+    /// counters and records, wait for a sandbox not reported yet, and go
+    /// to `late` records for one that ended.
+    #[test]
+    fn ingress_is_counted() {
+        let now = Instant::now();
+        let mut m = meter(T0 + 1000, now, true);
+        let (x, y) = (SandboxId::random().unwrap(), SandboxId::random().unwrap());
+        // y is used before its node reported it.
+        m.ingress(T0 + 1000, &y, "a", "n1", "python", 10, 20);
+        assert_eq!(m.ingress_of(&y), (10, 20));
+        let t = m.totals("a", T0 + 1000);
+        assert_eq!((t.ingress_received_bytes, t.ingress_sent_bytes), (10, 20));
+        let t1 = now + Duration::from_secs(1);
+        m.observe(
+            "n1",
+            T0 + 2000,
+            t1,
+            &BOUNDS,
+            vec![
+                observed(x, "a", usage(1000, 10, 0), T0 + 500),
+                observed(y, "a", usage(1000, 10, 0), T0 + 500),
+            ],
+            vec![],
+            7,
+            0,
+            true,
+        );
+        m.ingress(T0 + 2000, &x, "a", "n1", "python", 1000, 5000);
+        // Another tenant's name or another node: not counted.
+        m.ingress(T0 + 2000, &x, "b", "n1", "python", 1, 1);
+        m.ingress(T0 + 2000, &x, "a", "n2", "python", 1, 1);
+        assert_eq!(m.ingress_of(&x), (1000, 5000));
+        assert_eq!(m.ingress_of(&y), (10, 20));
+        // A node never takes ingress counters away (it reports none).
+        let t2 = now + Duration::from_secs(3);
+        m.observe(
+            "n1",
+            T0 + 4000,
+            t2,
+            &BOUNDS,
+            vec![
+                observed(x, "a", usage(3000, 20, 0), T0 + 500),
+                observed(y, "a", usage(3000, 20, 0), T0 + 500),
+            ],
+            vec![],
+            7,
+            0,
+            true,
+        );
+        assert_eq!(m.ingress_of(&x), (1000, 5000));
+        assert_eq!(m.odd, 2);
+        m.tick(T0 + 4000, true, &[]);
+        let recs = records(&mut m);
+        let of = |id: SandboxId| {
+            recs.iter()
+                .filter(|r| r.sandbox == id.to_string())
+                .fold(Counters::default(), |c, r| add(&c, &r.delta))
+        };
+        assert_eq!(of(x).ingress_sent_bytes, 5000);
+        assert_eq!(of(y).ingress_received_bytes, 10);
+        // Ended: the next bytes are a `late` record, in the totals.
+        let mut end = observed(x, "a", usage(4000, 30, 0), T0 + 500);
+        end.memory_bytes = 0;
+        m.observe("n1", T0 + 5000, t2, &BOUNDS, vec![], vec![end], 7, 1, true);
+        m.ingress(T0 + 6000, &x, "a", "n1", "python", 0, 7);
+        let late = records(&mut m)
+            .into_iter()
+            .find(|r| r.kind == Kind::Late)
+            .unwrap();
+        assert_eq!(late.delta.ingress_sent_bytes, 7);
+        let t = m.totals("a", T0 + 6000);
+        assert_eq!(
+            (t.ingress_received_bytes, t.ingress_sent_bytes),
+            (1010, 5027)
+        );
+        // A rebuild counts the late record in the totals.
+        let mut rebuilt = Rebuilt::default();
+        rebuilt.take(&serde_json::to_string(&late).unwrap(), true, &|t| t == "a");
+        assert_eq!(rebuilt.totals["a"].ingress_sent_bytes, 7);
+        assert!(rebuilt.baselines.is_empty() && rebuilt.closed.is_empty());
+    }
+
+    #[test]
+    fn ingress_of_a_sandbox_never_reported_is_counted_once() {
+        let now = Instant::now();
+        let mut m = meter(T0 + 1000, now, true);
+        let x = SandboxId::random().unwrap();
+        m.ingress(T0 + 1000, &x, "a", "n1", "python", 100, 400);
+        assert_eq!(m.ingress_of(&x), (100, 400));
+        let total = |m: &Meter| {
+            let t = m.totals("a", T0 + 1000);
+            (t.ingress_received_bytes, t.ingress_sent_bytes)
+        };
+        assert_eq!(total(&m), (100, 400));
+        // Its node never reports it: after a while the bytes become a
+        // `late` record, and the totals stay what they were.
+        if let Some(e) = m.early.get_mut(&x) {
+            e.since = now.checked_sub(LOST_AFTER * 2).unwrap_or(now);
+        }
+        m.tick(T0 + 1000, false, &[]);
+        let recs = records(&mut m);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].kind, Kind::Late);
+        assert_eq!(recs[0].delta.ingress_sent_bytes, 400);
+        assert_eq!(total(&m), (100, 400));
+        // Reported under another tenant's name: the same.
+        let y = SandboxId::random().unwrap();
+        m.ingress(T0 + 1000, &y, "a", "n1", "python", 1, 2);
+        m.observe(
+            "n1",
+            T0 + 2000,
+            now,
+            &BOUNDS,
+            vec![observed(y, "b", usage(1000, 10, 0), T0 + 500)],
+            vec![],
+            7,
+            0,
+            true,
+        );
+        assert_eq!(total(&m), (101, 402));
+        assert_eq!(m.totals("b", T0 + 2000).ingress_sent_bytes, 0);
+    }
+
+    #[test]
+    fn a_deleted_sandbox_that_is_lost_is_forgotten_and_never_charged() {
+        let now = Instant::now();
+        let mut m = meter(T0 + 1000, now, true);
+        let x = SandboxId::random().unwrap();
+        let see = |m: &mut Meter, at_ms: u64, at: Instant, live: Vec<Observed>| {
+            m.observe("n1", at_ms, at, &BOUNDS, live, vec![], 7, 0, true);
+        };
+        see(
+            &mut m,
+            T0 + 1000,
+            now,
+            vec![observed(x, "a", usage(1000, 100, 0), T0)],
+        );
+        m.note_delete(T0 + 1500, &x, "a", "n1", false);
+        assert!(m.free.contains(&x));
+        // Its node leaves it out for more than a minute.
+        let later = now + LOST_AFTER + Duration::from_secs(1);
+        see(&mut m, T0 + 62_000, later, vec![]);
+        assert!(m.free.is_empty() && m.lost.is_empty());
+        // Reported again: closed, and not charged.
+        let back = later + Duration::from_secs(2);
+        see(
+            &mut m,
+            T0 + 64_000,
+            back,
+            vec![observed(x, "a", usage(64_000, 9000, 0), T0)],
+        );
+        assert_eq!(m.tracked(), 0);
+        assert_eq!(m.totals("a", T0 + 64_000).cpu_ms, 100);
+        // A delete done for a sandbox its node does not report is forgotten.
+        let y = SandboxId::random().unwrap();
+        m.note_delete(T0 + 64_000, &y, "a", "n1", false);
+        m.note_delete(T0 + 65_000, &y, "a", "n1", true);
+        assert!(m.free.is_empty());
     }
 
     #[test]

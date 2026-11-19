@@ -24,6 +24,12 @@
 //!   address. The connect, read, and write run off the kernel
 //!   thread (`WouldBlock` plus a [`Waker`]), including a write-side
 //!   half-close.
+//! * optional inbound byte streams ([`Host::take_inbound`]): connections
+//!   the host side opened to a port a guest process listens on (ingress).
+//!   The host hands each one over with the port; the kernel queues it on
+//!   the listener (or refuses it) and answers with
+//!   [`Host::answer_inbound`]. From then on it is a stream like an
+//!   outbound one. Nothing the guest does can open one.
 //!
 //! Host errors are `std::io::Error`s; the core translates them by kind
 //! ([`crate::errno::Errno::from_host`]), never by host errno number.
@@ -62,6 +68,17 @@ pub struct OutboundFlow {
     /// at most 253 bytes. `None` for a fake IP issued without a name (by
     /// [`crate::Kernel::issue_fake_ip`], for tests).
     pub host: Option<String>,
+}
+
+/// A connection the host side opened to a guest port (ingress), waiting
+/// for the kernel to queue it on a listener or refuse it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboundConn {
+    /// The guest port it is for.
+    pub port: u16,
+    /// The stream, readable and writable once [`Host::answer_inbound`]
+    /// accepted it.
+    pub stream: HostStreamId,
 }
 
 /// Non-blocking view of a host byte stream.
@@ -314,6 +331,29 @@ pub trait Host {
         let _ = id;
     }
 
+    /// Sets the waker to call when an inbound connection arrives.
+    fn set_inbound_waker(&mut self, _waker: Waker) {}
+
+    /// Whether an inbound connection waits for [`Host::take_inbound`].
+    /// Cheap: called on every turn of the event loop.
+    fn inbound_pending(&self) -> bool {
+        false
+    }
+
+    /// The next inbound connection that arrived, if any. The kernel must
+    /// answer it with [`Host::answer_inbound`].
+    fn take_inbound(&mut self) -> Option<InboundConn> {
+        None
+    }
+
+    /// Accepts (`true`: the connection is queued on a listener; the host
+    /// tells its opener, and bytes flow from now on) or refuses (`false`:
+    /// no listener, a full backlog, too many streams; the host tells its
+    /// opener and drops it) an inbound connection.
+    fn answer_inbound(&mut self, stream: HostStreamId, accepted: bool) {
+        let _ = (stream, accepted);
+    }
+
     /// Waits at most `limit` until no outbound stream is open or still
     /// delivering bytes after its close, and returns whether that is so.
     /// A warm-clone template freezes only then: a stream (and its helper
@@ -384,6 +424,18 @@ impl<H: Host + ?Sized> Host for &mut H {
     }
     fn settle_streams(&mut self, limit: Duration) -> bool {
         (**self).settle_streams(limit)
+    }
+    fn set_inbound_waker(&mut self, waker: Waker) {
+        (**self).set_inbound_waker(waker)
+    }
+    fn inbound_pending(&self) -> bool {
+        (**self).inbound_pending()
+    }
+    fn take_inbound(&mut self) -> Option<InboundConn> {
+        (**self).take_inbound()
+    }
+    fn answer_inbound(&mut self, stream: HostStreamId, accepted: bool) {
+        (**self).answer_inbound(stream, accepted)
     }
 }
 

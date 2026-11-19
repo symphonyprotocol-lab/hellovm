@@ -18,6 +18,10 @@
 //! header names are tokens, values have no control bytes, folded headers
 //! and duplicate `Content-Length` are refused. Connections are kept alive
 //! (HTTP/1.1) up to [`Limits::idle_timeout`] between requests.
+//!
+//! A handler may take a connection over ([`Response::take_over`]): once
+//! the answer is written, the connection is handed to it and the server
+//! is done with it (the node daemon passes it into a sandbox for ingress).
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -80,7 +84,39 @@ pub struct Response {
     pub content_type: &'static str,
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
+    /// Takes the connection once the answer is written.
+    pub takeover: Option<Takeover>,
 }
+
+type TakeoverFn = Box<dyn FnOnce(TcpStream) + Send>;
+
+/// What takes a connection over after its answer (see
+/// [`Response::take_over`]). Runs at most once.
+#[derive(Clone)]
+pub struct Takeover(Arc<Mutex<Option<TakeoverFn>>>);
+
+impl Takeover {
+    fn run(&self, stream: TcpStream) {
+        let f = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = f {
+            f(stream);
+        }
+    }
+}
+
+impl std::fmt::Debug for Takeover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Takeover")
+    }
+}
+
+impl PartialEq for Takeover {
+    fn eq(&self, other: &Takeover) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Takeover {}
 
 /// The JSON body of every error: `{"error": {"code": ..., "message": ...}}`.
 #[derive(Debug, Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
@@ -101,6 +137,7 @@ impl Response {
                 status,
                 content_type: "application/json",
                 headers: Vec::new(),
+                takeover: None,
                 body,
             },
             Err(err) => Response::error(500, "internal", &format!("encoding the answer: {err}")),
@@ -118,6 +155,7 @@ impl Response {
             status,
             content_type: "application/json",
             headers: Vec::new(),
+            takeover: None,
             body: serde_json::to_vec(&body).unwrap_or_default(),
         }
     }
@@ -127,6 +165,7 @@ impl Response {
             status,
             content_type: "application/octet-stream",
             headers: Vec::new(),
+            takeover: None,
             body,
         }
     }
@@ -136,12 +175,23 @@ impl Response {
             status,
             content_type: "application/json",
             headers: Vec::new(),
+            takeover: None,
             body: Vec::new(),
         }
     }
 
     pub fn with_header(mut self, name: &'static str, value: String) -> Response {
         self.headers.push((name, value));
+        self
+    }
+
+    /// Hands the connection to `f` once this answer is written (with
+    /// `Connection: close`), instead of reading another request from it.
+    /// The client must send nothing after its request until it has read
+    /// the answer: a connection with bytes already read past the request
+    /// is closed instead, and `f` does not run.
+    pub fn take_over(mut self, f: impl FnOnce(TcpStream) + Send + 'static) -> Response {
+        self.takeover = Some(Takeover(Arc::new(Mutex::new(Some(Box::new(f))))));
         self
     }
 }
@@ -393,6 +443,17 @@ fn connection(
             };
         let keep_alive = keep_alive && served + 1 < limits.max_requests_per_connection;
         let response = handler.handle(request);
+        if let Some(takeover) = &response.takeover {
+            let written = write_response(&stream, &response, false, write_time(&response));
+            if written.is_ok() && pending.is_empty() {
+                let _ = stream.set_read_timeout(None);
+                let _ = stream.set_write_timeout(None);
+                takeover.run(stream);
+            } else {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            return;
+        }
         if write_response(&stream, &response, keep_alive, write_time(&response)).is_err()
             || !keep_alive
         {
@@ -832,6 +893,7 @@ impl ClientResponse {
             status: self.status,
             content_type,
             headers: Vec::new(),
+            takeover: None,
             body: self.body,
         }
     }

@@ -38,8 +38,9 @@ use hellovm_platform_seccomp::SeccompPlatform;
 use crate::{harden, Ended, Options, EXIT_DRAIN};
 
 /// Most connections served at once (clones and requests being read). Each
-/// takes up to five fds (connection, pidfd, three stdio fds while the
-/// request is read) under the kernel process's limit of 4096.
+/// takes up to six fds (connection, pidfd, three stdio fds and the ingress
+/// channel while the request is read) under the kernel process's limit of
+/// 4096.
 const MAX_CLIENTS: usize = 512;
 
 /// Exit status of a clone's kernel process that has reported an error
@@ -340,7 +341,7 @@ fn read_request(
         client.stream.as_fd(),
         &mut client.buf[have..],
         &mut client.fds,
-        3,
+        4,
     );
     client
         .buf
@@ -377,9 +378,11 @@ fn read_request(
             client.done = true;
         }
         Kind::Clone => {
-            if client.fds.len() != 3 {
+            let want = if request.ingress { 4 } else { 3 };
+            if client.fds.len() != want {
                 client.send(&Frame::Error(format!(
-                    "a clone request needs 3 fds (stdin, stdout, stderr), it came with {}",
+                    "a clone request needs {want} fds (stdin, stdout, stderr{}), it came with {}",
+                    if request.ingress { ", ingress" } else { "" },
                     client.fds.len()
                 )));
                 client.done = true;
@@ -565,11 +568,13 @@ fn become_clone(
             Err(why) => return fail(format!("a Landlock domain for the clone: {why}")),
         }
     }
-    let mut stdio = fds.into_iter().map(File::from);
+    let mut stdio = fds.into_iter();
     let (Some(stdin), Some(stdout), Some(stderr)) = (stdio.next(), stdio.next(), stdio.next())
     else {
         return fail("missing stdio fds".into());
     };
+    let (stdin, stdout, stderr) = (File::from(stdin), File::from(stdout), File::from(stderr));
+    let ingress = stdio.next();
     #[cfg(feature = "insecure-test-hooks")]
     let probe_out = stderr.try_clone();
     kernel.host_mut().set_console(stdin, stdout, stderr);
@@ -584,6 +589,15 @@ fn become_clone(
     let thawing = Instant::now();
     if let Err(err) = kernel.thaw(app, request.input) {
         return fail(format!("rebuilding the clone: {err}"));
+    }
+    if let Some(channel) = ingress {
+        let queue = kernel.host_mut().inbound_queue();
+        let spawned = std::thread::Builder::new()
+            .name("hellovm-ingress".into())
+            .spawn(move || ingress_channel(channel, queue));
+        if let Err(err) = spawned {
+            return fail(format!("the ingress channel: {err}"));
+        }
     }
     log::info!("clone sandbox id {sandbox_id:016x}");
     log::debug!(
@@ -613,6 +627,36 @@ fn become_clone(
     };
     send(Frame::Exit(status));
     0
+}
+
+/// Receives inbound connections on a clone's ingress channel (see
+/// [`warm`]) and hands them to the kernel until the channel closes or
+/// breaks the protocol (then ingress to this sandbox stops; nothing else
+/// does).
+fn ingress_channel(channel: OwnedFd, queue: hellovm_host::InboundQueue) {
+    let mut port = [0u8; 2];
+    let mut have = 0;
+    let mut fds: Vec<OwnedFd> = Vec::new();
+    loop {
+        match warm::recv_with_fds(channel.as_fd(), &mut port[have..], &mut fds, 1) {
+            Ok(0) => return,
+            Ok(n) => have += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                log::warn!("ingress channel: {err}; no more inbound connections");
+                return;
+            }
+        }
+        if have < port.len() {
+            continue;
+        }
+        have = 0;
+        let Some(conn) = fds.pop().filter(|_| fds.is_empty()) else {
+            log::warn!("ingress channel: a port without a connection; no more inbound connections");
+            return;
+        };
+        queue.push(u16::from_le_bytes(port), conn);
+    }
 }
 
 /// `hellovm --clone SOCKET`: asks the template for a clone with this

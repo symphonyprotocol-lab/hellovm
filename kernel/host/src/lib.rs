@@ -22,7 +22,7 @@ mod image;
 mod stream;
 
 use hellovm_core::host::{
-    ConsoleStream, Host, HostStat, HostStreamId, ImagePath, OutboundFlow, StreamStatus,
+    ConsoleStream, Host, HostStat, HostStreamId, ImagePath, InboundConn, OutboundFlow, StreamStatus,
 };
 
 use std::collections::VecDeque;
@@ -35,7 +35,10 @@ use hellovm_core::platform::Waker;
 
 use stream::{Endpoint, StreamTable};
 
-pub use stream::VERDICT_TIMEOUT;
+pub use stream::{
+    InboundQueue, INBOUND_ACCEPTED, INBOUND_REFUSED, MAX_LIVE_INBOUND, MAX_QUEUED_INBOUND,
+    VERDICT_TIMEOUT,
+};
 
 pub use image::ImageDir;
 
@@ -163,6 +166,24 @@ macro_rules! splice_host_methods {
         fn settle_streams(&mut self, limit: Duration) -> bool {
             self.splice.settle(limit)
         }
+
+        fn set_inbound_waker(&mut self, waker: Waker) {
+            self.inbound_waker = Some(waker.clone());
+            self.splice.set_inbound_waker(waker);
+        }
+
+        fn inbound_pending(&self) -> bool {
+            self.splice.inbound_pending()
+        }
+
+        fn take_inbound(&mut self) -> Option<InboundConn> {
+            self.splice.take_inbound()
+        }
+
+        fn answer_inbound(&mut self, stream: HostStreamId, accepted: bool) {
+            let waker = self.inbound_waker.clone().unwrap_or_else(Waker::noop);
+            self.splice.answer_inbound(stream, accepted, waker);
+        }
     };
 }
 
@@ -245,6 +266,8 @@ pub struct StdioHost {
     /// Given to the stdin reader when it starts.
     waker: Option<Waker>,
     splice: StreamTable,
+    /// Given to each inbound stream.
+    inbound_waker: Option<Waker>,
 }
 
 impl std::fmt::Debug for StdioHost {
@@ -268,7 +291,14 @@ impl StdioHost {
             stdin: None,
             waker: None,
             splice: StreamTable::default(),
+            inbound_waker: None,
         }
+    }
+
+    /// Where inbound connections (ingress) are handed over to this
+    /// sandbox's kernel, from any thread.
+    pub fn inbound_queue(&self) -> InboundQueue {
+        self.splice.inbound_queue()
     }
 
     /// Sends every outbound flow to the egress proxy listening on `path`.
@@ -386,6 +416,7 @@ pub struct CaptureHost {
     pub stdin: VecDeque<u8>,
     common: Common,
     splice: StreamTable,
+    inbound_waker: Option<Waker>,
 }
 
 impl CaptureHost {
@@ -402,7 +433,13 @@ impl CaptureHost {
             stdin: VecDeque::new(),
             common: Common::new(image),
             splice: StreamTable::default(),
+            inbound_waker: None,
         }
+    }
+
+    /// See [`StdioHost::inbound_queue`].
+    pub fn inbound_queue(&self) -> InboundQueue {
+        self.splice.inbound_queue()
     }
 
     /// Sends every outbound flow to the egress proxy listening on `path`.

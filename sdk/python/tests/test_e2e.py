@@ -42,6 +42,7 @@ TOKEN = os.environ.get("HELLOVM_TEST_TOKEN", "")
 TEMPLATE = os.environ.get("HELLOVM_TEST_TEMPLATE", "python")
 TOKEN_B = os.environ.get("HELLOVM_TEST_TOKEN_B", "")
 TEMPLATE_B = os.environ.get("HELLOVM_TEST_TEMPLATE_B", TEMPLATE)
+INGRESS = os.environ.get("HELLOVM_TEST_INGRESS", "")
 
 if not URL and os.environ.get("HELLOVM_REQUIRE_E2E") == "1":
     raise RuntimeError("required e2e dependency missing: HELLOVM_TEST_URL (start a plane, see kernel/api/tests/sdk.rs)")
@@ -430,6 +431,53 @@ class E2E(unittest.TestCase):
         self.assertEqual(held, ["held\n"])
 
     # -- files ---------------------------------------------------------
+
+    @unittest.skipUnless(INGRESS, "set HELLOVM_TEST_INGRESS (the ingress listener)")
+    def test_ingress(self) -> None:
+        import http.client
+        import urllib.parse
+
+        sb = self.sandbox()
+        sb.write_file("/tmp/www/index.html", "hello from the sandbox\n")
+        sb.exec("cd /tmp/www && nohup python3 -m http.server 8000 --bind 0.0.0.0 >/dev/null 2>&1 &")
+        self.assertEqual(sb.ingress().ports, [])
+        port = sb.expose(8000)
+        self.assertFalse(port.public)
+        host = urllib.parse.urlsplit(port.url).hostname or ""
+        self.assertTrue(host.startswith(f"8000-{sb.id}."), port.url)
+        token = sb.ingress().token
+
+        def get(headers: dict[str, str]) -> tuple[int, bytes]:
+            addr, _, p = INGRESS.rpartition(":")
+            conn = http.client.HTTPConnection(addr, int(p), timeout=10)
+            try:
+                conn.request("GET", "/index.html", headers={"Host": host, **headers})
+                r = conn.getresponse()
+                return r.status, r.read()
+            finally:
+                conn.close()
+
+        deadline = time.monotonic() + 20
+        while get({"X-Hellovm-Ingress-Token": token})[0] != 200:
+            self.assertLess(time.monotonic(), deadline, "the server never answered")
+            time.sleep(0.2)
+        self.assertEqual(get({"X-Hellovm-Ingress-Token": token}), (200, b"hello from the sandbox\n"))
+        self.assertEqual(get({})[0], 404)
+        self.assertTrue(sb.expose(8000, public=True).public)
+        self.assertEqual(get({})[0], 200)
+        new = sb.rotate_ingress_token()
+        self.assertNotEqual(new, token)
+        sb.unexpose(8000)
+        self.assertEqual(sb.ingress().ports, [])
+        self.assertEqual(get({"X-Hellovm-Ingress-Token": new})[0], 404)
+        # Metered for the sandbox (within a second or so).
+        deadline = time.monotonic() + 10
+        while True:
+            usage = sb.refresh().usage
+            if usage is not None and usage.ingress_sent_bytes > 0:
+                break
+            self.assertLess(time.monotonic(), deadline, "ingress not metered")
+            time.sleep(0.2)
 
     def test_files(self) -> None:
         sb = self.shared

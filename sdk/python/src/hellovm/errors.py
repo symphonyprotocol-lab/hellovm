@@ -112,6 +112,7 @@ _BY_STATUS: dict[int, type[APIError]] = {
 _BY_CODE: dict[tuple[int, str], type[APIError]] = {
     (429, "rate_limited"): RateLimitError,
     (429, "budget_exceeded"): BudgetExceededError,
+    (409, "too_many_ports"): LimitError,
 }
 
 

@@ -47,10 +47,11 @@ fn run(path: &str) -> Result<(), String> {
         max_connections_per_peer: 16,
         ..Default::default()
     };
-    // Each connection served may hold one more, to a node; and every
-    // node is probed at once.
+    // Each connection served may hold one more, to a node (an ingress
+    // connection too); and every node is probed at once.
+    let ingress_connections = config.ingress.as_ref().map_or(0, |i| i.max_connections);
     hellovm_control::ensure_fd_limit(
-        (limits.max_connections + admin_limits.max_connections) as u64 * 2
+        (limits.max_connections + admin_limits.max_connections + ingress_connections) as u64 * 2
             + nodes.len() as u64 * 2
             + 64,
     )?;
@@ -64,18 +65,38 @@ fn run(path: &str) -> Result<(), String> {
         ),
         None => None,
     };
+    let ingress_listener = match &config.ingress {
+        Some(ingress) => Some(
+            std::net::TcpListener::bind(&ingress.listen)
+                .map_err(|e| format!("ingress listen {}: {e}", ingress.listen))?,
+        ),
+        None => None,
+    };
+    // What is never forwarded to a guest: every token of hellovm's own.
+    let secrets: Vec<String> = tenants
+        .iter()
+        .map(|t| t.token.clone())
+        .chain(nodes.iter().map(|n| n.token.clone()))
+        .chain(admin_token.clone())
+        .collect();
+    let ingress = config
+        .ingress
+        .clone()
+        .map(|c| hellovm_api::ingress::IngressState::new(c, secrets));
     let interval = Duration::from_secs_f64(config.reconcile_interval);
     let policy = HealthPolicy {
         unhealthy_after: config.unhealthy_after,
         healthy_after: config.healthy_after,
     };
     let record_every = Duration::from_secs_f64(config.metering.interval);
-    let api = Arc::new(Api::new(
+    let mut api = Api::new(
         config,
         tenants,
         Nodes::new(nodes, policy),
         Arc::new(MemoryStore::default()),
-    ));
+    );
+    api.ingress = ingress;
+    let api = Arc::new(api);
     // What runs already (after a restart of this service) and the state of
     // every node are known before the first request is served.
     api.reconcile();
@@ -130,6 +151,15 @@ fn run(path: &str) -> Result<(), String> {
             })
             .map_err(|e| e.to_string())?;
         log::info!("admin API at {admin_addr}");
+    }
+    if let Some(listener) = ingress_listener {
+        let ingress_addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let api = Arc::clone(&api);
+        std::thread::Builder::new()
+            .name("ingress".into())
+            .spawn(move || hellovm_api::ingress::serve(listener, api))
+            .map_err(|e| e.to_string())?;
+        log::info!("ingress at {ingress_addr}");
     }
     log::info!("listening on {addr}");
     hellovm_control::http::serve(listener, api, limits).map_err(|e| format!("serving: {e}"))

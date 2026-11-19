@@ -1,6 +1,6 @@
 /**
  * The MCP server against a real plane (see `kernel/api/tests/sdk.rs`):
- * every tool's success and failure, truncation, a timeout, cancellation,
+ * every tool's success and failure (ingress ports too), truncation, a timeout, cancellation,
  * a sandbox that ended, the sandbox deleted at exit, and the token
  * nowhere in what the server wrote.
  */
@@ -116,6 +116,15 @@ describe("the MCP server against a real plane", { skip: skip ? "set HELLOVM_TEST
     assert.match(text(r), /^1\n2\n/);
     assert.match(text(r), /\/tmp\/long is 23893 bytes, too long/);
     assert.match(text((await p.call("read_file", { path: "/tmp" }))), /^Error \(400 is_directory\)/);
+
+    // A port made reachable, with its token, then not.
+    r = await p.call("expose_port", { port: 8000 });
+    assert.equal(r.isError, undefined);
+    assert.match(text(r), /^Port 8000 is reachable at http:\/\/8000-sb-[0-9a-f]{32}\.[^ ]+\/ with the sandbox's ingress token:\nsend the header X-Hellovm-Ingress-Token: [0-9a-f]{64}\n/);
+    r = await p.call("expose_port", { port: 8000, public: true });
+    assert.match(text(r), /^Port 8000 is reachable by anyone at http:/);
+    r = await p.call("unexpose_port", { port: 8000 });
+    assert.equal(text(r), "Port 8000 is no longer reachable from outside.");
 
     // Reset: a new, empty sandbox.
     r = await p.call("reset_sandbox");

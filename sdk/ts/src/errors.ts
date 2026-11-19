@@ -107,6 +107,7 @@ type Kind = new (status: number, code: string, message: string, retryAfter: numb
 const BY_CODE: Record<string, Kind> = {
   "429 rate_limited": RateLimitError,
   "429 budget_exceeded": BudgetExceededError,
+  "409 too_many_ports": LimitError,
 };
 
 /** A `Retry-After` of whole seconds (an HTTP date is not used). */

@@ -16,6 +16,8 @@ from ._http import Abort, AbortedError, Response, Transport
 from ._model import (
     ExecResult,
     ExecStatus,
+    ExposedPort,
+    Ingress,
     OmittedEvent,
     OutputEvent,
     Poll,
@@ -24,6 +26,7 @@ from ._model import (
     StreamEvent,
     Template,
     TenantUsage,
+    parse_ingress,
     parse_json,
     parse_poll,
     parse_result,
@@ -440,6 +443,47 @@ class Sandbox:
         if not isinstance(d, dict) or not isinstance(d.get("had_state"), bool):
             raise ResponseError("reset: expected had_state")
         return bool(d["had_state"])
+
+    # -- ingress -------------------------------------------------------
+
+    @staticmethod
+    def _port(port: int) -> int:
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("a port is 1 to 65535")
+        return port
+
+    def ingress(self) -> Ingress:
+        """The sandbox's ingress token and exposed ports (with their URLs)."""
+        r = self.client._request("GET", self._path("/ingress"), idempotent=True)
+        return parse_ingress(parse_json(r.body))
+
+    def expose(self, port: int, *, public: bool = False) -> ExposedPort:
+        """Makes ``port`` reachable from outside (a server in the sandbox
+        must listen on it, on ``0.0.0.0``); it needs the ingress token
+        unless ``public``. Calling it again changes ``public``. Returns
+        the port with its URL."""
+        port = self._port(port)
+        r = self.client._request(
+            "PUT",
+            self._path(f"/ingress/ports/{port}"),
+            json_body={"public": bool(public)},
+            idempotent=True,
+        )
+        for p in parse_ingress(parse_json(r.body)).ports:
+            if p.port == port:
+                return p
+        raise ResponseError("expose: the port is not in the answer")
+
+    def unexpose(self, port: int) -> None:
+        """Makes ``port`` unreachable from outside again (connections
+        already made go on)."""
+        port = self._port(port)
+        self.client._request("DELETE", self._path(f"/ingress/ports/{port}"), idempotent=True)
+
+    def rotate_ingress_token(self) -> str:
+        """Replaces the ingress token with a new one, at once; returns it."""
+        r = self.client._request("POST", self._path("/ingress/token"), idempotent=False)
+        return parse_ingress(parse_json(r.body)).token
 
     # -- files ---------------------------------------------------------
 

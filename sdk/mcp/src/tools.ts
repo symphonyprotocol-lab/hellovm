@@ -176,7 +176,8 @@ export function buildServer(holder: SandboxHolder): McpServer {
       capabilities: { tools: {} },
       instructions:
         "Tools for one Linux sandbox (a hellovm sandbox with Python), created on first use and private to this session: " +
-        "run shell commands, run Python in a persistent interpreter, and read, write and edit files. " +
+        "run shell commands, run Python in a persistent interpreter, read, write and edit files, " +
+        "and make an HTTP server in the sandbox reachable from outside. " +
         "Files and the Python interpreter's variables persist between calls; shell variables and the working directory do not.",
     },
   );
@@ -290,6 +291,50 @@ export function buildServer(holder: SandboxHolder): McpServer {
       withSandbox(holder, async (sandbox) => {
         const n = await sandbox.editFile(path, old_text, new_text, { replaceAll: replace_all ?? false });
         return `Replaced ${n} occurrence${n === 1 ? "" : "s"} in ${path}.`;
+      }),
+  );
+
+  const port = z.number().int().min(1).max(65535).describe("The TCP port a server in the sandbox listens on (on 0.0.0.0).");
+
+  server.registerTool(
+    "expose_port",
+    {
+      title: "Make a port reachable from outside",
+      description:
+        "Makes an HTTP server listening in the sandbox on this port reachable from outside, and returns its URL. " +
+        "Unless public is set, requests need the sandbox's ingress token (the result says how to send it). " +
+        "The server must listen on 0.0.0.0, not 127.0.0.1. Start the server first (in the background, with nohup).",
+      inputSchema: z.object({
+        port,
+        public: z.boolean().optional().describe("Reachable by anyone, without the token (default false)."),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ port: p, public: open }) =>
+      withSandbox(holder, async (sandbox) => {
+        const exposed = await sandbox.expose(p, { public: open ?? false });
+        if (exposed.public) return `Port ${p} is reachable by anyone at ${exposed.url}`;
+        const token = (await sandbox.ingress()).token;
+        return (
+          `Port ${p} is reachable at ${exposed.url} with the sandbox's ingress token:\n` +
+          `send the header X-Hellovm-Ingress-Token: ${token}\n` +
+          `or open ${exposed.url}?hellovm_ingress_token=${token} once in a browser (it sets a cookie).`
+        );
+      }),
+  );
+
+  server.registerTool(
+    "unexpose_port",
+    {
+      title: "Stop a port being reachable from outside",
+      description: "Makes a port exposed with expose_port unreachable from outside again.",
+      inputSchema: z.object({ port }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ port: p }) =>
+      withSandbox(holder, async (sandbox) => {
+        await sandbox.unexpose(p);
+        return `Port ${p} is no longer reachable from outside.`;
       }),
   );
 

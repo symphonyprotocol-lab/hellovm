@@ -42,6 +42,7 @@ the block too (`Symbol.asyncDispose`).
 | `sandbox.stream(command, options)`, `sandbox.streamPython(code, {stateful, ...})` | an `Execution`: `AsyncIterable` of `{type: "stdout" \| "stderr", data}`, `{type: "omitted", bytes}`, then `{type: "result", result}`; `cancel()`, `close()`, `wait()`, `cursor`, `result`, `Symbol.asyncDispose` (cancels what has not ended) |
 | `readFile(path): Uint8Array`, `readText`, `writeFile(path, data): number`, `editFile(path, old, new, {replaceAll}): number` | at most 16 MiB |
 | `resetPython(): boolean`, `latestExec()`, `refresh()`, `delete()` | |
+| `ingress(): Ingress` (`token`, `ports`), `expose(port, {public}): ExposedPort` (`port`, `public`, `url`), `unexpose(port)`, `rotateIngressToken(): string` | a server in the sandbox listening on `0.0.0.0:port`, reached from outside at `url`; with the token in `X-Hellovm-Ingress-Token` unless public |
 
 Cancelling: `execution.cancel()` cancels the exec in the sandbox (the
 iteration then ends with the cancelled result); aborting the `signal`

@@ -18,6 +18,26 @@ export interface Usage {
   memoryByteSeconds: number;
   egressSentBytes: number;
   egressReceivedBytes: number;
+  /** Bytes ingress delivered to the sandbox, and from it (0 from an API without ingress). */
+  ingressReceivedBytes: number;
+  ingressSentBytes: number;
+}
+
+/** A port reachable from outside through ingress, at `url`; one not `public` needs the ingress token. */
+export interface ExposedPort {
+  port: number;
+  public: boolean;
+  url: string;
+}
+
+/**
+ * A sandbox's ingress: its token (sent as the `X-Hellovm-Ingress-Token`
+ * header, or once as the `hellovm_ingress_token` query parameter, which
+ * sets a cookie) and its exposed ports.
+ */
+export interface Ingress {
+  token: string;
+  ports: ExposedPort[];
 }
 
 /** A tenant's quotas; `null`: no limit. */
@@ -28,6 +48,8 @@ export interface Quotas {
   requestBurst: number | null;
   cpuSecondsPerPeriod: number | null;
   egressBytesPerPeriod: number | null;
+  /** Ingress connections to its sandboxes at once (`null`: no ingress). */
+  maxIngressConnections: number | null;
 }
 
 /**
@@ -204,7 +226,22 @@ export function parseCounters(v: unknown): Usage {
     memoryByteSeconds: count(d, "memory_byte_seconds", w),
     egressSentBytes: count(d, "egress_sent_bytes", w),
     egressReceivedBytes: count(d, "egress_received_bytes", w),
+    ingressReceivedBytes: optCount(d, "ingress_received_bytes", w) ?? 0,
+    ingressSentBytes: optCount(d, "ingress_sent_bytes", w) ?? 0,
   };
+}
+
+export function parseIngress(v: unknown): Ingress {
+  const w = "ingress";
+  const d = obj(v, w);
+  if (!Array.isArray(d.ports)) throw new ResponseError("ingress: `ports` is not a list");
+  const ports = d.ports.map((p: unknown) => {
+    const q = obj(p, "port");
+    const port = count(q, "port", "port");
+    if (port < 1 || port > 65535) throw new ResponseError("port: out of range");
+    return { port, public: bool(q, "public", "port"), url: str(q, "url", "port") };
+  });
+  return { token: str(d, "token", w), ports };
 }
 
 function optCount(d: Obj, key: string, what: string): number | null {
@@ -238,6 +275,7 @@ export function parseUsage(v: unknown): TenantUsage {
       requestBurst: optCount(q, "request_burst", "quotas"),
       cpuSecondsPerPeriod: optNum(q, "cpu_seconds_per_period", "quotas"),
       egressBytesPerPeriod: optCount(q, "egress_bytes_per_period", "quotas"),
+      maxIngressConnections: optCount(q, "max_ingress_connections", "quotas"),
     },
     exceeded: exceeded as string[],
   };

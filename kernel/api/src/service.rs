@@ -18,6 +18,10 @@
 //! | `GET /v1/sandboxes/{id}/files?path=P` | | the bytes |
 //! | `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `WriteResult` |
 //! | `POST /v1/sandboxes/{id}/files/edit` | `EditRequest` | `EditResult` |
+//! | `GET /v1/sandboxes/{id}/ingress` | | `IngressInfo` (token, exposed ports and their URLs) |
+//! | `PUT /v1/sandboxes/{id}/ingress/ports/{port}` | `ExposeRequest` | `IngressInfo` |
+//! | `DELETE /v1/sandboxes/{id}/ingress/ports/{port}` | | `IngressInfo` |
+//! | `POST /v1/sandboxes/{id}/ingress/token` | | `IngressInfo` (a new token) |
 //! | `GET /v1/usage` | | `TenantUsage` |
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,8 +30,9 @@ use std::time::{Duration, Instant};
 use hellovm_control::http::{self, percent_encode, ClientResponse, Handler, Request, Response};
 use hellovm_control::ids::{token_eq, SandboxId};
 use hellovm_control::types::{
-    self, CreateSandbox, DrainRequest, ExecRequest, NodeCreate, NodeStatus, PollQuery, SandboxInfo,
-    SandboxList, TenantUsage,
+    self, check_port, CreateSandbox, DrainRequest, ExecRequest, IngressInfo, NodeCreate,
+    NodeIngress, NodeStatus, PollQuery, PortInfo, SandboxInfo, SandboxList, TenantUsage,
+    TouchRequest,
 };
 use hellovm_control::unix_ms;
 
@@ -65,6 +70,8 @@ pub struct Api {
     /// The usage log's writer, when there is a log.
     pub log: Option<Arc<LogWriter>>,
     pub limiter: RateLimiter,
+    /// HTTP ingress, when configured.
+    pub ingress: Option<crate::ingress::IngressState>,
 }
 
 fn error(status: u16, code: &str, message: &str) -> Response {
@@ -133,6 +140,7 @@ impl Api {
                 .map(|prefix| Arc::new(LogWriter::new(prefix, m.max_file_mb))),
             meter: Mutex::new(meter),
             limiter: RateLimiter::default(),
+            ingress: None,
             config,
             tenants,
             nodes,
@@ -154,9 +162,29 @@ impl Api {
             .into_iter()
             .map(|r| (r.id, r.tenant, r.node))
             .collect();
+        let counts = self
+            .ingress
+            .as_ref()
+            .map(|i| {
+                i.retain(|id| self.store.get(id).is_some());
+                i.take_counts()
+            })
+            .unwrap_or_default();
         let lines = {
             let mut meter = self.meter();
-            meter.tick(unix_ms(), flush, &deletes);
+            let now_ms = unix_ms();
+            for c in counts {
+                meter.ingress(
+                    now_ms,
+                    &c.sandbox,
+                    &c.tenant,
+                    &c.node,
+                    &c.template,
+                    c.received,
+                    c.sent,
+                );
+            }
+            meter.tick(now_ms, flush, &deletes);
             meter.take_lines()
         };
         if let Some(log) = &self.log {
@@ -446,6 +474,85 @@ impl Api {
             !list.ended_more,
         );
         self.finish_deletes(i, &reported);
+        self.touch(i, timeout);
+    }
+
+    /// Tells node `i` which of its sandboxes were used through ingress
+    /// since the last probe (their idle timeouts start again). Whether it
+    /// answers does not count for its health.
+    fn touch(&self, i: usize, timeout: Duration) {
+        let Some(ingress) = &self.ingress else {
+            return;
+        };
+        let node = &self.nodes.configs()[i];
+        let ids = ingress.take_touched(&node.name);
+        for chunk in ids.chunks(types::MAX_TOUCH) {
+            let body = TouchRequest {
+                sandboxes: chunk.iter().map(|id| id.to_string()).collect(),
+            };
+            let Ok(body) = serde_json::to_vec(&body) else {
+                return;
+            };
+            if let Err(err) = self.call_max(
+                node,
+                "POST",
+                "/v1/node/touch",
+                None,
+                &body,
+                timeout,
+                MAX_STATUS,
+            ) {
+                log::debug!("node {}: touching sandboxes: {err}", node.name);
+                return;
+            }
+        }
+    }
+
+    /// The ingress counters the API keeps, in a node's answer about a
+    /// sandbox (the node reports none).
+    fn with_ingress_usage(&self, info: &mut SandboxInfo) {
+        if let Some(id) = SandboxId::parse(&info.id) {
+            let (received, sent) = self.meter().ingress_of(&id);
+            info.usage.ingress_received_bytes = received;
+            info.usage.ingress_sent_bytes = sent;
+        }
+    }
+
+    /// A node's answer about a sandbox's ingress as its tenant sees it:
+    /// with the ports' URLs. Remembered for the ingress listener.
+    fn ingress_answer(&self, sandbox: SandboxId, answer: ClientResponse) -> Response {
+        let Some(ingress) = &self.ingress else {
+            return Self::ingress_disabled();
+        };
+        if answer.status != 200 {
+            return answer.into_response();
+        }
+        let state = match serde_json::from_slice::<NodeIngress>(&answer.body) {
+            Ok(state) if crate::ingress::valid_state(&state) => state,
+            _ => return error(502, "node_failed", "the node's answer is not valid"),
+        };
+        let info = IngressInfo {
+            token: state.token.clone(),
+            ports: state
+                .ports
+                .iter()
+                .map(|p| PortInfo {
+                    port: p.port,
+                    public: p.public,
+                    url: ingress.url(p.port, &sandbox),
+                })
+                .collect(),
+        };
+        ingress.remember(sandbox, state);
+        Response::json(200, &info)
+    }
+
+    fn ingress_disabled() -> Response {
+        error(
+            404,
+            "ingress_disabled",
+            "ingress is not configured on this API",
+        )
     }
 
     /// Does the deletes that waited for node `i`, which answered and runs
@@ -833,6 +940,9 @@ impl Api {
             }
         }
         sandboxes.sort_by_key(|s| (s.created_at, s.id.clone()));
+        for s in &mut sandboxes {
+            self.with_ingress_usage(s);
+        }
         Response::json(
             200,
             &SandboxList {
@@ -900,6 +1010,9 @@ impl Api {
         };
         let method = request.method.as_str();
         let delete = method == "DELETE" && rest.is_empty();
+        if rest.first() == Some(&"ingress") && self.ingress.is_none() {
+            return Self::ingress_disabled();
+        }
         if !self.nodes.reachable(i) {
             if delete {
                 return self.delete_later(&record);
@@ -982,6 +1095,25 @@ impl Api {
             ("POST", ["files", "edit"]) => {
                 (format!("/v1/sandboxes/{sandbox}/files/edit"), FILE_TIMEOUT)
             }
+            ("GET", ["ingress"]) => (format!("/v1/sandboxes/{sandbox}/ingress"), NODE_TIMEOUT),
+            ("POST", ["ingress", "token"]) => (
+                format!("/v1/sandboxes/{sandbox}/ingress/token"),
+                NODE_TIMEOUT,
+            ),
+            ("PUT" | "DELETE", ["ingress", "ports", port]) => {
+                let Some(port) = check_port(port) else {
+                    return error(400, "bad_request", "a port is 1 to 65535");
+                };
+                if method == "PUT" && !request.body.is_empty() {
+                    if let Err(e) = serde_json::from_slice::<types::ExposeRequest>(&request.body) {
+                        return error(400, "bad_request", &format!("malformed JSON body: {e}"));
+                    }
+                }
+                (
+                    format!("/v1/sandboxes/{sandbox}/ingress/ports/{port}"),
+                    NODE_TIMEOUT,
+                )
+            }
             _ => return error(404, "no_route", "no such endpoint"),
         };
         let answer = match self.call(
@@ -1015,6 +1147,15 @@ impl Api {
             self.store.forget(&sandbox);
         } else if gone {
             self.store.remove(&sandbox);
+        }
+        if rest.first() == Some(&"ingress") {
+            return self.ingress_answer(sandbox, answer);
+        }
+        if method == "GET" && rest.is_empty() && answer.status == 200 {
+            if let Ok(mut info) = serde_json::from_slice::<SandboxInfo>(&answer.body) {
+                self.with_ingress_usage(&mut info);
+                return Response::json(200, &info);
+            }
         }
         answer.into_response()
     }
@@ -1169,6 +1310,7 @@ impl Handler for Admin {
                         "sandboxes_metered": tracked,
                         "odd_reports": odd,
                         "deletes_waiting": api.store.deletes().len(),
+                        "ingress_connections": api.ingress.as_ref().map(|i| i.open()),
                         "log": log,
                     }),
                 )

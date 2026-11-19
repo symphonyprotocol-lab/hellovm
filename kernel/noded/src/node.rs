@@ -12,10 +12,10 @@
 //! operations, and removes the sandbox when the agent breaks the protocol
 //! or misses a deadline.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read};
-use std::net::Shutdown;
+use std::net::{Shutdown, TcpStream};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -27,8 +27,8 @@ use hellovm_control::http::Response;
 use hellovm_control::ids::SandboxId;
 use hellovm_control::types::{
     self, EditRequest, EditResult, EndedSandbox, ExecError, ExecKind, ExecList, ExecPoll,
-    ExecRequest, ExecResult, ExecState, ExecStatus, NodeCreate, NodeStatus, PollQuery, ResetResult,
-    SandboxInfo, SandboxUsage, WriteResult,
+    ExecRequest, ExecResult, ExecState, ExecStatus, ExposedPort, NodeCreate, NodeIngress,
+    NodeStatus, PollQuery, ResetResult, SandboxInfo, SandboxUsage, WriteResult,
 };
 use hellovm_control::unix_ms;
 use serde_json::{json, Map, Value};
@@ -65,6 +65,10 @@ const FINAL_AFTER: Duration = Duration::from_secs(2);
 const STATS_TIMEOUT: Duration = Duration::from_millis(500);
 /// Bytes of a sandbox's agent log (its stderr) passed to noded's log.
 const LOG_BUDGET: usize = 64 * 1024;
+/// How long handing an inbound connection to a sandbox's kernel process
+/// may wait for room in its ingress channel (the kernel process reads it
+/// all the time; it is full only when that process is stuck).
+const HAND_OVER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// An error as the node API reports it.
 #[derive(Debug, Clone)]
@@ -292,10 +296,34 @@ pub struct Sandbox {
     /// Most host processes (guest processes and threads) it may have.
     max_processes: usize,
     ready_ms: f64,
+    /// Its ingress channel (see `hellovm::warm`): inbound connections are
+    /// handed to its kernel process here, one at a time.
+    ingress_channel: Mutex<UnixStream>,
+    ingress: Mutex<Ingress>,
     /// When its kernel process started (clock ticks since boot): with its
     /// pid, what the egress proxy counts its flows by.
     kernel_start: Option<u64>,
     counters: Mutex<Counters>,
+}
+
+/// A sandbox's ingress: its token and its exposed ports (whether each is
+/// public).
+struct Ingress {
+    token: String,
+    ports: BTreeMap<u16, bool>,
+}
+
+impl Ingress {
+    fn view(&self) -> NodeIngress {
+        NodeIngress {
+            token: self.token.clone(),
+            ports: self
+                .ports
+                .iter()
+                .map(|(&port, &public)| ExposedPort { port, public })
+                .collect(),
+        }
+    }
 }
 
 /// What a sandbox used, as measured so far. Every field only grows.
@@ -355,7 +383,8 @@ impl Sandbox {
         }
     }
 
-    /// What it used, with its run time counted until `until`.
+    /// What it used, with its run time counted until `until`. Ingress is
+    /// counted by the API, which relays it: 0 here.
     fn usage(&self, until: Instant) -> SandboxUsage {
         let c = *lock(&self.counters);
         SandboxUsage {
@@ -364,7 +393,16 @@ impl Sandbox {
             memory_byte_seconds: c.memory_byte_seconds,
             egress_sent_bytes: c.egress_sent_bytes,
             egress_received_bytes: c.egress_received_bytes,
+            ..SandboxUsage::default()
         }
+    }
+
+    /// Hands `conn`, an inbound connection to guest `port`, to the clone's
+    /// kernel process over its ingress channel. The kernel process tells
+    /// the other end of `conn` whether a listener took it.
+    fn hand_over(&self, port: u16, conn: TcpStream) -> io::Result<()> {
+        let channel = lock(&self.ingress_channel);
+        hellovm::warm::send_with_fds(&channel, &port.to_le_bytes(), &[conn.as_raw_fd()])
     }
 
     /// Kills the clone: the template sees the connection's write side
@@ -880,15 +918,23 @@ impl Node {
         let (in_r, in_w) = std::io::pipe().map_err(|e| internal("pipes", &e))?;
         let (out_r, out_w) = std::io::pipe().map_err(|e| internal("pipes", &e))?;
         let (err_r, err_w) = std::io::pipe().map_err(|e| internal("pipes", &e))?;
-        let mut clone = WarmClone::request(
+        let (ingress_channel, theirs) =
+            UnixStream::pair().map_err(|e| internal("the ingress channel", &e))?;
+        ingress_channel
+            .set_write_timeout(Some(HAND_OVER_TIMEOUT))
+            .map_err(|e| internal("the ingress channel", &e))?;
+        let token =
+            hellovm_control::ids::random_token().map_err(|e| internal("an ingress token", &e))?;
+        let mut clone = WarmClone::request_with(
             &template.socket,
             Some(id.egress_id()),
             b"",
             [in_r.as_fd(), out_w.as_fd(), err_w.as_fd()],
+            Some(theirs.as_fd()),
         )
         .map_err(|e| internal("asking the template for a clone", &e))?;
         // Only the clone holds these now.
-        drop((in_r, out_w, err_w));
+        drop((in_r, out_w, err_w, theirs));
         clone
             .stream()
             .set_read_timeout(Some(START_DEADLINE))
@@ -931,6 +977,11 @@ impl Node {
             memory_limit: template.config.memory_limit_mb << 20,
             max_processes: template.config.max_processes,
             ready_ms,
+            ingress_channel: Mutex::new(ingress_channel),
+            ingress: Mutex::new(Ingress {
+                token,
+                ports: BTreeMap::new(),
+            }),
             kernel_start: crate::memory::stat_of(run.pid).map(|s| s.start),
             counters: Mutex::new(Counters::default()),
         });
@@ -1095,6 +1146,95 @@ impl Node {
             }
         }
         drop(clone);
+    }
+
+    /// A sandbox's ingress: its token and exposed ports.
+    pub fn ingress(&self, id: &str, tenant: Option<&str>) -> Result<NodeIngress, ApiError> {
+        Ok(lock(&self.get(id, tenant)?.ingress).view())
+    }
+
+    /// Exposes `port` (or changes whether it is public). At most
+    /// [`types::MAX_EXPOSED_PORTS`] per sandbox.
+    pub fn expose(
+        &self,
+        id: &str,
+        tenant: Option<&str>,
+        port: u16,
+        public: bool,
+    ) -> Result<NodeIngress, ApiError> {
+        let sandbox = self.get(id, tenant)?;
+        let mut ingress = lock(&sandbox.ingress);
+        if !ingress.ports.contains_key(&port) && ingress.ports.len() >= types::MAX_EXPOSED_PORTS {
+            return Err(ApiError::new(
+                409,
+                "too_many_ports",
+                format!(
+                    "at most {} ports may be exposed at once",
+                    types::MAX_EXPOSED_PORTS
+                ),
+            ));
+        }
+        ingress.ports.insert(port, public);
+        Ok(ingress.view())
+    }
+
+    /// Stops exposing `port` (nothing happens when it is not).
+    /// Connections already made go on.
+    pub fn unexpose(
+        &self,
+        id: &str,
+        tenant: Option<&str>,
+        port: u16,
+    ) -> Result<NodeIngress, ApiError> {
+        let sandbox = self.get(id, tenant)?;
+        let mut ingress = lock(&sandbox.ingress);
+        ingress.ports.remove(&port);
+        Ok(ingress.view())
+    }
+
+    /// Replaces the ingress token with a new random one.
+    pub fn rotate_token(&self, id: &str, tenant: Option<&str>) -> Result<NodeIngress, ApiError> {
+        let sandbox = self.get(id, tenant)?;
+        let token = hellovm_control::ids::random_token()
+            .map_err(|e| ApiError::new(503, "internal", format!("a token: {e}")))?;
+        let mut ingress = lock(&sandbox.ingress);
+        ingress.token = token;
+        Ok(ingress.view())
+    }
+
+    /// The answer to `POST .../ingress/connect?port=P`: `200`, after which
+    /// the connection itself is handed to the sandbox's kernel process for
+    /// guest port `port`, which must be exposed. Counts as use of the
+    /// sandbox. The caller (the API) checked the token.
+    pub fn connect(&self, id: &str, tenant: Option<&str>, port: u16) -> Result<Response, ApiError> {
+        let sandbox = self.get(id, tenant)?;
+        if !lock(&sandbox.ingress).ports.contains_key(&port) {
+            return Err(ApiError::new(
+                404,
+                "port_not_exposed",
+                "the port is not exposed",
+            ));
+        }
+        sandbox.touch();
+        Ok(Response::empty(200).take_over(move |conn| {
+            if let Err(err) = sandbox.hand_over(port, conn) {
+                log::debug!(
+                    "sandbox {}: an inbound connection was not handed over: {err}",
+                    sandbox.id
+                );
+            }
+        }))
+    }
+
+    /// Sandboxes used through ingress: their idle timeouts start again.
+    /// Unknown ids are skipped. Returns how many were touched.
+    pub fn touch(&self, ids: &[String]) -> usize {
+        let sandboxes = lock(&self.sandboxes);
+        ids.iter()
+            .filter_map(|id| SandboxId::parse(id))
+            .filter_map(|id| sandboxes.get(&id))
+            .map(|s| s.touch())
+            .count()
     }
 
     /// Removes sandboxes past their lifetime or idle too long. Runs for

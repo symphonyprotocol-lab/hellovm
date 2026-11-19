@@ -41,6 +41,7 @@ with client.create() as sandbox:                 # deleted when the block ends, 
 | `sandbox.stream(command, ...)`, `sandbox.stream_python(code, *, stateful=False, ...) -> Execution` | iterate: `OutputEvent`, `OmittedEvent`, then one `ResultEvent`; `cancel()` (any thread), `close()`, `wait()`, `cursor`, `result`; as a context manager it cancels what has not ended |
 | `sandbox.read_file(path) -> bytes`, `read_text`, `write_file(path, bytes or str) -> int`, `edit_file(path, old, new, *, replace_all=False) -> int` | at most 16 MiB |
 | `sandbox.reset_python() -> bool`, `sandbox.latest_exec()`, `sandbox.refresh()`, `sandbox.delete()` | |
+| `sandbox.ingress() -> Ingress` (`token`, `ports`), `expose(port, *, public=False) -> ExposedPort` (`port`, `public`, `url`), `unexpose(port)`, `rotate_ingress_token() -> str` | a server in the sandbox listening on `0.0.0.0:port`, reached from outside at `url`; with the token in `X-Hellovm-Ingress-Token` unless public |
 
 `ExecResult`: `exec_id`, `exit_code`, `signal`, `timed_out`, `cancelled`,
 `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`,

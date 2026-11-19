@@ -2,7 +2,7 @@
  * End-to-end tests against a real plane, the same ground as the Python
  * SDK's: `kernel/api/tests/sdk.rs` starts one and passes it in
  * `HELLOVM_TEST_URL`, `HELLOVM_TEST_TOKEN`, `HELLOVM_TEST_TEMPLATE`,
- * `HELLOVM_TEST_TOKEN_B`, `HELLOVM_TEST_TEMPLATE_B`. Skipped without them
+ * `HELLOVM_TEST_TOKEN_B`, `HELLOVM_TEST_TEMPLATE_B`, `HELLOVM_TEST_INGRESS`. Skipped without them
  * (a failure with `HELLOVM_REQUIRE_E2E=1`).
  */
 
@@ -28,6 +28,7 @@ const TOKEN = process.env.HELLOVM_TEST_TOKEN ?? "";
 const TEMPLATE = process.env.HELLOVM_TEST_TEMPLATE ?? "python";
 const TOKEN_B = process.env.HELLOVM_TEST_TOKEN_B ?? "";
 const TEMPLATE_B = process.env.HELLOVM_TEST_TEMPLATE_B ?? TEMPLATE;
+const INGRESS = process.env.HELLOVM_TEST_INGRESS ?? "";
 const skip = !URL_ || !TOKEN;
 if (skip && process.env.HELLOVM_REQUIRE_E2E === "1") {
   throw new Error("required e2e dependency missing: HELLOVM_TEST_URL (start a plane, see kernel/api/tests/sdk.rs)");
@@ -207,6 +208,43 @@ describe("against a real plane", { skip: skip ? "set HELLOVM_TEST_URL and HELLOV
     const bad = await shared.exec("true", { timeout: -1 }).catch((e: unknown) => e);
     assert.ok(bad instanceof APIError);
     assert.deepEqual([bad.status, bad.code], [400, "bad_request"]);
+  });
+
+  test("ingress: expose a server, the token, public, unexpose", { skip: !INGRESS }, async () => {
+    await client.withSandbox({ template: TEMPLATE }, async (sb) => {
+      await sb.writeFile("/tmp/www/index.html", "hello from the sandbox\n");
+      await sb.exec("cd /tmp/www && nohup python3 -m http.server 8000 --bind 0.0.0.0 >/dev/null 2>&1 &");
+      assert.deepEqual((await sb.ingress()).ports, []);
+      const port = await sb.expose(8000);
+      assert.equal(port.public, false);
+      const host = new URL(port.url).hostname;
+      assert.ok(host.startsWith(`8000-${sb.id}.`), port.url);
+      const token = (await sb.ingress()).token;
+      const [addr, p] = [INGRESS.slice(0, INGRESS.lastIndexOf(":")), Number(INGRESS.slice(INGRESS.lastIndexOf(":") + 1))];
+      const get = (headers: string) =>
+        new Promise<[number, string]>((resolve, reject) => {
+          const sock = net.connect(p, addr);
+          const chunks: Buffer[] = [];
+          sock.on("data", (d) => chunks.push(d));
+          sock.on("error", reject);
+          sock.on("end", () => {
+            const text = Buffer.concat(chunks).toString();
+            resolve([Number(text.slice(9, 12)), text.slice(text.indexOf("\r\n\r\n") + 4)]);
+          });
+          sock.write(`GET /index.html HTTP/1.1\r\nHost: ${host}\r\n${headers}\r\n`);
+        });
+      const auth = `X-Hellovm-Ingress-Token: ${token}\r\n`;
+      await eventually("the server answers", async () => (await get(auth))[0] === 200);
+      assert.deepEqual(await get(auth), [200, "hello from the sandbox\n"]);
+      assert.equal((await get(""))[0], 404);
+      assert.equal((await sb.expose(8000, { public: true })).public, true);
+      assert.equal((await get(""))[0], 200);
+      const rotated = await sb.rotateIngressToken();
+      assert.notEqual(rotated, token);
+      await sb.unexpose(8000);
+      assert.equal((await get(`X-Hellovm-Ingress-Token: ${rotated}\r\n`))[0], 404);
+      await eventually("ingress metered", async () => ((await sb.refresh()).usage?.ingressSentBytes ?? 0) > 0, 10000);
+    });
   });
 
   test("exec timeout", async () => {
