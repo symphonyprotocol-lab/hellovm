@@ -752,3 +752,141 @@ print("small ok")
         .unwrap();
     assert_eq!(bad.status.code(), Some(2));
 }
+
+/// A clone serving TCP on `0.0.0.0:8080` (and on `127.0.0.1:8081`, which
+/// ingress must not reach), driven through its ingress channel.
+const INGRESS_SERVER: &str = r#"
+import socket, time
+s = socket.socket()
+s.bind(("0.0.0.0", 8080))
+s.listen(32)
+lo = socket.socket()
+lo.bind(("127.0.0.1", 8081))
+lo.listen(4)
+print("listening", flush=True)
+# 1: read to the opener's FIN, answer, half-close, then read what follows.
+c, peer = s.accept()
+print("peer", peer[0], peer[1], flush=True)
+data = b""
+while True:
+    b = c.recv(65536)
+    if not b:
+        break
+    data += b
+c.sendall(b"got %d %s" % (len(data), data[:5]))
+c.shutdown(socket.SHUT_WR)
+c.close()
+# 2: a large answer to a slow reader.
+c, _ = s.accept()
+c.sendall(b"x" * (1 << 20))
+c.close()
+# 3: twenty at once, an echo of one line each.
+conns = [s.accept()[0] for _ in range(20)]
+for c in conns:
+    c.sendall(c.recv(100))
+    c.close()
+print("echoed", flush=True)
+# 4: one more is queued, then the listener goes away.
+time.sleep(0.5)
+s.close()
+print("closed", flush=True)
+# 5: a new listener; its connection stays open until the sandbox ends.
+s = socket.socket()
+s.bind(("0.0.0.0", 8082))
+s.listen(1)
+print("again", flush=True)
+c, _ = s.accept()
+time.sleep(60)
+"#;
+
+/// Hands the clone a new inbound connection to `port` and reads its
+/// verdict: the connection when it was accepted, `None` when refused.
+fn inbound(
+    channel: &std::os::unix::net::UnixStream,
+    port: u16,
+) -> Option<std::os::unix::net::UnixStream> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    hellovm::warm::send_with_fds(channel, &port.to_le_bytes(), &[theirs.as_raw_fd()]).unwrap();
+    drop(theirs);
+    ours.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut verdict = Vec::new();
+    ours.by_ref().take(1).read_to_end(&mut verdict).unwrap();
+    match verdict.as_slice() {
+        b"A" => Some(ours),
+        b"R" => {
+            let mut rest = Vec::new();
+            ours.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty(), "bytes after R: {rest:?}");
+            None
+        }
+        other => panic!("verdict {other:?}"),
+    }
+}
+
+#[test]
+fn inbound_connections_through_the_ingress_channel() {
+    use std::io::{Read, Write};
+    if !require_python() {
+        return;
+    }
+    let template = python_template();
+    ready(&template);
+    let (mut clone, channel) = template
+        .spawn_with_ingress(INGRESS_SERVER.as_bytes())
+        .unwrap_or_else(|err| panic!("a clone: {err}\n{}", template.output()));
+    assert_eq!(clone.line(), "listening\n");
+    // Nobody listens there, or only on loopback.
+    assert!(inbound(&channel, 9999).is_none());
+    assert!(inbound(&channel, 8081).is_none());
+    assert!(inbound(&channel, 0).is_none());
+    // 1: both ways, the opener's FIN, the guest's half-close.
+    let mut one = inbound(&channel, 8080).expect("accepted");
+    let body = vec![b'b'; 200_000];
+    one.write_all(&body).unwrap();
+    one.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut answer = Vec::new();
+    one.read_to_end(&mut answer).unwrap();
+    assert_eq!(answer, b"got 200000 bbbbb");
+    assert_eq!(clone.line(), "peer 192.0.2.1 32768\n");
+    // 2: a megabyte, taken slowly at first: the guest waits for room.
+    let mut two = inbound(&channel, 8080).expect("accepted");
+    std::thread::sleep(Duration::from_millis(300));
+    let mut got = Vec::new();
+    two.read_to_end(&mut got).unwrap();
+    assert_eq!(got.len(), 1 << 20);
+    assert!(got.iter().all(|&b| b == b'x'));
+    // 3: twenty at once.
+    let mut many: Vec<_> = (0..20)
+        .map(|i| {
+            let mut c = inbound(&channel, 8080).expect("accepted");
+            c.write_all(format!("line {i}\n").as_bytes()).unwrap();
+            c
+        })
+        .collect();
+    for (i, c) in many.iter_mut().enumerate() {
+        let mut got = String::new();
+        c.read_to_string(&mut got).unwrap();
+        assert_eq!(got, format!("line {i}\n"));
+    }
+    assert_eq!(clone.line(), "echoed\n");
+    // 4: queued when the listener closes: it ends without a byte.
+    let mut queued = inbound(&channel, 8080).expect("queued");
+    assert_eq!(clone.line(), "closed\n");
+    let mut got = Vec::new();
+    let _ = queued.read_to_end(&mut got);
+    assert!(got.is_empty(), "{got:?}");
+    assert!(inbound(&channel, 8080).is_none(), "no listener any more");
+    // 5: the sandbox ends while a connection is open: it ends too.
+    assert_eq!(clone.line(), "again\n");
+    let mut open = inbound(&channel, 8082).expect("accepted");
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    let _ = clone.kill();
+    let mut got = Vec::new();
+    let _ = open.read_to_end(&mut got);
+    assert!(got.is_empty());
+    assert!(started.elapsed() < Duration::from_secs(15));
+}

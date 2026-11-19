@@ -637,6 +637,41 @@ impl Template {
         })
     }
 
+    /// [`Template::spawn`] with an ingress channel: returns the clone and
+    /// the requester's end of the channel.
+    pub fn spawn_with_ingress(
+        &self,
+        input: &[u8],
+    ) -> std::io::Result<(RunningClone, std::os::unix::net::UnixStream)> {
+        use std::os::fd::AsFd;
+        let (in_r, in_w) = std::io::pipe()?;
+        let (out_r, out_w) = std::io::pipe()?;
+        let (err_r, err_w) = std::io::pipe()?;
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+        let mut conn = hellovm::warm::WarmClone::request_with(
+            &self.socket,
+            None,
+            input,
+            [in_r.as_fd(), out_w.as_fd(), err_w.as_fd()],
+            Some(theirs.as_fd()),
+        )?;
+        drop((in_r, out_w, err_w, theirs));
+        let started = conn.start()?;
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_done = collect(err_r, stderr.clone());
+        Ok((
+            RunningClone {
+                conn,
+                started,
+                stdin: Some(in_w),
+                stdout: std::io::BufReader::new(out_r),
+                stderr,
+                stderr_done,
+            },
+            ours,
+        ))
+    }
+
     /// Runs a clone to its end with `stdin` as its input.
     pub fn run(&self, input: &[u8], stdin: &[u8]) -> CloneRun {
         let mut clone = self

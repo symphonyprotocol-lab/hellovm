@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use crate::arch::{Arch, Sysno};
 use crate::host::{
-    ConsoleStream, Host, HostFileKind, HostStat, HostStreamId, ImagePath, OutboundFlow,
-    StreamStatus,
+    ConsoleStream, Host, HostFileKind, HostStat, HostStreamId, ImagePath, InboundConn,
+    OutboundFlow, StreamStatus,
 };
 use crate::platform::{
     AddressSpace, AddressSpaceInfo, AppMemory, Context, CpuInfo, Event, FrozenSpace, GuestAddr,
@@ -575,11 +575,18 @@ pub struct MockHost {
     pub splice_fail_connect: bool,
     /// The peer half-closes (FIN) as soon as the stream is up. Writes still work.
     pub splice_peer_fin: bool,
+    /// Inbound connections to hand over: when (on the mock clock), the
+    /// guest port, what the opener sends, and whether it then half-closes.
+    pub inbound: VecDeque<(Duration, u16, Vec<u8>, bool)>,
+    /// How the kernel answered each inbound connection, in order.
+    pub inbound_answers: Vec<(HostStreamId, bool)>,
     streams: Vec<MockStream>,
 }
 
 struct MockStream {
     flow: OutboundFlow,
+    /// Closed by the kernel (or refused).
+    closed: bool,
     inbound: VecDeque<u8>,
     outbound: VecDeque<u8>,
     shut_wr: bool,
@@ -718,6 +725,7 @@ impl Host for MockHost {
         let id = self.streams.len() as u64;
         self.streams.push(MockStream {
             flow,
+            closed: false,
             inbound: VecDeque::new(),
             outbound: VecDeque::new(),
             shut_wr: false,
@@ -798,6 +806,48 @@ impl Host for MockHost {
         if let Ok(stream) = self.mock_stream_mut(id) {
             stream.broken = true;
             stream.read_eof = true;
+            stream.closed = true;
+        }
+    }
+
+    fn inbound_pending(&self) -> bool {
+        self.inbound
+            .front()
+            .is_some_and(|(at, ..)| *at <= self.clock.get())
+    }
+
+    fn take_inbound(&mut self) -> Option<InboundConn> {
+        if !self.inbound_pending() {
+            return None;
+        }
+        let (_, port, data, fin) = self.inbound.pop_front()?;
+        let id = self.streams.len() as u64;
+        self.streams.push(MockStream {
+            flow: OutboundFlow {
+                sandbox_id: 0,
+                guest_pid: 0,
+                dest_ip: [0; 4],
+                dest_port: port,
+                host: None,
+            },
+            closed: false,
+            inbound: data.into(),
+            outbound: VecDeque::new(),
+            shut_wr: false,
+            read_eof: fin,
+            broken: false,
+            failed: false,
+        });
+        Some(InboundConn {
+            port,
+            stream: HostStreamId(id),
+        })
+    }
+
+    fn answer_inbound(&mut self, stream: HostStreamId, accepted: bool) {
+        self.inbound_answers.push((stream, accepted));
+        if !accepted {
+            self.stream_close(stream);
         }
     }
 }
@@ -822,6 +872,23 @@ impl MockHost {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Whether the kernel closed stream `id`.
+    pub fn stream_closed(&self, id: HostStreamId) -> bool {
+        self.streams[id.0 as usize].closed
+    }
+
+    /// Whether the guest half-closed stream `id`.
+    pub fn stream_shut_write(&self, id: HostStreamId) -> bool {
+        self.streams[id.0 as usize].shut_wr
+    }
+
+    /// More bytes from the opener of stream `id`, and maybe its FIN.
+    pub fn stream_send(&mut self, id: HostStreamId, data: &[u8], fin: bool) {
+        let stream = &mut self.streams[id.0 as usize];
+        stream.inbound.extend(data);
+        stream.read_eof |= fin;
     }
 
     pub fn splice_flows(&self) -> impl Iterator<Item = &OutboundFlow> {

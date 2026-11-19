@@ -446,6 +446,7 @@ impl<H: Host> Kernel<H> {
             return Err(KernelError::NoProgram);
         }
         self.host.set_console_waker(platform.waker());
+        self.host.set_inbound_waker(platform.waker());
         let result = self.event_loop(platform);
         self.end_all(platform);
         if let Some(cwd) = self.st.init_cwd.take() {
@@ -729,6 +730,9 @@ impl<H: Host> Kernel<H> {
                 }
                 continue;
             }
+            if self.host.inbound_pending() {
+                self.accept_inbound();
+            }
             self.resume_ready(platform)?;
             if self.st.init_status.is_some() {
                 continue;
@@ -756,6 +760,18 @@ impl<H: Host> Kernel<H> {
                     }
                     self.st.changed = true;
                 }
+            }
+        }
+    }
+
+    /// Queues every inbound connection the host has on the listener of
+    /// its port, or refuses it (see [`crate::net::Net::queue_inbound`]).
+    fn accept_inbound(&mut self) {
+        while let Some(conn) = self.host.take_inbound() {
+            let queued = self.st.net.queue_inbound(conn.port, conn.stream);
+            self.host.answer_inbound(conn.stream, queued);
+            if queued {
+                self.st.changed = true;
             }
         }
     }
@@ -2885,6 +2901,173 @@ mod tests {
         assert_eq!(got[5], 0, "zero-length recv {got:?}");
         assert_eq!(got[6], 4, "the data is still there {got:?}");
         assert_eq!(plat.mem(INIT).peek(buf, 4), b"ping");
+    }
+
+    /// A kernel whose init follows `traps`, with an inbound connection for
+    /// each of `inbound` (port, what its opener sends, whether it then
+    /// half-closes) arriving a second after the start (the script sleeps
+    /// two seconds first, after setting up its listeners).
+    fn with_inbound(
+        traps: Vec<Trap>,
+        inbound: &[(u16, &[u8], bool)],
+        data: &[(u64, &[u8])],
+    ) -> (Kernel<MockHost>, MockPlatform) {
+        let arch = Arch::X86_64;
+        let mut host = host_with_prog(arch);
+        let at = host.clock.get() + Duration::from_secs(1);
+        for (port, bytes, fin) in inbound {
+            host.inbound.push_back((at, *port, bytes.to_vec(), *fin));
+        }
+        let mut plat = MockPlatform::with_scripts(arch, &host, vec![traps]);
+        let mut kernel = Kernel::new(host).with_trace();
+        kernel
+            .exec(&mut plat, b"/bin/prog", &[b"prog".to_vec()], &[])
+            .unwrap();
+        let mem = plat.mem(INIT);
+        mem.poke(SCRATCH, &[0; 0x1000]);
+        for (addr, bytes) in data {
+            mem.poke(*addr, bytes);
+        }
+        (kernel, plat)
+    }
+
+    fn two_seconds() -> [u8; 16] {
+        let mut ts = [0u8; 16];
+        ts[..8].copy_from_slice(&2u64.to_le_bytes());
+        ts
+    }
+
+    /// An inbound connection reaches a listener on `0.0.0.0`: `accept`
+    /// returns it with the gateway as its peer, the opener's bytes and
+    /// FIN arrive, the guest's answer and its half-close go back, and
+    /// closing it closes the stream. Ports nobody listens on, or only on
+    /// loopback, are refused.
+    #[test]
+    fn inbound_connections_are_accepted_and_carry_bytes_both_ways() {
+        let arch = Arch::X86_64;
+        let any = sin([0, 0, 0, 0], 8080);
+        let lo = sin([127, 0, 0, 1], 7070);
+        let (addr, addrlen, peer, peerlen, buf) = (
+            SCRATCH + 0x100,
+            SCRATCH + 0x120,
+            SCRATCH + 0x140,
+            SCRATCH + 0x160,
+            SCRATCH + 0x200,
+        );
+        let traps = vec![
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[3, SCRATCH, 16]),
+            sc(arch, Sysno::Listen, &[3, 4]),
+            sc(arch, Sysno::Socket, &[2, 1, 0]),
+            sc(arch, Sysno::Bind, &[4, SCRATCH + 0x20, 16]),
+            sc(arch, Sysno::Listen, &[4, 4]),
+            sc(arch, Sysno::Nanosleep, &[SCRATCH + 0x40, 0]),
+            sc(arch, Sysno::Accept, &[3, addr, addrlen]),
+            sc(arch, Sysno::Read, &[5, buf, 64]),
+            sc(arch, Sysno::Read, &[5, buf + 64, 64]),
+            sc(arch, Sysno::Write, &[5, SCRATCH + 0x60, 2]),
+            sc(arch, Sysno::Shutdown, &[5, 1]),
+            sc(arch, Sysno::Getpeername, &[5, peer, peerlen]),
+            sc(arch, Sysno::Close, &[5]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ];
+        let (mut kernel, mut plat) = with_inbound(
+            traps,
+            &[(8080, b"GET", true), (9, b"x", false), (7070, b"y", false)],
+            &[
+                (SCRATCH, &any[..]),
+                (SCRATCH + 0x20, &lo[..]),
+                (SCRATCH + 0x40, &two_seconds()[..]),
+                (SCRATCH + 0x60, &b"OK"[..]),
+                (addrlen, &16u32.to_le_bytes()[..]),
+                (peerlen, &16u32.to_le_bytes()[..]),
+            ],
+        );
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[7], 5, "accept {got:?}");
+        assert_eq!(got[8], 3, "read {got:?}");
+        assert_eq!(plat.mem(INIT).peek(buf, 3), b"GET");
+        assert_eq!(got[9], 0, "the opener's FIN {got:?}");
+        assert_eq!(got[10], 2, "write {got:?}");
+        assert_eq!(got[12], 0, "getpeername {got:?}");
+        let gateway = sin([192, 0, 2, 1], crate::net::EPHEMERAL_LO);
+        assert_eq!(plat.mem(INIT).peek(addr, 16), gateway);
+        assert_eq!(plat.mem(INIT).peek(peer, 16), gateway);
+        let answers = kernel.host.inbound_answers.clone();
+        let accepted: Vec<bool> = answers.iter().map(|a| a.1).collect();
+        assert_eq!(accepted, [true, false, false], "{answers:?}");
+        let stream = answers[0].0;
+        assert_eq!(kernel.host.splice_outbound(stream), b"OK");
+        assert!(kernel.host.stream_shut_write(stream));
+        assert!(kernel.host.stream_closed(stream));
+        assert!(kernel.host.stream_closed(answers[1].0));
+        assert_eq!(kernel.st.net.inbound_open(), 0);
+    }
+
+    /// A full backlog refuses the next inbound connection; closing the
+    /// listener closes the ones still queued; at most `MAX_INBOUND` are
+    /// open at once; the end of the sandbox closes the rest.
+    #[test]
+    fn inbound_backlog_listener_close_limit_and_sandbox_end() {
+        let arch = Arch::X86_64;
+        let max = crate::net::MAX_INBOUND;
+        let mut traps = Vec::new();
+        // Listeners on 9000, 9001, 9002 (backlog 128 each) and 8080
+        // (backlog 2, fd 6).
+        for (i, port) in [9000u16, 9001, 9002, 8080].iter().enumerate() {
+            let at = SCRATCH + 0x300 + i as u64 * 0x20;
+            traps.extend([
+                sc(arch, Sysno::Socket, &[2, 1, 0]),
+                sc(arch, Sysno::Bind, &[3 + i as u64, at, 16]),
+                sc(
+                    arch,
+                    Sysno::Listen,
+                    &[3 + i as u64, if *port == 8080 { 2 } else { 128 }],
+                ),
+            ]);
+        }
+        traps.extend([
+            sc(arch, Sysno::Nanosleep, &[SCRATCH + 0x40, 0]),
+            // One of 8080's is accepted and kept open past the end.
+            sc(arch, Sysno::Accept, &[6, 0, 0]),
+            // Closing 8080's listener drops the one still queued.
+            sc(arch, Sysno::Close, &[6]),
+            sc(arch, Sysno::ExitGroup, &[0]),
+        ]);
+        let mut inbound: Vec<(u16, &[u8], bool)> = vec![(8080, b"", false); 3];
+        // 128 for each of the others: the limit is reached during 9001's.
+        for port in [9000u16, 9001, 9002] {
+            inbound.extend(std::iter::repeat_n((port, &b""[..], false), 128));
+        }
+        let mut data: Vec<(u64, Vec<u8>)> = vec![(SCRATCH + 0x40, two_seconds().to_vec())];
+        for (i, port) in [9000u16, 9001, 9002, 8080].iter().enumerate() {
+            data.push((
+                SCRATCH + 0x300 + i as u64 * 0x20,
+                sin([0, 0, 0, 0], *port).to_vec(),
+            ));
+        }
+        let data: Vec<(u64, &[u8])> = data.iter().map(|(a, d)| (*a, &d[..])).collect();
+        let (mut kernel, mut plat) = with_inbound(traps, &inbound, &data);
+        assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+        let got = returns(&plat, INIT);
+        assert_eq!(got[13], 7, "accept {got:?}");
+        let answers = kernel.host.inbound_answers.clone();
+        assert_eq!(answers.len(), 3 + 3 * 128);
+        // 8080: two queued, the third refused (backlog 2).
+        assert_eq!(
+            answers[..3].iter().map(|a| a.1).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        let taken = answers.iter().filter(|a| a.1).count();
+        assert_eq!(taken, max, "at most MAX_INBOUND open at once");
+        assert!(!answers.last().unwrap().1, "the last one is past the limit");
+        // Every stream is closed by now: refused, dropped with its
+        // listener, or at the end of the sandbox.
+        for (id, _) in &answers {
+            assert!(kernel.host.stream_closed(*id), "stream {id:?}");
+        }
+        assert_eq!(kernel.st.net.inbound_open(), 0);
     }
 
     /// `recvmsg` rejects iovec lengths whose sum overflows, and reports an

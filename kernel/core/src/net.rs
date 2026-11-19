@@ -34,6 +34,13 @@
 //! with unread data, or the host stream fails a write) fails the write
 //! immediately. That is what lets a server still reply after it has read
 //! the client's FIN.
+//!
+//! Inbound connections (ingress, [`Net::queue_inbound`]): the host side
+//! opens a connection to a guest port; it arrives at the guest NIC address,
+//! `192.0.2.2:PORT`, so a listener on `0.0.0.0` or `192.0.2.2` gets it and
+//! one on `127.0.0.1` only does not. Its peer is the gateway,
+//! `192.0.2.1`, on a port from the ephemeral range: never a loopback
+//! address, which servers often trust. Nothing a guest does can open one.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
@@ -78,6 +85,9 @@ const MAX_SOCKETS: usize = 4096;
 /// `listen` backlog limits.
 const BACKLOG_MIN: usize = 1;
 const BACKLOG_MAX: usize = 128;
+/// Inbound connections open in one sandbox at once (queued or accepted,
+/// until the guest closes them). Past this one is refused.
+pub const MAX_INBOUND: usize = 256;
 
 /// An index into [`Net`]'s socket arena.
 pub type SockId = usize;
@@ -168,6 +178,8 @@ pub(crate) struct Socket {
     pub rcvbuf: u32,
     pub backlog: usize,
     pub queue: VecDeque<SockId>,
+    /// An inbound connection (ingress): counted in `Net::inbound`.
+    pub inbound: bool,
     /// Open-file descriptions plus accept-queue membership.
     owners: u32,
 }
@@ -202,6 +214,7 @@ impl Socket {
             rcvbuf: STREAM_CAP as u32,
             backlog: 0,
             queue: VecDeque::new(),
+            inbound: false,
             owners: 1,
         }
     }
@@ -327,6 +340,10 @@ pub struct Net {
     held: BTreeSet<(u32, u16, u8)>,
     /// Names this sandbox to the egress proxy.
     pub(crate) sandbox_id: u64,
+    /// Inbound connections open (sockets with `inbound`).
+    inbound: usize,
+    /// The next peer port of an inbound connection.
+    inbound_port: u16,
 }
 
 impl Default for Net {
@@ -341,6 +358,8 @@ impl Default for Net {
             ephemeral: EPHEMERAL_LO,
             held: BTreeSet::new(),
             sandbox_id: 0,
+            inbound: 0,
+            inbound_port: EPHEMERAL_LO,
         }
     }
 }
@@ -628,6 +647,46 @@ impl Net {
         self.sockets.insert(sock)
     }
 
+    /// Queues an inbound connection (ingress) on the stream `stream` to
+    /// guest port `port`: on the TCP listener of `192.0.2.2:port` or
+    /// `0.0.0.0:port`, as an accepted socket connected to the stream, whose
+    /// peer is `192.0.2.1` on the next port of the ephemeral range. Returns
+    /// whether it was queued: not when no such listener exists (one bound
+    /// to loopback only does not take it), its backlog is full, or
+    /// [`MAX_INBOUND`] are open.
+    pub fn queue_inbound(&mut self, port: u16, stream: HostStreamId) -> bool {
+        if port == 0 || self.inbound >= MAX_INBOUND {
+            return false;
+        }
+        let Some(listener) = self.find_listener(GUEST_IP, port) else {
+            return false;
+        };
+        let l = self.sockets.get(listener);
+        if l.queue.len() >= l.backlog.max(1) {
+            return false;
+        }
+        let peer_port = self.inbound_port;
+        self.inbound_port = if peer_port >= EPHEMERAL_HI {
+            EPHEMERAL_LO
+        } else {
+            peer_port + 1
+        };
+        let Ok(accepted) = self.spawn_accepted(GUEST_IP, port, GATEWAY_IP, peer_port) else {
+            return false;
+        };
+        let sock = self.sockets.get_mut(accepted);
+        sock.phase = Phase::Connected(Link::Host(stream));
+        sock.inbound = true;
+        self.inbound += 1;
+        self.sockets.get_mut(listener).queue.push_back(accepted);
+        true
+    }
+
+    /// Inbound connections open now.
+    pub fn inbound_open(&self) -> usize {
+        self.inbound
+    }
+
     /// Drops one owner. Returns what the caller must do if this was the last
     /// owner: close a host stream, reset in-kernel peers, and drop queued
     /// children (each of those is returned so the caller can recurse — this
@@ -639,6 +698,9 @@ impl Net {
             return Dropped::default();
         }
         let sock = self.sockets.take(id);
+        if sock.inbound {
+            self.inbound = self.inbound.saturating_sub(1);
+        }
         if sock.holds_port {
             self.release_port(sock.local_ip, sock.local_port, sock.proto);
         }

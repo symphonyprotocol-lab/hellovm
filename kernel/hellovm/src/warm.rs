@@ -9,7 +9,8 @@
 //!  0      4   magic "HVMC"
 //!  4      1   version, 1
 //!  5      1   kind: b'C' make a clone, b'P' wait until the template is ready
-//!  6      2   flags (little endian): bit 0, the sandbox id below is set
+//!  6      2   flags (little endian): bit 0, the sandbox id below is set;
+//!             bit 1, a fourth fd is attached (the ingress channel)
 //!  8      8   sandbox id (little endian; random when bit 0 is clear)
 //! 16      4   length N of the clone's input (little endian), at most MAX_INPUT
 //! 20      N   the clone's input
@@ -17,7 +18,18 @@
 //!
 //! A clone request carries exactly three fds in an `SCM_RIGHTS` message with
 //! its first bytes: the clone's stdin, stdout and stderr (any readable and
-//! writable fds: pipes, files, sockets, a pty).
+//! writable fds: pipes, files, sockets, a pty); with flag bit 1, a fourth:
+//! the clone's ingress channel.
+//!
+//! The ingress channel is a connected Unix stream socket the requester
+//! keeps the other end of. Over it the requester hands the clone's kernel
+//! process inbound connections to guest ports: each message is the port
+//! (2 bytes, little endian) with one fd attached in `SCM_RIGHTS`, a
+//! connected stream socket. The kernel process queues it on the guest's
+//! listener for that port or refuses it, and the first byte the other end
+//! of that connection reads is the verdict: `A` (accepted; the guest's
+//! bytes follow) or `R` (refused; it closes). The channel carries nothing
+//! the other way. A message that is not exactly that ends the channel.
 //!
 //! The answers are frames, `[type: u8][length: u32 LE][payload]`:
 //!
@@ -51,6 +63,7 @@ pub const MAX_INPUT: usize = 64 * 1024;
 /// connection slots for ever.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const FLAG_SANDBOX_ID: u16 = 1;
+const FLAG_INGRESS: u16 = 2;
 /// Longest frame payload a client accepts.
 const MAX_FRAME: u32 = 64 * 1024;
 
@@ -66,6 +79,8 @@ pub enum Kind {
 pub struct Request {
     pub kind: Kind,
     pub sandbox_id: Option<u64>,
+    /// A fourth fd, the ingress channel, comes with it.
+    pub ingress: bool,
     pub input: Vec<u8>,
 }
 
@@ -78,11 +93,14 @@ impl Request {
             Kind::Clone => b'C',
             Kind::Ping => b'P',
         });
-        let flags = if self.sandbox_id.is_some() {
+        let mut flags = if self.sandbox_id.is_some() {
             FLAG_SANDBOX_ID
         } else {
             0
         };
+        if self.ingress {
+            flags |= FLAG_INGRESS;
+        }
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&self.sandbox_id.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&(self.input.len() as u32).to_le_bytes());
@@ -108,7 +126,7 @@ impl Request {
             other => return Err(format!("unknown request kind {other:#x}")),
         };
         let flags = u16::from_le_bytes([buf[6], buf[7]]);
-        if flags & !FLAG_SANDBOX_ID != 0 {
+        if flags & !(FLAG_SANDBOX_ID | FLAG_INGRESS) != 0 {
             return Err(format!("unknown request flags {flags:#x}"));
         }
         let id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -122,6 +140,7 @@ impl Request {
         let request = Request {
             kind,
             sandbox_id: (flags & FLAG_SANDBOX_ID != 0).then_some(id),
+            ingress: flags & FLAG_INGRESS != 0,
             input: buf[HEADER_LEN..HEADER_LEN + len].to_vec(),
         };
         Ok(Some((request, HEADER_LEN + len)))
@@ -447,6 +466,18 @@ impl WarmClone {
         input: &[u8],
         stdio: [BorrowedFd<'_>; 3],
     ) -> io::Result<WarmClone> {
+        Self::request_with(socket, sandbox_id, input, stdio, None)
+    }
+
+    /// [`WarmClone::request`], with the clone's ingress channel when
+    /// `ingress` is given (see the module documentation).
+    pub fn request_with(
+        socket: &Path,
+        sandbox_id: Option<u64>,
+        input: &[u8],
+        stdio: [BorrowedFd<'_>; 3],
+        ingress: Option<BorrowedFd<'_>>,
+    ) -> io::Result<WarmClone> {
         if input.len() > MAX_INPUT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -457,9 +488,11 @@ impl WarmClone {
         let request = Request {
             kind: Kind::Clone,
             sandbox_id,
+            ingress: ingress.is_some(),
             input: input.to_vec(),
         };
-        let fds = stdio.map(|fd| fd.as_raw_fd());
+        let mut fds = stdio.map(|fd| fd.as_raw_fd()).to_vec();
+        fds.extend(ingress.map(|fd| fd.as_raw_fd()));
         send_with_fds(&stream, &request.encode(), &fds)?;
         Ok(WarmClone { stream })
     }
@@ -496,6 +529,7 @@ pub fn wait_ready(socket: &Path) -> io::Result<(u64, u32)> {
     let request = Request {
         kind: Kind::Ping,
         sandbox_id: None,
+        ingress: false,
         input: Vec::new(),
     };
     stream.write_all(&request.encode())?;
@@ -514,6 +548,7 @@ mod tests {
         let request = Request {
             kind: Kind::Clone,
             sandbox_id: Some(0x1234_5678_9abc_def0),
+            ingress: true,
             input: b"print(1)".to_vec(),
         };
         let bytes = request.encode();
@@ -526,6 +561,7 @@ mod tests {
         let mut long = Request {
             kind: Kind::Ping,
             sandbox_id: None,
+            ingress: false,
             input: vec![0; MAX_INPUT + 1],
         }
         .encode();

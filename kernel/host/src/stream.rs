@@ -19,10 +19,21 @@
 //!
 //! Half-close is `shutdown(Shutdown::Write)` after the outbound buffer
 //! drains, so the peer reads EOF while the guest can still receive.
+//!
+//! Inbound streams (ingress) are connections the host side opened to a
+//! guest port and handed to this process as connected stream sockets
+//! ([`InboundQueue::push`]). The kernel takes each one
+//! ([`StreamTable::take_inbound`]) and answers it
+//! ([`StreamTable::answer_inbound`]): the first byte the opener reads is
+//! the verdict, `A` (queued on a listener; the guest's bytes follow) or
+//! `R` (refused; the connection closes). An accepted one is then a stream
+//! like an outbound one, with its own helper threads and limit
+//! ([`MAX_LIVE_INBOUND`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -232,6 +243,91 @@ impl Shared {
 /// `connect` fails with `EAGAIN` instead of exhausting host threads.
 const MAX_LIVE_STREAMS: usize = 512;
 
+/// Inbound streams whose helper threads may be alive at once, counting
+/// closed ones still draining; past this an inbound connection is refused.
+pub const MAX_LIVE_INBOUND: usize = 256;
+
+/// Inbound connections handed over and not yet taken by the kernel; past
+/// this one is refused at once.
+pub const MAX_QUEUED_INBOUND: usize = 64;
+
+/// The verdict byte of an accepted inbound connection.
+pub const INBOUND_ACCEPTED: u8 = b'A';
+/// The verdict byte of a refused one.
+pub const INBOUND_REFUSED: u8 = b'R';
+
+#[derive(Default)]
+struct InboundShared {
+    queue: Mutex<VecDeque<(u16, OwnedFd)>>,
+    /// `queue.len()`, readable without the lock.
+    queued: AtomicUsize,
+    waker: Mutex<Option<Waker>>,
+}
+
+/// Where inbound connections are handed over, from any thread (the one
+/// that receives them from the node daemon), to the kernel's thread.
+#[derive(Clone, Default)]
+pub struct InboundQueue(Arc<InboundShared>);
+
+impl std::fmt::Debug for InboundQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundQueue")
+            .field("queued", &self.0.queued.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl InboundQueue {
+    /// Hands over `conn`, a connected stream socket, for guest port
+    /// `port`. Refused at once (its opener reads `R`) when
+    /// [`MAX_QUEUED_INBOUND`] wait already, or the port is 0.
+    pub fn push(&self, port: u16, conn: OwnedFd) {
+        let waker = {
+            let mut queue = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if port == 0 || queue.len() >= MAX_QUEUED_INBOUND {
+                drop(queue);
+                refuse(conn);
+                return;
+            }
+            queue.push_back((port, conn));
+            self.0.queued.store(queue.len(), Ordering::Release);
+            self.0
+                .waker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn pop(&self) -> Option<(u16, OwnedFd)> {
+        let mut queue = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let next = queue.pop_front();
+        self.0.queued.store(queue.len(), Ordering::Release);
+        next
+    }
+
+    fn pending(&self) -> bool {
+        self.0.queued.load(Ordering::Acquire) > 0
+    }
+
+    fn set_waker(&self, waker: Waker) {
+        *self.0.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+    }
+}
+
+/// Tells the opener of an inbound connection that it was refused, without
+/// waiting for it (one byte into a new connection's empty send buffer),
+/// and closes it.
+fn refuse(conn: OwnedFd) {
+    let sock = UnixStream::from(conn);
+    if sock.set_nonblocking(true).is_ok() {
+        let _ = (&sock).write(&[INBOUND_REFUSED]);
+    }
+}
+
 /// Most recent flows kept for [`StreamTable::flows`].
 const FLOW_LOG: usize = 1024;
 
@@ -244,9 +340,120 @@ pub struct StreamTable {
     /// The last [`FLOW_LOG`] flows, oldest first.
     flows: Vec<OutboundFlow>,
     live: Arc<AtomicUsize>,
+    /// Inbound connections handed over, not yet taken.
+    inbound: InboundQueue,
+    /// Inbound streams taken and not yet answered.
+    adopted: HashMap<u64, Conn>,
+    /// Like `live`, for inbound streams.
+    inbound_live: Arc<AtomicUsize>,
 }
 
 impl StreamTable {
+    /// Where inbound connections are handed over.
+    pub fn inbound_queue(&self) -> InboundQueue {
+        self.inbound.clone()
+    }
+
+    pub fn set_inbound_waker(&mut self, waker: Waker) {
+        self.inbound.set_waker(waker);
+    }
+
+    pub fn inbound_pending(&self) -> bool {
+        self.inbound.pending()
+    }
+
+    /// The next inbound connection, as a stream not yet answered. Those
+    /// past [`MAX_LIVE_INBOUND`] are refused here.
+    pub fn take_inbound(&mut self) -> Option<hellovm_core::host::InboundConn> {
+        loop {
+            let (port, fd) = self.inbound.pop()?;
+            if self.inbound_live.load(Ordering::Relaxed) >= MAX_LIVE_INBOUND {
+                refuse(fd);
+                continue;
+            }
+            let id = self.next;
+            self.next += 1;
+            self.inbound_live.fetch_add(1, Ordering::Relaxed);
+            let shared = Arc::new(Shared {
+                inner: Mutex::new(Inner {
+                    phase: Phase::Connecting,
+                    inbound: VecDeque::new(),
+                    outbound: VecDeque::new(),
+                    shut_wr: false,
+                    closing: false,
+                    abort: false,
+                    read_eof: false,
+                    broken: false,
+                    connect_error: None,
+                    control: None,
+                }),
+                cv: Condvar::new(),
+                waker: Mutex::new(Waker::noop()),
+                live: Arc::clone(&self.inbound_live),
+            });
+            self.streams.insert(id, shared);
+            self.adopted.insert(id, Conn::Unix(UnixStream::from(fd)));
+            return Some(hellovm_core::host::InboundConn {
+                port,
+                stream: HostStreamId(id),
+            });
+        }
+    }
+
+    /// Answers an inbound stream: accepted, it gets its helper threads and
+    /// its opener reads [`INBOUND_ACCEPTED`] before the guest's bytes;
+    /// refused (or when no thread can be had), its opener reads
+    /// [`INBOUND_REFUSED`] and it is closed. `waker` is called when it may
+    /// have become readable or writable.
+    pub fn answer_inbound(&mut self, id: HostStreamId, accepted: bool, waker: Waker) {
+        let Some(conn) = self.adopted.remove(&id.0) else {
+            return;
+        };
+        let Some(shared) = self.streams.get(&id.0).cloned() else {
+            return;
+        };
+        let refused = |table: &mut StreamTable, conn: Conn| {
+            table.streams.remove(&id.0);
+            if let Conn::Unix(sock) = conn {
+                refuse(OwnedFd::from(sock));
+            }
+        };
+        if !accepted {
+            refused(self, conn);
+            return;
+        }
+        let (reader, writer) = match (conn.try_clone(), conn.try_clone()) {
+            (Ok(r), Ok(w)) => (r, w),
+            _ => {
+                refused(self, conn);
+                return;
+            }
+        };
+        {
+            let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.phase = Phase::Up;
+            inner.outbound.push_back(INBOUND_ACCEPTED);
+            inner.control = Some(conn);
+        }
+        *shared.waker.lock().unwrap_or_else(|e| e.into_inner()) = waker;
+        let helper = Arc::clone(&shared);
+        let spawned = thread::Builder::new()
+            .name(format!("hellovm-inbound-{}", id.0))
+            .spawn(move || {
+                let reader_shared = Arc::clone(&helper);
+                let _ = thread::Builder::new()
+                    .name("hellovm-inbound-read".into())
+                    .spawn(move || read_loop(reader, reader_shared));
+                write_loop(writer, helper);
+            });
+        if spawned.is_err() {
+            // Nothing runs for it: the guest sees a reset at once.
+            let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.broken = true;
+            inner.read_eof = true;
+        }
+    }
+
     pub fn set_endpoint(&mut self, endpoint: Endpoint) {
         self.endpoint = Some(endpoint);
     }
@@ -452,6 +659,7 @@ impl std::fmt::Debug for StreamTable {
             .field("endpoint", &self.endpoint)
             .field("streams", &self.streams.len())
             .field("flows", &self.flows.len())
+            .field("inbound", &self.inbound)
             .finish()
     }
 }
@@ -469,7 +677,7 @@ impl StreamTable {
             self.close(HostStreamId(id));
         }
         let start = Instant::now();
-        while self.live.load(Ordering::Relaxed) > 0 {
+        while self.live.load(Ordering::Relaxed) + self.inbound_live.load(Ordering::Relaxed) > 0 {
             if start.elapsed() >= limit {
                 return false;
             }
@@ -998,5 +1206,107 @@ mod egress_tests {
         let err = table.open(flow(None, 443), Waker::new(|| {})).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(table.flows().is_empty());
+    }
+}
+
+/// Inbound streams, against the other end of a socket pair.
+#[cfg(test)]
+mod inbound_tests {
+    use std::io::{ErrorKind, Read, Write};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use hellovm_core::platform::Waker;
+
+    use super::{StreamTable, MAX_QUEUED_INBOUND};
+
+    fn read_some(table: &mut StreamTable, id: hellovm_core::host::HostStreamId) -> Vec<u8> {
+        let start = Instant::now();
+        let mut buf = [0u8; 64];
+        loop {
+            match table.read(id, &mut buf) {
+                Ok(n) => return buf[..n].to_vec(),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    assert!(start.elapsed() < Duration::from_secs(5), "read");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("read: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_accepted_stream_says_so_and_carries_bytes_and_half_closes() {
+        let mut table = StreamTable::default();
+        let queue = table.inbound_queue();
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(!table.inbound_pending());
+        queue.push(8080, OwnedFd::from(ours));
+        assert!(table.inbound_pending());
+        let conn = table.take_inbound().unwrap();
+        assert_eq!(conn.port, 8080);
+        assert!(!table.inbound_pending());
+        table.answer_inbound(conn.stream, true, Waker::noop());
+        let mut verdict = [0u8; 1];
+        theirs.read_exact(&mut verdict).unwrap();
+        assert_eq!(&verdict, b"A");
+        theirs.write_all(b"hello").unwrap();
+        assert_eq!(read_some(&mut table, conn.stream), b"hello");
+        assert_eq!(table.write(conn.stream, b"back").unwrap(), 4);
+        let mut back = [0u8; 4];
+        theirs.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"back");
+        // The guest half-closes: the opener reads EOF and can still send.
+        table.shutdown_write(conn.stream).unwrap();
+        assert_eq!(theirs.read(&mut back).unwrap(), 0);
+        theirs.write_all(b"more").unwrap();
+        assert_eq!(read_some(&mut table, conn.stream), b"more");
+        // The opener closes: the guest reads EOF.
+        theirs.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(read_some(&mut table, conn.stream), b"");
+        table.close(conn.stream);
+        let start = Instant::now();
+        while table.inbound_live.load(Ordering::Relaxed) > 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "helpers live");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn refused_and_overflowing_connections_read_r_and_close() {
+        let mut table = StreamTable::default();
+        let queue = table.inbound_queue();
+        let mut openers = Vec::new();
+        for _ in 0..MAX_QUEUED_INBOUND + 1 {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            theirs
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            queue.push(80, OwnedFd::from(ours));
+            openers.push(theirs);
+        }
+        // The one past the queue's bound was refused at once.
+        let mut last = openers.pop().unwrap();
+        let mut got = Vec::new();
+        last.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"R");
+        let conn = table.take_inbound().unwrap();
+        table.answer_inbound(conn.stream, false, Waker::noop());
+        let mut got = Vec::new();
+        openers[0].read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"R");
+        assert!(table.read(conn.stream, &mut [0u8; 4]).is_err());
+        assert_eq!(table.inbound_live.load(Ordering::Relaxed), 0);
+        // The rest wait in the queue; dropping it drops them.
+        drop((table, queue));
+        let mut got = Vec::new();
+        openers[1].read_to_end(&mut got).unwrap();
+        assert!(got.is_empty());
     }
 }

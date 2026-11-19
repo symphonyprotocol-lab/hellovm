@@ -144,6 +144,7 @@ pub fn ping(socket: &Path, timeout: Duration) -> io::Result<(u64, u32)> {
     let request = Request {
         kind: Kind::Ping,
         sandbox_id: None,
+        ingress: false,
         input: Vec::new(),
     };
     stream.write_all(&request.encode())?;
