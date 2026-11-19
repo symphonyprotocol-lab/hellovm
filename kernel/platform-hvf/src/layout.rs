@@ -153,10 +153,14 @@ pub const CNTKCTL_EL1: u64 = 1 << 1;
 /// `CPSR` to run the shim's flush routine: EL1 with `SP_EL1`, every
 /// interrupt masked.
 pub const PSTATE_EL1H_MASKED: u64 = 0x3c5;
-/// The `PSTATE` bits an app may set: the condition flags. Everything else
-/// (the exception level, interrupt masks, single-step, illegal state) is
-/// the platform's: an app runs in EL0t.
-pub const PSTATE_APP_MASK: u64 = 0xf000_0000;
+/// The `PSTATE` bits that are the app's and kept across every exit: the
+/// condition flags, and `DIT` (data-independent timing, which an app sets
+/// with `msr dit` and must find still set after a system call; `hwcap`
+/// reports it). Everything else (the exception level, interrupt masks,
+/// single-step, illegal state) is the platform's: an app runs in EL0t.
+pub const PSTATE_APP_MASK: u64 = 0xf000_0000 | PSTATE_DIT;
+/// `PSTATE.DIT`, as in `SPSR_ELx`.
+pub const PSTATE_DIT: u64 = 1 << 24;
 
 /// Stage-1 descriptor bits (4 KiB granule).
 pub mod pte {

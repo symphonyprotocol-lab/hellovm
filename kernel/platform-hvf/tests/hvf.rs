@@ -14,6 +14,15 @@ static VM: Mutex<()> = Mutex::new(());
 
 fn platform() -> Option<(MutexGuard<'static, ()>, HvfPlatform)> {
     let guard = VM.lock().unwrap_or_else(|e| e.into_inner());
+    // Empty when this Mac lacks the tools to build them (see
+    // `test-guest/build.rs`).
+    if hellovm_test_guest::HELLO.is_empty() {
+        if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") {
+            panic!("HELLOVM_REQUIRE_E2E=1 but the test guests were not built");
+        }
+        eprintln!("SKIPPING: the test guests were not built on this Mac");
+        return None;
+    }
     match HvfPlatform::new(HvfConfig::default()) {
         Ok(p) => Some((guard, p)),
         Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
@@ -98,6 +107,42 @@ fn getpid_loop() {
     };
     let root = image(&[("loop", hellovm_test_guest::GETPID_LOOP)]);
     let (status, _) = run(&mut p, &root, &["/loop", "1000"]);
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// What language runtimes do with address space: a 64 GiB `PROT_NONE`
+/// reservation used in the middle, then pages mapped and unmapped at
+/// thousands of places. Neither may use up the page tables.
+#[test]
+fn address_space_is_reserved_and_reused_without_using_up_tables() {
+    let Some((_guard, mut p)) = platform() else {
+        return;
+    };
+    let root = image(&[("reserve", hellovm_test_guest::RESERVE)]);
+    let (status, _) = run(&mut p, &root, &["/reserve"]);
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// `ic ivau` and `dc cvau` over read-only code that has no memory yet are
+/// not writes (`__clear_cache`).
+#[test]
+fn cache_maintenance_over_untouched_code_is_no_fault() {
+    let Some((_guard, mut p)) = platform() else {
+        return;
+    };
+    let root = image(&[("icache", hellovm_test_guest::ICACHE)]);
+    let (status, _) = run(&mut p, &root, &["/icache"]);
+    assert_eq!(status, ExitStatus::Exited(0));
+}
+
+/// `PSTATE.DIT` is the app's: a system call does not clear it.
+#[test]
+fn dit_survives_a_system_call() {
+    let Some((_guard, mut p)) = platform() else {
+        return;
+    };
+    let root = image(&[("dit", hellovm_test_guest::DIT)]);
+    let (status, _) = run(&mut p, &root, &["/dit"]);
     assert_eq!(status, ExitStatus::Exited(0));
 }
 
@@ -406,7 +451,8 @@ fn odd_register_values_at_exits() {
     ctx.pstate = u64::MAX;
     run_with(&mut p, t, &ctx);
     assert_eq!(next(&mut p).trap, fault(4, 1, Some(CODE)));
-    assert_eq!(aarch64(p.context(t).unwrap()).pstate, 0xf000_0000);
+    // Of all that, the app keeps the condition flags and DIT.
+    assert_eq!(aarch64(p.context(t).unwrap()).pstate, 0xf100_0000);
     p.kill(t).unwrap();
 
     // Odd program counters and stack pointers.

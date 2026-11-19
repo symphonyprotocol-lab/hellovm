@@ -73,6 +73,23 @@ pub const SEGV: &str = env!("HELLOVM_GUEST_SEGV");
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const ODD_REGS: &str = env!("HELLOVM_GUEST_ODD_REGS");
 
+/// aarch64 Linux, built on macOS: sets `PSTATE.DIT`, makes a system call,
+/// and exits with 0 if it is still set (1 if not).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const DIT: &str = env!("HELLOVM_GUEST_DIT");
+
+/// aarch64 Linux, built on macOS: reserves 64 GiB with `PROT_NONE`, uses
+/// a few pages in the middle, unmaps it; then maps, touches and unmaps a
+/// page at 2000 places a gigabyte apart. Exits with 0, or the number of
+/// the step that failed.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const RESERVE: &str = env!("HELLOVM_GUEST_RESERVE");
+
+/// aarch64 Linux, built on macOS: cache maintenance (`ic ivau`, `dc cvau`)
+/// over read-only executable pages that were never touched. Exits with 0.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const ICACHE: &str = env!("HELLOVM_GUEST_ICACHE");
+
 /// aarch64 Linux, built on macOS: spins forever, making no system call.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const SPIN: &str = env!("HELLOVM_GUEST_SPIN");

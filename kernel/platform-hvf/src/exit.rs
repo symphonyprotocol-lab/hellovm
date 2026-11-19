@@ -94,9 +94,16 @@ pub fn decode(esr: u64, far: u64, pc: u64) -> AppException {
             let fsc = iss & 0x3f;
             // FnV: FAR is not valid.
             let addr = (iss & (1 << 10) == 0).then_some(untag(far));
+            // WnR says write, except for a cache maintenance or address
+            // translation instruction (CM), which always sets it and writes
+            // nothing a page's protection is about (`ic ivau` and `dc cvau`
+            // over read-only code are what `__clear_cache` does): Linux
+            // takes those as reads, and so does this. `dc zva`, which does
+            // write, then gets its page as a read would and, if the page is
+            // read only, a permission fault next.
             let access = if class == ec::IABT_LOWER {
                 Access::Exec
-            } else if iss & (1 << 6) != 0 {
+            } else if iss & (1 << 6) != 0 && iss & (1 << 8) == 0 {
                 Access::Write
             } else {
                 Access::Read
@@ -172,6 +179,14 @@ mod tests {
                 access: Access::Read
             },
             "the top byte is ignored"
+        );
+        // Cache maintenance sets WnR whatever it does: taken as a read.
+        assert_eq!(
+            decode(esr(0x24, 0x100 | 0x40 | 0x07), 0x7000, 0),
+            AppException::Translation {
+                addr: 0x7000,
+                access: Access::Read
+            }
         );
         assert_eq!(untag(0x00ff_0000_0000_0000), 0xffff_0000_0000_0000);
         assert_eq!(hvc_immediate(esr(0x16, 8)), Some(8));

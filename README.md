@@ -423,7 +423,10 @@ for EL0 addresses; `MAIR_EL1` attribute 0 is normal write-back memory
 `CPACR_EL1` lets FP and SIMD run untrapped; `CNTKCTL_EL1` lets EL0 read
 the virtual counter and nothing else of the timers; `VBAR_EL1` is the
 shim. The program starts with `PSTATE` EL0t; the only bits of `PSTATE` a
-program (or a signal frame) can set are the condition flags.
+program (or a signal frame) can set, and the ones kept across every exit,
+are the condition flags and `DIT` (data-independent timing, which
+`AT_HWCAP` reports: a library that sets it finds it still set after a
+system call).
 
 The page size the program sees (`AT_PAGESZ`) is 4 KiB, as aarch64 Linux
 programs expect; the host's 16 KiB pages only matter to `hv_vm_map`,
@@ -431,6 +434,19 @@ which maps the three regions once. Memory is allocated a 4 KiB page at a
 time when the program first touches it (a translation fault the platform
 resolves without telling the core), from the 2 GiB pool; a sandbox that
 uses it up is ended. Freed pages go back to the pool, not to the host.
+
+Address space costs page tables only where it is used. A mapped range
+with no memory yet that covers the whole span of a table entry above the
+last level (2 MiB, 1 GiB, 512 GiB) is one descriptor there, a
+reservation, with no table below it: the 64 GiB `PROT_NONE` reservation
+of a language runtime takes a table or two at its edges, and is split
+into smaller ones only where a part of it is touched, unmapped or given
+another protection. A table whose last entry goes is freed, so the 64 MiB
+of tables (16384 of them, each for 2 MiB of pages) bound what is mapped
+page by page at one time (32 GiB), not what was ever mapped. A cache
+maintenance instruction (`ic ivau`, `dc cvau`: `__clear_cache`) on a page
+with no memory yet is taken as a read, as on Linux, whatever its syndrome
+says of writing.
 
 **What the program can and cannot touch.** The isolation boundary is the
 stage-2 mapping, which Hypervisor.framework enforces: the VM's whole
@@ -488,7 +504,10 @@ The test guests for the Mac (`kernel/test-guest/asm`, and
 `kernel/test-guest/asm/hvf` for the HVF tests) are built by
 `test-guest/build.rs` with the system's clang
 (`--target=aarch64-linux-gnu`) and the Rust toolchain's own `rust-lld` as
-the linker: no Linux toolchain is needed. A C program needs a Linux libc,
+the linker: no Linux toolchain is needed. On a Mac without those (a Rust
+that is not rustup's may lack `rust-lld`) the workspace still builds:
+the build prints a warning, and the tests that need the guests skip (or
+fail under `HELLOVM_REQUIRE_E2E=1`). A C program needs a Linux libc,
 so the one C guest, `kernel/test-guest/c/smoke.c` (prints its arguments,
 reads a file, uses `malloc` and an 8 MiB `mmap`, exits with 3), is built
 statically with glibc in the dev container and passed to the test by

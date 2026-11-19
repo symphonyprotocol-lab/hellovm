@@ -18,6 +18,14 @@ fn hellovm() -> Option<&'static Path> {
     SIGNED
         .get_or_init(|| {
             let exe = PathBuf::from(env!("CARGO_BIN_EXE_hellovm"));
+            // Empty when this Mac lacks the tools to build the guests.
+            if hellovm_test_guest::HELLO.is_empty() {
+                if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") {
+                    panic!("HELLOVM_REQUIRE_E2E=1 but the test guests were not built");
+                }
+                eprintln!("SKIPPING: the test guests were not built on this Mac");
+                return None;
+            }
             let entitlements =
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("../platform-hvf/hellovm.entitlements");
             let signed = Command::new("codesign")
