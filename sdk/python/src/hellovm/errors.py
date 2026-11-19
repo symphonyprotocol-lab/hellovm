@@ -19,13 +19,15 @@ class HellovmError(Exception):
 
 
 class APIError(HellovmError):
-    """The API answered with an error."""
+    """The API answered with an error. ``retry_after`` is the answer's
+    ``Retry-After`` in seconds, when it had one."""
 
-    def __init__(self, status: int, code: str, message: str) -> None:
+    def __init__(self, status: int, code: str, message: str, retry_after: float | None = None) -> None:
         super().__init__(f"{status} {code}: {message}")
         self.status = status
         self.code = code
         self.message = message
+        self.retry_after = retry_after
 
 
 class AuthenticationError(APIError):
@@ -54,8 +56,21 @@ class SandboxEndedError(APIError):
 
 
 class LimitError(APIError):
-    """413 ``too_large``, 429 ``tenant_limit`` or ``too_many_polls``,
-    507 ``no_space``: a limit of the API or of the sandbox."""
+    """413 ``too_large``, 429 ``tenant_limit``, ``memory_limit`` or
+    ``too_many_polls``, 507 ``no_space``: a limit of the API or of the
+    sandbox; and the two below."""
+
+
+class RateLimitError(LimitError):
+    """429 ``rate_limited``: more requests than the tenant's rate allows.
+    The client waits ``retry_after`` and tries again (within
+    ``busy_timeout``) before raising it."""
+
+
+class BudgetExceededError(LimitError):
+    """429 ``budget_exceeded``: the tenant used up its CPU or egress budget
+    of the period, so no sandbox can be made and no exec started until
+    the period ends, in ``retry_after`` seconds. Everything else works."""
 
 
 class EditError(APIError):
@@ -94,7 +109,20 @@ _BY_STATUS: dict[int, type[APIError]] = {
 }
 
 
-def api_error(status: int, body: bytes) -> APIError:
+_BY_CODE: dict[tuple[int, str], type[APIError]] = {
+    (429, "rate_limited"): RateLimitError,
+    (429, "budget_exceeded"): BudgetExceededError,
+}
+
+
+def retry_after(value: str | None) -> float | None:
+    """A ``Retry-After`` of whole seconds (an HTTP date is not used)."""
+    if value is None or not value.strip().isdigit() or len(value.strip()) > 9:
+        return None
+    return float(int(value.strip()))
+
+
+def api_error(status: int, body: bytes, retry_after_seconds: float | None = None) -> APIError:
     """The exception for an error answer. The body is the API's
     ``{"error": {"code", "message"}}``; anything else (a proxy's page, say)
     is kept as a short message."""
@@ -114,4 +142,5 @@ def api_error(status: int, body: bytes) -> APIError:
         message = body[:512].decode("utf-8", "replace")
     code = code[:128]
     message = message[:4096]
-    return _BY_STATUS.get(status, APIError)(status, code, message)
+    kind = _BY_CODE.get((status, code)) or _BY_STATUS.get(status, APIError)
+    return kind(status, code, message, retry_after_seconds)

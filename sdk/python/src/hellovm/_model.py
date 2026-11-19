@@ -18,6 +18,46 @@ class Template:
 
 
 @dataclass(frozen=True)
+class Usage:
+    """What a sandbox used since it was made (its node's counters), or a
+    tenant's sandboxes in a period."""
+
+    run_ms: int
+    cpu_ms: int
+    memory_byte_seconds: int
+    egress_sent_bytes: int
+    egress_received_bytes: int
+
+
+@dataclass(frozen=True)
+class Quotas:
+    """A tenant's quotas; ``None``: no limit."""
+
+    max_sandboxes: int
+    max_memory_bytes: int | None
+    requests_per_second: float | None
+    request_burst: int | None
+    cpu_seconds_per_period: float | None
+    egress_bytes_per_period: int | None
+
+
+@dataclass(frozen=True)
+class TenantUsage:
+    """``GET /v1/usage``: the current metering period (Unix ms), what the
+    tenant's sandboxes used in it, its sandboxes and their memory limits
+    now, its quotas, and the budgets it used up (``cpu``, ``egress``)."""
+
+    tenant: str
+    period_start: int
+    period_end: int
+    usage: Usage
+    sandboxes: int
+    memory_limit_bytes: int
+    quotas: Quotas
+    exceeded: list[str]
+
+
+@dataclass(frozen=True)
 class SandboxInfo:
     id: str
     tenant: str
@@ -33,6 +73,8 @@ class SandboxInfo:
     memory_bytes: int
     memory_limit_bytes: int
     ready_ms: float
+    #: ``None`` from an API that does not report it.
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True)
@@ -212,6 +254,54 @@ def parse_sandbox(value: Any) -> SandboxInfo:
         memory_bytes=_count(d, "memory_bytes", w),
         memory_limit_bytes=_count(d, "memory_limit_bytes", w),
         ready_ms=_num(d, "ready_ms", w),
+        usage=None if d.get("usage") is None else parse_counters(d["usage"]),
+    )
+
+
+def parse_counters(value: Any) -> Usage:
+    w = "usage"
+    d = _obj(value, w)
+    return Usage(
+        run_ms=_count(d, "run_ms", w),
+        cpu_ms=_count(d, "cpu_ms", w),
+        memory_byte_seconds=_count(d, "memory_byte_seconds", w),
+        egress_sent_bytes=_count(d, "egress_sent_bytes", w),
+        egress_received_bytes=_count(d, "egress_received_bytes", w),
+    )
+
+
+def _opt_count(d: dict[str, Any], key: str, what: str) -> int | None:
+    return None if d.get(key) is None else _count(d, key, what)
+
+
+def _opt_num(d: dict[str, Any], key: str, what: str) -> float | None:
+    return None if d.get(key) is None else _num(d, key, what)
+
+
+def parse_usage(value: Any) -> TenantUsage:
+    w = "usage"
+    d = _obj(value, w)
+    period = _obj(d.get("period"), "period")
+    q = _obj(d.get("quotas"), "quotas")
+    exceeded = d.get("exceeded")
+    if not isinstance(exceeded, list) or not all(isinstance(x, str) for x in exceeded):
+        raise ResponseError("usage: `exceeded` is not a list of names")
+    return TenantUsage(
+        tenant=_str(d, "tenant", w),
+        period_start=_count(period, "start", "period"),
+        period_end=_count(period, "end", "period"),
+        usage=parse_counters(d.get("usage")),
+        sandboxes=_count(d, "sandboxes", w),
+        memory_limit_bytes=_count(d, "memory_limit_bytes", w),
+        quotas=Quotas(
+            max_sandboxes=_count(q, "max_sandboxes", "quotas"),
+            max_memory_bytes=_opt_count(q, "max_memory_bytes", "quotas"),
+            requests_per_second=_opt_num(q, "requests_per_second", "quotas"),
+            request_burst=_opt_count(q, "request_burst", "quotas"),
+            cpu_seconds_per_period=_opt_num(q, "cpu_seconds_per_period", "quotas"),
+            egress_bytes_per_period=_opt_count(q, "egress_bytes_per_period", "quotas"),
+        ),
+        exceeded=list(exceeded),
     )
 
 

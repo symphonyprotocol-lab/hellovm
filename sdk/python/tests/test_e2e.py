@@ -153,6 +153,11 @@ class E2E(unittest.TestCase):
             assert got.info is not None
             self.assertEqual(got.info.egress_id, sandbox.id[3:19])
             self.assertGreater(sandbox.refresh().memory_limit_bytes, 0)
+            self.assertIsNotNone(sandbox.refresh().usage)
+            usage = self.client.usage()
+            self.assertGreaterEqual(usage.sandboxes, 1)
+            self.assertGreater(usage.period_end, usage.period_start)
+            self.assertGreater(usage.quotas.max_sandboxes, 0)
         with self.assertRaises(NotFoundError) as cm:
             self.client.get(sandbox.id)
         self.assertEqual(cm.exception.code, "sandbox_not_found")

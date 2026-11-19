@@ -28,6 +28,7 @@ pub const ACME: &str = "acme-token-0123456789abcdef0123456789";
 pub const BETA: &str = "beta-token-0123456789abcdef0123456789";
 pub const NODE_TOKEN: &str = "node-token-0123456789abcdef0123456789";
 pub const ADMIN_TOKEN: &str = "admin-token-0123456789abcdef0123456789";
+pub const STATS_TOKEN: &str = "stats-token-0123456789abcdef0123456789";
 pub const WEB_BODY: &str = "hello-egress";
 
 pub fn e2e_required() -> bool {
@@ -188,6 +189,11 @@ pub struct PlaneOptions {
     pub extra_nodes: Vec<(String, String)>,
     /// Fields added to the API's configuration.
     pub api_extra: Value,
+    /// Fields added to each node's configuration, by index.
+    pub node_extra: Vec<Value>,
+    /// Fields added to the tenants' configurations.
+    pub acme_extra: Value,
+    pub beta_extra: Value,
 }
 
 impl Default for PlaneOptions {
@@ -201,6 +207,9 @@ impl Default for PlaneOptions {
             extra_template_on: None,
             extra_nodes: Vec::new(),
             api_extra: json!({}),
+            node_extra: Vec::new(),
+            acme_extra: json!({}),
+            beta_extra: json!({}),
         }
     }
 }
@@ -213,11 +222,34 @@ pub struct NodeProc {
     pub service: Option<Service>,
 }
 
+/// A port for a service that must keep it across restarts. Taken below
+/// the range the host gives out by itself (to `bind` to port 0 and to
+/// outgoing connections), so that nothing takes it between this check and
+/// the service's own `bind`, and never twice in this process.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .unwrap()
-        .port()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let ephemeral_low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|t| t.split_whitespace().next()?.parse::<u32>().ok())
+        .unwrap_or(32768);
+    let (low, high) = (10_000u32, ephemeral_low.min(60_000));
+    if high < low + 1000 {
+        // No room below it on this host: the old way.
+        return std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .unwrap()
+            .port();
+    }
+    let span = high - low;
+    let base = std::process::id().wrapping_mul(131) % span;
+    for _ in 0..span {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = (low + (base + n) % span) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port between {low} and {high}");
 }
 
 pub struct Plane {
@@ -274,6 +306,7 @@ impl Plane {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("egress")).unwrap();
+        std::fs::create_dir_all(dir.join("egress-stats")).unwrap();
         let web = web_server();
         let mut policy = Policy::new();
         policy.add_file("allow web.test:80\n").unwrap();
@@ -287,6 +320,9 @@ impl Plane {
         let proxy = Proxy::bind(dir.join("egress/egress.sock"), config)
             .unwrap()
             .spawn();
+        proxy
+            .serve_stats(&dir.join("egress-stats/stats.sock"), STATS_TOKEN.into())
+            .unwrap();
         let shared = landlock();
         if !shared {
             eprintln!(
@@ -363,7 +399,7 @@ impl Plane {
             templates.push(template("extra", Some("acme")));
         }
         let node = &self.nodes[i];
-        let noded = json!({
+        let mut noded = json!({
             "node": node.name,
             "listen": format!("127.0.0.1:{}", node.port),
             "token": NODE_TOKEN,
@@ -372,7 +408,16 @@ impl Plane {
             "egress": self.dir.join("egress/egress.sock"),
             "max_sandboxes": self.options.node_max_sandboxes.get(i).copied().unwrap_or(32),
             "templates": templates,
+            "egress_stats": {
+                "socket": self.dir.join("egress-stats/stats.sock"),
+                "token": STATS_TOKEN,
+            },
         });
+        if let Some(Value::Object(extra)) = self.options.node_extra.get(i) {
+            for (k, v) in extra {
+                noded[k] = v.clone();
+            }
+        }
         std::fs::write(self.node_config(i), noded.to_string()).unwrap();
     }
 
@@ -402,6 +447,31 @@ impl Plane {
         self.nodes[i].service = Some(Service::start(cmd, "hellovm-noded"));
     }
 
+    /// Stops node `i`'s process (`SIGSTOP`): it answers nothing, and its
+    /// sandboxes live on.
+    pub fn stop_node(&self, i: usize) {
+        let pid = self.nodes[i]
+            .service
+            .as_ref()
+            .expect("noded runs")
+            .child
+            .id();
+        // SAFETY: plain kill of our own child.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+    }
+
+    /// Lets node `i` run again (`SIGCONT`).
+    pub fn cont_node(&self, i: usize) {
+        let pid = self.nodes[i]
+            .service
+            .as_ref()
+            .expect("noded runs")
+            .child
+            .id();
+        // SAFETY: plain kill of our own child.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
+    }
+
     /// Kills node `i` hard (its sandboxes die with it).
     pub fn kill_node(&mut self, i: usize) {
         if let Some(mut node) = self.nodes[i].service.take() {
@@ -421,12 +491,22 @@ impl Plane {
         for (name, addr) in &self.options.extra_nodes {
             nodes.push(json!({"name": name, "addr": addr, "token": NODE_TOKEN}));
         }
+        let mut acme =
+            json!({"name": "acme", "token": ACME, "max_sandboxes": self.options.acme_max});
+        let mut beta = json!({"name": "beta", "token": BETA, "max_sandboxes": 2});
+        for (tenant, extra) in [
+            (&mut acme, &self.options.acme_extra),
+            (&mut beta, &self.options.beta_extra),
+        ] {
+            if let Value::Object(extra) = extra {
+                for (k, v) in extra {
+                    tenant[k] = v.clone();
+                }
+            }
+        }
         let mut api = json!({
             "listen": "127.0.0.1:0",
-            "tenants": [
-                {"name": "acme", "token": ACME, "max_sandboxes": self.options.acme_max},
-                {"name": "beta", "token": BETA, "max_sandboxes": 2},
-            ],
+            "tenants": [acme, beta],
             "nodes": nodes,
             "reconcile_interval": 0.5,
             "node_timeout": 2,
@@ -671,6 +751,38 @@ impl Plane {
         self.call(token, "DELETE", &format!("/v1/sandboxes/{id}"), b"")
             .status
     }
+}
+
+/// One request on a connection of its own, read raw: the status and the
+/// response head (for headers the client does not keep).
+pub fn raw_call(addr: &str, token: &str, method: &str, target: &str) -> (u16, String) {
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        stream,
+        "{method} {target} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer).to_string();
+    let head = answer.split("\r\n\r\n").next().unwrap_or("").to_string();
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, head)
+}
+
+/// A header's value in a response head.
+pub fn header(head: &str, name: &str) -> Option<String> {
+    head.lines().find_map(|l| {
+        let (n, v) = l.split_once(':')?;
+        n.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
 }
 
 /// Calls the public API at `addr`.

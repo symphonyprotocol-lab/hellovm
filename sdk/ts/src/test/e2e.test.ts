@@ -112,6 +112,9 @@ describe("against a real plane", { skip: skip ? "set HELLOVM_TEST_URL and HELLOV
       const got = await client.get(sb.id);
       assert.equal(got.info?.egressId, sb.id.slice(3, 19));
       assert.ok((await sb.refresh()).memoryLimitBytes > 0);
+      assert.ok((await sb.refresh()).usage !== null);
+      const usage = await client.usage();
+      assert.ok(usage.sandboxes >= 1 && usage.periodEnd > usage.periodStart && usage.quotas.maxSandboxes > 0);
     });
     const error = await client.get(id).catch((e: unknown) => e);
     assert.ok(error instanceof NotFoundError);

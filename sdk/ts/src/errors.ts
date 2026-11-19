@@ -18,6 +18,8 @@ export class APIError extends HellovmError {
     readonly status: number,
     readonly code: string,
     readonly apiMessage: string,
+    /** The answer's `Retry-After`, in seconds, when it had one. */
+    readonly retryAfter: number | null = null,
   ) {
     super(`${status} ${code}: ${apiMessage}`);
   }
@@ -47,9 +49,26 @@ export class SandboxEndedError extends APIError {
   }
 }
 
-/** 413 `too_large`, 429 `tenant_limit` / `too_many_polls`, 507 `no_space`. */
+/** 413 `too_large`, 429 `tenant_limit` / `memory_limit` / `too_many_polls`, 507 `no_space`, and the two below. */
 export class LimitError extends APIError {
   override name = "LimitError";
+}
+
+/**
+ * 429 `rate_limited`: more requests than the tenant's rate allows. The
+ * client waits `retryAfter` and tries again (within `busyTimeout`) first.
+ */
+export class RateLimitError extends LimitError {
+  override name = "RateLimitError";
+}
+
+/**
+ * 429 `budget_exceeded`: the tenant used up its CPU or egress budget of the
+ * period; no sandbox is made and no exec started until it ends, in
+ * `retryAfter` seconds. Everything else works.
+ */
+export class BudgetExceededError extends LimitError {
+  override name = "BudgetExceededError";
 }
 
 /** 422: an edit's `old` text does not occur (`no_match`) or is `ambiguous`. */
@@ -83,7 +102,20 @@ export class ResponseError extends HellovmError {
   override name = "ResponseError";
 }
 
-const BY_STATUS: Record<number, new (status: number, code: string, message: string) => APIError> = {
+type Kind = new (status: number, code: string, message: string, retryAfter: number | null) => APIError;
+
+const BY_CODE: Record<string, Kind> = {
+  "429 rate_limited": RateLimitError,
+  "429 budget_exceeded": BudgetExceededError,
+};
+
+/** A `Retry-After` of whole seconds (an HTTP date is not used). */
+export function retryAfter(value: string | null | undefined): number | null {
+  const v = (value ?? "").trim();
+  return /^[0-9]{1,9}$/.test(v) ? Number(v) : null;
+}
+
+const BY_STATUS: Record<number, Kind> = {
   401: AuthenticationError,
   404: NotFoundError,
   409: BusyError,
@@ -95,7 +127,7 @@ const BY_STATUS: Record<number, new (status: number, code: string, message: stri
 };
 
 /** The error for an error answer (any body: a proxy's page is kept short). */
-export function apiError(status: number, body: Uint8Array): APIError {
+export function apiError(status: number, body: Uint8Array, retryAfterSeconds: number | null = null): APIError {
   let code = "";
   let message = "";
   const text = new TextDecoder().decode(body);
@@ -114,6 +146,7 @@ export function apiError(status: number, body: Uint8Array): APIError {
     code = "http_error";
     message = text.slice(0, 512);
   }
-  const Kind = BY_STATUS[status] ?? APIError;
-  return new Kind(status, code.slice(0, 128), message.slice(0, 4096));
+  code = code.slice(0, 128);
+  const Kind = BY_CODE[`${status} ${code}`] ?? BY_STATUS[status] ?? APIError;
+  return new Kind(status, code, message.slice(0, 4096), retryAfterSeconds);
 }

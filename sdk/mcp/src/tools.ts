@@ -9,7 +9,16 @@
  * result; `reset_sandbox` starts over on purpose.
  */
 
-import { APIError, Client, HellovmError, NotFoundError, type Sandbox, SandboxEndedError } from "hellovm";
+import {
+  APIError,
+  BudgetExceededError,
+  Client,
+  HellovmError,
+  NotFoundError,
+  RateLimitError,
+  type Sandbox,
+  SandboxEndedError,
+} from "hellovm";
 import { McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 
@@ -137,8 +146,23 @@ async function withSandbox(holder: SandboxHolder, fn: (sandbox: Sandbox) => Prom
   }
 }
 
-/** An error as the model reads it: the API's own message first. */
+/** An error as the model reads it: the API's own message first, then what it means for the next step. */
 export function describe(error: unknown): string {
+  if (error instanceof BudgetExceededError) {
+    const when = error.retryAfter === null ? "" : ` (in ${error.retryAfter} s)`;
+    return (
+      `Error (${error.status} ${error.code}): ${error.apiMessage}\n` +
+      `No command or Python call can be started, and no sandbox made, until the usage period ends${when}. ` +
+      "Reading and writing files still works. Do not retry before then."
+    );
+  }
+  if (error instanceof RateLimitError) {
+    const when = error.retryAfter === null ? "a moment" : `${error.retryAfter} s`;
+    return `Error (${error.status} ${error.code}): ${error.apiMessage}\nToo many requests: wait ${when} before the next call.`;
+  }
+  if (error instanceof APIError && error.status === 429 && (error.code === "tenant_limit" || error.code === "memory_limit")) {
+    return `Error (${error.status} ${error.code}): ${error.apiMessage}\nThis account has as many sandboxes as it may: another one must be deleted first.`;
+  }
   if (error instanceof APIError) return `Error (${error.status} ${error.code}): ${error.apiMessage}`;
   if (error instanceof HellovmError) return `Error: ${error.message}`;
   return `Error: ${error instanceof Error ? error.message : String(error)}`;

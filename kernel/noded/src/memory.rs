@@ -32,13 +32,65 @@ pub struct Usage {
     pub processes: usize,
     /// More processes than the limit: `bytes` is not complete.
     pub too_many: bool,
+    /// CPU time of the processes found, in clock ticks: user and system
+    /// time of each, and of its children that ended and that it waited for
+    /// (a guest process that ended was waited for by its parent below the
+    /// root, so its time is in that parent's). Not complete when
+    /// `too_many`.
+    pub cpu_ticks: u64,
 }
 
-fn ppid_of(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // `pid (comm) state ppid ...`; comm may hold spaces and parentheses.
+/// What `/proc/PID/stat` says of a process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stat {
+    pub ppid: u32,
+    /// `utime + stime + cutime + cstime`, in clock ticks.
+    pub cpu_ticks: u64,
+    /// When it started, in clock ticks since boot.
+    pub start: u64,
+}
+
+/// Parses a `/proc/PID/stat` line: `pid (comm) state ppid ...`, where
+/// comm may hold spaces and parentheses, so fields are counted after its
+/// last `)` (field 3 is the first there).
+pub fn parse_stat(stat: &str) -> Option<Stat> {
     let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(1)?.parse().ok()
+    let fields: Vec<&str> = rest.split_whitespace().take(20).collect();
+    let field = |n: usize| -> Option<u64> { fields.get(n - 3)?.parse().ok() };
+    // cutime and cstime are signed in the kernel's format; never negative
+    // in practice.
+    let signed = |n: usize| -> Option<u64> {
+        let v: i64 = fields.get(n - 3)?.parse().ok()?;
+        Some(v.max(0) as u64)
+    };
+    Some(Stat {
+        ppid: u32::try_from(field(4)?).ok()?,
+        cpu_ticks: field(14)?
+            .saturating_add(field(15)?)
+            .saturating_add(signed(16)?)
+            .saturating_add(signed(17)?),
+        start: field(22)?,
+    })
+}
+
+pub fn stat_of(pid: u32) -> Option<Stat> {
+    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+#[cfg(test)]
+fn ppid_of(pid: u32) -> Option<u32> {
+    stat_of(pid).map(|s| s.ppid)
+}
+
+/// Clock ticks per second (`_SC_CLK_TCK`).
+pub fn ticks_per_second() -> u64 {
+    // SAFETY: sysconf with a constant.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks > 0 {
+        ticks as u64
+    } else {
+        100
+    }
 }
 
 fn private_bytes(pid: u32) -> Option<u64> {
@@ -88,11 +140,13 @@ fn known_space(spaces: &mut Vec<u32>, pid: u32) -> Option<bool> {
     Some(false)
 }
 
-/// The process tree of the host, from `/proc`: children by parent.
-fn children() -> HashMap<u32, Vec<u32>> {
+/// The process tree of the host, from `/proc`: children by parent, and
+/// each process's CPU time.
+fn processes() -> (HashMap<u32, Vec<u32>>, HashMap<u32, u64>) {
     let mut tree: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut cpu = HashMap::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
-        return tree;
+        return (tree, cpu);
     };
     for entry in dir.flatten().take(MAX_PIDS) {
         let Some(pid) = entry
@@ -102,17 +156,23 @@ fn children() -> HashMap<u32, Vec<u32>> {
         else {
             continue;
         };
-        if let Some(ppid) = ppid_of(pid) {
-            tree.entry(ppid).or_default().push(pid);
+        if let Some(stat) = stat_of(pid) {
+            tree.entry(stat.ppid).or_default().push(pid);
+            cpu.insert(pid, stat.cpu_ticks);
         }
     }
-    tree
+    (tree, cpu)
+}
+
+#[cfg(test)]
+fn children() -> HashMap<u32, Vec<u32>> {
+    processes().0
 }
 
 /// The private memory and process count of each root's process tree;
 /// each root comes with its process limit.
 pub fn measure(roots: &[(u32, usize)]) -> HashMap<u32, Usage> {
-    let tree = children();
+    let (tree, cpu) = processes();
     let mut out = HashMap::new();
     for &(root, max_processes) in roots {
         let max_processes = max_processes.min(MAX_PROCESSES);
@@ -137,6 +197,10 @@ pub fn measure(roots: &[(u32, usize)]) -> HashMap<u32, Usage> {
             bytes: 0,
             processes: members.len(),
             too_many,
+            cpu_ticks: members
+                .iter()
+                .filter_map(|pid| cpu.get(pid))
+                .fold(0u64, |a, b| a.saturating_add(*b)),
         };
         if !too_many {
             // One process per address space.
@@ -243,6 +307,32 @@ mod tests {
             let _ = kid.kill();
             let _ = kid.wait();
         }
+    }
+
+    #[test]
+    fn stat_lines_are_parsed() {
+        let line =
+            "4711 (a b) c)) S 17 4711 4711 0 -1 4194304 1 0 0 0 70 30 5 -1 20 0 1 0 98765 1 2";
+        assert_eq!(
+            parse_stat(line),
+            Some(Stat {
+                ppid: 17,
+                cpu_ticks: 105,
+                start: 98765
+            })
+        );
+        assert_eq!(parse_stat("1 (x) S 1 2"), None);
+        assert_eq!(parse_stat(""), None);
+        // This process: some CPU time already, and a start.
+        let me = stat_of(std::process::id()).unwrap();
+        assert!(me.start > 0);
+        let spin = std::time::Instant::now();
+        while spin.elapsed() < std::time::Duration::from_millis(100) {
+            std::hint::black_box(0u64);
+        }
+        let later = measure(&[(std::process::id(), MAX_PROCESSES)])[&std::process::id()];
+        assert!(later.cpu_ticks >= me.cpu_ticks, "{later:?} {me:?}");
+        assert!(ticks_per_second() >= 1);
     }
 
     #[test]

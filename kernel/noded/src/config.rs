@@ -49,7 +49,28 @@ pub struct Config {
     /// memory (`MemTotal`).
     #[serde(default)]
     pub max_memory_mb: Option<u64>,
+    /// Refuse new sandboxes from the start, as after `POST /v1/node/drain`
+    /// (undone by `{"draining": false}`), so that a drained node that is
+    /// restarted stays drained.
+    #[serde(default)]
+    pub start_drained: bool,
+    /// The egress proxy's stats socket (`hellovm-egress --stats`), from
+    /// which the bytes of each sandbox's outbound flows are read; none:
+    /// they are not counted.
+    #[serde(default)]
+    pub egress_stats: Option<EgressStats>,
     pub templates: Vec<TemplateConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressStats {
+    pub socket: PathBuf,
+    /// The proxy's `--stats-token-file` token, or a file holding it.
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
 }
 
 fn default_max_sandboxes() -> usize {
@@ -230,24 +251,40 @@ impl Config {
 
     /// The token, from `token` or `token_file`.
     pub fn token(&self) -> Result<String, String> {
-        let token = match (&self.token, &self.token_file) {
-            (Some(t), None) => t.clone(),
-            (None, Some(path)) => std::fs::read_to_string(path)
-                .map_err(|e| format!("token_file {}: {e}", path.display()))?
-                .trim()
-                .to_string(),
-            _ => return Err("give exactly one of token and token_file".into()),
-        };
-        if token.len() < hellovm_control::ids::MIN_TOKEN_LEN
-            || !token.bytes().all(|b| b.is_ascii_graphic())
-        {
-            return Err(format!(
-                "the token must be at least {} printable characters",
-                hellovm_control::ids::MIN_TOKEN_LEN
-            ));
-        }
-        Ok(token)
+        load_token(&self.token, &self.token_file)
     }
+
+    /// The egress stats socket and its token, if configured.
+    pub fn egress_stats(&self) -> Result<Option<(PathBuf, String)>, String> {
+        match &self.egress_stats {
+            None => Ok(None),
+            Some(stats) => Ok(Some((
+                stats.socket.clone(),
+                load_token(&stats.token, &stats.token_file)
+                    .map_err(|e| format!("egress_stats: {e}"))?,
+            ))),
+        }
+    }
+}
+
+fn load_token(token: &Option<String>, token_file: &Option<PathBuf>) -> Result<String, String> {
+    let token = match (token, token_file) {
+        (Some(t), None) => t.clone(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map_err(|e| format!("token_file {}: {e}", path.display()))?
+            .trim()
+            .to_string(),
+        _ => return Err("give exactly one of token and token_file".into()),
+    };
+    if token.len() < hellovm_control::ids::MIN_TOKEN_LEN
+        || !token.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(format!(
+            "the token must be at least {} printable characters",
+            hellovm_control::ids::MIN_TOKEN_LEN
+        ));
+    }
+    Ok(token)
 }
 
 #[cfg(test)]

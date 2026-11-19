@@ -8,7 +8,12 @@
  * - `409 busy`: until the busy deadline, unless `busy: "raise"`;
  * - `503` (`template_not_ready`, `node_full`, a connection limit):
  *   until the busy deadline;
- * - `429 too_many_polls`: polls only.
+ * - `429 too_many_polls`: polls only;
+ * - `429 rate_limited` (refused before anything was done): any request,
+ *   after the answer's `Retry-After`, until the busy deadline.
+ *
+ * `429 budget_exceeded` is not retried: the budget is back at the end of
+ * the period, usually far past any deadline.
  */
 
 import type { TransportError } from "./errors.js";
@@ -31,5 +36,6 @@ export function statusRetry(status: number, code: string, options: { busyWait: b
   if (status === 409 && code === "busy") return options.busyWait;
   if (status === 503) return true;
   if (status === 429 && code === "too_many_polls") return options.poll;
+  if (status === 429 && code === "rate_limited") return true;
   return false;
 }

@@ -322,6 +322,7 @@ fn a_node_fails_and_comes_back_and_the_api_restarts() {
         "{log}"
     );
     let node_addr = format!("127.0.0.1:{}", plane.nodes[1].port);
+    // (Deleting one is accepted and done later: see quotas.rs.)
     for id in &lost {
         for r in [
             plane.call(ACME, "GET", &format!("/v1/sandboxes/{id}"), b""),
@@ -331,7 +332,6 @@ fn a_node_fails_and_comes_back_and_the_api_restarts() {
                 &format!("/v1/sandboxes/{id}/exec"),
                 json!({"command": "true"}),
             ),
-            plane.call(ACME, "DELETE", &format!("/v1/sandboxes/{id}"), b""),
         ] {
             assert_eq!((r.status, r.code().as_str()), (502, "node_unreachable"));
             let body = String::from_utf8_lossy(&r.body);
@@ -469,6 +469,8 @@ fn fake_answer(stream: &mut TcpStream, fake: Fake) {
     let mut body = vec![0u8; length.min(1 << 20)];
     let _ = stream.read_exact(&mut body);
     let target = head.split(' ').nth(1).unwrap_or("").to_string();
+    // The path: the API asks for the list with `?ended_after=`.
+    let target = target.split('?').next().unwrap_or("").to_string();
     let reply = |stream: &mut TcpStream, status: &str, body: &str| {
         let _ = write!(
             stream,

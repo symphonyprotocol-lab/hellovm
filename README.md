@@ -267,6 +267,25 @@ kernel process as the host kernel reports it (`SO_PEERCRED`); unlike
 refusals in a burst and 5 per second after that; the next line written for
 that peer ends with `suppressed=N`, the number of its refusals left out.
 
+*Bytes per kernel process*: the proxy counts the bytes it relays per
+connecting process, named by its process id and start time (`SO_PEERCRED`
+and field 22 of `/proc/PID/stat`, which together name one process for the
+life of the host), as they move, not when a flow ends. With `--stats PATH
+--stats-token-file FILE` it answers `noded`'s questions about them on a
+second Unix socket (`kernel/egress/src/usage.rs`): the token on a line,
+then `PID:START` keys (at most 4096), and it answers `PID:START SENT
+RECEIVED` per key and `.`. Put that socket in a directory of its own: a
+kernel process sees the flow socket's directory. The sandbox id of the
+flow header is not used (the connecting process chooses it); the token
+keeps a kernel process that can still reach the socket (a host without
+mount namespaces) from reading other sandboxes' traffic, and
+connections that never present it from keeping `noded` out: of the 8
+questions answered at once, the one that waited longest without the
+token makes room for a new one. At most 16384 processes are counted at
+once (when the table is full, those that ended are dropped, the longest
+idle first; a process that still runs keeps its counter, and a flow of a
+new process past that is relayed but not counted).
+
 *Limits*:
 
 | What | Limit |
@@ -290,7 +309,8 @@ by its outer SNI, so it is refused unless that names the flow's host;
 protocols where the server speaks first (SSH, SMTP), `git://`, and HTTP
 `CONNECT` are refused; outbound UDP (including QUIC/HTTP/3) and IPv6
 sockets stay unavailable; there is no per-sandbox policy (one allowlist
-per proxy) and no rate or byte quota.
+per proxy) and no rate or byte limit in the proxy (the API has a byte
+budget per tenant and period: see **Quotas and metering**).
 
 *Test hooks*: the cargo feature `insecure-test-hooks` (off by default)
 adds `hellovm --splice-to 127.0.0.1:PORT`, which sends every outbound flow
@@ -760,7 +780,8 @@ staying next to the kernel it drives.
 for all of them (see **Scheduling** below for several nodes):
 
 ```sh
-hellovm-egress --listen /run/hellovm/egress/egress.sock --policy /etc/hellovm/egress.policy &
+hellovm-egress --listen /run/hellovm/egress/egress.sock --policy /etc/hellovm/egress.policy \
+  --stats /run/hellovm/egress-stats/stats.sock --stats-token-file /etc/hellovm/egress-stats.token &
 hellovm-noded --config /etc/hellovm/noded.json &
 hellovm-api --config /etc/hellovm/api.json &
 ```
@@ -769,6 +790,8 @@ hellovm-api --config /etc/hellovm/api.json &
 {"node": "node-1", "listen": "127.0.0.1:7071", "token_file": "/etc/hellovm/node.token",
  "hellovm": "/usr/local/bin/hellovm", "state_dir": "/run/hellovm-noded",
  "egress": "/run/hellovm/egress/egress.sock", "max_sandboxes": 64, "max_memory_mb": 16384,
+ "egress_stats": {"socket": "/run/hellovm/egress-stats/stats.sock",
+                  "token_file": "/etc/hellovm/egress-stats.token"},
  "templates": [{"name": "python", "root": "/", "python": "/usr/bin/python3",
                 "preload": ["json", "decimal", "sqlite3"], "memory_limit_mb": 1024,
                 "fs_limit_mb": 1024}]}
@@ -776,11 +799,14 @@ hellovm-api --config /etc/hellovm/api.json &
 
 ```json
 {"listen": "0.0.0.0:7070",
- "tenants": [{"name": "acme", "token_file": "/etc/hellovm/acme.token", "max_sandboxes": 10}],
+ "tenants": [{"name": "acme", "token_file": "/etc/hellovm/acme.token", "max_sandboxes": 10,
+              "max_memory_mb": 8192, "requests_per_second": 50,
+              "cpu_seconds_per_period": 36000, "egress_bytes_per_period": 10737418240}],
  "nodes": [{"name": "node-1", "addr": "127.0.0.1:7071", "token_file": "/etc/hellovm/node.token"}],
  "default_idle_timeout": 600, "max_idle_timeout": 86400,
  "default_lifetime": 3600, "max_lifetime": 86400,
- "admin": {"listen": "127.0.0.1:7079", "token_file": "/etc/hellovm/admin.token"}}
+ "admin": {"listen": "127.0.0.1:7079", "token_file": "/etc/hellovm/admin.token"},
+ "metering": {"period": 86400, "log": "/var/lib/hellovm-api/usage"}}
 ```
 
 Unknown fields in either file are errors. Tokens are at least 22
@@ -800,8 +826,8 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 | `GET /v1/templates` | | `{"templates": [{"name", "ready"}]}` |
 | `POST /v1/sandboxes` | `{"template", "idle_timeout"?, "lifetime"?}` (seconds) | `201`, the sandbox |
 | `GET /v1/sandboxes` | | `{"sandboxes": [...]}`, the caller's |
-| `GET /v1/sandboxes/{id}` | | `{"id", "tenant", "template", "node", "egress_id", "created_at", "last_used_at", "expires_at", "idle_timeout", "memory_bytes", "memory_limit_bytes", "ready_ms"}` |
-| `DELETE /v1/sandboxes/{id}` | | `204` |
+| `GET /v1/sandboxes/{id}` | | `{"id", "tenant", "template", "node", "egress_id", "created_at", "last_used_at", "expires_at", "idle_timeout", "memory_bytes", "memory_limit_bytes", "ready_ms", "usage"}` (`usage`: below) |
+| `DELETE /v1/sandboxes/{id}` | | `204`; `202` when its node does not answer (deleted there later) |
 | `POST /v1/sandboxes/{id}/exec` | `{"command"` or `"python", "stateful"?, "timeout"?, "cwd"?, "env"?, "stdin"?, "max_output"?}` | when it ended: `{"exec_id", "exit_code", "signal", "timed_out", "cancelled", "stdout", "stderr", "stdout_truncated", "stderr_truncated", "stdout_bytes", "stderr_bytes", "duration_ms"}`, and for a stateful call `"value"?, "error"?, "state_lost"` |
 | `POST /v1/sandboxes/{id}/execs` | the same | `201` once it started: `{"exec_id", "kind", "state": "running", "started_at", "cancel_requested", "result": null}` |
 | `GET /v1/sandboxes/{id}/execs` | | `{"execs": [...]}`: the latest exec, running or ended |
@@ -811,6 +837,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 | `GET /v1/sandboxes/{id}/files?path=P` | | the file's bytes |
 | `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `{"bytes"}` |
 | `POST /v1/sandboxes/{id}/files/edit` | `{"path", "old", "new", "replace_all"?}` | `{"replacements"}` |
+| `GET /v1/usage` | | `{"tenant", "period", "usage", "sandboxes", "memory_limit_bytes", "quotas", "exceeded"}` (see **Quotas and metering**) |
 
 | Status | Code | When |
 |---|---|---|
@@ -822,7 +849,9 @@ curl -s -H "Authorization: Bearer $TOKEN" -d '{"command": "ls /", "timeout": 10}
 | 410 | `sandbox_ended` | the node removed it and still remembers why (idle, lifetime, memory, its agent ended) |
 | 413 | `too_large` | a body or file over 16 MiB |
 | 422 | `no_match`, `ambiguous` | edit: `old` does not occur, or occurs more than once without `replace_all` |
-| 429 | `tenant_limit` | the tenant has `max_sandboxes` already |
+| 429 | `tenant_limit`, `memory_limit` | the tenant has `max_sandboxes` already; its sandboxes' memory limits and the new one's would be over its `max_memory_mb` |
+| 429 | `rate_limited` | more requests than `requests_per_second` allows; `Retry-After` says in how many seconds a request is taken again |
+| 429 | `budget_exceeded` | creating a sandbox or starting an exec while the tenant's CPU or egress budget of the period is used up; `Retry-After` is the end of the period |
 | 502 | `sandbox_failed`, `node_unreachable` | the sandbox's agent broke (the sandbox is removed); the sandbox's node does not answer, or is marked unreachable (try again later) |
 | 503 | `template_not_ready`, `node_full` | the template is starting, or ready on no node that takes sandboxes; no node has room: try again |
 | 507 | `no_space` | the writable layer is full |
@@ -1162,9 +1191,9 @@ under one lock, creations in progress included, so concurrent creates
 on several nodes never exceed it (tested with 20 at once). A sandbox
 whose create answer was lost is kept in the store (it counts) unless
 its node confirms deleting it, until the node's next list shows whether
-it exists. The sandboxes of an unreachable node keep counting: deleting
-one answers `502` until the node is back, or the operator removes the
-node from the configuration. Not exact: an API that restarts while a
+it exists. The sandboxes of an unreachable node keep counting until their
+tenant deletes them: the delete is accepted (`202`) and done on the node
+once it answers (see **Quotas and metering**). Not exact: an API that restarts while a
 node is unreachable does not know that node's sandboxes until it
 answers, so a tenant may then go over its limit by those (it cannot
 create more until it is under it again); and a tenant's sandbox list
@@ -1181,7 +1210,10 @@ which refuses new sandboxes from then on; its sandboxes run to their
 end and are served and deleted as usual. `.../undrain` reverses it. The
 flag lives in the `noded` process: an API that restarts finds it there,
 and a restarted `noded` (which lost its sandboxes anyway) takes
-sandboxes again. To retire a host: drain it, wait until its sandboxes
+sandboxes again, unless its configuration says `"start_drained": true`:
+then it starts drained (logged as `draining=true (start_drained)`) until
+an operator undrains it, so a host being retired does not fill again
+when its `noded` restarts (tested). To retire a host: drain it, wait until its sandboxes
 are gone (`report.sandboxes` is 0), stop it, and remove it from the
 configuration.
 
@@ -1199,13 +1231,15 @@ through it. At most 16 connections.
 | `GET /admin/v1/nodes/{name}` | `NODE`: `{"name", "addr", "state", "since", "last_error", "reported_ms_ago", "placed_since_report", "in_flight", "report"}` (`report`: the node's last status: counts, memory, `draining`, templates) |
 | `POST /admin/v1/nodes/{name}/drain` | `NODE`, once the node drains |
 | `POST /admin/v1/nodes/{name}/undrain` | `NODE`, once it takes sandboxes again |
+| `GET /admin/v1/usage` | `{"tenants": [USAGE...], "sandboxes_metered", "odd_reports", "deletes_waiting", "log"}` (`USAGE` as `GET /v1/usage` answers; `log`: `null` without one, else `{"path", "healthy", "last_error", "written", "backlog", "dropped"}`) |
+| `GET /admin/v1/usage/{tenant}` | `USAGE` |
 
 *Configuration.* In the API's file: `nodes` (each `name`, `addr`,
 `token` or `token_file`), `reconcile_interval` (seconds between probes,
 default 2), `node_timeout` (seconds a probe may take, default 5, at most
 60), `unhealthy_after` (default 3) and `healthy_after` (default 2), 1 to
-100 each, and `admin`. In `noded`'s: `max_sandboxes` and
-`max_memory_mb`. With the defaults a node that refuses connections is
+100 each, `admin`, and `metering` (below). In `noded`'s: `max_sandboxes`,
+`max_memory_mb`, `start_drained` (default `false`) and `egress_stats`. With the defaults a node that refuses connections is
 unreachable after about 6 s (three probes 2 s apart; sooner when
 requests to it fail), one that hangs after up to 21 s (each probe waits
 5 s), and either is healthy again about 4 s after it answers.
@@ -1228,6 +1262,214 @@ several API instances (their in-flight counts would not be shared; the
 tenant limit then needs a shared store), and TLS between the API and
 the nodes (see above).
 
+**Quotas and metering.** The nodes measure what each sandbox uses, the
+API adds it up per tenant and period, writes it to a usage log, and
+refuses new work to a tenant over its quotas
+(`kernel/api/src/{meter,meterlog,quota}.rs`).
+
+*What a node measures.* Every sandbox's `usage` (in `GET
+/v1/sandboxes/{id}`, and in the node's lists): `run_ms` (wall-clock time
+since it was made), `cpu_ms`, `memory_byte_seconds` and
+`egress_sent_bytes` / `egress_received_bytes`. Each counter only grows,
+lives as long as the sandbox, and keeps its last value when it ends.
+
+* CPU time: the scan that measures memory once a second (see **Resource
+  limits**) also reads `utime + stime + cutime + cstime` of the clone's
+  kernel process and of every process below it. A guest process that
+  ended was waited for by its parent below the kernel process, so its
+  time is in that parent's `cutime`/`cstime`, and counted. Not counted:
+  a process whose host parent went away before waiting for it (it was
+  reparented out of the tree) after the last scan that saw it. A sandbox
+  is measured once more as it is removed, before its processes are
+  killed, so it pays for its last second too (and one that lived less
+  than a second, for what it used). The node keeps the
+  largest sum seen, so a process moving from one place of the sum to
+  another never makes it go down.
+* Memory: each measurement of private memory counts for the time since
+  the one before (byte-seconds), the same overestimate as for the limit.
+* Egress: counted by the egress proxy, which relays every byte, not by
+  the kernel process: the kernel process parses guest input and could be
+  made to lie, and it sees bytes it buffered rather than bytes that left.
+  The proxy counts per connecting process (see **Egress**, *Bytes per
+  kernel process*) and `noded`, which knows each sandbox's kernel process
+  id and start time, asks it once a second on the stats socket
+  (`egress_stats` in its configuration; without it, egress is 0). Counted:
+  the bytes of allowed flows delivered upstream (`sent`: the guest's
+  request, TLS handshake included) and delivered to the guest
+  (`received`), as they move. Not counted: DNS (answered by the kernel
+  process; nothing leaves), refused flows, bytes the proxy read while
+  sniffing a flow that was then refused, TCP/IP and TLS framing the host
+  kernel adds, and bytes still in the proxy's buffers when a sandbox
+  ends (the counters are read for 2 s after it ended).
+
+A sandbox that ended stays in the node's memory (4096 of them); 2 s
+after its end its usage is final and gets a number, `seq`, increasing
+per `noded` process. The API asks `GET /v1/sandboxes?ended_after=SEQ`
+and gets, with the live sandboxes, those that ended since (at most 1024
+per answer, `ended_more` when there are more) and the node's `boot`, a
+random number per `noded` process (a new one means the numbering started
+again).
+
+*What the API counts.* The probes the API makes anyway (every
+`reconcile_interval`) bring every sandbox's counters. Per sandbox, the
+meter keeps the counters it took last; what grew since is added to the
+tenant's total for the current period and to the sandbox's next record.
+A node is not trusted to report sense:
+
+| Report | What the API does |
+|---|---|
+| a counter lower than the last one taken | nothing is counted, the higher value is kept (nothing is counted twice when it climbs back) |
+| a counter that grew more than possible since the last report (run time faster than the clock; CPU time faster than the node's CPUs, `cpus` in its status; egress faster than 100 Gbit/s; memory beyond the node's memory), each with 30 s of slack | counted up to that bound only |
+| a value beyond 2^53 | taken as 2^53 |
+| the first report of a sandbox made in the time the meter counts | counted from zero, up to what the time the meter has counted allows (not what the run time the node reports would) |
+| a sandbox reported with another tenant than the API made it for, or than it was first seen with, or from another node, or of a tenant not in the configuration | ignored (and logged) |
+| an ended sandbox listed again, or a `seq` not past the last one taken | ignored |
+| a node whose `boot` changed (it restarted, its sandboxes died) | its sandboxes are ended (`lost`) with what was counted, and its ended sandboxes are asked for from the first again |
+| a sandbox its node has not listed, live or ended, for 60 s while it answered | the same; if the node lists it again, it is counted on from where its counters stood |
+
+Each of these counts in `odd_reports` (admin). A node that lies can
+therefore add to its own tenants' usage at most what its hardware could
+have done, and nothing to a sandbox it does not run; a node that does
+not answer adds nothing, and what its sandboxes did meanwhile is counted
+when it answers again (counters are cumulative). A sandbox that ends
+between two probes is counted by its final counters from the node's list
+of ended ones. A sandbox first seen made before the time the meter
+counts (the period's start; without a log, also this API's start) is
+counted from its first report on.
+
+*The usage log.* `metering.log` is a path prefix: the records of the
+period that starts at `S` go to `PREFIX.YYYYMMDDTHHMMSSZ.jsonl` (`S` in
+UTC), then `.1.jsonl`, `.2.jsonl`... once a file holds `max_file_mb`
+(256). Files are only appended to; old periods' files are the operator's.
+One JSON object per line:
+
+```json
+{"v":1,"kind":"usage","ts":1794963600123,"period":1794960000,"tenant":"acme",
+ "sandbox":"sb-...","node":"node-1","template":"python",
+ "delta":{"run_ms":60000,"cpu_ms":1520,"memory_byte_seconds":2516582400,"egress_sent_bytes":812,"egress_received_bytes":40213},
+ "total":{"run_ms":180000,"cpu_ms":4210,"memory_byte_seconds":7549747200,"egress_sent_bytes":812,"egress_received_bytes":40213},
+ "memory_bytes":41943040}
+```
+
+| `kind` | When | `delta` |
+|---|---|---|
+| `usage` | every `metering.interval` (60 s) for a sandbox that grew | what grew since its previous record |
+| `final` | it ended; `end`: `ended` (its node said so) or `lost` | what grew since its previous record |
+| `carry` | a period began, for every sandbox running | zero (`total` carries its counters into the new period) |
+| `delete_pending`, `delete_done` | a delete waits for an unreachable node, and was done | none |
+
+`ts` is when it was made (Unix ms), `period` the start of its period (Unix
+seconds), `total` the sandbox's counters as taken, `memory_bytes` its
+memory at the last measurement. The `delta`s of a period's records add
+up to the tenants' totals for it, and a sandbox's add up to its `total`
+(tested). A writer thread appends once a second and syncs the file;
+when it cannot (a missing directory, a full disk) the API serves on,
+logs `usage log: cannot write ...` once and `usage log: writing again`
+when it can, and the records wait in memory (100000 at most; past that
+the oldest are dropped, logged and counted in the admin view's
+`log.dropped`). The usage counted for quotas does not depend on the log.
+
+*Restarts.* At start the API reads the current period's files (the
+totals, the last counters of each sandbox, the deletes still to do) and
+the previous period's (the last counters of sandboxes running across the
+boundary), at most `max_read_mb` (1024) in all: beyond it, it logs an
+error and its totals are short. A line that is not a record (one cut
+short by a crash: the next record starts a new line) is skipped and
+counted. Then every sandbox goes on from its logged counters, so what it
+used while no API ran, and in the last interval before the restart (not
+yet written), is counted once when the API sees it again; an ended
+sandbox with a final record is not counted again when its node lists it
+(tested). Without a log a restarted API starts the period's totals from
+zero and counts every running sandbox from its first report.
+
+*Quotas.* Per tenant, all optional:
+
+| Field | Limit | Checked | Past it |
+|---|---|---|---|
+| `max_sandboxes` | sandboxes at once | create, under one lock with the next | `429 tenant_limit` |
+| `max_memory_mb` | the memory limits of its sandboxes, summed | create, under the same lock, creations in progress included (with the largest limit any node reports for the template, the node not being chosen yet; when the sandbox made has a larger limit than that, or no node had reported one, the check is made again with the real limit and the sandbox is removed if the tenant is over) | `429 memory_limit` |
+| `requests_per_second`, `request_burst` (default two seconds' worth, at least 10) | requests: a token bucket per tenant | every request with the tenant's token | `429 rate_limited`, `Retry-After` |
+| `cpu_seconds_per_period` | CPU time of its sandboxes in the period | creating a sandbox, starting an exec (`exec`, `execs`) | `429 budget_exceeded`, `Retry-After` until the period ends |
+| `egress_bytes_per_period` | egress bytes, sent and received, in the period | the same | the same |
+
+`metering.period` (seconds, default 86400) is aligned to multiples of
+itself since the Unix epoch, so a day is a UTC day and the budgets start
+again at midnight UTC. A tenant over a budget gets no new sandbox and no
+new exec; everything else works (reads, lists, polls, cancels, files,
+resetting the interpreter, deletes), and what runs is not stopped: a
+long exec or a busy background process can take a tenant past its
+budget, by up to what it does before it ends (budgets are measured, not
+enforced in the guest). Usage reaches the API within about a second plus
+`reconcile_interval`, so a tenant can also go past a budget by what it
+does in that time. A budget of 0 refuses all new work.
+
+The rate limit is checked after the token and before anything else:
+a request without a valid token takes nothing from any bucket (it is a
+`401`), and a tenant over its rate gets `429` at once, without waiting
+and without touching a node, so one tenant's burst costs the others
+nothing (tested: another tenant's requests are all answered at once
+while one is refused). Every request counts, polls included.
+
+A tenant reads its own usage with `GET /v1/usage`:
+
+```json
+{"tenant": "acme", "period": {"start": 1794960000000, "end": 1795046400000, "seconds": 86400},
+ "usage": {"run_ms": 7260000, "cpu_ms": 41250, "memory_byte_seconds": 302003200000,
+           "egress_sent_bytes": 18233, "egress_received_bytes": 9120344},
+ "sandboxes": 2, "memory_limit_bytes": 2147483648,
+ "quotas": {"max_sandboxes": 10, "max_memory_bytes": 8589934592, "requests_per_second": 50.0,
+            "request_burst": 100, "cpu_seconds_per_period": 36000.0, "egress_bytes_per_period": 10737418240},
+ "exceeded": []}
+```
+
+and operators everyone's with `GET /admin/v1/usage`, which also shows
+the log's state.
+
+*Deleting a sandbox of an unreachable node.* The delete is accepted
+(`202`): the sandbox stops counting against the tenant at once (its slot
+and memory are free), is listed no more, and answers `404`. The API
+keeps it among the deletes to do (at most 4096 per node; past that the
+delete answers `502 node_unreachable` as before) and writes a
+`delete_pending` record to the usage log before it answers (when the log
+cannot be written, the record waits in memory like any other, and the
+delete is still accepted). When the
+node answers a probe again, the API deletes it there (`delete_done`); a
+sandbox whose node no longer lists it needs nothing more. The node's
+list does not bring it back meanwhile: the reconciliation leaves out
+sandboxes with a delete to do (tested). It runs on the node until then
+(its idle timeout and lifetime still apply), and what it uses is still
+its tenant's. An API that restarts before the node is back reads the
+deletes to do back from the log and does them (tested); without a log it
+does not know of them, and the sandbox shows again (and counts) once the
+node answers, until its tenant deletes it again or its idle timeout
+ends it.
+
+*Configuration.* `metering`: `period` (seconds, 1 to 366 days, default
+86400), `log` (none: no log), `interval` (seconds between records of a
+running sandbox, 1 to 86400, default 60), `max_file_mb` (256),
+`max_read_mb` (1024). Per tenant: `max_memory_mb`,
+`requests_per_second` and `request_burst`, `cpu_seconds_per_period`,
+`egress_bytes_per_period`. In `noded`'s: `egress_stats` (`socket`, and
+`token` or `token_file`: the proxy's `--stats-token-file`; the socket
+may not be in the egress socket's directory).
+
+Rejected: *a log per node* (each `noded` would need durable storage, and
+the usage of a tenant would have to be gathered from every host to
+check a budget); *a database* (the decision for now: metadata stays in
+memory, and the log is the API's only durable state); *counting egress
+in the kernel process* (it is the process a guest attacks, and it would
+need a new channel to `noded`); *stopping a tenant's running sandboxes
+or execs at its budget* (work would be lost at an arbitrary point; new
+work is what the budget refuses); *429 for budgets from the HTTP layer's
+per-address limit* (an address is not a tenant); *a rate limit before
+authentication* (unauthenticated requests would spend a tenant's
+budget); *months as periods* (fixed lengths keep the boundaries simple;
+a calendar month would be a period kind of its own).
+Not exact: with several API instances each would count its own rate and
+reservations (one API is assumed, as for scheduling); usage is sampled,
+so a budget can be passed by what a tenant does in about two seconds,
+and by work that was running.
+
 **Resource limits.** All clones of a template run in the template's
 cgroup: a clone runs before whoever asked for it learns its pid. What
 is enforced without root:
@@ -1240,6 +1482,7 @@ is enforced without root:
 | Time | per-exec `timeout`, idle timeout, lifetime | killed or removed |
 | Tasks, sockets, outbound flows | the kernel (2048 tasks, 4096 sockets) and the egress proxy (64 flows per sandbox) | `EAGAIN` and the like |
 | Sandboxes | per tenant (API) and per node (`max_sandboxes`) | `429`, `503` |
+| Memory of a tenant's sandboxes, requests, CPU time and egress per period | per tenant (API: see **Quotas and metering**) | `429` |
 
 The scan runs on a thread of its own (idle timeouts and lifetimes do not
 wait for it) and costs a binary search per process, `kcmp` ordering the
@@ -1348,10 +1591,36 @@ admin API refusing no token, tenant, node and wrong tokens (and absent
 from the tenants' listener), and fake nodes answering garbage, a
 terabyte `Content-Length`, an endless body, another node's name,
 absurd numbers, nothing at all, or nonsense refusals of every create,
-with the API's memory under 64 MiB after. `kernel/api` has unit tests
+with the API's memory under 64 MiB after. `kernel/api/tests/quotas.rs`
+(8 tests, about 30 s, its plane's periods 15 s long): CPU and egress budgets used
+up by real work and refused at create and exec (with `Retry-After`)
+while reads, polls, cancels, files, resets and deletes work and a
+running exec ends normally, another tenant untouched, and both back at
+the next period; the memory quota under 12 concurrent creates (exactly
+three made); the rate limit (a burst refused, another tenant's 50
+requests all answered at once, 90 requests without a valid token taking
+nothing from the bucket); the usage log while its directory is missing
+and once it exists, its records of a sandbox that ran, fetched through
+the proxy and ended (the deltas adding up to the final counters, CPU,
+memory and egress counted), and an API restart mid-period (the totals
+unchanged, nothing counted twice); a fake node reporting absurd,
+decreasing and out-of-range counters, a sandbox claimed for another
+tenant and an ended one listed again; a fake node that restarts (its
+ended sandboxes asked for from the first again); the delete of a sandbox on a
+stopped (`SIGSTOP`) node, its slot used at once, an API restart before
+the node is back, and the delete done then, the sandbox never listed
+again; and a node configured to start drained, undrained and restarted.
+`kernel/api` has unit tests
 for the health state machine, the placement rule (order, ties, spread of
 creations in flight, full, draining, unreachable and foreign
-templates), checking reports, and its configuration.
+templates), checking reports, its configuration, the meter (counters
+that go down or jump, tenants and nodes that change, period roll-over
+and carry, sandboxes first seen, lost and ended, rebuilding from the
+log), the log (rotation by size, bounded reads, cut and long lines, a
+log that cannot be written and its bounded backlog), the rate limiter,
+and the store's memory reservations and deletes to do. `kernel/egress`
+tests the per-process counters (bounded table) and the stats socket's
+token; `kernel/noded` parsing `/proc/PID/stat` and CPU time.
 `kernel/noded` has unit tests for the agent protocol (against the
 host's Python: execs, output frames, cancel, the stateful interpreter's
 state, interrupt, kill, end and reset), the frame parser (frames in any
@@ -1471,7 +1740,12 @@ something twice: any request whose connection could not be made; after
 a failure without an answer only idempotent ones (`GET`s, `DELETE`,
 cancel), never create, exec, starting a stream, write, edit or reset,
 which raise a transport error with `maybe_sent` instead; `503` until the
-busy deadline; `429 too_many_polls` for polls. Streams are long polls
+busy deadline; `429 too_many_polls` for polls; `429 rate_limited` after
+its `Retry-After`, until the busy deadline. `429 budget_exceeded` is
+raised at once as `BudgetExceededError` (with `retry_after`, the end of
+the period), `rate_limited` past the deadline as `RateLimitError`; a
+`DELETE` accepted for later (`202`) is a success; `client.usage()` reads
+`GET /v1/usage`, and a sandbox's description has its `usage`. Streams are long polls
 with the byte cursor: a dropped connection or a stalled poll resumes from
 the cursor and loses nothing. The SDKs keep no exec id but the one they
 started and are following (a sandbox keeps only its latest exec).
@@ -1508,7 +1782,10 @@ line saying so; a file read follows the same rule. A non-zero exit code
 or a Python exception is a result, not an error; a failure of the API
 (no such file, an ambiguous edit, busy past the deadline, a sandbox that
 could not be made) is a tool error (`isError`) with the API's code and
-message. A cancelled MCP request cancels its command in the sandbox.
+message; for a quota it adds what to do next (`budget_exceeded`: nothing
+can be run until the period ends, in N s, files still work, do not
+retry; `rate_limited`: wait N s; `tenant_limit`, `memory_limit`: another
+sandbox must be deleted first). A cancelled MCP request cancels its command in the sandbox.
 
 Decisions, and what was rejected:
 

@@ -69,15 +69,40 @@ fn run(path: &str) -> Result<(), String> {
         unhealthy_after: config.unhealthy_after,
         healthy_after: config.healthy_after,
     };
-    let api = Arc::new(Api {
+    let record_every = Duration::from_secs_f64(config.metering.interval);
+    let api = Arc::new(Api::new(
         config,
         tenants,
-        nodes: Nodes::new(nodes, policy),
-        store: Arc::new(MemoryStore::default()),
-    });
+        Nodes::new(nodes, policy),
+        Arc::new(MemoryStore::default()),
+    ));
     // What runs already (after a restart of this service) and the state of
     // every node are known before the first request is served.
     api.reconcile();
+    if let Some(log) = &api.log {
+        let log = Arc::clone(log);
+        std::thread::Builder::new()
+            .name("usage-log".into())
+            .spawn(move || log.run())
+            .map_err(|e| e.to_string())?;
+    }
+    {
+        let api = Arc::clone(&api);
+        std::thread::Builder::new()
+            .name("meter".into())
+            .spawn(move || {
+                let mut recorded = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let flush = recorded.elapsed() >= record_every;
+                    if flush {
+                        recorded = std::time::Instant::now();
+                    }
+                    api.tick(flush);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+    }
     // Each node is probed on a thread of its own, so a slow one does not
     // delay the others.
     for i in 0..api.nodes.configs().len() {

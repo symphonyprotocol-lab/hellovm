@@ -18,20 +18,25 @@
 //! | `GET /v1/sandboxes/{id}/files?path=P` | | the bytes |
 //! | `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `WriteResult` |
 //! | `POST /v1/sandboxes/{id}/files/edit` | `EditRequest` | `EditResult` |
+//! | `GET /v1/usage` | | `TenantUsage` |
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use hellovm_control::http::{self, percent_encode, ClientResponse, Handler, Request, Response};
 use hellovm_control::ids::{token_eq, SandboxId};
 use hellovm_control::types::{
     self, CreateSandbox, DrainRequest, ExecRequest, NodeCreate, NodeStatus, PollQuery, SandboxInfo,
-    SandboxList,
+    SandboxList, TenantUsage,
 };
+use hellovm_control::unix_ms;
 
 use crate::config::{valid_name, Config, Node, Tenant};
-use crate::nodes::{check_status, NoPlace, Nodes};
-use crate::store::{Record, Store};
+use crate::meter::{period_start, Meter, Observed};
+use crate::meterlog::{LogStatus, LogWriter};
+use crate::nodes::{check_status, NoPlace, Nodes, MAX_SANDBOX_MEMORY};
+use crate::quota::RateLimiter;
+use crate::store::{Record, Refused, Store};
 
 /// The header naming the tenant to the node.
 const TENANT_HEADER: &str = "X-Hellovm-Tenant";
@@ -56,6 +61,10 @@ pub struct Api {
     pub tenants: Vec<Tenant>,
     pub nodes: Nodes,
     pub store: Arc<dyn Store>,
+    pub meter: Mutex<Meter>,
+    /// The usage log's writer, when there is a log.
+    pub log: Option<Arc<LogWriter>>,
+    pub limiter: RateLimiter,
 }
 
 fn error(status: u16, code: &str, message: &str) -> Response {
@@ -67,6 +76,164 @@ fn not_found() -> Response {
 }
 
 impl Api {
+    /// The API, with what the usage log says (the period's totals, the
+    /// last counters of every sandbox, the deletes still to do) read back.
+    pub fn new(config: Config, tenants: Vec<Tenant>, nodes: Nodes, store: Arc<dyn Store>) -> Api {
+        let now_ms = unix_ms();
+        let m = config.metering.clone();
+        let names: Vec<String> = tenants.iter().map(|t| t.name.clone()).collect();
+        let known = |t: &str| names.iter().any(|n| n == t);
+        let rebuilt = match &m.log {
+            Some(prefix) => {
+                let start = period_start(now_ms / 1000, m.period);
+                let r = crate::meterlog::read(prefix, start, m.period, m.max_read_mb << 20, &known);
+                log::info!(
+                    "usage log: read {} records ({} not records) of the period from {}: {} tenants, \
+                     {} sandboxes running, {} deletes to do",
+                    r.records,
+                    r.bad,
+                    crate::meter::utc_stamp(start),
+                    r.totals.len(),
+                    r.baselines.len(),
+                    r.deletes.len()
+                );
+                if r.truncated {
+                    log::error!(
+                        "usage log: more than max_read_mb ({}); the period's totals are short",
+                        m.max_read_mb
+                    );
+                }
+                r
+            }
+            None => Default::default(),
+        };
+        for (id, (tenant, node)) in &rebuilt.deletes {
+            if nodes.index(node).is_some() {
+                store.add_delete(Record {
+                    id: *id,
+                    tenant: tenant.clone(),
+                    node: node.clone(),
+                    template: String::new(),
+                    memory_limit: 0,
+                });
+            }
+        }
+        let meter = Meter::new(
+            m.period,
+            now_ms,
+            Instant::now(),
+            m.log.is_some(),
+            (config.max_lifetime * 1000.0) as u64,
+            names.clone(),
+            &rebuilt,
+        );
+        Api {
+            log: m
+                .log
+                .map(|prefix| Arc::new(LogWriter::new(prefix, m.max_file_mb))),
+            meter: Mutex::new(meter),
+            limiter: RateLimiter::default(),
+            config,
+            tenants,
+            nodes,
+            store,
+        }
+    }
+
+    fn meter(&self) -> MutexGuard<'_, Meter> {
+        self.meter.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Once a second: starts a new period when one began, records what
+    /// running sandboxes used when `flush`, and hands the records to the
+    /// log.
+    pub fn tick(&self, flush: bool) {
+        let deletes: Vec<(SandboxId, String, String)> = self
+            .store
+            .deletes()
+            .into_iter()
+            .map(|r| (r.id, r.tenant, r.node))
+            .collect();
+        let lines = {
+            let mut meter = self.meter();
+            meter.tick(unix_ms(), flush, &deletes);
+            meter.take_lines()
+        };
+        if let Some(log) = &self.log {
+            log.push(lines);
+        }
+    }
+
+    /// A tenant's usage this period and its quotas.
+    fn usage_of(&self, tenant: &Tenant) -> TenantUsage {
+        let now_ms = unix_ms();
+        let (usage, period) = {
+            let meter = self.meter();
+            let period = crate::meter::period_view(
+                period_start(now_ms / 1000, self.config.metering.period),
+                self.config.metering.period,
+            );
+            (meter.totals(&tenant.name, now_ms), period)
+        };
+        let (sandboxes, memory_limit_bytes) = self.store.held(&tenant.name);
+        TenantUsage {
+            tenant: tenant.name.clone(),
+            period,
+            usage,
+            sandboxes,
+            memory_limit_bytes,
+            quotas: tenant.quotas(),
+            exceeded: Self::exceeded(tenant, &usage),
+        }
+    }
+
+    /// The budgets `tenant` used up, by `usage`.
+    fn exceeded(tenant: &Tenant, usage: &types::UsageTotals) -> Vec<String> {
+        let mut out = Vec::new();
+        if tenant.cpu_ms_per_period.is_some_and(|b| usage.cpu_ms >= b) {
+            out.push("cpu".to_string());
+        }
+        let egress = usage
+            .egress_sent_bytes
+            .saturating_add(usage.egress_received_bytes);
+        if tenant.egress_bytes_per_period.is_some_and(|b| egress >= b) {
+            out.push("egress".to_string());
+        }
+        out
+    }
+
+    /// `429 budget_exceeded` when `tenant` used up a budget of the
+    /// period: no new sandbox, no new exec, until the period ends.
+    fn over_budget(&self, tenant: &Tenant) -> Option<Response> {
+        if tenant.cpu_ms_per_period.is_none() && tenant.egress_bytes_per_period.is_none() {
+            return None;
+        }
+        let now_ms = unix_ms();
+        let (usage, left) = {
+            let meter = self.meter();
+            (
+                meter.totals(&tenant.name, now_ms),
+                meter.seconds_left(now_ms),
+            )
+        };
+        let exceeded = Self::exceeded(tenant, &usage);
+        if exceeded.is_empty() {
+            return None;
+        }
+        Some(
+            error(
+                429,
+                "budget_exceeded",
+                &format!(
+                    "the {} budget of this period is used up: no new sandbox or exec until it \
+                     ends, in {left} s",
+                    exceeded.join(" and ")
+                ),
+            )
+            .with_header("Retry-After", left.to_string()),
+        )
+    }
+
     /// The tenant whose token this is. Every token is compared, so the
     /// time taken does not tell which one matched.
     fn tenant(&self, request: &Request) -> Option<&Tenant> {
@@ -160,22 +327,29 @@ impl Api {
                 return;
             }
         };
-        let list = self
-            .call_max(
-                node,
-                "GET",
-                "/v1/sandboxes",
-                None,
-                b"",
-                NODE_TIMEOUT,
-                MAX_LIST,
-            )
-            .map_err(|e| e.to_string())
-            .and_then(|r| match r.status {
-                200 => serde_json::from_slice::<SandboxList>(&r.body)
-                    .map_err(|_| "a malformed sandbox list".to_string()),
-                status => Err(format!("status {status} for its sandboxes")),
-            });
+        let ask = |cursor: u64| {
+            let target = format!("/v1/sandboxes?ended_after={cursor}");
+            self.call_max(node, "GET", &target, None, b"", NODE_TIMEOUT, MAX_LIST)
+                .map_err(|e| e.to_string())
+                .and_then(|r| match r.status {
+                    200 => serde_json::from_slice::<SandboxList>(&r.body)
+                        .map_err(|_| "a malformed sandbox list".to_string()),
+                    status => Err(format!("status {status} for its sandboxes")),
+                })
+        };
+        let (known_boot, mut cursor) = {
+            let meter = self.meter();
+            (meter.boot(&node.name), meter.cursor(&node.name))
+        };
+        let mut list = ask(cursor);
+        // A node that restarted numbers its ended sandboxes from 1 again:
+        // ask from the start.
+        if let Ok(l) = &list {
+            if cursor > 0 && known_boot.is_some() && l.boot != known_boot {
+                cursor = 0;
+                list = ask(0);
+            }
+        }
         let list = match list {
             Ok(list) => list,
             Err(why) => {
@@ -184,23 +358,145 @@ impl Api {
                 return;
             }
         };
-        let records = list
-            .sandboxes
-            .into_iter()
-            .filter_map(|s| {
-                if !valid_name(&s.tenant) || !valid_name(&s.template) {
-                    return None;
-                }
-                Some(Record {
-                    id: SandboxId::parse(&s.id)?,
-                    tenant: s.tenant,
-                    node: node.name.clone(),
-                    template: s.template,
-                })
+        let observed = |s: &SandboxInfo| -> Option<Observed> {
+            if !valid_name(&s.tenant) || !valid_name(&s.template) {
+                return None;
+            }
+            Some(Observed {
+                id: SandboxId::parse(&s.id)?,
+                tenant: s.tenant.clone(),
+                template: s.template.clone(),
+                usage: s.usage,
+                memory_bytes: s.memory_bytes,
+                memory_limit: s.memory_limit_bytes.min(MAX_SANDBOX_MEMORY),
+                created_at: s.created_at,
+            })
+        };
+        let live: Vec<Observed> = list.sandboxes.iter().filter_map(observed).collect();
+        let records: Vec<Record> = live
+            .iter()
+            .map(|o| Record {
+                id: o.id,
+                tenant: o.tenant.clone(),
+                node: node.name.clone(),
+                template: o.template.clone(),
+                memory_limit: o.memory_limit,
             })
             .collect();
+        // What ended: only `seq`s past the cursor, in order, each once.
+        let ended_list = list.ended.unwrap_or_default();
+        let mut last_seq = cursor;
+        let mut ended = Vec::new();
+        for e in &ended_list {
+            if e.seq <= last_seq || !valid_name(&e.tenant) || !valid_name(&e.template) {
+                continue;
+            }
+            last_seq = e.seq;
+            if let Some(id) = SandboxId::parse(&e.id) {
+                ended.push(Observed {
+                    id,
+                    tenant: e.tenant.clone(),
+                    template: e.template.clone(),
+                    usage: e.usage,
+                    memory_bytes: 0,
+                    memory_limit: e.memory_limit_bytes.min(MAX_SANDBOX_MEMORY),
+                    created_at: e.created_at,
+                });
+            }
+        }
+        let reported: std::collections::HashSet<SandboxId> = live.iter().map(|o| o.id).collect();
+        // Usage is counted for the tenant this API made the sandbox for,
+        // where it knows: a node that names another tenant for it is not
+        // believed (its usage is not counted until it says the right one).
+        let mut foreign = 0usize;
+        let mut owned = |o: &Observed| {
+            let ours = self
+                .store
+                .get(&o.id)
+                .or_else(|| self.store.ended(&o.id))
+                .is_none_or(|r| r.tenant == o.tenant);
+            if !ours {
+                foreign += 1;
+            }
+            ours
+        };
+        let live: Vec<Observed> = live.into_iter().filter(&mut owned).collect();
+        let ended: Vec<Observed> = ended.into_iter().filter(&mut owned).collect();
+        if foreign > 0 {
+            log::warn!(
+                "node {}: {foreign} sandboxes reported with another tenant than they were made                  for; their usage is not counted",
+                node.name
+            );
+        }
         self.nodes.reported(i, asked, load, true);
+        let bounds = self.nodes.bounds(i);
         self.store.replace_node(&node.name, asked, records);
+        // A node that does not say when it started (an older one) has its
+        // ended sandboxes go unread: they are counted as lost.
+        let boot = list.boot.unwrap_or(0);
+        self.meter().observe(
+            &node.name,
+            unix_ms(),
+            Instant::now(),
+            &bounds,
+            live,
+            ended,
+            boot,
+            last_seq,
+            !list.ended_more,
+        );
+        self.finish_deletes(i, &reported);
+    }
+
+    /// Does the deletes that waited for node `i`, which answered and runs
+    /// `reported`.
+    fn finish_deletes(&self, i: usize, reported: &std::collections::HashSet<SandboxId>) {
+        let node = &self.nodes.configs()[i];
+        for record in self.store.deletes() {
+            if record.node != node.name {
+                continue;
+            }
+            let done = if reported.contains(&record.id) {
+                let target = format!("/v1/sandboxes/{}", record.id);
+                match self.call(
+                    node,
+                    "DELETE",
+                    &target,
+                    Some(&record.tenant),
+                    b"",
+                    NODE_TIMEOUT,
+                ) {
+                    Ok(a) => {
+                        a.status == 204
+                            || matches!(
+                                a.error_code().as_deref(),
+                                Some("sandbox_not_found" | "sandbox_ended")
+                            )
+                    }
+                    Err(err) => {
+                        // The node stopped answering: the rest waits for
+                        // the next probe rather than holding this one up
+                        // for a timeout each.
+                        self.node_failed(i, &err);
+                        return;
+                    }
+                }
+            } else {
+                // Not on the node any more (it ended, or died with it).
+                true
+            };
+            if done {
+                self.store.delete_done(&record.id);
+                self.meter()
+                    .note_delete(unix_ms(), &record.id, &record.tenant, &node.name, true);
+                log::info!(
+                    "sandbox {} of {}: the delete that waited for node {} is done",
+                    record.id,
+                    record.tenant,
+                    node.name
+                );
+            }
+        }
     }
 
     /// Probes every node at once; returns when all answered or failed.
@@ -264,12 +560,32 @@ impl Api {
         if body.template.is_empty() || body.template.len() > 64 {
             return error(400, "bad_request", "malformed template name");
         }
-        let Some(_slot) = self.store.reserve(&tenant.name, tenant.max_sandboxes) else {
-            return error(
-                429,
-                "tenant_limit",
-                &format!("at most {} sandboxes at once", tenant.max_sandboxes),
-            );
+        if let Some(refused) = self.over_budget(tenant) {
+            return refused;
+        }
+        // What its sandbox may use, by the nodes' reports (the largest, as
+        // the node is not chosen yet).
+        let memory = self
+            .nodes
+            .template_memory(&body.template, &tenant.name)
+            .unwrap_or(0);
+        let _slot = match self.store.reserve(
+            &tenant.name,
+            tenant.max_sandboxes,
+            memory,
+            tenant.max_memory_bytes,
+        ) {
+            Ok(slot) => slot,
+            Err(Refused::Count) => {
+                return error(
+                    429,
+                    "tenant_limit",
+                    &format!("at most {} sandboxes at once", tenant.max_sandboxes),
+                )
+            }
+            Err(Refused::Memory) => {
+                return Self::memory_limit(tenant.max_memory_bytes.unwrap_or(0))
+            }
         };
         let id = match SandboxId::random() {
             Ok(id) => id,
@@ -308,16 +624,31 @@ impl Api {
                         log::warn!("node {}: a malformed create answer", node.name);
                         self.nodes.done(i, false);
                         self.nodes.failed(i, "a malformed create answer");
-                        self.made_maybe(i, tenant, id, &body.template);
+                        self.made_maybe(i, tenant, id, &body.template, memory);
                         return error(502, "node_failed", "the sandbox could not be made");
                     };
                     self.nodes.done(i, true);
+                    let actual = info.memory_limit_bytes.min(MAX_SANDBOX_MEMORY);
                     self.store.insert(Record {
                         id,
                         tenant: tenant.name.clone(),
                         node: node.name.clone(),
                         template: body.template.clone(),
+                        memory_limit: actual,
                     });
+                    // The sandbox's limit is larger than what was reserved
+                    // (no node had reported the template's, or this node's
+                    // is larger): checked again with the real one, and the
+                    // sandbox removed if the tenant is over.
+                    if let Some(max) = tenant.max_memory_bytes.filter(|_| actual > memory) {
+                        let (_, held) = self.store.held(&tenant.name);
+                        // `held` counts this sandbox and its reservation.
+                        if held.saturating_sub(memory) > max {
+                            self.store.forget(&id);
+                            self.made_maybe(i, tenant, id, &body.template, actual);
+                            return Self::memory_limit(max);
+                        }
+                    }
                     return Response::json(201, &info);
                 }
                 Ok(answer) => {
@@ -359,11 +690,22 @@ impl Api {
                     // node could make it twice, so placement stops here.
                     self.nodes.done(i, false);
                     self.node_failed(i, &err);
-                    self.made_maybe(i, tenant, id, &body.template);
+                    self.made_maybe(i, tenant, id, &body.template, memory);
                     return Self::unreachable();
                 }
             }
         }
+    }
+
+    fn memory_limit(max: u64) -> Response {
+        error(
+            429,
+            "memory_limit",
+            &format!(
+                "the memory limits of all sandboxes may add up to at most {} MiB",
+                max >> 20
+            ),
+        )
     }
 
     /// Node `i` may have made sandbox `id` (its answer to the create was
@@ -371,7 +713,7 @@ impl Api {
     /// kept in the store, where it counts against the tenant's limit until
     /// the node's next list shows whether it exists (and the tenant sees it
     /// then if it does).
-    fn made_maybe(&self, i: usize, tenant: &Tenant, id: SandboxId, template: &str) {
+    fn made_maybe(&self, i: usize, tenant: &Tenant, id: SandboxId, template: &str, memory: u64) {
         let node = &self.nodes.configs()[i];
         let target = format!("/v1/sandboxes/{id}");
         let deleted = self
@@ -390,6 +732,7 @@ impl Api {
                 tenant: tenant.name.clone(),
                 node: node.name.clone(),
                 template: template.to_string(),
+                memory_limit: memory,
             });
         }
     }
@@ -471,21 +814,70 @@ impl Api {
                     .collect()
             }),
         };
+        // Deleted while their node did not answer: gone for the tenant.
+        let deleted: std::collections::HashSet<String> = self
+            .store
+            .deletes()
+            .into_iter()
+            .map(|r| r.id.to_string())
+            .collect();
         let mut sandboxes = Vec::new();
         for (i, list) in lists {
             let node = &self.nodes.configs()[i].name;
             match list {
                 // Only what this node runs for this tenant.
-                Some(list) => sandboxes.extend(
-                    list.sandboxes
-                        .into_iter()
-                        .filter(|s| s.tenant == tenant.name && s.node == *node),
-                ),
+                Some(list) => sandboxes.extend(list.sandboxes.into_iter().filter(|s| {
+                    s.tenant == tenant.name && s.node == *node && !deleted.contains(&s.id)
+                })),
                 None => log::debug!("node {node}: no sandbox list"),
             }
         }
         sandboxes.sort_by_key(|s| (s.created_at, s.id.clone()));
-        Response::json(200, &SandboxList { sandboxes })
+        Response::json(
+            200,
+            &SandboxList {
+                sandboxes,
+                ended: None,
+                ended_more: false,
+                boot: None,
+            },
+        )
+    }
+
+    /// Its tenant deletes a sandbox whose node does not answer: it stops
+    /// counting and being listed now, and is deleted on the node once the
+    /// node answers (`202`). When too many deletes wait on that node
+    /// already, or the sandbox is gone from the store, `502` as before.
+    fn delete_later(&self, record: &Record) -> Response {
+        match self.store.delete_later(&record.id) {
+            Some(r) => {
+                // Written before the answer: an API that restarts before
+                // the node is back still knows to delete it.
+                let lines = {
+                    let mut meter = self.meter();
+                    meter.note_delete(unix_ms(), &r.id, &r.tenant, &r.node, false);
+                    meter.take_lines()
+                };
+                if let Some(log) = &self.log {
+                    log.push(lines);
+                    // Not while the log cannot be written: the writer
+                    // thread retries that, and this request would only
+                    // wait for the same error.
+                    if log.status().healthy {
+                        log.write_some();
+                    }
+                }
+                log::info!(
+                    "sandbox {} of {}: deleted while node {} does not answer; it is deleted \
+                     there once it does",
+                    r.id,
+                    r.tenant,
+                    r.node
+                );
+                Response::empty(202)
+            }
+            None => Self::unreachable(),
+        }
     }
 
     /// Passes a request about one sandbox to its node.
@@ -506,11 +898,20 @@ impl Api {
         let Some(i) = self.nodes.index(&record.node) else {
             return not_found();
         };
+        let method = request.method.as_str();
+        let delete = method == "DELETE" && rest.is_empty();
         if !self.nodes.reachable(i) {
+            if delete {
+                return self.delete_later(&record);
+            }
             return Self::unreachable();
         }
+        if method == "POST" && matches!(rest, ["exec" | "execs"]) {
+            if let Some(refused) = self.over_budget(tenant) {
+                return refused;
+            }
+        }
         let node = &self.nodes.configs()[i];
-        let method = request.method.as_str();
         let (target, timeout) = match (method, rest) {
             ("GET" | "DELETE", []) => (format!("/v1/sandboxes/{sandbox}"), NODE_TIMEOUT),
             ("POST", [what @ ("exec" | "execs")]) => {
@@ -597,6 +998,11 @@ impl Api {
             }
             Err(err) => {
                 self.node_failed(i, &err);
+                // Whether or not the node got it, the delete is done once
+                // it answers again.
+                if delete {
+                    return self.delete_later(&record);
+                }
                 return Self::unreachable();
             }
         };
@@ -628,8 +1034,20 @@ impl Handler for Api {
             return error(401, "unauthorized", "a valid bearer token is required")
                 .with_header("WWW-Authenticate", "Bearer".into());
         };
+        // Only a request with a valid token takes from (its own) bucket.
+        if let Some((rate, burst)) = tenant.rate {
+            if let Err(wait) = self.limiter.take(&tenant.name, rate, burst, Instant::now()) {
+                return error(
+                    429,
+                    "rate_limited",
+                    &format!("more than {rate} requests per second; try again in {wait} s"),
+                )
+                .with_header("Retry-After", wait.to_string());
+            }
+        }
         let segments = request.segments();
         match (request.method.as_str(), segments.as_slice()) {
+            ("GET", ["v1", "usage"]) => Response::json(200, &self.usage_of(tenant)),
             ("GET", ["v1", "templates"]) => self.templates(tenant),
             ("POST", ["v1", "sandboxes"]) => self.create(tenant, &request),
             ("GET", ["v1", "sandboxes"]) => self.list(tenant),
@@ -648,6 +1066,8 @@ impl Handler for Api {
 /// | `GET /admin/v1/nodes/{name}` | `NodeView` |
 /// | `POST /admin/v1/nodes/{name}/drain` | `NodeView`, once the node drains |
 /// | `POST /admin/v1/nodes/{name}/undrain` | `NodeView`, once it takes sandboxes again |
+/// | `GET /admin/v1/usage` | every tenant's `TenantUsage`, and the log's state |
+/// | `GET /admin/v1/usage/{tenant}` | `TenantUsage` |
 pub struct Admin {
     pub api: Arc<Api>,
     pub token: String,
@@ -718,6 +1138,47 @@ impl Handler for Admin {
         let nodes = &self.api.nodes;
         let segments = request.segments();
         match (request.method.as_str(), segments.as_slice()) {
+            ("GET", ["admin", "v1", "usage"]) => {
+                #[derive(serde::Serialize)]
+                struct Log {
+                    path: String,
+                    #[serde(flatten)]
+                    status: LogStatus,
+                }
+                let api = &self.api;
+                let tenants: Vec<TenantUsage> =
+                    api.tenants.iter().map(|t| api.usage_of(t)).collect();
+                let (tracked, odd) = {
+                    let meter = api.meter();
+                    (meter.tracked(), meter.odd)
+                };
+                let log = api.log.as_ref().map(|w| Log {
+                    path: api
+                        .config
+                        .metering
+                        .log
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    status: w.status(),
+                });
+                Response::json(
+                    200,
+                    &serde_json::json!({
+                        "tenants": tenants,
+                        "sandboxes_metered": tracked,
+                        "odd_reports": odd,
+                        "deletes_waiting": api.store.deletes().len(),
+                        "log": log,
+                    }),
+                )
+            }
+            ("GET", ["admin", "v1", "usage", name]) => {
+                match self.api.tenants.iter().find(|t| t.name == *name) {
+                    Some(t) => Response::json(200, &self.api.usage_of(t)),
+                    None => error(404, "tenant_not_found", "no such tenant"),
+                }
+            }
             ("GET", ["admin", "v1", "nodes"]) => {
                 let views: Vec<_> = (0..nodes.configs().len()).map(|i| nodes.view(i)).collect();
                 Response::json(200, &serde_json::json!({ "nodes": views }))

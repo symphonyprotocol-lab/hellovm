@@ -11,6 +11,41 @@ export interface Template {
   ready: boolean;
 }
 
+/** What a sandbox used since it was made, or a tenant's sandboxes in a period. */
+export interface Usage {
+  runMs: number;
+  cpuMs: number;
+  memoryByteSeconds: number;
+  egressSentBytes: number;
+  egressReceivedBytes: number;
+}
+
+/** A tenant's quotas; `null`: no limit. */
+export interface Quotas {
+  maxSandboxes: number;
+  maxMemoryBytes: number | null;
+  requestsPerSecond: number | null;
+  requestBurst: number | null;
+  cpuSecondsPerPeriod: number | null;
+  egressBytesPerPeriod: number | null;
+}
+
+/**
+ * `GET /v1/usage`: the current metering period (Unix ms), what the tenant's
+ * sandboxes used in it, its sandboxes and their memory limits now, its
+ * quotas, and the budgets it used up (`cpu`, `egress`).
+ */
+export interface TenantUsage {
+  tenant: string;
+  periodStart: number;
+  periodEnd: number;
+  usage: Usage;
+  sandboxes: number;
+  memoryLimitBytes: number;
+  quotas: Quotas;
+  exceeded: string[];
+}
+
 export interface SandboxInfo {
   id: string;
   tenant: string;
@@ -26,6 +61,8 @@ export interface SandboxInfo {
   memoryBytes: number;
   memoryLimitBytes: number;
   readyMs: number;
+  /** `null` from an API that does not report it. */
+  usage: Usage | null;
 }
 
 /** The exception a stateful call raised. */
@@ -154,6 +191,55 @@ export function parseSandbox(v: unknown): SandboxInfo {
     memoryBytes: count(d, "memory_bytes", w),
     memoryLimitBytes: count(d, "memory_limit_bytes", w),
     readyMs: num(d, "ready_ms", w),
+    usage: d.usage === null || d.usage === undefined ? null : parseCounters(d.usage),
+  };
+}
+
+export function parseCounters(v: unknown): Usage {
+  const w = "usage";
+  const d = obj(v, w);
+  return {
+    runMs: count(d, "run_ms", w),
+    cpuMs: count(d, "cpu_ms", w),
+    memoryByteSeconds: count(d, "memory_byte_seconds", w),
+    egressSentBytes: count(d, "egress_sent_bytes", w),
+    egressReceivedBytes: count(d, "egress_received_bytes", w),
+  };
+}
+
+function optCount(d: Obj, key: string, what: string): number | null {
+  return d[key] === null || d[key] === undefined ? null : count(d, key, what);
+}
+
+function optNum(d: Obj, key: string, what: string): number | null {
+  return d[key] === null || d[key] === undefined ? null : num(d, key, what);
+}
+
+export function parseUsage(v: unknown): TenantUsage {
+  const w = "usage";
+  const d = obj(v, w);
+  const period = obj(d.period, "period");
+  const q = obj(d.quotas, "quotas");
+  const exceeded = d.exceeded;
+  if (!Array.isArray(exceeded) || !exceeded.every((x) => typeof x === "string")) {
+    throw new ResponseError("usage: `exceeded` is not a list of names");
+  }
+  return {
+    tenant: str(d, "tenant", w),
+    periodStart: count(period, "start", "period"),
+    periodEnd: count(period, "end", "period"),
+    usage: parseCounters(d.usage),
+    sandboxes: count(d, "sandboxes", w),
+    memoryLimitBytes: count(d, "memory_limit_bytes", w),
+    quotas: {
+      maxSandboxes: count(q, "max_sandboxes", "quotas"),
+      maxMemoryBytes: optCount(q, "max_memory_bytes", "quotas"),
+      requestsPerSecond: optNum(q, "requests_per_second", "quotas"),
+      requestBurst: optCount(q, "request_burst", "quotas"),
+      cpuSecondsPerPeriod: optNum(q, "cpu_seconds_per_period", "quotas"),
+      egressBytesPerPeriod: optCount(q, "egress_bytes_per_period", "quotas"),
+    },
+    exceeded: exceeded as string[],
   };
 }
 
