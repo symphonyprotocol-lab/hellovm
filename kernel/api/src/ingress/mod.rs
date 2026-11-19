@@ -56,6 +56,16 @@ const MAX_INTERIM: usize = 16;
 /// node's HTTP connections (256) for its moment, and the node's probes
 /// must always find one free, however many clients connect at once.
 pub const MAX_HANDOVERS_PER_NODE: usize = 64;
+/// Of those, at most this many for one tenant's sandboxes and for one
+/// sandbox: a sandbox whose kernel process is slow to answer holds its own
+/// share of a node's hand-overs, not the other tenants'.
+pub const MAX_HANDOVERS_PER_TENANT: usize = 16;
+pub const MAX_HANDOVERS_PER_SANDBOX: usize = 8;
+/// How long a failed question about a sandbox's ingress state is
+/// remembered (and not asked again).
+const FETCH_FAILED_FOR: Duration = Duration::from_secs(2);
+/// Failed questions remembered.
+const MAX_FETCH_FAILED: usize = 4096;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -77,22 +87,52 @@ pub struct IngressState {
     /// node.
     touched: Mutex<HashMap<SandboxId, String>>,
     slots: Mutex<Slots>,
-    /// Hand-overs in progress, by node.
-    handovers: Mutex<HashMap<String, usize>>,
+    /// Requests to nodes in progress (hand-overs, and questions about a
+    /// sandbox's ingress state).
+    handovers: Mutex<Handovers>,
+    /// Questions to nodes about sandboxes' ingress state.
+    fetches: Mutex<Fetches>,
+    fetched: Condvar,
 }
 
-/// A hand-over in progress to a node, given back when dropped.
-struct Handover<'a>(&'a IngressState, String);
+#[derive(Default)]
+struct Handovers {
+    nodes: HashMap<String, usize>,
+    /// By node and tenant.
+    tenants: HashMap<(String, String), usize>,
+    sandboxes: HashMap<SandboxId, usize>,
+}
+
+#[derive(Default)]
+struct Fetches {
+    /// Being asked now: the others that want the same answer wait for it.
+    running: std::collections::HashSet<SandboxId>,
+    /// Asked without an answer, and when.
+    failed: HashMap<SandboxId, Instant>,
+}
+
+/// A request to a node in progress, given back when dropped.
+struct Handover<'a> {
+    state: &'a IngressState,
+    node: String,
+    tenant: String,
+    sandbox: SandboxId,
+}
 
 impl Drop for Handover<'_> {
     fn drop(&mut self) {
-        let mut h = lock(&self.0.handovers);
-        if let Some(n) = h.get_mut(&self.1) {
-            *n -= 1;
-            if *n == 0 {
-                h.remove(&self.1);
+        fn down<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: &K) {
+            if let Some(n) = map.get_mut(key) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(key);
+                }
             }
         }
+        let mut h = lock(&self.state.handovers);
+        down(&mut h.nodes, &self.node);
+        down(&mut h.tenants, &(self.node.clone(), self.tenant.clone()));
+        down(&mut h.sandboxes, &self.sandbox);
     }
 }
 
@@ -176,7 +216,9 @@ impl IngressState {
             conns: Mutex::new(Vec::new()),
             touched: Mutex::new(HashMap::new()),
             slots: Mutex::new(Slots::default()),
-            handovers: Mutex::new(HashMap::new()),
+            handovers: Mutex::new(Handovers::default()),
+            fetches: Mutex::new(Fetches::default()),
+            fetched: Condvar::new(),
         }
     }
 
@@ -287,14 +329,95 @@ impl IngressState {
         }
     }
 
-    fn take_handover(&self, node: &str) -> Option<Handover<'_>> {
+    /// A place among the requests in progress to `node`, for `sandbox` of
+    /// `tenant`: `None` when the node, the tenant on that node or the
+    /// sandbox has its share already.
+    fn take_handover(&self, node: &str, tenant: &str, sandbox: SandboxId) -> Option<Handover<'_>> {
         let mut h = lock(&self.handovers);
-        let n = h.entry(node.to_string()).or_insert(0);
-        if *n >= MAX_HANDOVERS_PER_NODE {
+        let key = (node.to_string(), tenant.to_string());
+        if h.nodes.get(node).copied().unwrap_or(0) >= MAX_HANDOVERS_PER_NODE
+            || h.tenants.get(&key).copied().unwrap_or(0) >= MAX_HANDOVERS_PER_TENANT
+            || h.sandboxes.get(&sandbox).copied().unwrap_or(0) >= MAX_HANDOVERS_PER_SANDBOX
+        {
             return None;
         }
-        *n += 1;
-        Some(Handover(self, node.to_string()))
+        *h.nodes.entry(node.to_string()).or_insert(0) += 1;
+        *h.tenants.entry(key).or_insert(0) += 1;
+        *h.sandboxes.entry(sandbox).or_insert(0) += 1;
+        Some(Handover {
+            state: self,
+            node: node.to_string(),
+            tenant: tenant.to_string(),
+            sandbox,
+        })
+    }
+
+    /// What is known of `sandbox`'s ingress, asking its node with `ask`
+    /// when nothing is. One question per sandbox at a time: requests that
+    /// come meanwhile wait for its answer (at most `wait`) instead of each
+    /// asking, a question counts among the requests in progress to the
+    /// node, and one that failed is not asked again for a moment. So
+    /// however many clients ask about however many sandboxes, the node
+    /// sees a bounded number of questions at once.
+    fn state_of(
+        &self,
+        sandbox: SandboxId,
+        node: &str,
+        tenant: &str,
+        wait: Duration,
+        ask: impl FnOnce() -> Option<NodeIngress>,
+    ) -> Option<NodeIngress> {
+        let deadline = Instant::now() + wait;
+        {
+            let mut f = lock(&self.fetches);
+            loop {
+                if let Some(known) = lock(&self.cache).get(&sandbox).cloned() {
+                    return Some(known);
+                }
+                if f.failed
+                    .get(&sandbox)
+                    .is_some_and(|at| at.elapsed() < FETCH_FAILED_FOR)
+                {
+                    return None;
+                }
+                if !f.running.contains(&sandbox) {
+                    f.running.insert(sandbox);
+                    break;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                f = self
+                    .fetched
+                    .wait_timeout(f, left)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
+        // Asked without the lock.
+        let answer = self
+            .take_handover(node, tenant, sandbox)
+            .and_then(|_place| ask());
+        let mut f = lock(&self.fetches);
+        f.running.remove(&sandbox);
+        match &answer {
+            Some(state) => {
+                f.failed.remove(&sandbox);
+                self.remember(sandbox, state.clone());
+            }
+            None => {
+                if f.failed.len() >= MAX_FETCH_FAILED {
+                    f.failed.retain(|_, at| at.elapsed() < FETCH_FAILED_FOR);
+                }
+                if f.failed.len() < MAX_FETCH_FAILED {
+                    f.failed.insert(sandbox, Instant::now());
+                }
+            }
+        }
+        drop(f);
+        self.fetched.notify_all();
+        answer
     }
 
     /// A slot for `tenant` and `sandbox`.
@@ -421,8 +544,9 @@ fn read_head(stream: &TcpStream, timeout: Duration) -> Option<(Vec<u8>, Vec<u8>)
     let deadline = Instant::now() + timeout;
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
+    let mut scanned = 0;
     loop {
-        if let Some(end) = wire::head_end(&buf) {
+        if let Some(end) = wire::head_end_from(&buf, &mut scanned) {
             let rest = buf.split_off(end);
             return Some((buf, rest));
         }
@@ -497,13 +621,19 @@ fn connection(api: &Api, state: &IngressState, client: TcpStream, peer: SocketAd
     let known = lock(&state.cache).get(&sandbox).cloned();
     let ingress = match known {
         Some(known) => known,
-        None if reachable => match fetch(api, i, &sandbox, &record.tenant) {
-            Some(fetched) => {
-                state.remember(sandbox, fetched.clone());
-                fetched
+        None if reachable => {
+            let asked = state.state_of(
+                sandbox,
+                &record.node,
+                &record.tenant,
+                FETCH_TIMEOUT + Duration::from_secs(1),
+                || fetch(api, i, &sandbox, &record.tenant),
+            );
+            match asked {
+                Some(fetched) => fetched,
+                None => return not_found(&client),
             }
-            None => return not_found(&client),
-        },
+        }
         // Nothing is known of it, and its node cannot be asked: whether
         // the port is exposed or the token right cannot be told.
         None => return not_found(&client),
@@ -543,7 +673,7 @@ fn connection(api: &Api, state: &IngressState, client: TcpStream, peer: SocketAd
                 303,
                 "See Other",
                 "",
-                &[("Location", rest), ("Set-Cookie", cookie)],
+                &[("Location", wire::same_host(&rest)), ("Set-Cookie", cookie)],
             );
         }
         Ok(None) => head.target.clone(),
@@ -581,7 +711,7 @@ fn connection(api: &Api, state: &IngressState, client: TcpStream, peer: SocketAd
         );
     };
     let node = &api.nodes.configs()[i];
-    let Some(handover) = state.take_handover(&node.name) else {
+    let Some(handover) = state.take_handover(&node.name, &record.tenant, sandbox) else {
         return reply(
             &client,
             503,
@@ -733,8 +863,9 @@ fn hand_over(
     write_until(&stream, request.as_bytes(), deadline).map_err(|e| failed("asking", &e))?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
+    let mut scanned = 0;
     let end = loop {
-        if let Some(end) = wire::head_end(&buf) {
+        if let Some(end) = wire::head_end_from(&buf, &mut scanned) {
             break end;
         }
         if buf.len() > MAX_HANDSHAKE {
@@ -1059,8 +1190,10 @@ impl Relay<'_> {
         let mut answered = false;
         let mut interim = 0;
         let response = loop {
+            // A new head each time round (the one before was drained).
+            let mut scanned = 0;
             let end = loop {
-                if let Some(end) = wire::head_end(&pending) {
+                if let Some(end) = wire::head_end_from(&pending, &mut scanned) {
                     break end;
                 }
                 if pending.len() > wire::MAX_HEAD {
@@ -1202,5 +1335,103 @@ fn body_framing(r: &wire::ResponseHead, head_only: bool) -> Option<Framing> {
             .and_then(|v| v.parse().ok())
             .map(Framing::Length),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hellovm_control::types::ExposedPort;
+    use std::sync::atomic::AtomicUsize;
+
+    fn state() -> IngressState {
+        let config: IngressConfig =
+            serde_json::from_str(r#"{"listen": "127.0.0.1:0", "domain": "sandbox.test"}"#).unwrap();
+        IngressState::new(config, Vec::new())
+    }
+
+    fn answer() -> NodeIngress {
+        NodeIngress {
+            token: "t".repeat(32),
+            ports: vec![ExposedPort {
+                port: 80,
+                public: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn requests_in_progress_to_a_node_are_shared_out() {
+        let state = state();
+        let ids: Vec<SandboxId> = (0..12).map(|_| SandboxId::random().unwrap()).collect();
+        // One sandbox has its share, then its tenant, then the node.
+        let mut held = Vec::new();
+        for _ in 0..MAX_HANDOVERS_PER_SANDBOX {
+            held.push(state.take_handover("n1", "a", ids[0]).unwrap());
+        }
+        assert!(state.take_handover("n1", "a", ids[0]).is_none());
+        for _ in MAX_HANDOVERS_PER_SANDBOX..MAX_HANDOVERS_PER_TENANT {
+            held.push(state.take_handover("n1", "a", ids[1]).unwrap());
+        }
+        assert!(state.take_handover("n1", "a", ids[2]).is_none());
+        // Another tenant on the node, and the same tenant on another
+        // node, are not held up by it.
+        assert!(state.take_handover("n1", "b", ids[3]).is_some());
+        assert!(state.take_handover("n2", "a", ids[2]).is_some());
+        for (t, id) in ["b", "c", "d"].iter().zip(&ids[4..]) {
+            for _ in 0..MAX_HANDOVERS_PER_SANDBOX {
+                held.push(state.take_handover("n1", t, *id).unwrap());
+            }
+            for _ in 0..MAX_HANDOVERS_PER_SANDBOX {
+                held.push(
+                    state
+                        .take_handover("n1", t, SandboxId::random().unwrap())
+                        .unwrap(),
+                );
+            }
+        }
+        assert_eq!(held.len(), MAX_HANDOVERS_PER_NODE);
+        assert!(state.take_handover("n1", "e", ids[8]).is_none());
+        drop(held);
+        assert!(state.take_handover("n1", "e", ids[8]).is_some());
+        let h = lock(&state.handovers);
+        assert!(h.nodes.is_empty() && h.tenants.is_empty() && h.sandboxes.is_empty());
+    }
+
+    #[test]
+    fn a_sandbox_is_asked_about_once_however_many_want_to_know() {
+        let state = state();
+        let id = SandboxId::random().unwrap();
+        let asked = AtomicUsize::new(0);
+        let wait = Duration::from_secs(5);
+        std::thread::scope(|scope| {
+            let all: Vec<_> = (0..32)
+                .map(|_| {
+                    scope.spawn(|| {
+                        state.state_of(id, "n1", "a", wait, || {
+                            asked.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(100));
+                            Some(answer())
+                        })
+                    })
+                })
+                .collect();
+            for t in all {
+                assert_eq!(t.join().unwrap(), Some(answer()));
+            }
+        });
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // A question that fails is not asked again at once, by anyone.
+        let other = SandboxId::random().unwrap();
+        for _ in 0..10 {
+            let got = state.state_of(other, "n1", "a", wait, || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                None
+            });
+            assert_eq!(got, None);
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        assert!(lock(&state.fetches).running.is_empty());
+        assert!(lock(&state.handovers).nodes.is_empty());
     }
 }

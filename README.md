@@ -1604,7 +1604,8 @@ not public must carry it, in one of three ways:
   when `ingress.scheme` is `https`), which a browser gets by opening the
   URL once with `?hellovm_ingress_token=TOKEN`: that request is answered
   by the ingress itself with `303 See Other` to the same URL without the
-  parameter and `Set-Cookie: ...; Path=/; HttpOnly; SameSite=Lax`
+  parameter (a path that begins with `//` or `/\`, which a browser would
+  take for another host, is made to begin with one `/`) and `Set-Cookie: ...; Path=/; HttpOnly; SameSite=Lax`
   (`; Secure` over `https`). The parameter is taken only on `GET` and
   `HEAD` (`400` otherwise) and never forwarded. The cookie is host-only
   (one port of one sandbox), `HttpOnly` keeps the guest's own pages from
@@ -1716,7 +1717,8 @@ the other way round.
 | No byte either way | `idle_timeout` 60 s | `504` if the guest has not answered yet, else the connection ends |
 | A connection in all | `max_duration` 3600 s | it ends |
 | Connections at once | `max_connections` 512 in all, `max_connections_per_client` 64 from one address (not counted with `behind_proxy`), `max_connections_per_tenant` 128 (or the tenant's `max_ingress_connections`, at most that), `max_connections_per_sandbox` 32 | `503` |
-| Hand-overs in progress | 64 per node at once (each holds one of the node's 256 HTTP connections for its moment, so the node's probes always find one) | `503` |
+| Requests to a node in progress (hand-overs, and questions about a sandbox's ingress state) | 64 per node at once (each holds one of the node's 256 HTTP connections for its moment, so the node's probes always find one), of which at most 16 for one tenant's sandboxes and 8 for one sandbox (a sandbox whose kernel process is slow to answer holds up its own share, not the other tenants') | `503` |
+| Questions about one sandbox's ingress state (asked when the API does not know it yet) | one at a time per sandbox: requests that come meanwhile wait for its answer, and a question that failed is not asked again for 2 s | `404` when it fails |
 | Exposed ports | 16 per sandbox | `409 too_many_ports` |
 | Bytes held | 16 KiB per direction per connection in the API | back-pressure |
 

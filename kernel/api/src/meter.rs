@@ -385,9 +385,10 @@ impl Rebuilt {
                 }
                 if r.kind == Kind::Final {
                     self.baselines.remove(&id);
-                    self.freed.remove(&id);
+                    let deleted = self.freed.remove(&id);
                     self.closed.insert(id);
-                    if r.end.as_deref() == Some("lost") && self.lost.len() < MAX_TRACKS {
+                    if r.end.as_deref() == Some("lost") && !deleted && self.lost.len() < MAX_TRACKS
+                    {
                         self.lost
                             .insert(id, (r.tenant, r.node, r.template, r.total, r.ts));
                     } else {
@@ -620,6 +621,14 @@ impl Meter {
                 self.tracks.insert(*id, t);
             }
             self.free.insert(*id);
+        } else if !done {
+            log::warn!(
+                "sandbox {id}: too many deleted sandboxes are remembered ({MAX_TRACKS}); what \
+                 this one uses until its node deletes it is charged"
+            );
+        } else if !self.tracks.contains_key(id) {
+            // Done, and its node does not report it: nothing more comes.
+            self.free.remove(id);
         }
         let record = Record {
             v: 1,
@@ -853,14 +862,15 @@ impl Meter {
 
     /// Writes a sandbox's last record and forgets it.
     fn finish(&mut self, id: SandboxId, now_ms: u64, end: &str) {
-        if end != "lost" {
-            self.free.remove(&id);
-        }
+        // A deleted one is done with either way: if it was lost it is not
+        // kept to be counted on (it stays closed, and uncharged, should
+        // its node report it again).
+        let deleted = self.free.remove(&id);
         let mut lost = None;
         if let Some(t) = self.tracks.remove(&id) {
             let delta = t.pending;
             self.record(Kind::Final, now_ms, &id, &t, delta, Some(end));
-            if end == "lost" {
+            if end == "lost" && !deleted {
                 lost = Some(Lost {
                     tenant: t.tenant,
                     node: t.node,
@@ -999,7 +1009,6 @@ impl Meter {
             t.pending = add(&t.pending, &delta);
         } else if self.closed.contains(id) {
             self.late(now_ms, id, tenant, node, template, delta);
-            return;
         } else {
             let full = self.early.len() >= MAX_TRACKS;
             match self.early.get_mut(id) {
@@ -1012,7 +1021,6 @@ impl Meter {
                 }
                 None if full => {
                     self.late(now_ms, id, tenant, node, template, delta);
-                    return;
                 }
                 None => {
                     self.early.insert(
@@ -1032,7 +1040,9 @@ impl Meter {
         *t = add(t, &delta);
     }
 
-    /// A `late` record of `delta` (added to the tenant's totals here).
+    /// A `late` record of `delta`. The caller counts `delta` in the
+    /// tenant's totals, once: ingress that waited in `early` is in them
+    /// already.
     fn late(
         &mut self,
         now_ms: u64,
@@ -1042,8 +1052,6 @@ impl Meter {
         template: &str,
         delta: Counters,
     ) {
-        let t = self.totals.entry(tenant.to_string()).or_default();
-        *t = add(t, &delta);
         let track = Track {
             tenant: tenant.to_string(),
             node: node.to_string(),
@@ -1384,6 +1392,84 @@ mod tests {
         rebuilt.take(&serde_json::to_string(&late).unwrap(), true, &|t| t == "a");
         assert_eq!(rebuilt.totals["a"].ingress_sent_bytes, 7);
         assert!(rebuilt.baselines.is_empty() && rebuilt.closed.is_empty());
+    }
+
+    #[test]
+    fn ingress_of_a_sandbox_never_reported_is_counted_once() {
+        let now = Instant::now();
+        let mut m = meter(T0 + 1000, now, true);
+        let x = SandboxId::random().unwrap();
+        m.ingress(T0 + 1000, &x, "a", "n1", "python", 100, 400);
+        assert_eq!(m.ingress_of(&x), (100, 400));
+        let total = |m: &Meter| {
+            let t = m.totals("a", T0 + 1000);
+            (t.ingress_received_bytes, t.ingress_sent_bytes)
+        };
+        assert_eq!(total(&m), (100, 400));
+        // Its node never reports it: after a while the bytes become a
+        // `late` record, and the totals stay what they were.
+        if let Some(e) = m.early.get_mut(&x) {
+            e.since = now.checked_sub(LOST_AFTER * 2).unwrap_or(now);
+        }
+        m.tick(T0 + 1000, false, &[]);
+        let recs = records(&mut m);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].kind, Kind::Late);
+        assert_eq!(recs[0].delta.ingress_sent_bytes, 400);
+        assert_eq!(total(&m), (100, 400));
+        // Reported under another tenant's name: the same.
+        let y = SandboxId::random().unwrap();
+        m.ingress(T0 + 1000, &y, "a", "n1", "python", 1, 2);
+        m.observe(
+            "n1",
+            T0 + 2000,
+            now,
+            &BOUNDS,
+            vec![observed(y, "b", usage(1000, 10, 0), T0 + 500)],
+            vec![],
+            7,
+            0,
+            true,
+        );
+        assert_eq!(total(&m), (101, 402));
+        assert_eq!(m.totals("b", T0 + 2000).ingress_sent_bytes, 0);
+    }
+
+    #[test]
+    fn a_deleted_sandbox_that_is_lost_is_forgotten_and_never_charged() {
+        let now = Instant::now();
+        let mut m = meter(T0 + 1000, now, true);
+        let x = SandboxId::random().unwrap();
+        let see = |m: &mut Meter, at_ms: u64, at: Instant, live: Vec<Observed>| {
+            m.observe("n1", at_ms, at, &BOUNDS, live, vec![], 7, 0, true);
+        };
+        see(
+            &mut m,
+            T0 + 1000,
+            now,
+            vec![observed(x, "a", usage(1000, 100, 0), T0)],
+        );
+        m.note_delete(T0 + 1500, &x, "a", "n1", false);
+        assert!(m.free.contains(&x));
+        // Its node leaves it out for more than a minute.
+        let later = now + LOST_AFTER + Duration::from_secs(1);
+        see(&mut m, T0 + 62_000, later, vec![]);
+        assert!(m.free.is_empty() && m.lost.is_empty());
+        // Reported again: closed, and not charged.
+        let back = later + Duration::from_secs(2);
+        see(
+            &mut m,
+            T0 + 64_000,
+            back,
+            vec![observed(x, "a", usage(64_000, 9000, 0), T0)],
+        );
+        assert_eq!(m.tracked(), 0);
+        assert_eq!(m.totals("a", T0 + 64_000).cpu_ms, 100);
+        // A delete done for a sandbox its node does not report is forgotten.
+        let y = SandboxId::random().unwrap();
+        m.note_delete(T0 + 64_000, &y, "a", "n1", false);
+        m.note_delete(T0 + 65_000, &y, "a", "n1", true);
+        assert!(m.free.is_empty());
     }
 
     #[test]

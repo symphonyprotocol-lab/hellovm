@@ -75,7 +75,36 @@ pub struct ResponseHead {
 
 /// Where the head ends: the index just past its empty line.
 pub fn head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+    head_end_from(buf, &mut 0)
+}
+
+/// [`head_end`] for a buffer that grows: `scanned` (0 at first) is how
+/// far earlier calls looked, so that each byte is looked at once however
+/// the bytes arrive (a head sent a byte at a time would otherwise cost
+/// the square of its length).
+pub fn head_end_from(buf: &[u8], scanned: &mut usize) -> Option<usize> {
+    // A mark past the buffer is not this buffer's (it shrank): from the
+    // start.
+    let from = if *scanned > buf.len() {
+        0
+    } else {
+        scanned.saturating_sub(3)
+    };
+    let found = buf[from..]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| from + i + 4);
+    *scanned = buf.len();
+    found
+}
+
+/// Where a redirect to `target` (a request target) leads on this host
+/// only: a target that begins with more than one `/` (or a `\\`, which
+/// browsers take for one) names another host to a browser, so the run is
+/// made one `/`.
+pub fn same_host(target: &str) -> String {
+    let rest = target.trim_start_matches(['/', '\\']);
+    format!("/{rest}")
 }
 
 fn is_tchar(b: u8) -> bool {
@@ -1026,5 +1055,42 @@ mod tests {
             &[("Location", "/x\r\nEvil: 1".into())],
         );
         assert!(!String::from_utf8(a).unwrap().contains("\r\nEvil"));
+    }
+
+    #[test]
+    fn the_head_end_is_found_however_the_bytes_arrive() {
+        let head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nrest";
+        assert_eq!(head_end(head), Some(head.len() - 4));
+        assert_eq!(head_end(b"GET / HTTP/1.1\r\n\r"), None);
+        // A byte at a time, or in pieces that split the empty line: found
+        // at the same place, each byte looked at once.
+        for step in 1..=5 {
+            let mut buf = Vec::new();
+            let mut scanned = 0;
+            let mut found = None;
+            for piece in head.chunks(step) {
+                buf.extend_from_slice(piece);
+                found = head_end_from(&buf, &mut scanned);
+                assert_eq!(scanned, buf.len());
+                if found.is_some() {
+                    break;
+                }
+            }
+            assert_eq!(found, Some(head.len() - 4), "step {step}");
+        }
+        // A scan mark past the buffer (it was drained) does no harm.
+        assert_eq!(head_end_from(b"\r\n\r\n", &mut 100), Some(4));
+    }
+
+    #[test]
+    fn a_redirect_stays_on_this_host() {
+        assert_eq!(same_host("/a/b?x=1"), "/a/b?x=1");
+        assert_eq!(same_host("/"), "/");
+        assert_eq!(same_host("//evil.example/x"), "/evil.example/x");
+        assert_eq!(same_host("///evil.example"), "/evil.example");
+        assert_eq!(same_host("/\\evil.example"), "/evil.example");
+        assert_eq!(same_host("/\\/evil.example"), "/evil.example");
+        // Later slashes are the path's own.
+        assert_eq!(same_host("/a//b"), "/a//b");
     }
 }
