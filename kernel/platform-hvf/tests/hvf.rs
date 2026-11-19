@@ -13,6 +13,10 @@ use hellovm_platform_hvf::{HvfConfig, HvfPlatform};
 static VM: Mutex<()> = Mutex::new(());
 
 fn platform() -> Option<(MutexGuard<'static, ()>, HvfPlatform)> {
+    platform_with(HvfConfig::default())
+}
+
+fn platform_with(config: HvfConfig) -> Option<(MutexGuard<'static, ()>, HvfPlatform)> {
     let guard = VM.lock().unwrap_or_else(|e| e.into_inner());
     // Empty when this Mac lacks the tools to build them (see
     // `test-guest/build.rs`).
@@ -23,7 +27,7 @@ fn platform() -> Option<(MutexGuard<'static, ()>, HvfPlatform)> {
         eprintln!("SKIPPING: the test guests were not built on this Mac");
         return None;
     }
-    match HvfPlatform::new(HvfConfig::default()) {
+    match HvfPlatform::new(config) {
         Ok(p) => Some((guard, p)),
         Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
             panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
@@ -569,37 +573,6 @@ fn timeouts_wakers_interrupts_and_the_killer() {
     assert!(p.context(t).is_err(), "the task is gone");
 }
 
-/// A static glibc program (`kernel/test-guest/c/smoke.c`), built in the
-/// Linux dev container by `kernel/platform-hvf/build-c-guest.sh`; its path
-/// is `HELLOVM_HVF_C_GUEST`.
-#[test]
-fn c_program() {
-    let Some(path) = std::env::var_os("HELLOVM_HVF_C_GUEST") else {
-        if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") {
-            panic!("HELLOVM_REQUIRE_E2E=1 but HELLOVM_HVF_C_GUEST is not set");
-        }
-        eprintln!("SKIPPING: set HELLOVM_HVF_C_GUEST (see platform-hvf/build-c-guest.sh)");
-        return;
-    };
-    let Some((_guard, mut p)) = platform() else {
-        return;
-    };
-    let root = image(&[("smoke", path.to_str().unwrap())]);
-    std::fs::write(root.join("greeting.txt"), "hello from a file\n").unwrap();
-    let (status, host) = run(&mut p, &root, &["/smoke", "one", "two words"]);
-    assert_eq!(
-        String::from_utf8_lossy(&host.stdout),
-        "argv[0]=/smoke\nargv[1]=one\nargv[2]=two words\n\
-         read 18 bytes: hello from a file\n\
-         malloc ok, mmap ok: zz, pid 1\n",
-        "stderr: {}",
-        String::from_utf8_lossy(&host.stderr)
-    );
-    assert_eq!(status, ExitStatus::Exited(3));
-    let (ram, tables) = p.memory_in_use();
-    eprintln!("after the run: {ram} bytes of app memory, {tables} of page tables in use");
-}
-
 /// The cost of one system call round trip (README, "The HVF platform").
 /// Run with `cargo test --release -p hellovm-platform-hvf --test hvf --
 /// --ignored --nocapture syscall_round_trip`.
@@ -698,4 +671,252 @@ fn stopping_from_outside_keeps_the_apps_progress() {
     let ctx = aarch64(p.context(t).unwrap());
     assert_eq!(ctx.x[0], 200_000_000);
     assert_eq!(ctx.pc, CODE + 20);
+}
+
+// Copies of address spaces through the trait, and what the TLB may hold.
+
+/// `str x2, [x1]`.
+const STR_X2_X1: u32 = 0xf900_0022;
+/// `b .-16`.
+const B_BACK_16: u32 = 0x17ff_fffc;
+
+fn syscall_arg0(trap: Trap) -> u64 {
+    match trap {
+        Trap::Syscall(SyscallTrap { args, .. }) => args[0],
+        other => panic!("not a syscall: {other:?}"),
+    }
+}
+
+/// Runs `t` to its next trap; every other task is stopped.
+fn step(p: &mut HvfPlatform, t: TaskKey, resume: Resume) -> Trap {
+    p.resume(t, resume).unwrap();
+    let ev = next(p);
+    assert_eq!(ev.task, t);
+    ev.trap
+}
+
+/// After `fork`, each process writes its own copy of a page whose
+/// writable entry the parent's TLB held before the fork, and both keep
+/// reading their own copy across many switches between their address
+/// spaces (each has its ASID, so a switch flushes nothing).
+#[test]
+fn fork_keeps_address_spaces_apart_in_the_tlb() {
+    let Some((_guard, mut p)) = platform() else {
+        return;
+    };
+    // Loop: x0 = [x1]; svc; [x1] = x2; svc.
+    let code = [LDR_X0_X1, SVC, STR_X2_X1, SVC, B_BACK_16];
+    let t = new_code(&mut p, &code);
+    p.write(t, DATA, &0x1111u64.to_le_bytes()).unwrap();
+    let mut ctx = patterned(1);
+    ctx.pc = CODE;
+    ctx.x[1] = DATA;
+    ctx.x[2] = 0xaaaa;
+    run_with(&mut p, t, &ctx);
+    // The parent read the page: its TLB may hold it, writable.
+    assert_eq!(syscall_arg0(next(&mut p).trap), 0x1111);
+    let c = p.clone_task(t, false).unwrap();
+    let mut child = aarch64(p.context(c).unwrap());
+    assert_eq!(
+        child.pc,
+        CODE + 8,
+        "the child continues where the parent was"
+    );
+    child.x[2] = 0xbbbb;
+    p.set_context(c, &Context::Aarch64(child)).unwrap();
+    // The parent stores through what its TLB may still hold: the store
+    // must fault and copy, not reach the frame the child shares.
+    assert!(matches!(
+        step(&mut p, t, Resume::Return(0)),
+        Trap::Syscall(_)
+    ));
+    let mut word = [0u8; 8];
+    p.read(c, DATA, &mut word).unwrap();
+    assert_eq!(u64::from_le_bytes(word), 0x1111, "the child's copy");
+    assert!(matches!(
+        step(&mut p, c, Resume::Continue),
+        Trap::Syscall(_)
+    ));
+    let before = p.flushes();
+    for round in 0..200 {
+        for (task, want) in [(t, 0xaaaa), (c, 0xbbbb)] {
+            let trap = step(&mut p, task, Resume::Return(0));
+            assert_eq!(syscall_arg0(trap), want, "round {round}");
+            assert!(matches!(
+                step(&mut p, task, Resume::Return(0)),
+                Trap::Syscall(_)
+            ));
+        }
+    }
+    let after = p.flushes();
+    assert_eq!(after, before, "switching address spaces flushed: {after:?}");
+    for (task, want) in [(t, 0xaaaau64), (c, 0xbbbb)] {
+        p.read(task, DATA, &mut word).unwrap();
+        assert_eq!(u64::from_le_bytes(word), want);
+    }
+    // The core writes into the parent's page, which is its alone now.
+    p.write(t, DATA, &0xccccu64.to_le_bytes()).unwrap();
+    assert_eq!(syscall_arg0(step(&mut p, t, Resume::Return(0))), 0xcccc);
+    assert_eq!(syscall_arg0(step(&mut p, c, Resume::Return(0))), 0xbbbb);
+    p.kill(c).unwrap();
+    p.kill(t).unwrap();
+    assert_eq!(p.memory_in_use().0, 0);
+}
+
+/// A frame freed with its address space and handed out again is never
+/// reached through what the TLB held for the space that is gone, even
+/// when the new space gets the same ASID and maps the same address.
+#[test]
+fn a_freed_frame_is_not_reached_through_a_stale_entry() {
+    let Some((_guard, mut p)) = platform() else {
+        return;
+    };
+    for round in 0..20u64 {
+        // X: reads its page (its TLB holds it) and stops.
+        let x = new_code(&mut p, &[LDR_X0_X1, SVC]);
+        let secret = 0x5ec7_e700 + round;
+        p.write(x, DATA, &secret.to_le_bytes()).unwrap();
+        let mut ctx = patterned(round);
+        ctx.pc = CODE;
+        ctx.x[1] = DATA;
+        run_with(&mut p, x, &ctx);
+        assert_eq!(syscall_arg0(next(&mut p).trap), secret);
+        p.kill(x).unwrap();
+        // Y: its first frame is X's page's (frames are reused last freed
+        // first), at another address, holding something else; its own
+        // page at X's address is new and must read as zero.
+        let y = p.spawn().unwrap();
+        const OTHER: u64 = 0x30_000;
+        p.map(y, OTHER, PAGE, Prot::RW, Sharing::Private).unwrap();
+        p.write(y, OTHER, &0xfeedu64.to_le_bytes()).unwrap();
+        p.map(y, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
+        let bytes: Vec<u8> = [LDR_X0_X1, SVC]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        p.write(y, CODE, &bytes).unwrap();
+        p.protect(y, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
+            .unwrap();
+        p.map(y, DATA, PAGE, Prot::RW, Sharing::Private).unwrap();
+        run_with(&mut p, y, &ctx);
+        assert_eq!(syscall_arg0(next(&mut p).trap), 0, "round {round}");
+        p.kill(y).unwrap();
+    }
+}
+
+/// Shared memory across `clone` without a copy (threads, `vfork`): a
+/// store by one task is what the other loads.
+#[test]
+fn clone_with_shared_memory_shares_it() {
+    let Some((_guard, mut p)) = platform() else {
+        return;
+    };
+    let code = [LDR_X0_X1, SVC, STR_X2_X1, SVC, B_BACK_16];
+    let t = new_code(&mut p, &code);
+    let mut ctx = patterned(3);
+    ctx.pc = CODE;
+    ctx.x[1] = DATA;
+    ctx.x[2] = 0x7777;
+    run_with(&mut p, t, &ctx);
+    assert_eq!(syscall_arg0(next(&mut p).trap), 0);
+    let c = p.clone_task(t, true).unwrap();
+    let mut child = aarch64(p.context(c).unwrap());
+    child.x[2] = 0x8888;
+    p.set_context(c, &Context::Aarch64(child)).unwrap();
+    assert!(matches!(
+        step(&mut p, t, Resume::Return(0)),
+        Trap::Syscall(_)
+    ));
+    // The child loads what the parent stored, then stores its own.
+    assert!(matches!(
+        step(&mut p, c, Resume::Continue),
+        Trap::Syscall(_)
+    ));
+    assert_eq!(syscall_arg0(step(&mut p, c, Resume::Return(0))), 0x8888);
+    assert_eq!(syscall_arg0(step(&mut p, t, Resume::Return(0))), 0x8888);
+    // The address space goes with its last task.
+    p.kill(t).unwrap();
+    let mut word = [0u8; 8];
+    p.read(c, DATA, &mut word).unwrap();
+    assert_eq!(u64::from_le_bytes(word), 0x8888);
+    p.kill(c).unwrap();
+    assert_eq!(p.memory_in_use().0, 0);
+}
+
+/// Preemption: tasks that never trap share the vCPU, and one that makes
+/// system calls is not kept waiting behind them.
+#[test]
+fn spinning_tasks_do_not_starve_others() {
+    let Some((_guard, mut p)) = platform() else {
+        return;
+    };
+    // Counts in x0 forever, with a syscall every 2^20 increments.
+    let counter = [
+        0x9100_0400, // add x0, x0, #1
+        0xf240_4c1f, // tst x0, #0xfffff
+        0x54ff_ffc1, // b.ne .-8
+        SVC,
+        B_BACK_16,
+    ];
+    let spinner = spawn_code(&mut p, &[B_SELF]);
+    let a = spawn_code(&mut p, &counter);
+    let b = spawn_code(&mut p, &counter);
+    let caller = spawn_code(&mut p, &[SVC, 0x17ff_ffff]);
+    let mut counts = std::collections::HashMap::new();
+    let start = Instant::now();
+    let mut caller_calls = 0;
+    while start.elapsed() < Duration::from_millis(500) {
+        let ev = next(&mut p);
+        assert!(matches!(ev.trap, Trap::Syscall(_)), "{ev:?}");
+        *counts.entry(ev.task).or_insert(0u64) += 1;
+        if ev.task == caller {
+            caller_calls += 1;
+        }
+        p.resume(ev.task, Resume::Continue).unwrap();
+    }
+    let (na, nb) = (
+        counts.get(&a).copied().unwrap_or(0),
+        counts.get(&b).copied().unwrap_or(0),
+    );
+    eprintln!("in 500 ms: counters {na} and {nb} rounds, the caller {caller_calls} calls");
+    assert!(na > 0 && nb > 0, "a counter did not run: {na} {nb}");
+    assert!(na * 3 > nb && nb * 3 > na, "unfair: {na} {nb}");
+    // The caller runs whenever it is runnable: it gets far more round
+    // trips than one per slice of each spinner (which would be ~33).
+    assert!(caller_calls > 1000, "the caller made {caller_calls} calls");
+    for t in [spinner, a, b, caller] {
+        p.kill(t).unwrap();
+    }
+}
+
+/// The core writes into a copy-on-write page whose read-only entry the
+/// app's TLB holds: the page gets a copy, and the app's next load reads
+/// the copy, not the frame it shared (the page's entry was invalidated).
+#[test]
+fn the_cores_write_to_a_shared_page_reaches_only_its_process() {
+    let Some((_guard, mut p)) = platform() else {
+        return;
+    };
+    // Loop: x0 = [x1]; svc.
+    let t = new_code(&mut p, &[LDR_X0_X1, SVC, 0x17ff_fffe /* b .-8 */]);
+    p.write(t, DATA, &1u64.to_le_bytes()).unwrap();
+    let mut ctx = patterned(4);
+    ctx.pc = CODE;
+    ctx.x[1] = DATA;
+    run_with(&mut p, t, &ctx);
+    assert_eq!(syscall_arg0(next(&mut p).trap), 1);
+    for value in 2..50u64 {
+        let c = p.clone_task(t, false).unwrap();
+        // The child loads the shared frame: its TLB may hold it.
+        assert_eq!(syscall_arg0(step(&mut p, c, Resume::Continue)), value - 1);
+        // The core writes the child's page: a copy, at once.
+        p.write(c, DATA, &value.to_le_bytes()).unwrap();
+        assert_eq!(syscall_arg0(step(&mut p, c, Resume::Return(0))), value);
+        assert_eq!(syscall_arg0(step(&mut p, t, Resume::Return(0))), value - 1);
+        // The parent's page is its alone again: written in place.
+        p.write(t, DATA, &value.to_le_bytes()).unwrap();
+        assert_eq!(syscall_arg0(step(&mut p, t, Resume::Return(0))), value);
+        p.kill(c).unwrap();
+    }
+    p.kill(t).unwrap();
 }

@@ -64,6 +64,9 @@ pub enum AppException {
     /// A translation fault: the page may be mapped but not yet backed.
     /// `addr` has its top byte (ignored by the hardware for EL0) removed.
     Translation { addr: u64, access: Access },
+    /// A permission fault: the page may be copy-on-write. `addr` as for
+    /// `Translation`.
+    Permission { addr: u64, access: Access },
     /// A CPU exception, as a signal.
     Fault(Fault),
     /// `wfi`/`wfe`: nothing to do; skip the instruction.
@@ -118,7 +121,10 @@ pub fn decode(esr: u64, far: u64, pc: u64) -> AppException {
                 },
                 // Access flag fault (never set up) and permission fault.
                 0b00_1000..=0b00_1011 => fault(SIGSEGV, SEGV_MAPERR, addr),
-                0b00_1100..=0b00_1111 => fault(SIGSEGV, SEGV_ACCERR, addr),
+                0b00_1100..=0b00_1111 => match addr {
+                    Some(addr) => AppException::Permission { addr, access },
+                    None => fault(SIGSEGV, SEGV_ACCERR, None),
+                },
                 0b10_0001 => fault(SIGBUS, BUS_ADRALN, addr),
                 _ => fault(SIGBUS, BUS_OBJERR, addr),
             }
@@ -158,11 +164,26 @@ mod tests {
         );
         assert_eq!(
             decode(esr(0x20, 0x0f), 0x5000, 0x5000),
+            AppException::Permission {
+                addr: 0x5000,
+                access: Access::Exec
+            }
+        );
+        assert_eq!(
+            decode(esr(0x24, 0x4f), 0x6000, 0),
+            AppException::Permission {
+                addr: 0x6000,
+                access: Access::Write
+            }
+        );
+        assert_eq!(
+            decode(esr(0x24, 0x40f), 0x6000, 0),
             AppException::Fault(Fault {
                 signal: SIGSEGV,
                 code: SEGV_ACCERR,
-                addr: Some(0x5000)
-            })
+                addr: None
+            }),
+            "FAR not valid"
         );
         assert_eq!(
             decode(esr(0x00, 0), 0, 0x4000),
