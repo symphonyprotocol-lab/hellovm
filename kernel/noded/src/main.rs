@@ -68,11 +68,12 @@ fn run(config_path: &str) -> Result<(), String> {
             config.hellovm.display()
         ));
     }
-    // Per sandbox: its control connection twice, the agent's two pipes and
-    // its log pipe. Per template: its process's two output pipes and the
-    // socket of a ping. Then the API's connections and noded's own files.
+    // Per sandbox: its control connection twice, the agent's two pipes,
+    // its log pipe and its ingress channel. Per template: its process's two
+    // output pipes and the socket of a ping. Then the API's connections
+    // and noded's own files.
     let limits = hellovm_control::http::Limits::default();
-    let fds = config.max_sandboxes as u64 * 5
+    let fds = config.max_sandboxes as u64 * 6
         + config.templates.len() as u64 * 4
         + limits.max_connections as u64
         + 64;

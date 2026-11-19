@@ -279,13 +279,13 @@ impl LogWriter {
 pub fn read(
     prefix: &Path,
     start: u64,
-    period: u64,
+    period: impl Into<crate::meter::Periods>,
     max_bytes: u64,
     known: &dyn Fn(&str) -> bool,
 ) -> Rebuilt {
     let mut rebuilt = Rebuilt::default();
     let mut left = max_bytes;
-    let periods = [(start.checked_sub(period), false), (Some(start), true)];
+    let periods = [(period.into().previous(start), false), (Some(start), true)];
     for (p, current) in periods {
         let Some(p) = p else { continue };
         for index in 0..MAX_FILES {

@@ -20,12 +20,20 @@
 //! | `GET /v1/sandboxes/{id}/files?path=P` | | the bytes |
 //! | `PUT /v1/sandboxes/{id}/files?path=P` | the bytes | `WriteResult` |
 //! | `POST /v1/sandboxes/{id}/files/edit` | `EditRequest` | `EditResult` |
+//! | `GET /v1/sandboxes/{id}/ingress` | | `NodeIngress` (token and exposed ports) |
+//! | `PUT /v1/sandboxes/{id}/ingress/ports/{port}` | `ExposeRequest` | `NodeIngress` |
+//! | `DELETE /v1/sandboxes/{id}/ingress/ports/{port}` | | `NodeIngress` |
+//! | `POST /v1/sandboxes/{id}/ingress/token` | | `NodeIngress` (a new token) |
+//! | `POST /v1/sandboxes/{id}/ingress/connect?port=P` | | `200`, then the connection is the guest's (see `Node::connect`) |
+//! | `POST /v1/node/touch` | `TouchRequest` | `{"touched"}` |
 
 use std::sync::Arc;
 
 use hellovm_control::http::{Handler, Request, Response};
 use hellovm_control::ids::token_eq;
-use hellovm_control::types::{self, DrainRequest, PollQuery, SandboxList};
+use hellovm_control::types::{
+    self, check_port, DrainRequest, ExposeRequest, PollQuery, SandboxList, TouchRequest,
+};
 use serde::de::DeserializeOwned;
 
 use crate::node::{ApiError, Node};
@@ -80,6 +88,14 @@ impl NodeApi {
                 }
                 Response::json(200, &list)
             }
+            ("POST", ["v1", "node", "touch"]) => match json_body::<TouchRequest>(request) {
+                Ok(r) if r.sandboxes.len() <= types::MAX_TOUCH => Response::json(
+                    200,
+                    &serde_json::json!({ "touched": node.touch(&r.sandboxes) }),
+                ),
+                Ok(_) => ApiError::new(400, "bad_request", "too many sandboxes").response(),
+                Err(err) => err.response(),
+            },
             ("POST", ["v1", "sandboxes"]) => {
                 respond(201, json_body(request).and_then(|r| node.create(r)))
             }
@@ -129,6 +145,39 @@ impl NodeApi {
                             }
                         } else {
                             respond(200, node.write_file(id, Some(tenant), path, &request.body))
+                        }
+                    }
+                    ("GET", ["ingress"]) => respond(200, node.ingress(id, Some(tenant))),
+                    ("POST", ["ingress", "token"]) => {
+                        respond(200, node.rotate_token(id, Some(tenant)))
+                    }
+                    ("PUT" | "DELETE", ["ingress", "ports", port]) => {
+                        let Some(port) = check_port(port) else {
+                            return ApiError::new(400, "bad_request", "a port is 1 to 65535")
+                                .response();
+                        };
+                        if method == "PUT" {
+                            respond(
+                                200,
+                                if request.body.is_empty() {
+                                    Ok(ExposeRequest::default())
+                                } else {
+                                    json_body::<ExposeRequest>(request)
+                                }
+                                .and_then(|r| node.expose(id, Some(tenant), port, r.public)),
+                            )
+                        } else {
+                            respond(200, node.unexpose(id, Some(tenant), port))
+                        }
+                    }
+                    ("POST", ["ingress", "connect"]) => {
+                        let Some(port) = request.query("port").and_then(check_port) else {
+                            return ApiError::new(400, "bad_request", "a port is 1 to 65535")
+                                .response();
+                        };
+                        match node.connect(id, Some(tenant), port) {
+                            Ok(response) => response,
+                            Err(err) => err.response(),
                         }
                     }
                     ("POST", ["files", "edit"]) => respond(

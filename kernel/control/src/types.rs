@@ -105,6 +105,13 @@ pub struct SandboxUsage {
     pub egress_sent_bytes: u64,
     /// Bytes its outbound flows delivered to it (received by the guest).
     pub egress_received_bytes: u64,
+    /// Bytes ingress delivered to it: requests from outside, as relayed
+    /// (counted by the API, which relays them; a node reports 0).
+    #[serde(default)]
+    pub ingress_received_bytes: u64,
+    /// Bytes ingress delivered from it to the outside: its answers.
+    #[serde(default)]
+    pub ingress_sent_bytes: u64,
 }
 
 /// A sandbox that ended, with its final usage (`GET /v1/sandboxes` on a
@@ -560,6 +567,81 @@ pub struct Quotas {
     pub request_burst: Option<u32>,
     pub cpu_seconds_per_period: Option<f64>,
     pub egress_bytes_per_period: Option<u64>,
+    /// Ingress connections to its sandboxes at once (`None`: no ingress).
+    #[serde(default)]
+    pub max_ingress_connections: Option<usize>,
+}
+
+/// Most ports one sandbox may have exposed at once.
+pub const MAX_EXPOSED_PORTS: usize = 16;
+
+/// A port of a sandbox reachable through ingress.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExposedPort {
+    pub port: u16,
+    /// Reachable without the sandbox's ingress token.
+    pub public: bool,
+}
+
+/// A sandbox's ingress state on its node (`GET`, `PUT`, `DELETE` of
+/// `/v1/sandboxes/{id}/ingress...` on a node): its token and its exposed
+/// ports, in order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeIngress {
+    pub token: String,
+    pub ports: Vec<ExposedPort>,
+}
+
+/// `PUT .../ingress/ports/{port}`: expose a port (or change whether it is
+/// public).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExposeRequest {
+    #[serde(default)]
+    pub public: bool,
+}
+
+/// An exposed port as the public API reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PortInfo {
+    pub port: u16,
+    pub public: bool,
+    /// Where it is reached from outside.
+    pub url: String,
+}
+
+/// A sandbox's ingress as the public API reports it to its tenant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IngressInfo {
+    /// What a request to a port that is not public must carry.
+    pub token: String,
+    pub ports: Vec<PortInfo>,
+}
+
+/// Most sandboxes one `POST /v1/node/touch` names.
+pub const MAX_TOUCH: usize = 4096;
+
+/// `POST /v1/node/touch`: these sandboxes were used (through ingress)
+/// just now; their idle timeouts start again.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TouchRequest {
+    pub sandboxes: Vec<String>,
+}
+
+/// Whether `port` may be exposed: 1 to 65535.
+pub fn check_port(text: &str) -> Option<u16> {
+    if text.is_empty() || text.len() > 5 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse::<u16>().ok().filter(|&p| p > 0)
 }
 
 /// `POST /v1/node/drain`: stop or resume taking new sandboxes.
@@ -572,6 +654,18 @@ pub struct DrainRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ports_are_checked() {
+        assert_eq!(check_port("1"), Some(1));
+        assert_eq!(check_port("8080"), Some(8080));
+        assert_eq!(check_port("65535"), Some(65535));
+        for bad in [
+            "", "0", "65536", "08080", "-1", "+80", "80 ", "1e3", "99999999",
+        ] {
+            assert_eq!(check_port(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn exec_requests_are_checked() {

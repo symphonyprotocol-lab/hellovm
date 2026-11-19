@@ -7,14 +7,17 @@
 //!   "nodes": [{"name": "node-1", "addr": "127.0.0.1:7071", "token_file": "/etc/hellovm/node.token"}],
 //!   "default_idle_timeout": 600, "max_idle_timeout": 86400,
 //!   "default_lifetime": 3600, "max_lifetime": 86400,
-//!   "admin": {"listen": "127.0.0.1:7079", "token_file": "/etc/hellovm/admin.token"}
+//!   "admin": {"listen": "127.0.0.1:7079", "token_file": "/etc/hellovm/admin.token"},
+//!   "ingress": {"listen": "0.0.0.0:7080", "domain": "sandbox.example.com"}
 //! }
 //! ```
 
 use std::path::PathBuf;
 
 use hellovm_control::ids::MIN_TOKEN_LEN;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+use crate::meter::Periods;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,16 +58,148 @@ pub struct Config {
     /// The metering period and log.
     #[serde(default)]
     pub metering: MeteringConfig,
+    /// HTTP ingress to sandboxes, on a listener of its own; none: not
+    /// served.
+    #[serde(default)]
+    pub ingress: Option<IngressConfig>,
+}
+
+/// HTTP ingress (see `crate::ingress`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngressConfig {
+    /// `HOST:PORT` the ingress listener binds (behind the TLS proxy).
+    pub listen: String,
+    /// Requests for `PORT-SANDBOX.DOMAIN` reach that sandbox's port.
+    pub domain: String,
+    /// The scheme clients use (`https` behind a TLS proxy): in the URLs
+    /// the API reports, `X-Forwarded-Proto`, and the cookie's `Secure`.
+    #[serde(default = "default_scheme")]
+    pub scheme: String,
+    /// The port in the URLs the API reports, when not the scheme's own.
+    #[serde(default)]
+    pub url_port: Option<u16>,
+    /// The listener is reached only through a reverse proxy that sets
+    /// `X-Forwarded-For` and `X-Forwarded-Proto`: those are taken from it
+    /// (and the peer appended) instead of replaced.
+    #[serde(default)]
+    pub behind_proxy: bool,
+    #[serde(default = "default_ingress_max")]
+    pub max_connections: usize,
+    #[serde(default = "default_ingress_per_tenant")]
+    pub max_connections_per_tenant: usize,
+    #[serde(default = "default_ingress_per_sandbox")]
+    pub max_connections_per_sandbox: usize,
+    #[serde(default = "default_ingress_per_client")]
+    pub max_connections_per_client: usize,
+    /// Seconds a request head may take to arrive.
+    #[serde(default = "default_head_timeout")]
+    pub head_timeout: f64,
+    /// Seconds without a byte in either direction that end a connection.
+    #[serde(default = "default_ingress_idle")]
+    pub idle_timeout: f64,
+    /// Seconds a connection may last at most (a WebSocket, a long
+    /// download).
+    #[serde(default = "default_max_duration")]
+    pub max_duration: f64,
+}
+
+fn default_scheme() -> String {
+    "https".into()
+}
+fn default_ingress_max() -> usize {
+    512
+}
+fn default_ingress_per_tenant() -> usize {
+    128
+}
+fn default_ingress_per_sandbox() -> usize {
+    32
+}
+fn default_ingress_per_client() -> usize {
+    64
+}
+fn default_head_timeout() -> f64 {
+    10.0
+}
+fn default_ingress_idle() -> f64 {
+    60.0
+}
+fn default_max_duration() -> f64 {
+    3600.0
+}
+
+/// Whether `domain` is a DNS name of at least two labels of lowercase
+/// letters, digits and `-` (not at either end), at most 200 bytes.
+pub fn valid_domain(domain: &str) -> bool {
+    domain.len() <= 200
+        && domain.split('.').count() >= 2
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+impl IngressConfig {
+    fn check(&self) -> Result<(), String> {
+        if !valid_domain(&self.domain) {
+            return Err("ingress.domain must be a lowercase DNS name of two labels or more".into());
+        }
+        if self.scheme != "https" && self.scheme != "http" {
+            return Err("ingress.scheme must be https or http".into());
+        }
+        if self.url_port == Some(0) {
+            return Err("ingress.url_port must be 1 to 65535".into());
+        }
+        if !(1..=4096).contains(&self.max_connections) {
+            return Err("ingress.max_connections must be 1 to 4096".into());
+        }
+        for (what, value) in [
+            (
+                "max_connections_per_tenant",
+                self.max_connections_per_tenant,
+            ),
+            (
+                "max_connections_per_sandbox",
+                self.max_connections_per_sandbox,
+            ),
+            (
+                "max_connections_per_client",
+                self.max_connections_per_client,
+            ),
+        ] {
+            if !(1..=self.max_connections).contains(&value) {
+                return Err(format!("ingress.{what} must be 1 to max_connections"));
+            }
+        }
+        for (what, value, max) in [
+            ("head_timeout", self.head_timeout, 60.0),
+            ("idle_timeout", self.idle_timeout, 3600.0),
+            ("max_duration", self.max_duration, 7.0 * 86400.0),
+        ] {
+            if !(value.is_finite() && value > 0.0 && value <= max) {
+                return Err(format!(
+                    "ingress.{what} must be more than 0 and at most {max}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeteringConfig {
     /// Seconds per period, aligned to multiples of it since the Unix
-    /// epoch (86400: UTC days). The per-period budgets start again at
-    /// every boundary.
-    #[serde(default = "default_period")]
-    pub period: u64,
+    /// epoch (86400: UTC days), or `"month"`: calendar months in UTC. The
+    /// per-period budgets start again at every boundary.
+    #[serde(default = "default_period", deserialize_with = "periods")]
+    pub period: Periods,
     /// The usage log's path prefix: records of a period go to
     /// `LOG.YYYYMMDDTHHMMSSZ.jsonl` (the period's start), then `.1.jsonl`,
     /// `.2.jsonl`... past `max_file_mb`. None: no log.
@@ -93,8 +228,25 @@ impl Default for MeteringConfig {
     }
 }
 
-fn default_period() -> u64 {
-    86400
+fn default_period() -> Periods {
+    Periods::Seconds(86400)
+}
+
+/// `metering.period`: a number of seconds or `"month"`.
+fn periods<'de, D: Deserializer<'de>>(d: D) -> Result<Periods, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Text {
+        Seconds(u64),
+        Name(String),
+    }
+    match Text::deserialize(d)? {
+        Text::Seconds(s) => Ok(Periods::Seconds(s)),
+        Text::Name(n) if n == "month" => Ok(Periods::Months),
+        Text::Name(_) => Err(serde::de::Error::custom(
+            "metering.period must be a number of seconds or \"month\"",
+        )),
+    }
 }
 fn default_record_interval() -> f64 {
     60.0
@@ -173,6 +325,10 @@ pub struct TenantConfig {
     /// Egress bytes (sent and received) its sandboxes may move per period.
     #[serde(default)]
     pub egress_bytes_per_period: Option<u64>,
+    /// Ingress connections to its sandboxes at once (default and at most
+    /// `ingress.max_connections_per_tenant`).
+    #[serde(default)]
+    pub max_ingress_connections: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +383,8 @@ pub struct Tenant {
     pub rate: Option<(f64, u32)>,
     pub cpu_ms_per_period: Option<u64>,
     pub egress_bytes_per_period: Option<u64>,
+    /// Ingress connections to its sandboxes at once.
+    pub max_ingress_connections: Option<usize>,
 }
 
 impl Tenant {
@@ -239,6 +397,7 @@ impl Tenant {
             request_burst: self.rate.map(|(_, b)| b),
             cpu_seconds_per_period: self.cpu_ms_per_period.map(|ms| ms as f64 / 1000.0),
             egress_bytes_per_period: self.egress_bytes_per_period,
+            max_ingress_connections: self.max_ingress_connections,
         }
     }
 }
@@ -295,8 +454,13 @@ impl Config {
             return Err("no nodes".into());
         }
         let m = &config.metering;
-        if !(1..=366 * 86400).contains(&m.period) {
-            return Err("metering.period must be 1 to 31622400 seconds".into());
+        if let Periods::Seconds(p) = m.period {
+            if !(1..=366 * 86400).contains(&p) {
+                return Err("metering.period must be 1 to 31622400 seconds, or \"month\"".into());
+            }
+        }
+        if let Some(ingress) = &config.ingress {
+            ingress.check()?;
         }
         if !(m.interval.is_finite() && m.interval >= 1.0 && m.interval <= 86400.0) {
             return Err("metering.interval must be 1 to 86400 seconds".into());
@@ -346,7 +510,18 @@ impl Config {
                 Some(s) if (0.0..=1e12).contains(&s) => Some((s * 1000.0) as u64),
                 Some(_) => return Err(what("cpu_seconds_per_period must be 0 to 1e12")),
             };
+            let max_ingress_connections = match (&self.ingress, t.max_ingress_connections) {
+                (None, _) => None,
+                (Some(i), None) => Some(i.max_connections_per_tenant),
+                (Some(i), Some(n)) if (1..=i.max_connections_per_tenant).contains(&n) => Some(n),
+                (Some(_), Some(_)) => {
+                    return Err(what(
+                        "max_ingress_connections must be 1 to ingress.max_connections_per_tenant",
+                    ))
+                }
+            };
             out.push(Tenant {
+                max_ingress_connections,
                 name: t.name.clone(),
                 token,
                 max_sandboxes: t.max_sandboxes,
@@ -437,7 +612,30 @@ mod tests {
         assert!(with(r#""metering":{"interval":0.5}"#).is_err());
         assert!(with(r#""metering":{"bogus":1}"#).is_err());
         let m = with(r#""metering":{"period":3600,"log":"/tmp/u"}"#).unwrap();
-        assert_eq!(m.metering.period, 3600);
+        assert_eq!(m.metering.period, Periods::Seconds(3600));
+        let m = with(r#""metering":{"period":"month"}"#).unwrap();
+        assert_eq!(m.metering.period, Periods::Months);
+        assert!(with(r#""metering":{"period":"week"}"#).is_err());
+        assert!(with(r#""metering":{"period":-1}"#).is_err());
+        let i = with(r#""ingress":{"listen":"127.0.0.1:0","domain":"sb.example.com"}"#).unwrap();
+        let i = i.ingress.unwrap();
+        assert_eq!(
+            (i.scheme.as_str(), i.max_connections_per_sandbox),
+            ("https", 32)
+        );
+        for bad in [
+            r#""ingress":{"listen":"x","domain":"Example.com"}"#,
+            r#""ingress":{"listen":"x","domain":"com"}"#,
+            r#""ingress":{"listen":"x","domain":"a..b"}"#,
+            r#""ingress":{"listen":"x","domain":"-a.b"}"#,
+            r#""ingress":{"listen":"x","domain":"a.b","scheme":"ftp"}"#,
+            r#""ingress":{"listen":"x","domain":"a.b","max_connections":0}"#,
+            r#""ingress":{"listen":"x","domain":"a.b","max_connections":10,"max_connections_per_sandbox":11}"#,
+            r#""ingress":{"listen":"x","domain":"a.b","idle_timeout":0}"#,
+            r#""ingress":{"listen":"x","domain":"a.b","bogus":1}"#,
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
 
         let base_ok = base.replace("TOKEN_B", "bbbbbbbbbbbbbbbbbbbbbbbb");
         let quota = |extra: &str| {
