@@ -29,7 +29,7 @@ function start(env: Record<string, string> = {}, era: "modern" | "legacy" = "mod
   return p;
 }
 
-const TOOLS = ["exec", "python", "read_file", "write_file", "edit_file", "reset_sandbox"];
+const TOOLS = ["exec", "python", "read_file", "write_file", "edit_file", "expose_port", "unexpose_port", "reset_sandbox"];
 
 function result(over: Partial<ExecResult> = {}): ExecResult {
   return {

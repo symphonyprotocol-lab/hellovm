@@ -15,6 +15,8 @@ export type { BusyPolicy, ClientOptions, CreateOptions, ExecOptions, RunOptions,
 export type {
   ExecResult,
   ExecStatus,
+  ExposedPort,
+  Ingress,
   OmittedEvent,
   OutputEvent,
   PythonError,

@@ -177,6 +177,10 @@ class Parsing(unittest.TestCase):
         u = _model.parse_sandbox(info(usage=counters(cpu_ms=7))).usage
         assert u is not None
         self.assertEqual((u.cpu_ms, u.egress_received_bytes), (7, 5))
+        self.assertEqual(u.ingress_sent_bytes, 0, "absent from an older API")
+        u = _model.parse_sandbox(info(usage=counters(ingress_sent_bytes=9))).usage
+        assert u is not None
+        self.assertEqual(u.ingress_sent_bytes, 9)
         with self.assertRaises(ResponseError):
             _model.parse_sandbox(info(usage=counters(cpu_ms=-1)))
 
@@ -357,6 +361,55 @@ class AgainstFake(unittest.TestCase):
         with self.assertRaises(BudgetExceededError) as cm:
             self.client(self.serve(handler)).create()
         self.assertEqual((cm.exception.retry_after, len(calls)), (3600.0, 1))
+
+    def test_ingress(self) -> None:
+        state = {"token": "t" * 64, "ports": [{"port": 8000, "public": False, "url": "https://8000-x.sb/"}]}
+        calls: list[tuple[str, str, bytes]] = []
+
+        def handler(req: Request, conn: Conn) -> None:
+            calls.append((req.method, req.path, req.body))
+            if req.path.endswith("/ingress/ports/8001") and req.method == "PUT":
+                conn.json(409, {"error": {"code": "too_many_ports", "message": "at most 16"}})
+            elif req.path.endswith("/ingress/token"):
+                conn.json(200, dict(state, token="n" * 64))
+            else:
+                conn.json(200, state)
+
+        sandbox = self.client(self.serve(handler)).sandbox(SB)
+        ingress = sandbox.ingress()
+        self.assertEqual((ingress.token, ingress.ports[0].port, ingress.ports[0].public), ("t" * 64, 8000, False))
+        self.assertNotIn("t" * 64, repr(ingress))
+        p = sandbox.expose(8000, public=False)
+        self.assertEqual(p.url, "https://8000-x.sb/")
+        self.assertEqual(calls[-1][:2], ("PUT", f"/v1/sandboxes/{SB}/ingress/ports/8000"))
+        self.assertEqual(json.loads(calls[-1][2]), {"public": False})
+        with self.assertRaises(LimitError) as cm:
+            sandbox.expose(8001)
+        self.assertEqual(cm.exception.code, "too_many_ports")
+        sandbox.unexpose(8000)
+        self.assertEqual(calls[-1][:2], ("DELETE", f"/v1/sandboxes/{SB}/ingress/ports/8000"))
+        self.assertEqual(sandbox.rotate_ingress_token(), "n" * 64)
+        for bad in (0, 65536, -1, True, "80"):
+            with self.assertRaises(ValueError):
+                sandbox.expose(bad)  # type: ignore[arg-type]
+        n = len(calls)
+        with self.assertRaises(ValueError):
+            sandbox.unexpose(0)
+        self.assertEqual(len(calls), n, "nothing was sent")
+
+    def test_ingress_answers_are_checked(self) -> None:
+        good = {"token": "t" * 64, "ports": [{"port": 1, "public": True, "url": "u"}]}
+        self.assertEqual(_model.parse_ingress(good).ports[0].public, True)
+        bads: list[dict[str, Any]] = [
+            {"ports": []},
+            {"token": "t", "ports": None},
+            {"token": "t", "ports": [{"port": 0, "public": True, "url": "u"}]},
+            {"token": "t", "ports": [{"port": 70000, "public": True, "url": "u"}]},
+            {"token": "t", "ports": [{"port": 1, "public": "yes", "url": "u"}]},
+        ]
+        for bad in bads:
+            with self.assertRaises(ResponseError):
+                _model.parse_ingress(bad)
 
     def test_usage_and_an_accepted_delete(self) -> None:
         def handler(req: Request, conn: Conn) -> None:

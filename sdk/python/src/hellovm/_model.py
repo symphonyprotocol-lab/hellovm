@@ -27,6 +27,10 @@ class Usage:
     memory_byte_seconds: int
     egress_sent_bytes: int
     egress_received_bytes: int
+    #: Bytes ingress delivered to the sandbox, and from it to clients
+    #: (0 from an API without ingress).
+    ingress_received_bytes: int = 0
+    ingress_sent_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,32 @@ class Quotas:
     request_burst: int | None
     cpu_seconds_per_period: float | None
     egress_bytes_per_period: int | None
+    #: Ingress connections to its sandboxes at once (``None``: no ingress).
+    max_ingress_connections: int | None = None
+
+
+@dataclass(frozen=True)
+class ExposedPort:
+    """A port of a sandbox reachable from outside through ingress, at
+    ``url``. One that is not ``public`` needs the sandbox's ingress token."""
+
+    port: int
+    public: bool
+    url: str
+
+
+@dataclass(frozen=True)
+class Ingress:
+    """A sandbox's ingress: its token (sent as the
+    ``X-Hellovm-Ingress-Token`` header, or once as the
+    ``hellovm_ingress_token`` query parameter, which sets a cookie) and its
+    exposed ports."""
+
+    token: str
+    ports: list[ExposedPort]
+
+    def __repr__(self) -> str:  # never the token
+        return f"Ingress(ports={self.ports!r})"
 
 
 @dataclass(frozen=True)
@@ -267,7 +297,25 @@ def parse_counters(value: Any) -> Usage:
         memory_byte_seconds=_count(d, "memory_byte_seconds", w),
         egress_sent_bytes=_count(d, "egress_sent_bytes", w),
         egress_received_bytes=_count(d, "egress_received_bytes", w),
+        ingress_received_bytes=_opt_count(d, "ingress_received_bytes", w) or 0,
+        ingress_sent_bytes=_opt_count(d, "ingress_sent_bytes", w) or 0,
     )
+
+
+def parse_ingress(value: Any) -> Ingress:
+    w = "ingress"
+    d = _obj(value, w)
+    ports = d.get("ports")
+    if not isinstance(ports, list):
+        raise ResponseError("ingress: `ports` is not a list")
+    out = []
+    for p in ports:
+        p = _obj(p, "port")
+        port = _int(p, "port", "port")
+        if not 1 <= port <= 65535:
+            raise ResponseError("port: out of range")
+        out.append(ExposedPort(port=port, public=_bool(p, "public", "port"), url=_str(p, "url", "port")))
+    return Ingress(token=_str(d, "token", w), ports=out)
 
 
 def _opt_count(d: dict[str, Any], key: str, what: str) -> int | None:
@@ -300,6 +348,7 @@ def parse_usage(value: Any) -> TenantUsage:
             request_burst=_opt_count(q, "request_burst", "quotas"),
             cpu_seconds_per_period=_opt_num(q, "cpu_seconds_per_period", "quotas"),
             egress_bytes_per_period=_opt_count(q, "egress_bytes_per_period", "quotas"),
+            max_ingress_connections=_opt_count(q, "max_ingress_connections", "quotas"),
         ),
         exceeded=list(exceeded),
     )

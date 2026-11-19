@@ -37,7 +37,8 @@ this shape):
 Tools: `exec` (`command`, `timeout?`, `cwd?`), `python` (`code`,
 `timeout?`, `restart?`), `read_file` (`path`), `write_file` (`path`,
 `content`), `edit_file` (`path`, `old_text`, `new_text`,
-`replace_all?`), `reset_sandbox`. An API error is a tool error with the
+`replace_all?`), `expose_port` (`port`, `public?`: the port's URL and
+how to send the ingress token), `unexpose_port` (`port`), `reset_sandbox`. An API error is a tool error with the
 API's code and message; a quota error (`budget_exceeded`,
 `rate_limited`, `tenant_limit`, `memory_limit`) also says what the model
 can do next. The repository's README explains the choices.

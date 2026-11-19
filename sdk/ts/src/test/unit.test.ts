@@ -27,7 +27,7 @@ import {
   type StreamEvent,
 } from "../index.js";
 import { apiError, retryAfter } from "../errors.js";
-import { parseEvent, parsePoll, parseResult, parseSandbox, parseUsage } from "../model.js";
+import { parseEvent, parseIngress, parsePoll, parseResult, parseSandbox, parseUsage } from "../model.js";
 import * as retry from "../retry.js";
 import { type Conn, FakeServer, type Request } from "./fakeserver.js";
 
@@ -324,6 +324,40 @@ describe("against a fake server", () => {
     const error = await client(server).create().catch((e: unknown) => e);
     assert.ok(error instanceof BudgetExceededError);
     assert.deepEqual([error.retryAfter, calls], [3600, 1]);
+  });
+
+  test("ingress: read, expose, unexpose, rotate", async () => {
+    const state = { token: "t".repeat(64), ports: [{ port: 8000, public: false, url: "https://8000-x.sb/" }] };
+    const calls: [string, string, string][] = [];
+    const server = await serve((req, conn) => {
+      calls.push([req.method, req.path, new TextDecoder().decode(req.body)]);
+      if (req.method === "PUT" && req.path.endsWith("/ingress/ports/8001")) {
+        conn.error(409, "too_many_ports", "at most 16");
+      } else if (req.path.endsWith("/ingress/token")) {
+        conn.json(200, { ...state, token: "n".repeat(64) });
+      } else {
+        conn.json(200, state);
+      }
+    });
+    const sandbox = client(server).sandbox(SB);
+    const ingress = await sandbox.ingress();
+    assert.deepEqual([ingress.token, ingress.ports[0]?.port, ingress.ports[0]?.public], ["t".repeat(64), 8000, false]);
+    assert.equal((await sandbox.expose(8000)).url, "https://8000-x.sb/");
+    assert.deepEqual(calls.at(-1), ["PUT", `/v1/sandboxes/${SB}/ingress/ports/8000`, '{"public":false}']);
+    const error = await sandbox.expose(8001).catch((e: unknown) => e);
+    assert.ok(error instanceof LimitError && error.code === "too_many_ports");
+    await sandbox.unexpose(8000);
+    assert.deepEqual(calls.at(-1)?.slice(0, 2), ["DELETE", `/v1/sandboxes/${SB}/ingress/ports/8000`]);
+    assert.equal(await sandbox.rotateIngressToken(), "n".repeat(64));
+    const n = calls.length;
+    for (const bad of [0, 65536, -1, 1.5, Number.NaN]) {
+      await assert.rejects(sandbox.expose(bad), TypeError);
+    }
+    assert.equal(calls.length, n, "nothing was sent");
+    assert.equal(parseIngress({ token: "t", ports: [] }).ports.length, 0);
+    for (const bad of [{ ports: [] }, { token: "t", ports: null }, { token: "t", ports: [{ port: 0, public: true, url: "u" }] }]) {
+      assert.throws(() => parseIngress(bad), ResponseError);
+    }
   });
 
   test("usage, and a delete accepted for later", async () => {

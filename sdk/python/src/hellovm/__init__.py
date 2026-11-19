@@ -12,6 +12,8 @@ from ._http import Abort, AbortedError
 from ._model import (
     ExecResult,
     ExecStatus,
+    ExposedPort,
+    Ingress,
     OmittedEvent,
     OutputEvent,
     PythonError,
@@ -53,7 +55,9 @@ __all__ = [
     "ExecResult",
     "ExecStatus",
     "Execution",
+    "ExposedPort",
     "HellovmError",
+    "Ingress",
     "LimitError",
     "NotFoundError",
     "OmittedEvent",

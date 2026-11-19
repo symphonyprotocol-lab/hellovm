@@ -3,11 +3,14 @@ import { type Fetch, type HttpResponse, send, sleep } from "./http.js";
 import {
   type ExecResult,
   type ExecStatus,
+  type ExposedPort,
+  type Ingress,
   type Poll,
   type SandboxInfo,
   type StreamEvent,
   type Template,
   type TenantUsage,
+  parseIngress,
   parseJson,
   parsePoll,
   parseResult,
@@ -301,6 +304,12 @@ function execRequest(
   return r;
 }
 
+function checkPort(port: number): void {
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new TypeError("a port is 1 to 65535");
+  }
+}
+
 function checkPath(path: string): string {
   if (typeof path !== "string" || !path || path.includes("\0") || new TextEncoder().encode(path).length > 4096) {
     throw new TypeError("a path must be 1 to 4096 bytes without NUL bytes");
@@ -416,6 +425,39 @@ export class Sandbox implements AsyncDisposable {
     const d = parseJson((await this.client.request("POST", this.path("/python/reset"), { idempotent: false })).body) as { had_state?: unknown };
     if (typeof d?.had_state !== "boolean") throw new ResponseError("reset: expected had_state");
     return d.had_state;
+  }
+
+  /** The sandbox's ingress token and exposed ports (with their URLs). */
+  async ingress(): Promise<Ingress> {
+    return parseIngress(parseJson((await this.client.request("GET", this.path("/ingress"), { idempotent: true })).body));
+  }
+
+  /**
+   * Makes `port` reachable from outside (a server in the sandbox must
+   * listen on it, on `0.0.0.0`); it needs the ingress token unless
+   * `public`. Calling it again changes `public`. Returns the port with its URL.
+   */
+  async expose(port: number, options: { public?: boolean } = {}): Promise<ExposedPort> {
+    checkPort(port);
+    const r = await this.client.request("PUT", this.path(`/ingress/ports/${port}`), {
+      json: { public: options.public ?? false },
+      idempotent: true,
+    });
+    const found = parseIngress(parseJson(r.body)).ports.find((p) => p.port === port);
+    if (!found) throw new ResponseError("expose: the port is not in the answer");
+    return found;
+  }
+
+  /** Makes `port` unreachable from outside again (connections already made go on). */
+  async unexpose(port: number): Promise<void> {
+    checkPort(port);
+    await this.client.request("DELETE", this.path(`/ingress/ports/${port}`), { idempotent: true });
+  }
+
+  /** Replaces the ingress token with a new one, at once; returns it. */
+  async rotateIngressToken(): Promise<string> {
+    const r = await this.client.request("POST", this.path("/ingress/token"), { idempotent: false });
+    return parseIngress(parseJson(r.body)).token;
   }
 
   /** The file's bytes (at most 16 MiB). */
