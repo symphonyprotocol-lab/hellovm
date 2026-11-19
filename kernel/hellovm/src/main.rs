@@ -71,8 +71,8 @@
 //! `debug`, `trace`).
 //!
 //! On macOS on Apple silicon, programs run on the HVF platform
-//! (Hypervisor.framework; aarch64 Linux programs only, one process, no
-//! `fork` or threads yet), and only the first form works, without
+//! (Hypervisor.framework; aarch64 Linux programs only, on one vCPU), and
+//! only the first form works, without
 //! `--egress` and `--template`/`--clone`. Nothing hardens the kernel
 //! process there: `--sandbox require` refuses to start. The executable
 //! must be signed with the hypervisor entitlement (see README, "The HVF
@@ -763,8 +763,8 @@ fn fence_test(test: &str) -> ! {
     }
 }
 
-/// macOS on Apple silicon: the HVF platform. Only what a single-process
-/// program needs: no hardening, no egress, no warm clones.
+/// macOS on Apple silicon: the HVF platform. No hardening, no egress, no
+/// warm clones.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run(
     options: &Options,
