@@ -10,6 +10,7 @@ dependencies = [
  "hellovm-core",
  "hellovm-egress",
  "hellovm-host",
+ "hellovm-platform-hvf",
  "hellovm-platform-seccomp",
  "hellovm-sandbox",
  "hellovm-test-guest",
@@ -83,6 +84,17 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hellovm-platform-hvf"
+version = "0.0.1"
+dependencies = [
+ "hellovm-core",
+ "hellovm-host",
+ "hellovm-test-guest",
+ "libc",
+ "log",
 ]
 
 [[package]]
