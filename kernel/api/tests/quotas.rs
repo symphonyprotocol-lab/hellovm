@@ -730,6 +730,14 @@ fn a_delete_on_an_unreachable_node_is_done_when_it_is_back() {
         ("node-2".into(), "node-2".into())
     );
     let (s1, s2) = (id_of(&s1), id_of(&s2));
+    // s1 keeps a CPU busy from now on, also after its delete.
+    let r = plane.sh(
+        ACME,
+        &s1,
+        "nohup python3 -c 'while True: pass' >/dev/null 2>&1 &",
+    );
+    assert_eq!(r["exit_code"], 0, "{r}");
+    std::thread::sleep(Duration::from_secs(2));
 
     plane.stop_node(1);
     eventually(Duration::from_secs(20), "node-2 unreachable", || {
@@ -737,6 +745,10 @@ fn a_delete_on_an_unreachable_node_is_done_when_it_is_back() {
     });
     // Accepted: gone for the tenant at once, and its slot free.
     assert_eq!(plane.delete(ACME, &s1), 202);
+    let cpu_at_delete = usage(&plane, ACME)["usage"]["cpu_ms"].as_u64().unwrap();
+    assert!(cpu_at_delete > 0);
+    // What it burns while its node does not answer is not charged.
+    std::thread::sleep(Duration::from_secs(4));
     assert_eq!(
         plane
             .call(ACME, "GET", &format!("/v1/sandboxes/{s1}"), b"")
@@ -808,6 +820,27 @@ fn a_delete_on_an_unreachable_node_is_done_when_it_is_back() {
         .admin_call(ADMIN_TOKEN, "GET", "/admin/v1/usage")
         .json();
     assert_eq!(admin["deletes_waiting"], 0, "{admin}");
+    // Its final record is in, and none of what it burned after its delete
+    // (seconds of CPU) was charged: s2 and s3 were idle, a fraction of a
+    // second at most.
+    eventually(Duration::from_secs(15), "s1's final record", || {
+        log_records(&dir)
+            .iter()
+            .any(|r| r["sandbox"] == s1 && r["kind"] == "final")
+    });
+    let cpu = usage(&plane, ACME)["usage"]["cpu_ms"].as_u64().unwrap();
+    assert!(
+        cpu < cpu_at_delete + 1500,
+        "charged {} ms of CPU after the delete",
+        cpu - cpu_at_delete
+    );
+    let after: u64 = log_records(&dir)
+        .iter()
+        .filter(|r| r["sandbox"] == s1 && r["ts"].as_u64() > Some(0))
+        .skip_while(|r| r["kind"] != "delete_pending")
+        .map(|r| r["delta"]["cpu_ms"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(after, 0, "records of s1 after its delete charge CPU");
     assert!(plane
         .api
         .as_ref()
@@ -865,4 +898,85 @@ fn a_node_configured_to_start_drained_stays_drained_across_restarts() {
         .unwrap()
         .log()
         .contains("draining=true (start_drained)"));
+}
+
+/// `metering.period: "month"`: UTC calendar months, for the usage
+/// answers, `Retry-After`, the log's file names, and the totals read back
+/// after a restart.
+#[test]
+fn calendar_month_periods() {
+    let Some(mut plane) = Plane::start(PlaneOptions {
+        beta_extra: json!({"cpu_seconds_per_period": 0}),
+        ..PlaneOptions::default()
+    }) else {
+        return;
+    };
+    let dir = plane.dir.join("usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    plane.options.api_extra =
+        json!({"metering": {"period": "month", "log": dir.join("usage"), "interval": 1}});
+    plane.restart_api();
+    let u = usage(&plane, ACME);
+    let (start, end) = (
+        u["period"]["start"].as_u64().unwrap() / 1000,
+        u["period"]["end"].as_u64().unwrap() / 1000,
+    );
+    let now = now_secs() as u64;
+    assert!(start <= now && now < end, "{u}");
+    let (y, m, d) = civil(start);
+    assert_eq!((d, start % 86400), (1, 0), "{u}");
+    let (y2, m2, d2) = civil(end);
+    assert_eq!((d2, end % 86400), (1, 0));
+    assert_eq!((y2, m2), if m == 12 { (y + 1, 1) } else { (y, m + 1) });
+    assert_eq!(u["period"]["seconds"].as_u64().unwrap(), end - start);
+    // A budget of the month: Retry-After is the month's end.
+    let body = json!({"template": plane.template(BETA)}).to_string();
+    let mut conn = TcpStream::connect(plane.api_addr()).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        conn,
+        "POST /v1/sandboxes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {BETA}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut answer = String::new();
+    let _ = conn.read_to_string(&mut answer);
+    assert!(answer.contains("budget_exceeded"), "{answer}");
+    let wait: u64 = header(&answer, "retry-after").unwrap().parse().unwrap();
+    let left = end - now_secs() as u64;
+    assert!(
+        wait.abs_diff(left) <= 5,
+        "Retry-After {wait}, {left} s left"
+    );
+    // Usage goes to the month's file and is read back after a restart.
+    let s = id_of(&plane.create(ACME, json!({})));
+    plane.exec(ACME, &s, burn(0.5));
+    let file = dir.join(format!("usage.{y:04}{m:02}01T000000Z.jsonl"));
+    eventually(Duration::from_secs(15), "the month's log file", || {
+        std::fs::read_to_string(&file).is_ok_and(|t| t.contains("cpu_ms"))
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let before = usage(&plane, ACME)["usage"]["cpu_ms"].as_u64().unwrap();
+    assert!(before > 0);
+    plane.restart_api();
+    let after = usage(&plane, ACME)["usage"]["cpu_ms"].as_u64().unwrap();
+    assert!(
+        after >= before && after < before + 1000,
+        "{before} then {after}"
+    );
+}
+
+/// (year, month, day) of a Unix time (UTC).
+fn civil(unix_secs: u64) -> (i64, i64, i64) {
+    let z = (unix_secs / 86400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(month <= 2), month, day)
 }

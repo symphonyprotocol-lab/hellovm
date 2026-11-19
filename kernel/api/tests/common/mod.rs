@@ -226,7 +226,7 @@ pub struct NodeProc {
 /// the range the host gives out by itself (to `bind` to port 0 and to
 /// outgoing connections), so that nothing takes it between this check and
 /// the service's own `bind`, and never twice in this process.
-fn free_port() -> u16 {
+pub fn free_port() -> u16 {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let ephemeral_low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
         .ok()
@@ -266,7 +266,12 @@ pub struct Plane {
     pub options: PlaneOptions,
     /// The admin API's port (fixed, so a restarted API keeps it).
     pub admin_port: u16,
+    /// The ingress listener's port (domain [`INGRESS_DOMAIN`], `http`).
+    pub ingress_port: u16,
 }
+
+/// The ingress domain of the plane.
+pub const INGRESS_DOMAIN: &str = "sb.test";
 
 /// A local HTTP server: answers every request with [`WEB_BODY`].
 fn web_server() -> u16 {
@@ -348,6 +353,7 @@ impl Plane {
             shared,
             options,
             admin_port: free_port(),
+            ingress_port: free_port(),
         };
         for i in 0..plane.nodes.len() {
             plane.write_node_config(i);
@@ -511,9 +517,20 @@ impl Plane {
             "reconcile_interval": 0.5,
             "node_timeout": 2,
             "admin": {"listen": format!("127.0.0.1:{}", self.admin_port), "token": ADMIN_TOKEN},
+            "ingress": {"listen": format!("127.0.0.1:{}", self.ingress_port),
+                        "domain": INGRESS_DOMAIN, "scheme": "http"},
         });
         if let Value::Object(extra) = &self.options.api_extra {
             for (k, v) in extra {
+                if k == "ingress" {
+                    // Merged into the listener's settings.
+                    if let Value::Object(fields) = v {
+                        for (f, value) in fields {
+                            api["ingress"][f] = value.clone();
+                        }
+                    }
+                    continue;
+                }
                 api[k] = v.clone();
             }
         }
@@ -755,6 +772,74 @@ impl Plane {
 
 /// One request on a connection of its own, read raw: the status and the
 /// response head (for headers the client does not keep).
+/// What an ingress client got: the status (0 when the connection closed
+/// without an answer), the head and the body as sent (to the end of the
+/// connection).
+pub struct IngressAnswer {
+    pub status: u16,
+    pub head: String,
+    pub body: Vec<u8>,
+}
+
+impl IngressAnswer {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+impl Plane {
+    pub fn ingress_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.ingress_port)
+    }
+
+    /// The `Host` of `port` of sandbox `id`.
+    pub fn ingress_host(port: u16, id: &str) -> String {
+        format!("{port}-{id}.{INGRESS_DOMAIN}")
+    }
+
+    /// Sends `request` (raw bytes) to the ingress listener and reads the
+    /// answer to the end of the connection, within `timeout`.
+    pub fn ingress_raw(&self, request: &[u8], timeout: Duration) -> IngressAnswer {
+        let mut conn = std::net::TcpStream::connect(self.ingress_addr()).unwrap();
+        conn.set_read_timeout(Some(timeout)).unwrap();
+        let _ = conn.write_all(request);
+        let mut got = Vec::new();
+        let _ = conn.read_to_end(&mut got);
+        parse_answer(got)
+    }
+
+    /// `GET path` of `port` of sandbox `id` with `headers` (lines without
+    /// CRLF).
+    pub fn ingress_get(&self, port: u16, id: &str, path: &str, headers: &[&str]) -> IngressAnswer {
+        let mut req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\n",
+            Self::ingress_host(port, id)
+        );
+        for h in headers {
+            req.push_str(h);
+            req.push_str("\r\n");
+        }
+        req.push_str("\r\n");
+        self.ingress_raw(req.as_bytes(), Duration::from_secs(30))
+    }
+}
+
+/// Splits what an ingress client read into status, head and body.
+pub fn parse_answer(got: Vec<u8>) -> IngressAnswer {
+    let end = got
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(got.len());
+    let head = String::from_utf8_lossy(&got[..end]).into_owned();
+    let status = head.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+    IngressAnswer {
+        status,
+        head,
+        body: got[end..].to_vec(),
+    }
+}
+
 pub fn raw_call(addr: &str, token: &str, method: &str, target: &str) -> (u16, String) {
     let mut stream = std::net::TcpStream::connect(addr).unwrap();
     stream
