@@ -49,6 +49,16 @@ pub const DYNAMIC: &str = env!("HELLOVM_GUEST_DYNAMIC");
 #[cfg(target_os = "linux")]
 pub const THREADS: &str = env!("HELLOVM_GUEST_THREADS");
 
+/// A static-PIE glibc program that checks processes: fork and wait,
+/// copy-on-write both ways, shared anonymous memory, fork then execve,
+/// vfork, posix_spawn, a fork of a fork, 64 MiB copied, many children, a
+/// pipe between children and a child that never makes a system call.
+/// Prints one line per check (see `hellovm/tests/forks.rs`). Also a fork
+/// bomb (`forks bomb SECONDS`) and a benchmark (`forks bench N MIB`).
+/// Empty when cross-compiling.
+#[cfg(target_os = "linux")]
+pub const FORKS: &str = env!("HELLOVM_GUEST_FORKS");
+
 /// Dynamically linked glibc program that exercises emulated IPv4 sockets: loopback,
 /// address classification, half-close, `MSG_NOSIGNAL`, ioctl, `/proc/net`,
 /// virtual DNS, and `getaddrinfo` / `getifaddrs`. Empty when cross-compiling.
