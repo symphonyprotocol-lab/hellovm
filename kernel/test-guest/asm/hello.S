@@ -43,7 +43,8 @@ _start:
         mov     x2, #out_len
         mov     x8, #64
         svc     #0
-        cmp     x0, #out_len
+        mov     x9, #out_len            // (clang cannot cmp with a later symbol)
+        cmp     x0, x9
         b.ne    fail
 
         mov     x0, #2                  // write(2, err, err_len)
@@ -52,7 +53,8 @@ _start:
         mov     x2, #err_len
         mov     x8, #64
         svc     #0
-        cmp     x0, #err_len
+        mov     x9, #err_len
+        cmp     x0, x9
         b.ne    fail
 
         mov     x0, #42                 // exit_group(42)

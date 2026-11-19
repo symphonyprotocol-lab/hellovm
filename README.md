@@ -11,6 +11,7 @@ The kernel lives in `kernel/`, a Rust workspace:
 | `hellovm-core` | `kernel/core` | Syscall emulation: processes, threads, signals, pipes, ELF loading, memory map, filesystem, terminal, `/proc`, IPv4 sockets; independent of the host OS |
 | `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks, outbound streams to the egress proxy |
 | `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
+| `hellovm-platform-hvf` | `kernel/platform-hvf` | macOS platform on Apple silicon: a Hypervisor.framework VM with no guest kernel (see **The HVF platform (macOS)**) |
 | `hellovm-sandbox` | `kernel/sandbox` | Least privilege for the kernel process itself (see **Hardening**) |
 | `hellovm` | `kernel/hellovm` | Command-line launcher; warm-clone templates and clones, and the control protocol's client (`hellovm::warm`) |
 | `hellovm-egress` | `kernel/egress` | The egress proxy (`hellovm-egress` binary): default-deny domain allowlist, one per host |
@@ -373,6 +374,202 @@ Both the aarch64 and the x86_64 builds have been tested end to end
 (busybox shell, CPython, pthreads, signals, dynamic linking and the
 terminal). The x86_64 run is `kernel/dev/run-e2e.sh` on a native x86_64
 Linux host.
+
+## The HVF platform (macOS)
+
+On macOS on Apple silicon, `hellovm` runs aarch64 Linux programs in a
+virtual machine of Hypervisor.framework (`kernel/platform-hvf`). It is a
+prototype (milestone P1a): one process, with no `fork` and no threads
+yet. The same kernel core handles every system call; only the platform
+differs.
+
+**How it works.** The program runs at EL0 of a VM that has no guest kernel.
+At EL1 there is only a shim: a 4 KiB page whose 16 exception vectors are
+each one `hvc` instruction. A `svc` from the program, or any fault or
+undefined instruction, enters a vector, which leaves the VM at once:
+`hv_vcpu_run` returns in the kernel process, which reads the program's
+registers (untouched by the exception) and `ESR_EL1`, `FAR_EL1`,
+`ELR_EL1`, and hands the core a syscall or a fault. To resume, the kernel
+process sets the program counter and `CPSR` (EL0) itself; nothing runs at
+EL1 on the way back, except the shim's flush routine (`tlbi vmalle1is`,
+`ic ialluis`, `eret`) after page tables changed. hellovm writes the
+program's page tables itself; the VM never does.
+
+The vCPU belongs to the kernel's event-loop thread and runs inside the
+platform's `wait`; tasks are register contexts multiplexed on it. A
+`wait` timeout is the guest's virtual timer (the vCPU exits when it
+fires); a waker or `--timeout` calls `hv_vcpus_exit` from another
+thread.
+
+**The VM layout.**
+
+| Guest-physical | Size | Stage 2 | What |
+|---|---|---|---|
+| `0x1_0000` | 16 KiB | read, execute | The shim page (vectors at 0, flush routine at `0x800`) |
+| `0x4000_0000` | 64 MiB | read | Page tables, written only by the kernel process |
+| `0x1_0000_0000` | 2 GiB | read, write, execute | The program's memory |
+
+Each region is host memory of the kernel process, reserved up front and
+committed on first touch. Stage 1 uses a 4 KiB granule and 48-bit
+addresses. `TTBR0_EL1` is the program's address space (`0x1_0000` to
+`1 << 48`); `TTBR1_EL1` maps only the shim, at `0xffff_0000_0000_0000`,
+for EL1 (read and execute, `UXN`). The system registers: `SCTLR_EL1` turns
+on the MMU and caches and lets EL0 use `DC ZVA`, `CTR_EL0` and cache
+maintenance by address (as Linux does), with stack alignment checks and
+without alignment faults, `WXN` or pointer authentication; `TCR_EL1`
+selects the granule, inner-shareable write-back walks, and top-byte-ignore
+for EL0 addresses; `MAIR_EL1` attribute 0 is normal write-back memory
+(the host maps the same memory the same way, so both see the same bytes);
+`CPACR_EL1` lets FP and SIMD run untrapped; `CNTKCTL_EL1` lets EL0 read
+the virtual counter and nothing else of the timers; `VBAR_EL1` is the
+shim. The program starts with `PSTATE` EL0t; the only bits of `PSTATE` a
+program (or a signal frame) can set, and the ones kept across every exit,
+are the condition flags and `DIT` (data-independent timing, which
+`AT_HWCAP` reports: a library that sets it finds it still set after a
+system call).
+
+The page size the program sees (`AT_PAGESZ`) is 4 KiB, as aarch64 Linux
+programs expect; the host's 16 KiB pages only matter to `hv_vm_map`,
+which maps the three regions once. Memory is allocated a 4 KiB page at a
+time when the program first touches it (a translation fault the platform
+resolves without telling the core), from the 2 GiB pool; a sandbox that
+uses it up is ended. Freed pages go back to the pool, not to the host.
+
+Address space costs page tables only where it is used. A mapped range
+with no memory yet that covers the whole span of a table entry above the
+last level (2 MiB, 1 GiB, 512 GiB) is one descriptor there, a
+reservation, with no table below it: the 64 GiB `PROT_NONE` reservation
+of a language runtime takes a table or two at its edges, and is split
+into smaller ones only where a part of it is touched, unmapped or given
+another protection. A table whose last entry goes is freed, so the 64 MiB
+of tables (16384 of them, each for 2 MiB of pages) bound what is mapped
+page by page at one time (32 GiB), not what was ever mapped. A cache
+maintenance instruction (`ic ivau`, `dc cvau`: `__clear_cache`) on a page
+with no memory yet is taken as a read, as on Linux, whatever its syndrome
+says of writing.
+
+**What the program can and cannot touch.** The isolation boundary is the
+stage-2 mapping, which Hypervisor.framework enforces: the VM's whole
+guest-physical address space is the three regions above, so nothing in it
+can address any other memory of the kernel process or the host. Inside
+the VM, the stage-1 tables hellovm writes decide what EL0 reaches: the
+pages the core mapped, with their protections (`PROT_NONE` pages are not
+valid; executable pages are never executable at EL1, `PXN`), and nothing
+else. The shim page is mapped for EL1 only, and the page tables are not
+mapped at stage 1 at all; stage 2 makes both read-only, so not even code at
+EL1 could change them. EL0 reaches EL1 only by taking an exception, which
+lands in a vector and leaves the VM. System registers are out of reach
+from EL0: the tests check that `mrs`/`msr` of EL1 registers, `tlbi`,
+`hvc`, `eret`, the timer registers and `msr daifclr` are illegal
+instructions (`SIGILL`), that loads, stores and jumps to the shim and the
+vectors are `SIGSEGV`, that the guest-physical addresses of the page
+tables and of program memory are not mapped, and that a context with every
+`PSTATE` bit set still runs at EL0. Not tested directly (true by
+construction): that EL1 cannot write the shim or the tables.
+
+What the kernel process trusts from the VM: nothing but the exit record
+and the vCPU's registers, which it decodes without panicking on any value
+(`exit.rs` is checked against every exception class with random
+syndromes); page tables are read only from the region the VM cannot
+write.
+
+**Building, signing, running.** Hypervisor.framework requires the
+`com.apple.security.hypervisor` entitlement; an ad-hoc signature is
+enough for local builds (no developer account), and nothing else is
+needed (no root, no System Settings change). Without it, creating the VM
+fails with `HV_DENIED`. `kernel/.cargo/config.toml` makes
+`kernel/platform-hvf/sign-and-run.sh` the runner of every binary `cargo
+run` and `cargo test` start on `aarch64-apple-darwin`: it signs the
+binary with `kernel/platform-hvf/hellovm.entitlements`, then runs it. A
+binary run directly needs the same signature:
+
+```sh
+cd kernel
+cargo build -p hellovm
+codesign --force --sign - --entitlements platform-hvf/hellovm.entitlements target/debug/hellovm
+mkdir -p /tmp/image && cp target/debug/build/hellovm-test-guest-*/out/hello /tmp/image/
+target/debug/hellovm --sandbox off --root /tmp/image /hello
+```
+
+On the Mac, `hellovm --root DIR PROGRAM [ARGS...]` works with `--trace`,
+`--timeout`, `--env`, `--fs-limit` and `--tty`/`--no-tty` (the terminal
+console reads and writes; a shell still cannot start commands, for want
+of `fork`). `--egress`,
+`--template`, `--clone` and `--sandbox require` are refused: nothing
+hardens the kernel process on macOS yet (the default `best-effort` says
+so with a warning; `--sandbox off` silences it). `hellovm-noded` and the
+API stay Linux-only.
+
+The test guests for the Mac (`kernel/test-guest/asm`, and
+`kernel/test-guest/asm/hvf` for the HVF tests) are built by
+`test-guest/build.rs` with the system's clang
+(`--target=aarch64-linux-gnu`) and the Rust toolchain's own `rust-lld` as
+the linker: no Linux toolchain is needed. On a Mac without those (a Rust
+that is not rustup's may lack `rust-lld`) the workspace still builds:
+the build prints a warning, and the tests that need the guests skip (or
+fail under `HELLOVM_REQUIRE_E2E=1`). A C program needs a Linux libc,
+so the one C guest, `kernel/test-guest/c/smoke.c` (prints its arguments,
+reads a file, uses `malloc` and an 8 MiB `mmap`, exits with 3), is built
+statically with glibc in the dev container and passed to the test by
+path:
+
+```sh
+docker build -t hellovm-dev kernel/dev
+kernel/platform-hvf/build-c-guest.sh
+cd kernel
+HELLOVM_HVF_C_GUEST=$PWD/target/hvf-guests/smoke cargo test -p hellovm-platform-hvf
+cargo test -p hellovm --test hvf_cli
+```
+
+The tests (`kernel/platform-hvf/tests/hvf.rs`, `kernel/hellovm/tests/hvf_cli.rs`)
+cover the hello world end to end (through the core and through the
+command line), the C program, `SIGSEGV` delivery, fault events from
+unmapped and protected memory (and that `mprotect` and `munmap` reach a
+program whose TLB already held the page), the EL1 and shim probes above,
+registers (every general, SIMD and FP register, `SP`, `TPIDR_EL0`, the
+flags) surviving exits for two tasks sharing the vCPU, odd register
+values at exits (system calls with all-ones arguments and number, odd
+`PC`, `SP` and `PSTATE`, and 300 random contexts), wait timeouts, wakers,
+interrupts and the killer. A test binary that cannot use the hypervisor
+(not signed) prints `SKIPPING` and passes, unless `HELLOVM_REQUIRE_E2E=1`.
+Hypervisor.framework allows one VM per process, so the tests take turns.
+
+**Performance.** One system call round trip (the program's `svc` to the
+platform's next trap, with the trap reported to and answered by the
+caller) costs **834 ns** on an M3 Max (macOS 27.2), measured as the best
+of 5 runs of 1,000,000 `svc` in a loop answered straight through the
+`Platform` trait (`cargo test --release -p hellovm-platform-hvf --test
+hvf -- --ignored --nocapture syscall_round_trip`). Through the kernel
+core (`getpid` in a loop, `kernel/test-guest/asm/hvf/getpid_loop.S`), it
+is **904 ns** per call, VM creation and loading included. Of the 834 ns,
+736 ns is the VM exit and entry alone (`hv_vcpu_run` with nothing read);
+reading a general register costs about 5 ns and a system register 11 ns
+(`exit_cost_breakdown` in `platform-hvf/src/app.rs`). Measured the same way as on Linux, through the command line
+(release build, `--sandbox off`, wall clock of a run of 1,000,000 calls
+minus a run of 0, best of 5), HVF takes 906 ns per `getpid`, and starting
+`hellovm` (VM creation included) about 5 ms. For comparison only, in a
+different environment: the seccomp platform in the dev container under
+Docker Desktop on the same Mac (whose Linux runs in a VM, so every ptrace
+stop goes through that VM's kernel) took about 23 µs per `getpid` with
+the same loop and method. That is not what seccomp costs on a native Linux
+host, which this Mac cannot measure.
+
+**What works, and what does not yet.** Static aarch64 Linux programs that
+run as one process: the libc-free test guests and a static glibc program
+(arguments, files, `brk`, `mmap`, `mprotect`, `getrandom`, stdio). Not
+Signals work as far as one process goes: the dev container's static
+build of `kernel/test-guest/c/signals.c` passes every check before its
+first `fork` (a `SIGSEGV` handler, masks, `alarm`, `sigsuspend`, the
+alternate stack, FP state across asynchronous handlers); static-PIE
+programs (`pie.c`) and busybox applets that do not fork run. Not yet:
+`fork`, `vfork`, `clone` and threads (`clone_task` reports
+"unsupported"), so no shell commands, pipelines or `subprocess`; shared
+anonymous memory across processes; dynamic linking and `execve` have not
+been tested (`execve` replaces the task through `spawn`, which works);
+x86_64 programs (Rosetta is not used);
+memory returned to the host; warm clones; hardening of the kernel
+process; `AT_HWCAP2` (zero) and emulated `mrs` of ID registers (`HWCAP_CPUID`
+is not reported, so programs do not try).
 
 ## Hardening
 
@@ -2330,8 +2527,11 @@ is `1.99`, deliberately stricter than the language MSRV (about 1.88). A C
 compiler with a static libc (`cc`, used to build the test guests) is also
 required. No root or extra capabilities are required, and it works inside a
 container with the default Docker seccomp profile (ptrace of one's own
-child is allowed there). On other hosts the workspace builds, but the
-end-to-end tests are skipped and `hellovm` cannot run programs yet.
+child is allowed there). On macOS on Apple silicon `hellovm` runs
+single-process aarch64 Linux programs on the HVF platform (see **The HVF
+platform (macOS)** for signing and its own tests); there the Linux
+end-to-end tests are compiled out. On other hosts the workspace builds,
+but `hellovm` cannot run programs.
 
 `kernel/dev/run-e2e.sh`, run from the repository root, is the one-shot
 path on the machine it runs on (a native host, or the dev container on
@@ -2402,7 +2602,7 @@ cargo run -p hellovm -- --root /tmp/image /bin/busybox sh -i
 The container's own root works as an image too, e.g. for CPython:
 `hellovm --root / /usr/bin/python3 -c 'print(42)'`.
 
-On macOS, use a Linux container. `kernel/dev/Dockerfile` starts from
+For everything beyond the HVF prototype on macOS, use a Linux container. `kernel/dev/Dockerfile` starts from
 `rust:1.99.1-bookworm` (matching `rust-toolchain.toml`) and adds clippy,
 rustfmt, `busybox-static` and an x86_64 cross toolchain. The base image
 already has `python3`, its standard library and `ldd`:

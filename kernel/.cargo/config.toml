@@ -1,0 +1,5 @@
+# macOS on Apple silicon: executables that use Hypervisor.framework (the HVF
+# platform) need the com.apple.security.hypervisor entitlement. This runner
+# signs every binary `cargo run` and `cargo test` start with it (ad hoc).
+[target.aarch64-apple-darwin]
+runner = "platform-hvf/sign-and-run.sh"

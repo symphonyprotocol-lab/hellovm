@@ -1,0 +1,925 @@
+//! Guest-physical memory and the stage-1 page tables hellovm writes for
+//! the app.
+//!
+//! Two pools of 4 KiB frames live in host memory: page tables (mapped
+//! into the VM read only) and app memory (read, write, execute). An
+//! address space is a 4-level table tree (4 KiB granule, 48-bit
+//! addresses) rooted in `TTBR0_EL1`. Its descriptors are also the only
+//! record of what the core mapped: a software bit marks a page as mapped
+//! and three more keep its `PROT_*` value, so a page can be mapped but not
+//! valid in hardware (`PROT_NONE`, or not yet backed).
+//!
+//! A range that covers the whole span of an entry above the last level
+//! (2 MiB, 1 GiB or 512 GiB) and has no memory yet is one such descriptor
+//! there, a *reservation*, with no table below it: reserving address
+//! space costs tables only at the edges of the range, whatever its size.
+//! A reservation is split into a table of smaller ones when a part of it
+//! is touched, unmapped or protected differently. A table whose last
+//! entry goes is freed, so tables are held only for what is mapped now.
+//!
+//! App memory is allocated on first touch: [`Phys::map`] only writes
+//! descriptors, and the first access the hardware refuses with a
+//! translation fault gets a zeroed frame ([`Phys::demand`]). Frames and
+//! tables come from fixed-size pools that are reserved up front: running
+//! out fails the operation (or, on first touch, ends the app), and never
+//! makes the kernel process allocate more.
+//!
+//! Nothing here trusts app memory: descriptors are read only from the
+//! table pool, which the VM cannot write.
+
+use hellovm_core::platform::Prot;
+
+use crate::layout::{pte, MAX_ADDR, PAGE, RAM_IPA, SHIM_IPA, SHIM_VA, TABLES_IPA};
+
+/// Memory the pools live in.
+pub trait Backing {
+    fn bytes(&self) -> &[u8];
+    fn bytes_mut(&mut self) -> &mut [u8];
+    /// Makes code written to `offset..offset + len` visible to the guest's
+    /// instruction fetch.
+    fn sync_icache(&mut self, offset: usize, len: usize);
+}
+
+#[cfg(test)]
+impl Backing for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self
+    }
+
+    fn sync_icache(&mut self, _offset: usize, _len: usize) {}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmuError {
+    /// A pool is exhausted.
+    NoMemory,
+    /// The range is not (fully) mapped, or not with the access asked for,
+    /// or outside the app's addresses.
+    BadAddress,
+}
+
+/// How the app touched a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    Write,
+    Exec,
+}
+
+impl Access {
+    fn allowed(self, prot: Prot) -> bool {
+        match self {
+            // There is no write-only or execute-only memory: any access
+            // makes a page readable, as on Linux/arm64.
+            Access::Read => prot != Prot::NONE,
+            Access::Write => prot.contains(Prot::WRITE),
+            Access::Exec => prot.contains(Prot::EXEC),
+        }
+    }
+}
+
+/// What [`Phys::demand`] did about a translation fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Demand {
+    /// The page was mapped but had no memory yet; it has now. Resume.
+    Filled,
+    /// The page is mapped, backed and allows the access: the fault came
+    /// from a stale TLB entry.
+    Present,
+    /// Nothing is mapped there (`SEGV_MAPERR`).
+    Unmapped,
+    /// Mapped, but this access is not allowed (`SEGV_ACCERR`).
+    Denied,
+    /// The app's memory pool is exhausted.
+    NoMemory,
+}
+
+/// A pool of 4 KiB frames at a guest-physical base.
+#[derive(Debug)]
+struct Pool {
+    base: u64,
+    frames: u64,
+    /// Frames below this were handed out at least once.
+    next: u64,
+    free: Vec<u64>,
+}
+
+impl Pool {
+    fn new(base: u64, bytes: u64) -> Pool {
+        Pool {
+            base,
+            frames: bytes / PAGE,
+            next: 0,
+            free: Vec::new(),
+        }
+    }
+
+    /// A frame and whether it may hold old data (fresh ones are zero).
+    fn alloc(&mut self) -> Option<(u64, bool)> {
+        if let Some(ipa) = self.free.pop() {
+            return Some((ipa, true));
+        }
+        if self.next == self.frames {
+            return None;
+        }
+        let ipa = self.base + self.next * PAGE;
+        self.next += 1;
+        Some((ipa, false))
+    }
+
+    fn release(&mut self, ipa: u64) {
+        debug_assert!(self.contains(ipa));
+        // `free` never holds more than `frames` entries: each frame is in
+        // it at most once.
+        self.free.push(ipa);
+    }
+
+    fn contains(&self, ipa: u64) -> bool {
+        ipa >= self.base && ipa < self.base + self.frames * PAGE
+    }
+
+    fn in_use(&self) -> u64 {
+        self.next - self.free.len() as u64
+    }
+}
+
+/// The two pools and the tables in them.
+pub struct Phys<B> {
+    tables: B,
+    ram: B,
+    table_pool: Pool,
+    ram_pool: Pool,
+    /// Per table frame: how many of its 512 entries are not zero. Kept
+    /// here, not in the tables, which only the host writes anyway.
+    used: Vec<u16>,
+}
+
+/// What [`Phys::apply`] does to a range.
+#[derive(Clone, Copy)]
+enum Op {
+    Map(Prot),
+    Unmap,
+    Protect(Prot),
+}
+
+/// The address span of one entry of a table at `level`.
+fn span(level: u32) -> u64 {
+    1 << (39 - 9 * level)
+}
+
+fn index(va: u64, level: u32) -> usize {
+    ((va >> (39 - 9 * level)) & 511) as usize
+}
+
+fn leaf(frame: Option<u64>, prot: Prot) -> u64 {
+    let sw = pte::SW_MAPPED | ((prot.0 as u64 & 7) << pte::SW_PROT_SHIFT);
+    let Some(frame) = frame else {
+        return sw;
+    };
+    if prot == Prot::NONE {
+        return sw | frame;
+    }
+    let mut desc = sw
+        | frame
+        | pte::VALID
+        | pte::TABLE_OR_PAGE
+        | pte::AF
+        | pte::SH_INNER
+        | pte::NG
+        | pte::PXN
+        | pte::AP_EL0;
+    if !prot.contains(Prot::WRITE) {
+        desc |= pte::AP_RO;
+    }
+    if !prot.contains(Prot::EXEC) {
+        desc |= pte::UXN;
+    }
+    desc
+}
+
+fn leaf_prot(desc: u64) -> Prot {
+    Prot(((desc & pte::SW_PROT_MASK) >> pte::SW_PROT_SHIFT) as u32)
+}
+
+fn leaf_frame(desc: u64) -> Option<u64> {
+    let frame = desc & pte::ADDR_MASK;
+    (frame != 0).then_some(frame)
+}
+
+/// Checks that `addr..addr + len` is page aligned and inside the app's
+/// addresses, and returns its end.
+fn page_range(addr: u64, len: u64) -> Result<u64, MmuError> {
+    let end = addr.checked_add(len).ok_or(MmuError::BadAddress)?;
+    if !addr.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) || end > MAX_ADDR {
+        return Err(MmuError::BadAddress);
+    }
+    Ok(end)
+}
+
+impl<B: Backing> Phys<B> {
+    /// Pools over `tables` (at [`TABLES_IPA`]) and `ram` (at [`RAM_IPA`]).
+    pub fn new(tables: B, ram: B) -> Phys<B> {
+        let table_pool = Pool::new(TABLES_IPA, tables.bytes().len() as u64);
+        let ram_pool = Pool::new(RAM_IPA, ram.bytes().len() as u64);
+        let used = vec![0; table_pool.frames as usize];
+        Phys {
+            tables,
+            ram,
+            table_pool,
+            ram_pool,
+            used,
+        }
+    }
+
+    pub fn tables_backing(&self) -> &B {
+        &self.tables
+    }
+
+    pub fn ram_backing(&self) -> &B {
+        &self.ram
+    }
+
+    /// App memory in use, in bytes.
+    pub fn ram_in_use(&self) -> u64 {
+        self.ram_pool.in_use() * PAGE
+    }
+
+    /// Page-table memory in use, in bytes.
+    pub fn tables_in_use(&self) -> u64 {
+        self.table_pool.in_use() * PAGE
+    }
+
+    fn entry(&self, table: u64, idx: usize) -> u64 {
+        let off = (table - TABLES_IPA) as usize + idx * 8;
+        u64::from_le_bytes(self.tables.bytes()[off..off + 8].try_into().unwrap())
+    }
+
+    fn table_index(table: u64) -> usize {
+        ((table - TABLES_IPA) / PAGE) as usize
+    }
+
+    fn set_entry(&mut self, table: u64, idx: usize, value: u64) {
+        let old = self.entry(table, idx);
+        let off = (table - TABLES_IPA) as usize + idx * 8;
+        self.tables.bytes_mut()[off..off + 8].copy_from_slice(&value.to_le_bytes());
+        let used = &mut self.used[Self::table_index(table)];
+        match (old != 0, value != 0) {
+            (false, true) => *used += 1,
+            (true, false) => *used -= 1,
+            _ => {}
+        }
+    }
+
+    fn new_table(&mut self) -> Result<u64, MmuError> {
+        let (ipa, dirty) = self.table_pool.alloc().ok_or(MmuError::NoMemory)?;
+        if dirty {
+            let off = (ipa - TABLES_IPA) as usize;
+            self.tables.bytes_mut()[off..off + PAGE as usize].fill(0);
+        }
+        self.used[Self::table_index(ipa)] = 0;
+        Ok(ipa)
+    }
+
+    /// Gives a table back to the pool, zeroed.
+    fn release_table(&mut self, table: u64) {
+        let off = (table - TABLES_IPA) as usize;
+        self.tables.bytes_mut()[off..off + PAGE as usize].fill(0);
+        self.used[Self::table_index(table)] = 0;
+        self.table_pool.release(table);
+    }
+
+    fn new_frame(&mut self) -> Option<u64> {
+        let (ipa, dirty) = self.ram_pool.alloc()?;
+        if dirty {
+            let off = (ipa - RAM_IPA) as usize;
+            self.ram.bytes_mut()[off..off + PAGE as usize].fill(0);
+        }
+        Some(ipa)
+    }
+
+    fn frame(&self, ipa: u64) -> &[u8] {
+        let off = (ipa - RAM_IPA) as usize;
+        &self.ram.bytes()[off..off + PAGE as usize]
+    }
+
+    fn frame_mut(&mut self, ipa: u64) -> &mut [u8] {
+        let off = (ipa - RAM_IPA) as usize;
+        &mut self.ram.bytes_mut()[off..off + PAGE as usize]
+    }
+
+    fn sync_frame(&mut self, ipa: u64) {
+        self.ram
+            .sync_icache((ipa - RAM_IPA) as usize, PAGE as usize);
+    }
+
+    /// A new, empty address space: its level-0 table.
+    pub fn new_space(&mut self) -> Result<u64, MmuError> {
+        self.new_table()
+    }
+
+    /// The `TTBR1_EL1` tree: the shim page at [`SHIM_VA`], EL1 read and
+    /// execute only. EL0 can neither read nor execute it.
+    pub fn shim_space(&mut self) -> Result<u64, MmuError> {
+        let root = self.new_table()?;
+        let mut table = root;
+        for level in 0..3 {
+            let next = self.new_table()?;
+            self.set_entry(
+                table,
+                index(SHIM_VA, level),
+                next | pte::VALID | pte::TABLE_OR_PAGE,
+            );
+            table = next;
+        }
+        let desc = SHIM_IPA
+            | pte::VALID
+            | pte::TABLE_OR_PAGE
+            | pte::AF
+            | pte::SH_INNER
+            | pte::AP_RO
+            | pte::UXN;
+        self.set_entry(table, index(SHIM_VA, 3), desc);
+        Ok(root)
+    }
+
+    /// The level-3 table and index of `va`, splitting reservations on the
+    /// way. `None` when nothing is mapped there.
+    fn leaf_slot(&mut self, root: u64, va: u64) -> Result<Option<(u64, usize)>, MmuError> {
+        let mut table = root;
+        for level in 0..3 {
+            let idx = index(va, level);
+            let desc = self.entry(table, idx);
+            table = if desc & pte::VALID != 0 {
+                desc & pte::ADDR_MASK
+            } else if desc & pte::SW_MAPPED != 0 {
+                self.split(table, idx)?
+            } else {
+                return Ok(None);
+            };
+        }
+        Ok(Some((table, index(va, 3))))
+    }
+
+    /// Replaces the reservation at a slot above the last level with a
+    /// table of 512 smaller ones (unbacked pages, at the last level) of
+    /// the same protection. Returns the table.
+    fn split(&mut self, table: u64, idx: usize) -> Result<u64, MmuError> {
+        let desc = self.entry(table, idx);
+        let child = self.new_table()?;
+        let off = (child - TABLES_IPA) as usize;
+        let (entries, _) = self.tables.bytes_mut()[off..off + PAGE as usize].as_chunks_mut::<8>();
+        for entry in entries {
+            *entry = desc.to_le_bytes();
+        }
+        self.used[Self::table_index(child)] = 512;
+        self.set_entry(table, idx, child | pte::VALID | pte::TABLE_OR_PAGE);
+        Ok(child)
+    }
+
+    /// The descriptor that says what `va` is: its page's (0 if none), or
+    /// the reservation that covers it (mapped, no memory).
+    pub fn lookup(&self, root: u64, va: u64) -> u64 {
+        if va >= MAX_ADDR {
+            return 0;
+        }
+        let mut table = root;
+        for level in 0..3 {
+            let desc = self.entry(table, index(va, level));
+            if desc & pte::VALID == 0 {
+                return if desc & pte::SW_MAPPED != 0 { desc } else { 0 };
+            }
+            table = desc & pte::ADDR_MASK;
+        }
+        self.entry(table, index(va, 3))
+    }
+
+    /// Releases the memory of a page descriptor, if it has any. Returns
+    /// whether the hardware may have cached it (it was valid).
+    fn drop_page(&mut self, desc: u64) -> bool {
+        if desc & pte::SW_MAPPED == 0 {
+            return false;
+        }
+        if let Some(frame) = leaf_frame(desc) {
+            self.ram_pool.release(frame);
+        }
+        desc & pte::VALID != 0
+    }
+
+    /// Does `op` to `addr..end` (page aligned) within the table `table`
+    /// of `level`, whose first entry is for address `base`. Returns whether
+    /// stale TLB entries may exist. After an error the range may be partly
+    /// changed.
+    fn apply(
+        &mut self,
+        table: u64,
+        level: u32,
+        base: u64,
+        addr: u64,
+        end: u64,
+        op: Op,
+    ) -> Result<bool, MmuError> {
+        let span = span(level);
+        let mut flush = false;
+        let mut idx = ((addr - base) / span) as usize;
+        while idx < 512 && base + idx as u64 * span < end {
+            let lo = base + idx as u64 * span;
+            let hi = lo + span;
+            let (from, to) = (addr.max(lo), end.min(hi));
+            let full = from == lo && to == hi;
+            let desc = self.entry(table, idx);
+            if level == 3 {
+                match op {
+                    Op::Map(prot) => {
+                        flush |= self.drop_page(desc);
+                        self.set_entry(table, idx, leaf(None, prot));
+                    }
+                    Op::Unmap => {
+                        flush |= self.drop_page(desc);
+                        self.set_entry(table, idx, 0);
+                    }
+                    Op::Protect(prot) => {
+                        if desc & pte::SW_MAPPED != 0 {
+                            let frame = leaf_frame(desc);
+                            flush |= desc & pte::VALID != 0;
+                            self.set_entry(table, idx, leaf(frame, prot));
+                            if let Some(frame) = frame {
+                                if prot.contains(Prot::EXEC)
+                                    && !leaf_prot(desc).contains(Prot::EXEC)
+                                {
+                                    self.sync_frame(frame);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if desc & pte::VALID != 0 {
+                let child = desc & pte::ADDR_MASK;
+                match op {
+                    // The whole span is replaced: its tables go at once.
+                    Op::Map(_) | Op::Unmap if full => {
+                        self.free_subtree(child, level + 1);
+                        // A freed table may be in the walk cache.
+                        flush = true;
+                        let new = match op {
+                            Op::Map(prot) => leaf(None, prot),
+                            _ => 0,
+                        };
+                        self.set_entry(table, idx, new);
+                    }
+                    _ => {
+                        flush |= self.apply(child, level + 1, lo, from, to, op)?;
+                        if self.used[Self::table_index(child)] == 0 {
+                            self.release_table(child);
+                            self.set_entry(table, idx, 0);
+                            flush = true;
+                        }
+                    }
+                }
+            } else if desc & pte::SW_MAPPED != 0 {
+                // A reservation: never valid, so nothing is cached of it.
+                let same = match op {
+                    Op::Map(prot) | Op::Protect(prot) => leaf(None, prot) == desc,
+                    Op::Unmap => false,
+                };
+                if full {
+                    let new = match op {
+                        Op::Map(prot) | Op::Protect(prot) => leaf(None, prot),
+                        Op::Unmap => 0,
+                    };
+                    self.set_entry(table, idx, new);
+                } else if !same {
+                    let child = self.split(table, idx)?;
+                    flush |= self.apply(child, level + 1, lo, from, to, op)?;
+                }
+            } else if let Op::Map(prot) = op {
+                if full {
+                    self.set_entry(table, idx, leaf(None, prot));
+                } else {
+                    let child = self.new_table()?;
+                    self.set_entry(table, idx, child | pte::VALID | pte::TABLE_OR_PAGE);
+                    flush |= self.apply(child, level + 1, lo, from, to, op)?;
+                }
+            }
+            idx += 1;
+        }
+        Ok(flush)
+    }
+
+    /// Whether every page of `addr..end` is mapped.
+    fn all_mapped(&self, table: u64, level: u32, base: u64, addr: u64, end: u64) -> bool {
+        let span = span(level);
+        let mut idx = ((addr - base) / span) as usize;
+        while idx < 512 && base + idx as u64 * span < end {
+            let lo = base + idx as u64 * span;
+            let desc = self.entry(table, idx);
+            if level < 3 && desc & pte::VALID != 0 {
+                let (from, to) = (addr.max(lo), end.min(lo + span));
+                if !self.all_mapped(desc & pte::ADDR_MASK, level + 1, lo, from, to) {
+                    return false;
+                }
+            } else if desc & pte::SW_MAPPED == 0 {
+                return false;
+            }
+            idx += 1;
+        }
+        true
+    }
+
+    /// Maps `addr..addr + len` with `prot`, replacing what was there. The
+    /// pages get memory on first touch. Returns whether stale TLB entries
+    /// may exist; after an error they may.
+    pub fn map(&mut self, root: u64, addr: u64, len: u64, prot: Prot) -> Result<bool, MmuError> {
+        let end = page_range(addr, len)?;
+        match self.apply(root, 0, 0, addr, end, Op::Map(prot)) {
+            Ok(flush) => Ok(flush),
+            Err(err) => {
+                // Leave no half-made mapping behind (unmapping needs no
+                // table that is not there already, except to split a
+                // reservation at an edge, which the failed map did first).
+                // The caller flushes the TLB after a failure too: pages
+                // this call already replaced may be cached.
+                let _ = self.apply(root, 0, 0, addr, end, Op::Unmap);
+                Err(err)
+            }
+        }
+    }
+
+    /// Unmaps `addr..addr + len`; unmapped parts are ignored. Returns
+    /// whether stale TLB entries may exist.
+    pub fn unmap(&mut self, root: u64, addr: u64, len: u64) -> Result<bool, MmuError> {
+        let end = page_range(addr, len)?;
+        self.apply(root, 0, 0, addr, end, Op::Unmap)
+    }
+
+    /// Changes the protection of a fully mapped range. Returns whether
+    /// stale TLB entries may exist.
+    pub fn protect(
+        &mut self,
+        root: u64,
+        addr: u64,
+        len: u64,
+        prot: Prot,
+    ) -> Result<bool, MmuError> {
+        let end = page_range(addr, len)?;
+        if !self.all_mapped(root, 0, 0, addr, end) {
+            return Err(MmuError::BadAddress);
+        }
+        self.apply(root, 0, 0, addr, end, Op::Protect(prot))
+    }
+
+    /// Handles a translation fault of the app at `va` (top byte already
+    /// removed) for `access`.
+    pub fn demand(&mut self, root: u64, va: u64, access: Access) -> Demand {
+        let va = va & !(PAGE - 1);
+        let desc = self.lookup(root, va);
+        if desc & pte::SW_MAPPED == 0 {
+            return Demand::Unmapped;
+        }
+        let prot = leaf_prot(desc);
+        if !access.allowed(prot) {
+            return Demand::Denied;
+        }
+        if leaf_frame(desc).is_some() {
+            return Demand::Present;
+        }
+        // The page's own slot first (inside a reservation it needs up to
+        // three tables), then its memory.
+        let Ok(Some((table, idx))) = self.leaf_slot(root, va) else {
+            return Demand::NoMemory;
+        };
+        let Some(frame) = self.new_frame() else {
+            return Demand::NoMemory;
+        };
+        if prot.contains(Prot::EXEC) {
+            self.sync_frame(frame);
+        }
+        self.set_entry(table, idx, leaf(Some(frame), prot));
+        Demand::Filled
+    }
+
+    /// Copies app memory at `addr` into `buf`, as the app could read it.
+    /// Pages with no memory yet read as zeros.
+    pub fn read(&self, root: u64, addr: u64, buf: &mut [u8]) -> Result<(), MmuError> {
+        let end = addr
+            .checked_add(buf.len() as u64)
+            .filter(|&end| end <= MAX_ADDR)
+            .ok_or(MmuError::BadAddress)?;
+        let mut va = addr;
+        while va < end {
+            let page_off = (va % PAGE) as usize;
+            let n = ((PAGE as usize - page_off) as u64).min(end - va) as usize;
+            let desc = self.lookup(root, va);
+            if desc & pte::SW_MAPPED == 0 || !Access::Read.allowed(leaf_prot(desc)) {
+                return Err(MmuError::BadAddress);
+            }
+            let at = (va - addr) as usize;
+            match leaf_frame(desc) {
+                Some(frame) => {
+                    buf[at..at + n].copy_from_slice(&self.frame(frame)[page_off..page_off + n])
+                }
+                None => buf[at..at + n].fill(0),
+            }
+            va += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Writes `data` to app memory at `addr`; the pages must be writable.
+    /// Nothing is written unless all of it is mapped writable and there is
+    /// memory for it.
+    pub fn write(&mut self, root: u64, addr: u64, data: &[u8]) -> Result<(), MmuError> {
+        let end = addr
+            .checked_add(data.len() as u64)
+            .filter(|&end| end <= MAX_ADDR)
+            .ok_or(MmuError::BadAddress)?;
+        let first = addr & !(PAGE - 1);
+        let mut va = first;
+        let mut unbacked = 0;
+        while va < end {
+            let desc = self.lookup(root, va);
+            if desc & pte::SW_MAPPED == 0 || !Access::Write.allowed(leaf_prot(desc)) {
+                return Err(MmuError::BadAddress);
+            }
+            if leaf_frame(desc).is_none() {
+                unbacked += 1;
+            }
+            va += PAGE;
+        }
+        if unbacked > self.ram_pool.frames - self.ram_pool.in_use() {
+            return Err(MmuError::NoMemory);
+        }
+        let mut va = addr;
+        while va < end {
+            let page_off = (va % PAGE) as usize;
+            let n = ((PAGE as usize - page_off) as u64).min(end - va) as usize;
+            let mut desc = self.lookup(root, va);
+            if leaf_frame(desc).is_none() {
+                // Fails only when a reservation cannot be split for want
+                // of tables: then the pages before this one are written.
+                if self.demand(root, va, Access::Write) != Demand::Filled {
+                    return Err(MmuError::NoMemory);
+                }
+                desc = self.lookup(root, va);
+            }
+            let frame = leaf_frame(desc).ok_or(MmuError::NoMemory)?;
+            let at = (va - addr) as usize;
+            self.frame_mut(frame)[page_off..page_off + n].copy_from_slice(&data[at..at + n]);
+            if leaf_prot(desc).contains(Prot::EXEC) {
+                self.sync_frame(frame);
+            }
+            va += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Frees an address space: its memory and its tables.
+    pub fn destroy(&mut self, root: u64) {
+        self.free_subtree(root, 0);
+    }
+
+    /// Frees a table and everything below it.
+    fn free_subtree(&mut self, table: u64, level: u32) {
+        for idx in 0..512 {
+            let desc = self.entry(table, idx);
+            if level < 3 {
+                if desc & pte::VALID != 0 {
+                    self.free_subtree(desc & pte::ADDR_MASK, level + 1);
+                }
+            } else if desc & pte::SW_MAPPED != 0 {
+                if let Some(frame) = leaf_frame(desc) {
+                    self.ram_pool.release(frame);
+                }
+            }
+        }
+        self.release_table(table);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn phys(tables: usize, ram: usize) -> Phys<Vec<u8>> {
+        Phys::new(
+            vec![0; tables * PAGE as usize],
+            vec![0; ram * PAGE as usize],
+        )
+    }
+
+    #[test]
+    fn map_touch_read_write_unmap() {
+        let mut p = phys(16, 16);
+        let root = p.new_space().unwrap();
+        assert!(!p.map(root, 0x40_0000, 3 * PAGE, Prot::RW).unwrap());
+        assert_eq!(p.ram_in_use(), 0, "memory comes on first touch");
+        let mut buf = [1u8; 8];
+        p.read(root, 0x40_0ffc, &mut buf).unwrap();
+        assert_eq!(buf, [0; 8]);
+        p.write(root, 0x40_0ffc, b"abcdefgh").unwrap();
+        assert_eq!(p.ram_in_use(), 2 * PAGE);
+        p.read(root, 0x40_0ffc, &mut buf).unwrap();
+        assert_eq!(&buf, b"abcdefgh");
+        let desc = p.lookup(root, 0x40_0000);
+        assert_ne!(desc & pte::VALID, 0);
+        assert_eq!(desc & pte::AP_RO, 0);
+        assert_ne!(desc & pte::UXN, 0);
+        assert_ne!(desc & pte::PXN, 0);
+        assert!(
+            p.unmap(root, 0x40_0000, 3 * PAGE).unwrap(),
+            "valid pages need a flush"
+        );
+        assert_eq!(p.ram_in_use(), 0);
+        assert_eq!(p.read(root, 0x40_0000, &mut buf), Err(MmuError::BadAddress));
+    }
+
+    #[test]
+    fn protections_and_faults() {
+        let mut p = phys(16, 16);
+        let root = p.new_space().unwrap();
+        p.map(root, 0x1_0000, PAGE, Prot::READ).unwrap();
+        assert_eq!(p.write(root, 0x1_0000, b"x"), Err(MmuError::BadAddress));
+        assert_eq!(p.demand(root, 0x1_0010, Access::Write), Demand::Denied);
+        assert_eq!(p.demand(root, 0x1_0010, Access::Exec), Demand::Denied);
+        assert_eq!(p.demand(root, 0x1_0010, Access::Read), Demand::Filled);
+        assert_eq!(p.demand(root, 0x9_0000, Access::Read), Demand::Unmapped);
+        assert_ne!(p.lookup(root, 0x1_0000) & pte::AP_RO, 0);
+        p.protect(root, 0x1_0000, PAGE, Prot::NONE).unwrap();
+        let desc = p.lookup(root, 0x1_0000);
+        assert_eq!(desc & pte::VALID, 0, "PROT_NONE is not valid in hardware");
+        assert_ne!(desc & pte::ADDR_MASK, 0, "but keeps its memory");
+        assert_eq!(p.demand(root, 0x1_0000, Access::Read), Demand::Denied);
+        p.protect(root, 0x1_0000, PAGE, Prot::ALL).unwrap();
+        let desc = p.lookup(root, 0x1_0000);
+        assert_eq!(desc & (pte::UXN | pte::AP_RO), 0);
+        assert_eq!(
+            p.protect(root, 0x1_0000, 2 * PAGE, Prot::READ),
+            Err(MmuError::BadAddress),
+            "partly unmapped"
+        );
+    }
+
+    #[test]
+    fn pools_run_out_cleanly() {
+        let mut p = phys(4, 2);
+        let root = p.new_space().unwrap();
+        p.map(root, 0x1_0000, 4 * PAGE, Prot::RW).unwrap();
+        assert_eq!(
+            p.write(root, 0x1_0000, &[7; 3 * PAGE as usize]),
+            Err(MmuError::NoMemory)
+        );
+        assert_eq!(p.ram_in_use(), 0, "nothing written");
+        assert_eq!(p.demand(root, 0x1_0000, Access::Write), Demand::Filled);
+        assert_eq!(p.demand(root, 0x1_1000, Access::Write), Demand::Filled);
+        assert_eq!(p.demand(root, 0x1_2000, Access::Write), Demand::NoMemory);
+        // A far-away mapping needs three new tables; only none are left.
+        assert_eq!(
+            p.map(root, 0x7f00_0000_0000, PAGE, Prot::RW),
+            Err(MmuError::NoMemory)
+        );
+        p.destroy(root);
+        assert_eq!(p.ram_in_use(), 0);
+        assert_eq!(p.tables_in_use(), 0);
+    }
+
+    #[test]
+    fn reserving_address_space_costs_tables_only_at_its_edges() {
+        const GIB: u64 = 1 << 30;
+        let mut p = phys(16, 16);
+        let root = p.new_space().unwrap();
+        // 256 GiB, aligned to 1 GiB: 256 entries of one level-1 table.
+        p.map(root, 4 * GIB, 256 * GIB, Prot::NONE).unwrap();
+        assert_eq!(p.tables_in_use(), 2 * PAGE, "the root and one table");
+        assert_ne!(p.lookup(root, 100 * GIB + 0x1234) & pte::SW_MAPPED, 0);
+        assert_eq!(p.lookup(root, 3 * GIB), 0);
+        assert_eq!(p.lookup(root, 260 * GIB), 0);
+        assert_eq!(p.demand(root, 100 * GIB, Access::Read), Demand::Denied);
+        // A range that is not aligned takes tables at its two ends only.
+        p.map(root, 300 * GIB + PAGE, 8 * GIB, Prot::RW).unwrap();
+        assert_eq!(p.tables_in_use(), 6 * PAGE, "two per end");
+        // Making a part usable splits what covers it, and touching a page
+        // gives it memory.
+        p.protect(root, 100 * GIB, 16 * PAGE, Prot::RW).unwrap();
+        assert_eq!(p.tables_in_use(), 8 * PAGE);
+        assert_eq!(
+            p.demand(root, 100 * GIB + PAGE, Access::Write),
+            Demand::Filled
+        );
+        assert_eq!(
+            p.demand(root, 100 * GIB + 16 * PAGE, Access::Write),
+            Demand::Denied
+        );
+        p.write(root, 304 * GIB, b"far").unwrap();
+        let mut buf = [0u8; 3];
+        p.read(root, 304 * GIB, &mut buf).unwrap();
+        assert_eq!(&buf, b"far");
+        assert_eq!(p.ram_in_use(), 2 * PAGE);
+        // The same protection again splits nothing.
+        let before = p.tables_in_use();
+        p.protect(root, 200 * GIB + PAGE, PAGE, Prot::NONE).unwrap();
+        assert_eq!(p.tables_in_use(), before);
+        // A hole in a reservation: the rest stays mapped.
+        p.unmap(root, 50 * GIB + PAGE, PAGE).unwrap();
+        assert_eq!(p.lookup(root, 50 * GIB + PAGE), 0);
+        assert_ne!(p.lookup(root, 50 * GIB) & pte::SW_MAPPED, 0);
+        assert_ne!(p.lookup(root, 50 * GIB + 2 * PAGE) & pte::SW_MAPPED, 0);
+        assert_eq!(
+            p.protect(root, 50 * GIB, 3 * PAGE, Prot::RW),
+            Err(MmuError::BadAddress),
+            "a hole"
+        );
+        // Unmapping everything gives every table back but the root.
+        assert!(p.unmap(root, 0, MAX_ADDR).unwrap());
+        assert_eq!(p.tables_in_use(), PAGE);
+        assert_eq!(p.ram_in_use(), 0);
+        // The whole address space is one reservation per root entry.
+        p.map(root, 0, MAX_ADDR, Prot::NONE).unwrap();
+        assert_eq!(p.tables_in_use(), PAGE);
+        p.destroy(root);
+        assert_eq!(p.tables_in_use(), 0);
+    }
+
+    #[test]
+    fn tables_are_given_back_when_their_last_page_goes() {
+        let mut p = phys(8, 4);
+        let root = p.new_space().unwrap();
+        // Map, touch and unmap a page at many places far apart: far more
+        // than the pool could hold if tables were kept.
+        for i in 0..2000u64 {
+            let at = 0x1_0000_0000 + i * (1 << 30) + (i % 7) * PAGE;
+            p.map(root, at, 2 * PAGE, Prot::RW).unwrap();
+            p.write(root, at + PAGE - 1, b"xy").unwrap();
+            assert_eq!(p.tables_in_use(), 4 * PAGE);
+            assert!(p.unmap(root, at, PAGE).unwrap());
+            assert_eq!(p.tables_in_use(), 4 * PAGE, "one page is left");
+            assert!(p.unmap(root, at + PAGE, PAGE).unwrap());
+            assert_eq!(p.tables_in_use(), PAGE, "only the root");
+            assert_eq!(p.ram_in_use(), 0);
+        }
+        // Replacing a mapped range with a reservation frees its tables.
+        p.map(root, 0x4000_0000, 4 * PAGE, Prot::RW).unwrap();
+        p.write(root, 0x4000_0000, b"x").unwrap();
+        assert!(p.map(root, 0x4000_0000, 1 << 30, Prot::NONE).unwrap());
+        assert_eq!(p.tables_in_use(), 2 * PAGE);
+        assert_eq!(p.ram_in_use(), 0);
+        // Out of tables in the middle of a map: nothing of it is left.
+        let mut small = phys(3, 1);
+        let root = small.new_space().unwrap();
+        assert_eq!(
+            small.map(root, 0x1_0000, PAGE, Prot::RW),
+            Err(MmuError::NoMemory)
+        );
+        assert_eq!(small.tables_in_use(), PAGE);
+        // A reservation that cannot be split for want of tables: the
+        // touch fails, and so does a write, with nothing written.
+        small.map(root, 0, 1 << 39, Prot::RW).unwrap();
+        assert_eq!(
+            small.demand(root, 0x1_0000, Access::Write),
+            Demand::NoMemory
+        );
+        assert_eq!(small.write(root, 0x1_0000, b"x"), Err(MmuError::NoMemory));
+        assert_eq!(small.ram_in_use(), 0);
+    }
+
+    #[test]
+    fn bad_ranges_are_refused() {
+        let mut p = phys(8, 2);
+        let root = p.new_space().unwrap();
+        assert_eq!(
+            p.map(root, 0x1001, PAGE, Prot::RW),
+            Err(MmuError::BadAddress)
+        );
+        assert_eq!(
+            p.map(root, MAX_ADDR, PAGE, Prot::RW),
+            Err(MmuError::BadAddress)
+        );
+        assert_eq!(p.unmap(root, !(PAGE - 1), PAGE), Err(MmuError::BadAddress));
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            p.read(root, u64::MAX - 4, &mut buf),
+            Err(MmuError::BadAddress)
+        );
+        assert_eq!(p.write(root, MAX_ADDR - 8, &buf), Err(MmuError::BadAddress));
+        assert_eq!(p.demand(root, u64::MAX, Access::Read), Demand::Unmapped);
+    }
+
+    #[test]
+    fn shim_is_el1_only() {
+        let mut p = phys(8, 1);
+        let root = p.shim_space().unwrap();
+        // The walk of the upper half uses the same indexes.
+        let mut table = root;
+        for level in 0..3 {
+            table = p.entry(table, index(SHIM_VA, level)) & pte::ADDR_MASK;
+        }
+        let desc = p.entry(table, index(SHIM_VA, 3));
+        assert_eq!(desc & pte::ADDR_MASK, SHIM_IPA);
+        assert_eq!(desc & pte::AP_EL0, 0, "no EL0 access");
+        assert_ne!(desc & pte::AP_RO, 0, "read only");
+        assert_ne!(desc & pte::UXN, 0, "EL0 cannot execute it");
+        assert_eq!(desc & pte::PXN, 0, "EL1 can");
+    }
+}
