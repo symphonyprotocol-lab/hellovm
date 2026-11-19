@@ -24,6 +24,10 @@ log.workspace = true
 hellovm-platform-seccomp.workspace = true
 libc.workspace = true
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+hellovm-platform-hvf.workspace = true
+libc.workspace = true
+
 [dev-dependencies]
 # The tests run the kernel through `--insecure-test-session`.
 hellovm = { path = ".", features = ["insecure-test-hooks"] }

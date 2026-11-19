@@ -69,6 +69,14 @@
 //!
 //! `HELLOVM_LOG` sets the log level (`error`, `warn` (default), `info`,
 //! `debug`, `trace`).
+//!
+//! On macOS on Apple silicon, programs run on the HVF platform
+//! (Hypervisor.framework; aarch64 Linux programs only, one process, no
+//! `fork` or threads yet), and only the first form works, without
+//! `--egress` and `--template`/`--clone`. Nothing hardens the kernel
+//! process there: `--sandbox require` refuses to start. The executable
+//! must be signed with the hypervisor entitlement (see README, "The HVF
+//! platform").
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -126,7 +134,10 @@ fn init_logging() {
     let _ = log::set_logger(&StderrLogger);
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))),
+    allow(dead_code)
+)]
 struct Options {
     trace: bool,
     /// `Some(true)`: `--tty`; `Some(false)`: `--no-tty`; `None`: decide by
@@ -142,12 +153,15 @@ struct Options {
     fs_limit: Option<u64>,
     /// Test hook: splice outbound TCP to this loopback address.
     #[cfg(feature = "insecure-test-hooks")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     splice_to: Option<std::net::SocketAddr>,
     /// Test hook: serve programs on stdin (`hellovm::session`).
     #[cfg(feature = "insecure-test-hooks")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     session: bool,
     /// Test hook: try to break out of the hardened process, then exit.
     #[cfg(feature = "insecure-test-hooks")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fence_test: Option<String>,
     sandbox: SandboxMode,
     env: Vec<Vec<u8>>,
@@ -157,8 +171,10 @@ struct Options {
     /// `--clone SOCKET`.
     clone: Option<PathBuf>,
     /// `--input DATA` (with `--clone`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     input: Vec<u8>,
     /// `--ready` (with `--clone`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ready: bool,
 }
 
@@ -440,7 +456,10 @@ fn main() -> ExitCode {
 }
 
 /// How a run ended.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))),
+    allow(dead_code)
+)]
 enum Ended {
     Status(hellovm_core::ExitStatus),
     /// Killed by `--timeout` after this long.
@@ -744,16 +763,105 @@ fn fence_test(test: &str) -> ! {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS on Apple silicon: the HVF platform. Only what a single-process
+/// program needs: no hardening, no egress, no warm clones.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run(
+    options: &Options,
+    _fds: Result<usize, String>,
+) -> Result<Ended, Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use hellovm_core::Kernel;
+    use hellovm_host::{ImageDir, StdioHost};
+    use hellovm_platform_hvf::{HvfConfig, HvfPlatform};
+
+    if options.template.is_some() || options.clone.is_some() {
+        return Err("warm clones (--template, --clone) need Linux".into());
+    }
+    if options.egress.is_some() {
+        return Err("--egress is not supported on macOS yet".into());
+    }
+    match options.sandbox {
+        SandboxMode::Require => {
+            return Err(
+                "--sandbox require: the kernel process cannot be hardened on macOS (yet)".into(),
+            )
+        }
+        SandboxMode::BestEffort => {
+            log::warn!("no hardening of the kernel process on macOS (--sandbox off to silence)")
+        }
+        SandboxMode::Off => {}
+    }
+    let image = ImageDir::open(&options.root)
+        .map_err(|err| format!("image {}: {err}", options.root.display()))?;
+    let mut app = HvfPlatform::new(HvfConfig::default())?;
+    let host = StdioHost::new(Some(image));
+    let mut kernel = Kernel::new(host);
+    if let Some(id) = options.sandbox_id {
+        kernel = kernel.with_sandbox_id(id);
+    }
+    if let Some(bytes) = options.fs_limit {
+        kernel = kernel.with_fs_limit(bytes);
+    }
+    if options.trace {
+        kernel = kernel.with_trace();
+    }
+    let terminal = options
+        .tty
+        .unwrap_or_else(|| host_tty::is_terminal(0) && host_tty::is_terminal(1));
+    let _raw = if terminal {
+        kernel = kernel.with_console(hellovm_core::ConsoleMode::Terminal);
+        host_tty::RawMode::enter(0)
+    } else {
+        None
+    };
+    kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
+    if terminal {
+        if let Some((rows, cols)) = host_tty::window_size(1) {
+            kernel.set_window_size(rows, cols);
+        }
+    }
+    let timed_out = Arc::new(AtomicBool::new(false));
+    if let Some(timeout) = options.timeout {
+        let killer = app.killer();
+        let timed_out = Arc::clone(&timed_out);
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            timed_out.store(true, Ordering::SeqCst);
+            killer.kill();
+        });
+    }
+    let status = kernel.run(&mut app);
+    for record in kernel.trace() {
+        eprintln!("hellovm: trace: {record}");
+    }
+    let status = status?;
+    match (status, options.timeout) {
+        (hellovm_core::ExitStatus::Signaled(9), Some(timeout))
+            if timed_out.load(Ordering::SeqCst) =>
+        {
+            Ok(Ended::TimedOut(timeout))
+        }
+        _ => Ok(Ended::Status(status)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
 fn run(
     _options: &Options,
     _fds: Result<usize, String>,
 ) -> Result<Ended, Box<dyn std::error::Error>> {
-    Err("no platform for this host yet: only Linux (seccomp) is implemented".into())
+    Err(
+        "no platform for this host: hellovm runs programs on Linux (seccomp) \
+         and on macOS on Apple silicon (Hypervisor.framework)"
+            .into(),
+    )
 }
 
 /// The host terminal hellovm runs in, if any.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 mod host_tty {
     /// Whether `fd` is a terminal.
     pub fn is_terminal(fd: i32) -> bool {
