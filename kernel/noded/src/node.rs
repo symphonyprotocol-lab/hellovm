@@ -755,6 +755,10 @@ impl Node {
         let Some(sandbox) = lock(&self.sandboxes).remove(&id) else {
             return false;
         };
+        // Measured once more while its processes still run: the sampling
+        // is once a second, and without this a sandbox would not pay for
+        // its last second (one that lived less than a second, for nothing).
+        self.measure_last(&sandbox);
         let removed = Instant::now();
         sandbox.fail(ApiError::ended(reason));
         sandbox.kill();
@@ -1122,6 +1126,21 @@ impl Node {
             self.egress();
             self.finalize();
         }
+    }
+
+    /// The last measurement of a sandbox that is being removed: its CPU
+    /// time and memory until now.
+    fn measure_last(&self, sandbox: &Sandbox) {
+        let usage = crate::memory::measure(&[(sandbox.kernel_pid, sandbox.max_processes)]);
+        let Some(usage) = usage.get(&sandbox.kernel_pid) else {
+            return;
+        };
+        let mut c = lock(&sandbox.counters);
+        if !usage.too_many {
+            c.memory(usage.bytes, Instant::now());
+        }
+        let cpu_ms = usage.cpu_ticks.saturating_mul(1000) / self.ticks_per_second;
+        c.cpu_ms = c.cpu_ms.max(cpu_ms);
     }
 
     fn measure(&self) {

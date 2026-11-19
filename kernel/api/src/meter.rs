@@ -224,6 +224,16 @@ pub struct Observed {
     pub created_at: u64,
 }
 
+/// A sandbox closed as lost: where its counters stood, should its node
+/// report it again.
+struct Lost {
+    tenant: String,
+    node: String,
+    template: String,
+    total: Counters,
+    at: Instant,
+}
+
 struct Track {
     tenant: String,
     node: String,
@@ -248,8 +258,12 @@ pub struct Rebuilt {
     /// The last counters of sandboxes with no final record: `(tenant,
     /// node, template, total, ts)`.
     pub baselines: HashMap<SandboxId, (String, String, String, Counters, u64)>,
-    /// Sandboxes with a final record.
-    pub closed: Vec<SandboxId>,
+    /// Sandboxes whose last record is a final one.
+    pub closed: HashSet<SandboxId>,
+    /// Of those, the ones closed as `lost`, with their last counters: `(tenant,
+    /// node, template, total, ts)`. One that its node reports again is
+    /// counted on from there.
+    pub lost: HashMap<SandboxId, (String, String, String, Counters, u64)>,
     /// Deletes not done: `(tenant, node)`.
     pub deletes: HashMap<SandboxId, (String, String)>,
     pub records: u64,
@@ -284,10 +298,21 @@ impl Rebuilt {
                 }
                 if r.kind == Kind::Final {
                     self.baselines.remove(&id);
-                    self.closed.push(id);
-                } else if self.baselines.len() < MAX_TRACKS || self.baselines.contains_key(&id) {
-                    self.baselines
-                        .insert(id, (r.tenant, r.node, r.template, r.total, r.ts));
+                    self.closed.insert(id);
+                    if r.end.as_deref() == Some("lost") && self.lost.len() < MAX_TRACKS {
+                        self.lost
+                            .insert(id, (r.tenant, r.node, r.template, r.total, r.ts));
+                    } else {
+                        self.lost.remove(&id);
+                    }
+                } else {
+                    // A record after a final one: it was lost and came back.
+                    self.closed.remove(&id);
+                    self.lost.remove(&id);
+                    if self.baselines.len() < MAX_TRACKS || self.baselines.contains_key(&id) {
+                        self.baselines
+                            .insert(id, (r.tenant, r.node, r.template, r.total, r.ts));
+                    }
                 }
             }
             Kind::DeletePending => {
@@ -312,6 +337,8 @@ pub struct Meter {
     tracks: HashMap<SandboxId, Track>,
     closed: HashSet<SandboxId>,
     closed_order: VecDeque<SandboxId>,
+    /// Of the closed ones, those that were lost (not reported as ended).
+    lost: HashMap<SandboxId, Lost>,
     /// Per node: its boot number and the `seq` of the last ended sandbox
     /// taken.
     cursors: HashMap<String, (u64, u64)>,
@@ -345,6 +372,7 @@ impl Meter {
             tracks: HashMap::new(),
             closed: HashSet::new(),
             closed_order: VecDeque::new(),
+            lost: HashMap::new(),
             cursors: HashMap::new(),
             out: Vec::new(),
             logged,
@@ -355,6 +383,21 @@ impl Meter {
         };
         for id in &rebuilt.closed {
             meter.close(*id);
+        }
+        for (id, (tenant, node, template, total, ts)) in &rebuilt.lost {
+            if meter.closed.contains(id) {
+                let ago = Duration::from_millis(now_ms.saturating_sub(*ts));
+                meter.lost.insert(
+                    *id,
+                    Lost {
+                        tenant: tenant.clone(),
+                        node: node.clone(),
+                        template: template.clone(),
+                        total: *total,
+                        at: now.checked_sub(ago).unwrap_or(now),
+                    },
+                );
+            }
         }
         for (id, (tenant, node, template, total, ts)) in &rebuilt.baselines {
             let ago = Duration::from_millis(now_ms.saturating_sub(*ts));
@@ -387,6 +430,7 @@ impl Meter {
             if self.closed_order.len() > MAX_CLOSED {
                 if let Some(old) = self.closed_order.pop_front() {
                     self.closed.remove(&old);
+                    self.lost.remove(&old);
                 }
             }
         }
@@ -549,8 +593,38 @@ impl Meter {
         bounds: &Bounds,
         o: &Observed,
     ) -> bool {
-        if self.closed.contains(&o.id) || !self.tenants.contains(&o.tenant) {
+        if !self.tenants.contains(&o.tenant) {
             return false;
+        }
+        if self.closed.contains(&o.id) {
+            // Closed as lost and reported again by the same node for the
+            // same tenant: it lives, and is counted on from where its
+            // counters stood. Anything else closed stays closed.
+            let back = self
+                .lost
+                .get(&o.id)
+                .is_some_and(|l| l.tenant == o.tenant && l.node == node);
+            if !back || self.tracks.len() >= MAX_TRACKS {
+                return false;
+            }
+            if let Some(l) = self.lost.remove(&o.id) {
+                self.closed.remove(&o.id);
+                self.closed_order.retain(|id| *id != o.id);
+                self.tracks.insert(
+                    o.id,
+                    Track {
+                        tenant: l.tenant,
+                        node: l.node,
+                        template: l.template,
+                        total: l.total,
+                        pending: Counters::default(),
+                        memory_bytes: 0,
+                        memory_limit: 0,
+                        at: l.at,
+                        seen: now,
+                    },
+                );
+            }
         }
         let usage = Counters {
             run_ms: o.usage.run_ms.min(MAX_COUNTER),
@@ -584,9 +658,15 @@ impl Meter {
                     return false;
                 }
                 // First seen: from zero if it was made in the time this
-                // meter counts, else from now.
+                // meter counts, else from now. What it may have used is
+                // bounded by the time this meter counts, not only by the
+                // run time its node reports: the node is not trusted with
+                // its own bound.
                 let (delta, kept) = if o.created_at >= self.count_from() {
-                    let elapsed = usage.run_ms.min(self.max_lifetime_ms);
+                    let elapsed = usage
+                        .run_ms
+                        .min(self.max_lifetime_ms)
+                        .min(now_ms.saturating_sub(self.count_from()));
                     let (delta, kept, odd) = grow(&Counters::default(), &usage, elapsed, bounds);
                     if odd {
                         self.odd += 1;
@@ -612,7 +692,6 @@ impl Meter {
                 delta
             }
         };
-        let _ = now_ms;
         let t = self.totals.entry(o.tenant.clone()).or_default();
         *t = add(t, &delta);
         true
@@ -620,11 +699,30 @@ impl Meter {
 
     /// Writes a sandbox's last record and forgets it.
     fn finish(&mut self, id: SandboxId, now_ms: u64, end: &str) {
+        let mut lost = None;
         if let Some(t) = self.tracks.remove(&id) {
             let delta = t.pending;
             self.record(Kind::Final, now_ms, &id, &t, delta, Some(end));
+            if end == "lost" {
+                lost = Some(Lost {
+                    tenant: t.tenant,
+                    node: t.node,
+                    template: t.template,
+                    total: t.total,
+                    at: t.at,
+                });
+            }
         }
         self.close(id);
+        // After `close`, which may have dropped the oldest closed one.
+        match lost {
+            Some(l) if self.closed.contains(&id) => {
+                self.lost.insert(id, l);
+            }
+            _ => {
+                self.lost.remove(&id);
+            }
+        }
     }
 
     /// Once a second: starts a new period when one began (the old one's
@@ -796,6 +894,140 @@ mod tests {
         );
         assert!(odd);
         assert_eq!(d.run_ms, SLACK_MS);
+    }
+
+    #[test]
+    fn a_first_sample_is_bounded_by_the_time_counted() {
+        let now = Instant::now();
+        // The meter counts from T0 (the period's start); it is T0 + 2 s.
+        let mut m = meter(T0 + 2000, now, true);
+        let x = SandboxId::random().unwrap();
+        // A node claims a week of run time and CPU for a sandbox made
+        // just now: counted up to what 2 s (and the slack) allow.
+        let week = 7 * 86_400_000;
+        let claim = Counters {
+            run_ms: week,
+            cpu_ms: week * 4,
+            ..Counters::default()
+        };
+        m.observe(
+            "n1",
+            T0 + 2000,
+            now,
+            &BOUNDS,
+            vec![observed(x, "a", claim, T0 + 1000)],
+            vec![],
+            7,
+            0,
+            true,
+        );
+        let t = m.totals("a", T0 + 2000);
+        assert_eq!(t.run_ms, 2000 + SLACK_MS);
+        assert_eq!(t.cpu_ms, (2000 + SLACK_MS) * 4);
+        assert_eq!(m.odd, 1);
+    }
+
+    #[test]
+    fn a_lost_sandbox_that_is_reported_again_is_counted_on() {
+        let now = Instant::now();
+        let mut m = meter(T0 + 1000, now, true);
+        let x = SandboxId::random().unwrap();
+        let see = |m: &mut Meter, at_ms: u64, at: Instant, live: Vec<Observed>| {
+            m.observe("n1", at_ms, at, &BOUNDS, live, vec![], 7, 0, true);
+        };
+        see(
+            &mut m,
+            T0 + 1000,
+            now,
+            vec![observed(x, "a", usage(1000, 100, 0), T0)],
+        );
+        // Its node leaves it out for more than a minute: closed as lost.
+        let later = now + LOST_AFTER + Duration::from_secs(1);
+        see(&mut m, T0 + 62_000, later, vec![]);
+        let recs = records(&mut m);
+        assert_eq!(recs.last().unwrap().end.as_deref(), Some("lost"));
+        assert_eq!(m.tracked(), 0);
+        // And then reports it again: counted from where it stood, once.
+        let back = later + Duration::from_secs(2);
+        see(
+            &mut m,
+            T0 + 64_000,
+            back,
+            vec![observed(x, "a", usage(64_000, 900, 0), T0)],
+        );
+        assert_eq!(m.tracked(), 1);
+        assert_eq!(m.totals("a", T0 + 64_000).cpu_ms, 900);
+        // Not under another tenant's name, nor from another node.
+        let y = SandboxId::random().unwrap();
+        see(
+            &mut m,
+            T0 + 64_000,
+            back,
+            vec![
+                observed(x, "a", usage(64_000, 900, 0), T0),
+                observed(y, "a", usage(1000, 50, 0), T0),
+            ],
+        );
+        let gone = back + LOST_AFTER + Duration::from_secs(1);
+        see(
+            &mut m,
+            T0 + 130_000,
+            gone,
+            vec![observed(x, "a", usage(130_000, 900, 0), T0)],
+        );
+        m.observe(
+            "n2",
+            T0 + 131_000,
+            gone,
+            &BOUNDS,
+            vec![observed(y, "a", usage(131_000, 5000, 0), T0)],
+            vec![],
+            9,
+            0,
+            true,
+        );
+        see(
+            &mut m,
+            T0 + 131_000,
+            gone,
+            vec![
+                observed(x, "a", usage(131_000, 900, 0), T0),
+                observed(y, "b", usage(131_000, 5000, 0), T0),
+            ],
+        );
+        assert_eq!(m.totals("a", T0 + 131_000).cpu_ms, 950);
+        assert_eq!(m.totals("b", T0 + 131_000).cpu_ms, 0);
+        // The log says the same after a restart: lost, with its counters.
+        let mut rebuilt = Rebuilt::default();
+        let known = |t: &str| t == "a" || t == "b";
+        let mut m2 = meter(T0 + 1000, now, true);
+        see(
+            &mut m2,
+            T0 + 1000,
+            now,
+            vec![observed(x, "a", usage(1000, 100, 0), T0)],
+        );
+        see(&mut m2, T0 + 62_000, later, vec![]);
+        for line in m2.take_lines() {
+            rebuilt.take(&line.text, true, &known);
+        }
+        assert!(rebuilt.closed.contains(&x) && rebuilt.lost.contains_key(&x));
+        let mut m3 = Meter::new(
+            3600,
+            T0 + 63_000,
+            later,
+            true,
+            86_400_000,
+            vec!["a".into(), "b".into()],
+            &rebuilt,
+        );
+        see(
+            &mut m3,
+            T0 + 64_000,
+            back,
+            vec![observed(x, "a", usage(64_000, 900, 0), T0)],
+        );
+        assert_eq!(m3.totals("a", T0 + 64_000).cpu_ms, 900);
     }
 
     #[test]
@@ -1026,7 +1258,7 @@ mod tests {
         rebuilt.take(&lines[0].text.replace("\"a\"", "\"other\""), true, &known);
         assert_eq!(rebuilt.bad, 2);
         assert_eq!(rebuilt.totals["a"].cpu_ms, 550);
-        assert_eq!(rebuilt.closed, vec![y]);
+        assert_eq!(rebuilt.closed, HashSet::from([y]));
         assert!(rebuilt.baselines.contains_key(&x));
         assert!(rebuilt.deletes.contains_key(&id));
         // The new process: x continues from its logged counters, y (whose

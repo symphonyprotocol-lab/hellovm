@@ -222,11 +222,34 @@ pub struct NodeProc {
     pub service: Option<Service>,
 }
 
+/// A port for a service that must keep it across restarts. Taken below
+/// the range the host gives out by itself (to `bind` to port 0 and to
+/// outgoing connections), so that nothing takes it between this check and
+/// the service's own `bind`, and never twice in this process.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .unwrap()
-        .port()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let ephemeral_low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|t| t.split_whitespace().next()?.parse::<u32>().ok())
+        .unwrap_or(32768);
+    let (low, high) = (10_000u32, ephemeral_low.min(60_000));
+    if high < low + 1000 {
+        // No room below it on this host: the old way.
+        return std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .unwrap()
+            .port();
+    }
+    let span = high - low;
+    let base = std::process::id().wrapping_mul(131) % span;
+    for _ in 0..span {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = (low + (base + n) % span) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port between {low} and {high}");
 }
 
 pub struct Plane {

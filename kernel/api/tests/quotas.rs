@@ -378,6 +378,12 @@ fn the_usage_log_records_what_ran_and_survives_a_restart() {
             .contains("usage log: writing again")
     });
     assert_eq!(plane.delete(ACME, &x), 204);
+    // A sandbox removed between two of its node's measurements (they are
+    // a second apart) pays for what it used all the same: it is measured
+    // once more as it is removed.
+    let z = id_of(&plane.create(ACME, json!({})));
+    plane.exec(ACME, &z, burn(0.6));
+    assert_eq!(plane.delete(ACME, &z), 204);
     let finals = |records: &[Value], id: &str| {
         records
             .iter()
@@ -387,6 +393,14 @@ fn the_usage_log_records_what_ran_and_survives_a_restart() {
     eventually(Duration::from_secs(15), "x's final record", || {
         finals(&log_records(&dir), &x) == 1
     });
+    eventually(Duration::from_secs(15), "z's final record", || {
+        finals(&log_records(&dir), &z) == 1
+    });
+    let of_z = log_records(&dir)
+        .into_iter()
+        .rfind(|r| r["sandbox"] == z && r["kind"] == "final")
+        .unwrap();
+    assert!(of_z["total"]["cpu_ms"].as_u64().unwrap() >= 400, "{of_z}");
     // Let a record of y come too.
     std::thread::sleep(Duration::from_millis(1500));
     let records = log_records(&dir);
@@ -438,8 +452,9 @@ fn the_usage_log_records_what_ran_and_survives_a_restart() {
     let acme_before = usage(&plane, ACME)["usage"].clone();
     let beta_before = usage(&plane, BETA)["usage"].clone();
     assert_eq!(
-        acme_before["cpu_ms"], total["cpu_ms"],
-        "acme's only sandbox was x"
+        acme_before["cpu_ms"].as_u64().unwrap(),
+        total["cpu_ms"].as_u64().unwrap() + of_z["total"]["cpu_ms"].as_u64().unwrap(),
+        "acme's sandboxes were x and z"
     );
     plane.restart_api();
     std::thread::sleep(Duration::from_millis(1500));

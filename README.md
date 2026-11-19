@@ -278,9 +278,13 @@ RECEIVED` per key and `.`. Put that socket in a directory of its own: a
 kernel process sees the flow socket's directory. The sandbox id of the
 flow header is not used (the connecting process chooses it); the token
 keeps a kernel process that can still reach the socket (a host without
-mount namespaces) from reading other sandboxes' traffic. At most 16384
-processes are counted at once (those whose flows all ended are dropped,
-the longest idle first; a flow past that is relayed but not counted).
+mount namespaces) from reading other sandboxes' traffic, and
+connections that never present it from keeping `noded` out: of the 8
+questions answered at once, the one that waited longest without the
+token makes room for a new one. At most 16384 processes are counted at
+once (when the table is full, those that ended are dropped, the longest
+idle first; a process that still runs keeps its counter, and a flow of a
+new process past that is relayed but not counted).
 
 *Limits*:
 
@@ -1275,8 +1279,10 @@ lives as long as the sandbox, and keeps its last value when it ends.
   ended was waited for by its parent below the kernel process, so its
   time is in that parent's `cutime`/`cstime`, and counted. Not counted:
   a process whose host parent went away before waiting for it (it was
-  reparented out of the tree) after the last scan that saw it, and the
-  last second of a sandbox before it is removed. The node keeps the
+  reparented out of the tree) after the last scan that saw it. A sandbox
+  is measured once more as it is removed, before its processes are
+  killed, so it pays for its last second too (and one that lived less
+  than a second, for what it used). The node keeps the
   largest sum seen, so a process moving from one place of the sum to
   another never makes it go down.
 * Memory: each measurement of private memory counts for the time since
@@ -1315,10 +1321,11 @@ A node is not trusted to report sense:
 | a counter lower than the last one taken | nothing is counted, the higher value is kept (nothing is counted twice when it climbs back) |
 | a counter that grew more than possible since the last report (run time faster than the clock; CPU time faster than the node's CPUs, `cpus` in its status; egress faster than 100 Gbit/s; memory beyond the node's memory), each with 30 s of slack | counted up to that bound only |
 | a value beyond 2^53 | taken as 2^53 |
-| a sandbox first seen with another tenant or node, or of a tenant not in the configuration | ignored |
+| the first report of a sandbox made in the time the meter counts | counted from zero, up to what the time the meter has counted allows (not what the run time the node reports would) |
+| a sandbox reported with another tenant than the API made it for, or than it was first seen with, or from another node, or of a tenant not in the configuration | ignored (and logged) |
 | an ended sandbox listed again, or a `seq` not past the last one taken | ignored |
 | a node whose `boot` changed (it restarted, its sandboxes died) | its sandboxes are ended (`lost`) with what was counted, and its ended sandboxes are asked for from the first again |
-| a sandbox its node has not listed, live or ended, for 60 s while it answered | the same |
+| a sandbox its node has not listed, live or ended, for 60 s while it answered | the same; if the node lists it again, it is counted on from where its counters stood |
 
 Each of these counts in `odd_reports` (admin). A node that lies can
 therefore add to its own tenants' usage at most what its hardware could
@@ -1380,7 +1387,7 @@ zero and counts every running sandbox from its first report.
 | Field | Limit | Checked | Past it |
 |---|---|---|---|
 | `max_sandboxes` | sandboxes at once | create, under one lock with the next | `429 tenant_limit` |
-| `max_memory_mb` | the memory limits of its sandboxes, summed | create, under the same lock, creations in progress included (with the largest limit any node reports for the template, the node not being chosen yet) | `429 memory_limit` |
+| `max_memory_mb` | the memory limits of its sandboxes, summed | create, under the same lock, creations in progress included (with the largest limit any node reports for the template, the node not being chosen yet; when the sandbox made has a larger limit than that, or no node had reported one, the check is made again with the real limit and the sandbox is removed if the tenant is over) | `429 memory_limit` |
 | `requests_per_second`, `request_burst` (default two seconds' worth, at least 10) | requests: a token bucket per tenant | every request with the tenant's token | `429 rate_limited`, `Retry-After` |
 | `cpu_seconds_per_period` | CPU time of its sandboxes in the period | creating a sandbox, starting an exec (`exec`, `execs`) | `429 budget_exceeded`, `Retry-After` until the period ends |
 | `egress_bytes_per_period` | egress bytes, sent and received, in the period | the same | the same |

@@ -26,7 +26,7 @@
 //! process that can reach the socket anyway (a host without mount
 //! namespaces) from learning other sandboxes' traffic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -36,8 +36,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Most processes counted at once. Entries with no flow are dropped when
-/// it is full, the longest idle first.
+/// Most processes counted at once. When it is full, the entries of
+/// processes that ended are dropped, the longest idle first (a process
+/// that still runs keeps its counter, flows or not: dropping it would
+/// start its count again from zero).
 pub const MAX_PEERS: usize = 16384;
 /// Most keys in one question.
 pub const MAX_KEYS: usize = 4096;
@@ -110,16 +112,17 @@ impl Default for Usage {
 
 impl Usage {
     /// The counter for flows of `key`; `None` when the table is full of
-    /// processes with flows running (the flow is relayed, not counted).
+    /// processes that still run (the flow is relayed, not counted).
     pub fn counter(&self, key: Key) -> Option<Arc<PeerBytes>> {
         let now = self.start.elapsed().as_millis() as u64;
         let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
         if !peers.contains_key(&key) && peers.len() >= MAX_PEERS {
-            // Drop the idle half: those whose flows all ended, the longest
-            // idle first. Their last values were read long ago.
+            // Drop up to half: those whose process ended (so no flow of
+            // theirs runs), the longest idle first. Their last values were
+            // read long ago.
             let mut idle: Vec<(u64, Key)> = peers
                 .iter()
-                .filter(|(_, c)| Arc::strong_count(c) == 1)
+                .filter(|(k, c)| Arc::strong_count(c) == 1 && Key::of(k.pid) != Some(**k))
                 .map(|(k, c)| (c.last.load(Ordering::Relaxed), *k))
                 .collect();
             idle.sort_unstable();
@@ -154,6 +157,17 @@ impl Usage {
 
     /// Answers one question on `conn` (see the module documentation).
     pub fn answer(&self, conn: UnixStream, token: &str) -> io::Result<()> {
+        self.answer_then(conn, token, || {})
+    }
+
+    /// As [`Usage::answer`]; `authenticated` runs once the token was
+    /// presented.
+    fn answer_then(
+        &self,
+        conn: UnixStream,
+        token: &str,
+        authenticated: impl FnOnce(),
+    ) -> io::Result<()> {
         conn.set_read_timeout(Some(QUESTION_TIMEOUT))?;
         conn.set_write_timeout(Some(QUESTION_TIMEOUT))?;
         let mut reader = BufReader::new((&conn).take(MAX_LINE as u64 * 2));
@@ -172,6 +186,7 @@ impl Usage {
             let _ = (&conn).write_all(b"denied\n");
             return Err(io::ErrorKind::PermissionDenied.into());
         }
+        authenticated();
         let keys = line(&mut reader)?;
         let mut out = String::new();
         for (n, text) in keys.split_ascii_whitespace().enumerate() {
@@ -187,6 +202,12 @@ impl Usage {
         out.push_str(".\n");
         (&conn).write_all(out.as_bytes())
     }
+}
+
+fn lock_waiting(
+    waiting: &Mutex<VecDeque<(u64, UnixStream)>>,
+) -> std::sync::MutexGuard<'_, VecDeque<(u64, UnixStream)>> {
+    waiting.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Compares in time that depends on the lengths only.
@@ -212,28 +233,57 @@ pub fn serve_stats(usage: Arc<Usage>, path: &Path, token: String) -> io::Result<
     }
     let listener = UnixListener::bind(path)?;
     let busy = Arc::new(AtomicUsize::new(0));
+    // Connections that have not presented the token yet, oldest first.
+    let waiting: Arc<Mutex<VecDeque<(u64, UnixStream)>>> = Arc::new(Mutex::new(VecDeque::new()));
     let token = Arc::new(token);
     thread::Builder::new()
         .name("egress-stats".into())
         .spawn(move || {
+            let mut next = 0u64;
             for conn in listener.incoming() {
                 let Ok(conn) = conn else {
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 };
-                if busy.fetch_add(1, Ordering::SeqCst) >= MAX_QUESTIONS {
-                    busy.fetch_sub(1, Ordering::SeqCst);
-                    continue;
+                if busy.load(Ordering::SeqCst) >= MAX_QUESTIONS {
+                    // Room is made at the cost of whoever has waited
+                    // longest without the token, so that connections which
+                    // never present it cannot keep `noded` out. With every
+                    // place taken by an authenticated question, this one
+                    // is dropped.
+                    let oldest = lock_waiting(&waiting).pop_front();
+                    match oldest {
+                        Some((_, old)) => {
+                            let _ = old.shutdown(std::net::Shutdown::Both);
+                        }
+                        None => continue,
+                    }
                 }
-                let (usage, token, done) =
-                    (Arc::clone(&usage), Arc::clone(&token), Arc::clone(&busy));
+                let Ok(handle) = conn.try_clone() else {
+                    continue;
+                };
+                let id = next;
+                next += 1;
+                lock_waiting(&waiting).push_back((id, handle));
+                busy.fetch_add(1, Ordering::SeqCst);
+                let (usage, token, done, waiting2) = (
+                    Arc::clone(&usage),
+                    Arc::clone(&token),
+                    Arc::clone(&busy),
+                    Arc::clone(&waiting),
+                );
+                let forget = move |waiting: &Mutex<VecDeque<(u64, UnixStream)>>| {
+                    lock_waiting(waiting).retain(|(i, _)| *i != id);
+                };
                 let spawned = thread::Builder::new()
                     .name("egress-stats-answer".into())
                     .spawn(move || {
-                        let _ = usage.answer(conn, &token);
+                        let _ = usage.answer_then(conn, &token, || forget(&waiting2));
+                        forget(&waiting2);
                         done.fetch_sub(1, Ordering::SeqCst);
                     });
                 if spawned.is_err() {
+                    lock_waiting(&waiting).retain(|(i, _)| *i != id);
                     busy.fetch_sub(1, Ordering::SeqCst);
                 }
             }
@@ -316,7 +366,8 @@ mod tests {
             "another process"
         );
         drop(c);
-        // Full of idle processes: room is made.
+        // Full of processes that ended: room is made. (No process has
+        // these start times.)
         for pid in 2..(MAX_PEERS as u32 + 10) {
             assert!(usage.counter(Key { pid, start: 1 }).is_some());
         }
@@ -334,6 +385,23 @@ mod tests {
             .collect();
         assert!(usage.counter(Key { pid: 9, start: 9 }).is_none());
         drop(held);
+        // A process that still runs keeps its counter, idle or not.
+        #[cfg(target_os = "linux")]
+        {
+            let me = Key::of(std::process::id()).unwrap();
+            usage
+                .counter(me)
+                .unwrap()
+                .sent
+                .fetch_add(7, Ordering::Relaxed);
+            for pid in 0..(2 * MAX_PEERS as u32) {
+                usage.counter(Key {
+                    pid: 200_000 + pid,
+                    start: 1,
+                });
+            }
+            assert_eq!(usage.get(me), (7, 0));
+        }
     }
 
     #[test]
@@ -354,6 +422,15 @@ mod tests {
         let got = ask(&path, "secret-token", &[key, other], Duration::from_secs(2)).unwrap();
         assert_eq!(got, vec![(key, 1234, 0), (other, 0, 0)]);
         assert!(ask(&path, "wrong-token!", &[key], Duration::from_secs(2)).is_err());
+        // Connections that never present the token do not keep others
+        // out: the oldest of them makes room.
+        let idle: Vec<UnixStream> = (0..MAX_QUESTIONS * 3)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        std::thread::sleep(Duration::from_millis(100));
+        let got = ask(&path, "secret-token", &[key], Duration::from_secs(2)).unwrap();
+        assert_eq!(got, vec![(key, 1234, 0)]);
+        drop(idle);
         // Garbage keys end the question.
         let conn = UnixStream::connect(&path).unwrap();
         (&conn).write_all(b"secret-token\nnot-a-key\n").unwrap();

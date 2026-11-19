@@ -405,6 +405,29 @@ impl Api {
             }
         }
         let reported: std::collections::HashSet<SandboxId> = live.iter().map(|o| o.id).collect();
+        // Usage is counted for the tenant this API made the sandbox for,
+        // where it knows: a node that names another tenant for it is not
+        // believed (its usage is not counted until it says the right one).
+        let mut foreign = 0usize;
+        let mut owned = |o: &Observed| {
+            let ours = self
+                .store
+                .get(&o.id)
+                .or_else(|| self.store.ended(&o.id))
+                .is_none_or(|r| r.tenant == o.tenant);
+            if !ours {
+                foreign += 1;
+            }
+            ours
+        };
+        let live: Vec<Observed> = live.into_iter().filter(&mut owned).collect();
+        let ended: Vec<Observed> = ended.into_iter().filter(&mut owned).collect();
+        if foreign > 0 {
+            log::warn!(
+                "node {}: {foreign} sandboxes reported with another tenant than they were made                  for; their usage is not counted",
+                node.name
+            );
+        }
         self.nodes.reported(i, asked, load, true);
         let bounds = self.nodes.bounds(i);
         self.store.replace_node(&node.name, asked, records);
@@ -451,8 +474,11 @@ impl Api {
                             )
                     }
                     Err(err) => {
+                        // The node stopped answering: the rest waits for
+                        // the next probe rather than holding this one up
+                        // for a timeout each.
                         self.node_failed(i, &err);
-                        false
+                        return;
                     }
                 }
             } else {
@@ -558,14 +584,7 @@ impl Api {
                 )
             }
             Err(Refused::Memory) => {
-                return error(
-                    429,
-                    "memory_limit",
-                    &format!(
-                        "the memory limits of all sandboxes may add up to at most {} MiB",
-                        tenant.max_memory_bytes.unwrap_or(0) >> 20
-                    ),
-                )
+                return Self::memory_limit(tenant.max_memory_bytes.unwrap_or(0))
             }
         };
         let id = match SandboxId::random() {
@@ -609,13 +628,27 @@ impl Api {
                         return error(502, "node_failed", "the sandbox could not be made");
                     };
                     self.nodes.done(i, true);
+                    let actual = info.memory_limit_bytes.min(MAX_SANDBOX_MEMORY);
                     self.store.insert(Record {
                         id,
                         tenant: tenant.name.clone(),
                         node: node.name.clone(),
                         template: body.template.clone(),
-                        memory_limit: info.memory_limit_bytes.min(MAX_SANDBOX_MEMORY),
+                        memory_limit: actual,
                     });
+                    // The sandbox's limit is larger than what was reserved
+                    // (no node had reported the template's, or this node's
+                    // is larger): checked again with the real one, and the
+                    // sandbox removed if the tenant is over.
+                    if let Some(max) = tenant.max_memory_bytes.filter(|_| actual > memory) {
+                        let (_, held) = self.store.held(&tenant.name);
+                        // `held` counts this sandbox and its reservation.
+                        if held.saturating_sub(memory) > max {
+                            self.store.forget(&id);
+                            self.made_maybe(i, tenant, id, &body.template, actual);
+                            return Self::memory_limit(max);
+                        }
+                    }
                     return Response::json(201, &info);
                 }
                 Ok(answer) => {
@@ -662,6 +695,17 @@ impl Api {
                 }
             }
         }
+    }
+
+    fn memory_limit(max: u64) -> Response {
+        error(
+            429,
+            "memory_limit",
+            &format!(
+                "the memory limits of all sandboxes may add up to at most {} MiB",
+                max >> 20
+            ),
+        )
     }
 
     /// Node `i` may have made sandbox `id` (its answer to the create was
@@ -816,7 +860,12 @@ impl Api {
                 };
                 if let Some(log) = &self.log {
                     log.push(lines);
-                    log.write_some();
+                    // Not while the log cannot be written: the writer
+                    // thread retries that, and this request would only
+                    // wait for the same error.
+                    if log.status().healthy {
+                        log.write_some();
+                    }
                 }
                 log::info!(
                     "sandbox {} of {}: deleted while node {} does not answer; it is deleted \
