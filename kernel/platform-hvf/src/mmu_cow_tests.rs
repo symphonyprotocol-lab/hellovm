@@ -21,8 +21,10 @@ const RX: Prot = Prot(Prot::READ.0 | Prot::EXEC.0);
 /// (every live address space):
 ///
 /// * each frame's count is the number of page descriptors that point at
-///   it, a frame is free exactly when its count is 0, and the free lists
-///   have no duplicates;
+///   it plus the shared objects that hold it, a frame is free exactly
+///   when its count is 0, and the free lists have no duplicates;
+/// * each shared object is named by as many descriptors as it counts,
+///   and none is left that no descriptor names;
 /// * each table is reachable once, its count of used entries is right,
 ///   and the pool holds exactly the reachable tables;
 /// * a valid private page is writable in hardware only if its frame has
@@ -31,12 +33,14 @@ const RX: Prot = Prot(Prot::READ.0 | Prot::EXEC.0);
 fn check(p: &Phys<Vec<u8>>, roots: &[u64]) {
     let mut refs: HashMap<u64, u32> = HashMap::new();
     let mut tables = HashSet::new();
+    let mut named: HashMap<u64, u64> = HashMap::new();
     fn walk(
         p: &Phys<Vec<u8>>,
         table: u64,
         level: u32,
         refs: &mut HashMap<u64, u32>,
         tables: &mut HashSet<u64>,
+        named: &mut HashMap<u64, u64>,
     ) {
         assert!(tables.insert(table), "table {table:#x} reachable twice");
         let mut used = 0;
@@ -47,10 +51,16 @@ fn check(p: &Phys<Vec<u8>>, roots: &[u64]) {
             if desc != 0 {
                 used += 1;
             }
+            if !(level < 3 && desc & pte::VALID != 0) {
+                if let Some(id) = leaf_object(desc) {
+                    assert!(leaf_shared(desc), "a private page names a shared object");
+                    *named.entry(id).or_default() += 1;
+                }
+            }
             if level < 3 {
                 if desc & pte::VALID != 0 {
                     assert_eq!(desc & !pte::ADDR_MASK, pte::VALID | pte::TABLE_OR_PAGE);
-                    walk(p, desc & pte::ADDR_MASK, level + 1, refs, tables);
+                    walk(p, desc & pte::ADDR_MASK, level + 1, refs, tables, named);
                 } else if desc != 0 {
                     assert_ne!(desc & pte::SW_MAPPED, 0, "junk in a table");
                     assert_eq!(leaf_frame(desc), None, "a reservation with memory");
@@ -95,7 +105,14 @@ fn check(p: &Phys<Vec<u8>>, roots: &[u64]) {
         );
     }
     for &root in roots {
-        walk(p, root, 0, &mut refs, &mut tables);
+        walk(p, root, 0, &mut refs, &mut tables, &mut named);
+    }
+    assert_eq!(p.objects.len(), named.len(), "a shared object nobody names");
+    for (id, object) in &p.objects {
+        assert_eq!(Some(&object.descs), named.get(id), "object {id}");
+        for &frame in object.frames.values() {
+            *refs.entry(frame).or_default() += 1;
+        }
     }
     assert_eq!(p.table_pool.in_use(), tables.len() as u64, "tables leaked");
     let free: HashSet<u64> = p.ram_pool.free.iter().copied().collect();
@@ -253,21 +270,34 @@ fn shared_mappings_stay_shared() {
     assert_eq!(p.tables_in_use(), 4 * PAGE);
     let b = p.fork(a).unwrap();
     check(&p, &[a, b]);
-    // Every shared page has its memory now: 3 + 512.
-    assert_eq!(p.ram_in_use(), 515 * PAGE);
+    // The copy took no memory and split nothing: the shared pages that
+    // had none still have none, and the reservation is one descriptor.
+    assert_eq!(p.ram_in_use(), PAGE);
+    assert_eq!(p.tables_in_use(), 8 * PAGE);
     for root in [a, b] {
-        let desc = p.lookup(root, 0x20_1000);
+        let desc = p.lookup(root, 0x20_0000);
         assert_ne!(desc & pte::SW_SHARED, 0);
         assert_eq!(desc & pte::AP_RO, 0, "shared pages stay writable");
+        assert_eq!(leaf_frame(p.lookup(root, 0x20_1000)), None);
     }
-    // Writes by either side, by the core or by the app, reach the other.
+    // Writes by either side, by the core or by the app, reach the other,
+    // whoever touches a page first.
     p.write(b, 0x20_0000, b"child ").unwrap();
     p.write(a, 0x20_1000, b"parent").unwrap();
+    let mut early = [0u8; 6];
+    p.read(b, 0x20_1000, &mut early).unwrap();
+    assert_eq!(&early, b"parent", "read before b touched the page");
     assert_eq!(
         p.demand(b, 0x40_0000 + 77 * PAGE, Access::Write),
-        Demand::Present
+        Demand::Filled
     );
     p.write(b, 0x40_0000 + 77 * PAGE, b"far").unwrap();
+    assert_eq!(
+        p.demand(a, 0x40_0000 + 77 * PAGE, Access::Read),
+        Demand::Filled,
+        "a gets the frame b made"
+    );
+    check(&p, &[a, b]);
     let mut buf = [0u8; 6];
     p.read(a, 0x20_0000, &mut buf).unwrap();
     assert_eq!(&buf, b"child ");
@@ -275,7 +305,7 @@ fn shared_mappings_stay_shared() {
     assert_eq!(&buf, b"parent");
     p.read(a, 0x40_0000 + 77 * PAGE, &mut buf[..3]).unwrap();
     assert_eq!(&buf[..3], b"far");
-    assert_eq!(p.ram_in_use(), 515 * PAGE, "nothing copied");
+    assert_eq!(p.ram_in_use(), 3 * PAGE, "one frame per page touched");
     // A fork of the fork shares the same frames.
     let c = p.fork(b).unwrap();
     p.write(c, 0x20_2000, b"third").unwrap();
@@ -292,6 +322,30 @@ fn shared_mappings_stay_shared() {
     p.unmap(b, 0x20_0000, 3 * PAGE).unwrap();
     p.read(c, 0x20_0000, &mut buf[..1]).unwrap();
     assert_eq!(&buf[..1], b"y");
+    check(&p, &[a, b, c]);
+    // What one wrote and unmapped is still there for one that had not
+    // touched the page: the shared object holds it.
+    p.write(c, 0x40_0000 + 9 * PAGE, b"kept").unwrap();
+    p.unmap(c, 0x40_0000, 1 << 21).unwrap();
+    p.protect(a, 0x40_0000 + 9 * PAGE, PAGE, Prot::READ)
+        .unwrap();
+    p.read(a, 0x40_0000 + 9 * PAGE, &mut buf[..4]).unwrap();
+    assert_eq!(&buf[..4], b"kept");
+    assert_eq!(
+        p.demand(a, 0x40_0000 + 9 * PAGE, Access::Read),
+        Demand::Filled
+    );
+    check(&p, &[a, b, c]);
+    // A huge shared reservation costs a fork nothing.
+    let before = (p.ram_in_use(), p.tables_in_use());
+    p.map(a, 1 << 39, 1 << 38, Prot::RW, true).unwrap();
+    let d = p.fork(a).unwrap();
+    assert_eq!(p.ram_in_use(), before.0);
+    p.write(d, (1 << 39) + (5 << 30), b"deep").unwrap();
+    p.read(a, (1 << 39) + (5 << 30), &mut buf[..4]).unwrap();
+    assert_eq!(&buf[..4], b"deep");
+    check(&p, &[a, b, c, d]);
+    p.destroy(d);
     check(&p, &[a, b, c]);
     for root in [a, b, c] {
         p.destroy(root);
@@ -400,17 +454,26 @@ fn running_out_in_the_middle_of_a_fork_leaves_no_copy() {
         before.0,
         "no copy: the frame is the parent's alone"
     );
-    // No memory for a shared page that needs it at the fork: no copy.
+    // Shared pages without memory take none at a fork, however little is
+    // left; running out later fails that touch only.
     let mut p = phys(16, 2);
     let a = p.new_space().unwrap();
     p.map(a, 0x40_0000, 4 * PAGE, Prot::RW, true).unwrap();
-    assert_eq!(p.fork(a), Err(MmuError::NoMemory));
-    let tables = p.tables_in_use();
-    check(&p, &[a]);
+    let b = p.fork(a).unwrap();
+    assert_eq!(p.ram_in_use(), 0);
+    assert_eq!(p.demand(b, 0x40_0000, Access::Write), Demand::Filled);
+    assert_eq!(p.demand(a, 0x40_1000, Access::Write), Demand::Filled);
+    assert_eq!(p.demand(b, 0x40_2000, Access::Write), Demand::NoMemory);
+    assert_eq!(p.write(a, 0x40_3000, b"x"), Err(MmuError::NoMemory));
+    // A page the other touched needs no new memory.
+    assert_eq!(p.demand(a, 0x40_0000, Access::Read), Demand::Filled);
+    assert_eq!(p.ram_in_use(), 2 * PAGE);
+    check(&p, &[a, b]);
     p.destroy(a);
+    check(&p, &[b]);
+    p.destroy(b);
     check(&p, &[]);
     assert_eq!((p.ram_in_use(), p.tables_in_use()), (0, 0));
-    assert_eq!(tables, 4 * PAGE);
 }
 
 #[test]
@@ -595,7 +658,10 @@ fn compare_page(p: &Phys<Vec<u8>>, root: u64, va: u64, page: Option<&Page>) {
         matches!(page.data, Data::Shared(_)),
         "{va:#x} sharing"
     );
-    let same = |bytes: &[u8]| match leaf_frame(desc) {
+    // A shared page this address space has not touched reads as what
+    // its shared object holds for it.
+    let frame = leaf_frame(desc).or_else(|| p.object_frame(leaf_object(desc)?, va));
+    let same = |bytes: &[u8]| match frame {
         Some(frame) if bytes.is_empty() => p.frame(frame).iter().all(|&b| b == 0),
         Some(frame) => p.frame(frame) == bytes,
         None => bytes.iter().all(|&b| b == 0),

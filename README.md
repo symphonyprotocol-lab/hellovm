@@ -481,9 +481,15 @@ follow the same descriptors, so they see the process's own copy.
 Reservations and pages that never had memory are copied as descriptors,
 with no memory. Pages of `MAP_SHARED` mappings carry a software bit
 (`DBM`, bit 51, which the hardware ignores while `TCR_EL1.HD` is clear)
-and are never copied: both processes keep the same frame, and a shared
-page with no memory yet gets one at the `fork`, so that both see the same
-page from then on. `execve` frees the old address space with its last
+and are never copied: both processes keep the same frame. A shared page
+(or a whole reservation) with no memory yet takes none at the `fork`
+either, as on Linux: the `fork` marks it, in both address spaces, as
+taking its memory from a shared object made for that `fork`, a table on
+the host side from page address to frame. Whoever touches the page first
+gets a frame and enters it there, the others find it there, and the
+object keeps what was written for those who have not touched the page
+yet, until the last descriptor that names it is gone. So a `fork` with
+gigabytes of untouched shared memory costs no memory and no table. `execve` frees the old address space with its last
 task: each frame's count goes down, a frame with no users left goes back
 to the pool, and every table goes back too.
 
@@ -661,9 +667,10 @@ table leaked or freed twice, no writable shared private page) and
 against a simulated TLB that keeps what each touch cached until the
 platform says it may be stale; a second run with tiny pools makes 42%
 of the operations fail and checks the same invariants and that nothing
-leaks. Breaking the code on purpose in any of seven ways (no read-only
+leaks. Breaking the code on purpose in any of eight ways (no read-only
 parent after `fork`, no invalidation after a copy, an early free, a
-frame not zeroed, shared pages not backed at `fork`, the core's writes
+frame not zeroed, shared pages without memory not tied to one shared
+object at `fork`, that object not keeping its frames, the core's writes
 not copying, `mprotect` making a shared frame writable) makes it fail. A test binary that cannot use the hypervisor
 (not signed) prints `SKIPPING` and passes, unless
 `HELLOVM_REQUIRE_E2E=1`. Hypervisor.framework allows one VM per process,
@@ -727,9 +734,7 @@ parallel); x86_64 programs (Rosetta is not used); memory returned to the
 host (the pools only grow to their high-water mark); warm clones;
 hardening of the kernel process; `AT_HWCAP2` (zero) and emulated `mrs` of
 ID registers (`HWCAP_CPUID` is not reported, so programs do not try).
-`MAP_SHARED` memory that is never touched before a `fork` takes all its
-frames at the `fork` (Linux keeps a shared object instead), and a
-process that writes a copy-on-write page when the pool is used up gets
+A process that writes a copy-on-write page when the pool is used up gets
 `SIGKILL` rather than an error.
 
 ## Hardening

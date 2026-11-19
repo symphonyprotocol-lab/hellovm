@@ -1331,6 +1331,70 @@ mod vm_tests {
         }
     }
 
+    /// The timer (or a waker) may stop the vCPU inside the page flush
+    /// routine, while `x0` holds the routine's operand and the app's own
+    /// `x0` waits in `TPIDR_EL1`: the app gets its own back, and the whole
+    /// TLB is flushed instead.
+    #[test]
+    fn an_interrupted_page_flush_gives_the_app_its_x0_back() {
+        let _guard = VM.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = match HvfPlatform::new(HvfConfig::default()) {
+            Ok(p) => p,
+            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
+                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
+            }
+            Err(err) => {
+                eprintln!("SKIPPING: {err}");
+                return;
+            }
+        };
+        let t = p.spawn().unwrap();
+        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
+        // Loop: svc.
+        let code: Vec<u8> = [0xd400_0001u32, 0x17ff_ffff]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        p.write(t, CODE, &code).unwrap();
+        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
+            .unwrap();
+        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
+            unreachable!()
+        };
+        ctx.pc = CODE;
+        ctx.x[0] = 0x1111;
+        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        assert_eq!(word(p.wait(None).unwrap().unwrap().trap), 0x1111);
+        // The vCPU as an exit inside the routine leaves it, at each of
+        // its instructions: before and after `x0` is the app's again.
+        for (at, x0) in [
+            (0u64, 0xdead_0000_0000_0123u64),
+            (12, 0xdead_0000_0000_0123),
+            (16, 0x2222),
+        ] {
+            p.flush = false;
+            p.vcpu.set_sys_reg(sysreg::TPIDR_EL1, 0x2222).unwrap();
+            p.vcpu.set_reg(0, x0).unwrap();
+            p.vcpu
+                .set_reg(HV_REG_PC, SHIM_VA + FLUSH_PAGE_OFFSET + at)
+                .unwrap();
+            p.vcpu
+                .set_reg(HV_REG_CPSR, layout::PSTATE_EL1H_MASKED)
+                .unwrap();
+            assert!(matches!(p.interrupted_at(t).unwrap(), Interrupted::Settled));
+            assert!(p.flush, "the whole TLB is flushed instead");
+            assert_eq!(p.vcpu.reg(0).unwrap(), 0x2222);
+            // And the app runs on with it.
+            p.resume(t, Resume::Continue).unwrap();
+            assert_eq!(
+                word(p.wait(None).unwrap().unwrap().trap),
+                0x2222,
+                "at +{at}"
+            );
+        }
+    }
+
     /// With ASIDs used up, new spaces share ASID 0, and switching between
     /// two of them flushes: each process still reads its own page.
     #[test]

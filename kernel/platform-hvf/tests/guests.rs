@@ -130,6 +130,8 @@ fn fork_exec_vfork_and_copy_on_write() {
             "cow: parent-saw=1ppp child-kept-its-own=yes",
             "shared: parent-sees=CD private-untouched=0",
             "shared: child-sees=P",
+            "zero: child=ok parent=kept",
+            "big shared: child 0, parent-sees=Sp",
             "exec: child forked",
             "fork+exec: status 7",
             "exec: child vforked",

@@ -41,14 +41,22 @@
 //! gone) the page is just made writable again. The core's own writes
 //! ([`Phys::write`]) copy the same way. Pages of shared mappings are never
 //! copied: both address spaces keep writing the same frame. A shared page
-//! with no memory yet gets its frame at the copy, so that both sides see
-//! the same memory from then on.
+//! (or reservation) with no memory yet gets none at the copy either, as
+//! on Linux: the copy marks it, in both address spaces, as taking its
+//! memory from a *shared object* made for that copy, a table on the host
+//! side from page address to frame. Whoever touches the page first gets a
+//! frame and enters it there; the others find it there when they touch
+//! the page. The object keeps a reference on each of its frames, so what
+//! was written stays for those who have not touched the page yet, and it
+//! goes, with those references, with the last descriptor that names it.
 //!
 //! What keeps one address space out of another's memory:
 //!
 //! * A frame is reachable only through the descriptors counted in its
-//!   reference count, and it is freed (and zeroed before its next use)
-//!   only when that count reaches zero.
+//!   reference count (and, for a shared page, through the shared object
+//!   that holds it, which only the address spaces copied from the one
+//!   that mapped it can name), and it is freed (and zeroed before its
+//!   next use) only when that count reaches zero.
 //! * A valid descriptor of a private page is writable in hardware only if
 //!   its frame's count is 1. Counts only grow in [`Phys::fork`], which
 //!   makes every such page read only in both address spaces first.
@@ -62,6 +70,8 @@
 //!
 //! Nothing here trusts app memory: descriptors are read only from the
 //! table pool, which the VM cannot write.
+
+use std::collections::HashMap;
 
 use hellovm_core::platform::Prot;
 
@@ -198,12 +208,30 @@ pub struct Phys<B> {
     /// Per table frame: how many of its 512 entries are not zero. Kept
     /// here, not in the tables, which only the host writes anyway.
     used: Vec<u16>,
-    /// Per app frame: how many page descriptors point at it.
+    /// Per app frame: how many page descriptors point at it, and shared
+    /// objects hold it.
     refs: Vec<u32>,
+    /// Shared objects, by number (see the module documentation).
+    objects: HashMap<u64, Object>,
+    next_object: u64,
     /// What changes since the last [`Phys::take_stale`] may have left
     /// stale in the TLB (see the module documentation).
     stale: Stale,
 }
+
+/// Where shared pages that had no memory when their address space was
+/// copied get it from.
+#[derive(Default)]
+struct Object {
+    /// Descriptors, in all address spaces, that name it.
+    descs: u64,
+    /// The frames it holds (with a reference each), by page number.
+    frames: HashMap<u64, u64>,
+}
+
+/// Most shared objects ever made: their numbers fit a descriptor's
+/// address field.
+const MAX_OBJECTS: u64 = 1 << 36;
 
 /// What the TLB may hold that is no longer true ([`Phys::take_stale`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,8 +302,25 @@ fn leaf_prot(desc: u64) -> Prot {
 }
 
 fn leaf_frame(desc: u64) -> Option<u64> {
+    if leaf_object(desc).is_some() {
+        return None;
+    }
     let frame = desc & pte::ADDR_MASK;
     (frame != 0).then_some(frame)
+}
+
+/// The shared object a descriptor without memory takes it from, if any.
+fn leaf_object(desc: u64) -> Option<u64> {
+    (desc & pte::VALID == 0 && desc & pte::SW_LAZY != 0).then_some((desc & pte::ADDR_MASK) >> 12)
+}
+
+/// `new`, a descriptor without memory, naming the shared object `old`
+/// names (if it names one): for a change that keeps the page.
+fn keep_object(new: u64, old: u64) -> u64 {
+    match leaf_object(old) {
+        Some(id) => new | pte::SW_LAZY | (id << 12),
+        None => new,
+    }
 }
 
 fn leaf_shared(desc: u64) -> bool {
@@ -306,6 +351,8 @@ impl<B: Backing> Phys<B> {
             ram_pool,
             used,
             refs,
+            objects: HashMap::new(),
+            next_object: 1,
             stale: Stale::Clean,
         }
     }
@@ -365,6 +412,41 @@ impl<B: Backing> Phys<B> {
             (true, false) => *used -= 1,
             _ => {}
         }
+        // The new one first: the same object may be named by both.
+        if let Some(id) = leaf_object(value) {
+            self.object_named(id, 1);
+        }
+        if let Some(id) = leaf_object(old) {
+            self.object_dropped(id);
+        }
+    }
+
+    /// `count` more descriptors name shared object `id`.
+    fn object_named(&mut self, id: u64, count: u64) {
+        if let Some(object) = self.objects.get_mut(&id) {
+            object.descs += count;
+        }
+    }
+
+    /// One descriptor less names shared object `id`; with the last one it
+    /// goes, and lets go of its frames.
+    fn object_dropped(&mut self, id: u64) {
+        let Some(object) = self.objects.get_mut(&id) else {
+            return;
+        };
+        object.descs = object.descs.saturating_sub(1);
+        if object.descs == 0 {
+            if let Some(object) = self.objects.remove(&id) {
+                for frame in object.frames.into_values() {
+                    self.put_frame(frame);
+                }
+            }
+        }
+    }
+
+    /// The frame shared object `id` has for the page at `va`, if any.
+    fn object_frame(&self, id: u64, va: u64) -> Option<u64> {
+        self.objects.get(&id)?.frames.get(&(va >> 12)).copied()
     }
 
     fn new_table(&mut self) -> Result<u64, MmuError> {
@@ -507,6 +589,9 @@ impl<B: Backing> Phys<B> {
             *entry = desc.to_le_bytes();
         }
         self.used[Self::table_index(child)] = 512;
+        if let Some(id) = leaf_object(desc) {
+            self.object_named(id, 512);
+        }
         self.set_entry(table, idx, child | pte::VALID | pte::TABLE_OR_PAGE);
         Ok(child)
     }
@@ -575,7 +660,7 @@ impl<B: Backing> Phys<B> {
                     Op::Protect(prot) => {
                         if desc & pte::SW_MAPPED != 0 {
                             let frame = leaf_frame(desc);
-                            let new = self.page(frame, prot, leaf_shared(desc));
+                            let new = keep_object(self.page(frame, prot, leaf_shared(desc)), desc);
                             if desc & pte::VALID != 0 && new != desc {
                                 self.mark_all();
                             }
@@ -614,7 +699,9 @@ impl<B: Backing> Phys<B> {
                 // A reservation: never valid, so nothing is cached of it.
                 let new = match op {
                     Op::Map(prot, shared) => leaf(None, prot, shared, true),
-                    Op::Protect(prot) => leaf(None, prot, leaf_shared(desc), true),
+                    Op::Protect(prot) => {
+                        keep_object(leaf(None, prot, leaf_shared(desc), true), desc)
+                    }
                     Op::Unmap => 0,
                 };
                 if full {
@@ -722,8 +809,25 @@ impl<B: Backing> Phys<B> {
         let Ok(Some((table, idx))) = self.leaf_slot(root, va) else {
             return Demand::NoMemory;
         };
-        let Some(frame) = self.new_frame() else {
-            return Demand::NoMemory;
+        // A shared page that was there at a copy: the frame its shared
+        // object has for it, if another address space touched it first.
+        let object = leaf_object(self.entry(table, idx));
+        let frame = match object.and_then(|id| self.object_frame(id, va)) {
+            Some(frame) => {
+                self.get_frame(frame);
+                frame
+            }
+            None => {
+                let Some(frame) = self.new_frame() else {
+                    return Demand::NoMemory;
+                };
+                if let Some(held) = object.and_then(|id| self.objects.get_mut(&id)) {
+                    held.frames.insert(va >> 12, frame);
+                    // The object's own reference.
+                    self.get_frame(frame);
+                }
+                frame
+            }
         };
         if prot.contains(Prot::EXEC) {
             self.sync_frame(frame);
@@ -766,7 +870,8 @@ impl<B: Backing> Phys<B> {
     }
 
     /// Copies app memory at `addr` into `buf`, as the app could read it.
-    /// Pages with no memory yet read as zeros.
+    /// Pages with no memory yet read as zeros (or as what another address
+    /// space wrote, for a shared page that was there at a copy).
     pub fn read(&self, root: u64, addr: u64, buf: &mut [u8]) -> Result<(), MmuError> {
         let end = addr
             .checked_add(buf.len() as u64)
@@ -781,7 +886,9 @@ impl<B: Backing> Phys<B> {
                 return Err(MmuError::BadAddress);
             }
             let at = (va - addr) as usize;
-            match leaf_frame(desc) {
+            let frame = leaf_frame(desc)
+                .or_else(|| self.object_frame(leaf_object(desc)?, va & !(PAGE - 1)));
+            match frame {
                 Some(frame) => {
                     buf[at..at + n].copy_from_slice(&self.frame(frame)[page_off..page_off + n])
                 }
@@ -848,42 +955,45 @@ impl<B: Backing> Phys<B> {
 
     /// Copies the address space at `root` for `fork` and returns the
     /// copy's root. Private pages become copy-on-write in both; shared
-    /// pages without memory get it now. On failure (a pool is exhausted)
-    /// there is no copy, and the original is as it was, apart from shared
-    /// pages that got their memory early.
+    /// pages without memory get it from one shared object from now on. On
+    /// failure (the table pool is exhausted) there is no copy, and the
+    /// original is as it was (its shared pages without memory may name a
+    /// shared object, which changes nothing for it).
     pub fn fork(&mut self, root: u64) -> Result<u64, MmuError> {
-        self.back_shared(root, 0)?;
         if self.count_tables(root, 0) > self.table_pool.available() {
             return Err(MmuError::NoMemory);
+        }
+        if self.next_object >= MAX_OBJECTS {
+            return Err(MmuError::NoMemory);
+        }
+        let id = self.next_object;
+        self.objects.insert(id, Object::default());
+        self.name_shared(root, 0, id);
+        if self.objects.get(&id).is_some_and(|o| o.descs == 0) {
+            // Nothing shared was without memory: no object needed.
+            self.objects.remove(&id);
+        } else {
+            self.next_object += 1;
         }
         self.copy_table(root, 0)
     }
 
-    /// Gives every shared page below `table` that has no memory a frame,
-    /// splitting shared reservations.
-    fn back_shared(&mut self, table: u64, level: u32) -> Result<(), MmuError> {
+    /// Makes every shared page and reservation below `table` that has no
+    /// memory, and names no shared object yet, name `id`. Nothing is
+    /// split and no memory is taken.
+    fn name_shared(&mut self, table: u64, level: u32, id: u64) {
         for idx in 0..512 {
             let desc = self.entry(table, idx);
-            if desc & pte::SW_MAPPED != 0 && !leaf_shared(desc) {
-                continue;
-            }
-            if level < 3 {
-                if desc & pte::VALID != 0 {
-                    self.back_shared(desc & pte::ADDR_MASK, level + 1)?;
-                } else if desc & pte::SW_MAPPED != 0 {
-                    let child = self.split(table, idx)?;
-                    self.back_shared(child, level + 1)?;
-                }
-            } else if desc & pte::SW_MAPPED != 0 && leaf_frame(desc).is_none() {
-                let frame = self.new_frame().ok_or(MmuError::NoMemory)?;
-                let prot = leaf_prot(desc);
-                if prot.contains(Prot::EXEC) {
-                    self.sync_frame(frame);
-                }
-                self.set_entry(table, idx, leaf(Some(frame), prot, true, true));
+            if level < 3 && desc & pte::VALID != 0 {
+                self.name_shared(desc & pte::ADDR_MASK, level + 1, id);
+            } else if desc & pte::SW_MAPPED != 0
+                && leaf_shared(desc)
+                && leaf_frame(desc).is_none()
+                && leaf_object(desc).is_none()
+            {
+                self.set_entry(table, idx, desc | pte::SW_LAZY | (id << 12));
             }
         }
-        Ok(())
     }
 
     /// How many tables the tree at `table` has.
@@ -950,12 +1060,16 @@ impl<B: Backing> Phys<B> {
     fn free_subtree(&mut self, table: u64, level: u32) {
         for idx in 0..512 {
             let desc = self.entry(table, idx);
-            if level < 3 {
-                if desc & pte::VALID != 0 {
-                    self.free_subtree(desc & pte::ADDR_MASK, level + 1);
-                }
-            } else {
+            if level < 3 && desc & pte::VALID != 0 {
+                self.free_subtree(desc & pte::ADDR_MASK, level + 1);
+                continue;
+            }
+            if level == 3 {
                 self.drop_page(desc);
+            }
+            // The table is zeroed below without `set_entry`.
+            if let Some(id) = leaf_object(desc) {
+                self.object_dropped(id);
             }
         }
         self.release_table(table);

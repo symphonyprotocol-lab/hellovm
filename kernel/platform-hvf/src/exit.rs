@@ -101,9 +101,11 @@ pub fn decode(esr: u64, far: u64, pc: u64) -> AppException {
             // translation instruction (CM), which always sets it and writes
             // nothing a page's protection is about (`ic ivau` and `dc cvau`
             // over read-only code are what `__clear_cache` does): Linux
-            // takes those as reads, and so does this. `dc zva`, which does
-            // write, then gets its page as a read would and, if the page is
-            // read only, a permission fault next.
+            // takes those as reads, and so does this. `dc zva` is not one
+            // of them: it does write, the architecture does not class it
+            // as cache maintenance, and its faults come with CM clear, so
+            // it is a write here (it is how glibc zeroes large blocks, and
+            // must copy a copy-on-write page like any other write).
             let access = if class == ec::IABT_LOWER {
                 Access::Exec
             } else if iss & (1 << 6) != 0 && iss & (1 << 8) == 0 {

@@ -411,6 +411,68 @@ static int bench(int rounds, int mib) {
     return 0;
 }
 
+// Zeroes `n` bytes at `p` (a multiple of the block size): with `dc zva`
+// where the CPU has it, which is how glibc's memset zeroes large blocks
+// on arm64, else with memset.
+static void zero(char *p, size_t n) {
+#ifdef __aarch64__
+    unsigned long dczid;
+    __asm__("mrs %0, dczid_el0" : "=r"(dczid));
+    if (!(dczid & 16)) {
+        size_t block = (size_t)4 << (dczid & 15);
+        for (size_t off = 0; off + block <= n; off += block) {
+            __asm__ volatile("dc zva, %0" : : "r"(p + off) : "memory");
+        }
+        return;
+    }
+#endif
+    memset(p, 0, n);
+}
+
+// A child zeroes memory it shares copy-on-write with its parent (the
+// write that copies a page may be a `dc zva`); the parent keeps its own.
+static void zero_after_fork(void) {
+    size_t n = 1 << 20;
+    char *heap = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(heap != MAP_FAILED, "mmap");
+    memset(heap, 'k', n);
+    pid_t pid = fork();
+    check(pid >= 0, "fork");
+    if (pid == 0) {
+        zero(heap, n);
+        for (size_t i = 0; i < n; i++) {
+            if (heap[i] != 0) _exit(1);
+        }
+        _exit(0);
+    }
+    int child = status_of(pid);
+    int kept = 1;
+    for (size_t i = 0; i < n; i++) kept &= heap[i] == 'k';
+    printf("zero: child=%s parent=%s\n", child == 0 ? "ok" : "bad", kept ? "kept" : "lost");
+    munmap(heap, n);
+}
+
+// A large shared mapping nobody touched costs a fork nothing: 8 GiB,
+// more than a sandbox's memory. One page written by the child is seen by
+// the parent, and one written by the parent after the child is gone is
+// still its own.
+static void big_shared(void) {
+    size_t n = (size_t)8 << 30;
+    char *shared = mmap(NULL, n, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    check(shared != MAP_FAILED, "mmap 8 GiB shared");
+    pid_t pid = fork();
+    check(pid >= 0, "fork with 8 GiB shared");
+    if (pid == 0) {
+        shared[n / 2] = 'S';
+        _exit(0);
+    }
+    int child = status_of(pid);
+    shared[n / 4] = 'p';
+    printf("big shared: child %d, parent-sees=%c%c\n", child, shared[n / 2], shared[n / 4]);
+    munmap(shared, n);
+}
+
 int main(int argc, char **argv) {
     self = argv[0];
     if (argc == 3 && strcmp(argv[1], "exec-child") == 0) {
@@ -425,6 +487,8 @@ int main(int argc, char **argv) {
     fork_and_wait();
     copy_on_write();
     shared_memory();
+    zero_after_fork();
+    big_shared();
     fork_exec_vfork_spawn();
     fork_of_fork();
     big();

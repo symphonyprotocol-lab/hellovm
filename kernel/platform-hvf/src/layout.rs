@@ -207,6 +207,12 @@ pub mod pte {
     /// `TCR_EL1.HD` is clear, as it is here (Linux uses the same bit as a
     /// software bit for the same reason).
     pub const SW_SHARED: u64 = 1 << 51;
+    /// Software bit of a descriptor that is not valid (the hardware
+    /// ignores all of such a descriptor): a shared page, or reservation,
+    /// with no memory of its own yet that was there when its address
+    /// space was copied. Its address field is then not a frame but the
+    /// number of the shared object it takes its memory from (see `mmu`).
+    pub const SW_LAZY: u64 = 1 << 2;
     pub const PXN: u64 = 1 << 53;
     pub const UXN: u64 = 1 << 54;
     /// Software bit: the page is part of the address space (the core
