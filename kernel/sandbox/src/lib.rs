@@ -46,6 +46,13 @@
 //! different: only Landlock ABI 6 (Linux 6.12) scopes them. On an older
 //! host a compromised K can still `SIGKILL` processes of its own user,
 //! which is why the egress proxy should run as another user (see README).
+//!
+//! On macOS (`macos`, `seatbelt`) the layers are: inherited fds closed,
+//! resource limits (including `RLIMIT_NPROC` 1), the environment cleared,
+//! `PT_DENY_ATTACH`, and a Seatbelt profile the process enters itself:
+//! reading the image is the only file access, no network, no processes,
+//! no Mach IPC, and system call and Mach trap allowlists. All are required
+//! for `--sandbox=require`. See README, "Hardening".
 
 #[cfg(target_os = "linux")]
 mod allowlist;
@@ -61,8 +68,19 @@ mod landlock;
 mod learn;
 #[cfg(target_os = "linux")]
 mod limits;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "linux")]
 mod ns;
+#[cfg(target_os = "macos")]
+mod seatbelt;
+
+#[cfg(target_os = "macos")]
+pub use macos::{
+    apply, close_inherited_fds, open_fds, profile, Config, Layer, LayerReport, Refused, Report,
+};
+#[cfg(target_os = "macos")]
+pub use seatbelt::Kind as ProfileKind;
 
 /// See `landlock::nest`: a nested Landlock domain for a warm clone's
 /// kernel process.
