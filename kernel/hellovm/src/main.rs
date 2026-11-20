@@ -824,10 +824,16 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
     let image_path = image.root().to_path_buf();
-    let mut app = HvfPlatform::new(HvfConfig {
+    // Never dropped: the process exits when this function has returned,
+    // which ends the vCPU threads and the VM with it. Dropping the
+    // platform would end and join the vCPU threads first, and a thread
+    // that ends in a process that joins it gives up port rights with
+    // Mach traps the hardened process is not allowed (see `seatbelt`).
+    let mut app = std::mem::ManuallyDrop::new(HvfPlatform::new(HvfConfig {
         vcpus: options.vcpus.unwrap_or(0),
         ..HvfConfig::default()
-    })?;
+    })?);
+    let app: &mut HvfPlatform = &mut app;
     let host = StdioHost::new(Some(image));
     let terminal = options
         .tty
@@ -861,7 +867,7 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     if terminal {
         kernel = kernel.with_console(hellovm_core::ConsoleMode::Terminal);
     }
-    kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
+    kernel.exec(app, &options.argv[0], &options.argv, &options.env)?;
     if let Some((rows, cols)) = window {
         kernel.set_window_size(rows, cols);
     }
@@ -875,7 +881,7 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
             killer.kill();
         });
     }
-    let status = kernel.run(&mut app);
+    let status = kernel.run(app);
     for record in kernel.trace() {
         eprintln!("hellovm: trace: {record}");
     }

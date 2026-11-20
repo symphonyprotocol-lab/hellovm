@@ -312,6 +312,11 @@ const PENDING_NONE: u64 = 0;
 /// The whole TLB.
 const PENDING_ALL: u64 = u64::MAX;
 
+/// The `tlbi vae1is` operand for the page of `va` in the space with `asid`.
+fn page_operand(asid: u16, va: u64) -> u64 {
+    u64::from(asid) << 48 | (va >> 12) & 0xfff_ffff_ffff
+}
+
 /// What the threads know of one vCPU without a lock.
 struct Slot {
     kicker: OnceLock<VcpuKicker>,
@@ -480,9 +485,7 @@ impl Smp {
         let add = match stale {
             Stale::Clean => return,
             Stale::All => PENDING_ALL,
-            Stale::Page { root: at, va } if at == root => {
-                u64::from(asid) << 48 | (va >> 12) & 0xfff_ffff_ffff
-            }
+            Stale::Page { root: at, va } if at == root => page_operand(asid, va),
             Stale::Page { .. } => PENDING_ALL,
         };
         for slot in &self.slots {
@@ -529,6 +532,18 @@ impl Smp {
         if space.asid != 0 {
             self.lock().free_asids.push(space.asid);
         }
+    }
+
+    /// Ends a task the platform cannot run any more and reports it to
+    /// the event loop as [`Trap::Gone`].
+    fn lose(&self, sched: MutexGuard<'_, Sched>, key: TaskKey) {
+        self.remove(sched, key);
+        let mut sched = self.lock();
+        sched.events.push_back(Event {
+            task: key,
+            trap: Trap::Gone,
+        });
+        self.notify_loop(&sched);
     }
 
     fn flushes(&self) -> Flushes {
@@ -757,12 +772,44 @@ impl Runner {
         self.set_space(current.root, current.asid)
     }
 
-    /// Saves the vCPU's registers into `key`, if they are still its.
+    /// Saves the vCPU's registers into `key`, if they are still its. A
+    /// system call's result that waited for this vCPU to run the task
+    /// goes into them: whoever reads the task's registers next (the core,
+    /// for a signal frame) must see it.
+    ///
+    /// If the vCPU cannot be read, the task has no registers any more and
+    /// ends ([`Trap::Gone`]); it must not stay loaded in a vCPU that
+    /// nothing will ask again.
     fn unload(&mut self, smp: &Smp, key: TaskKey) -> Result<(), PlatformError> {
-        let context = self.read_vcpu().map_err(host_err)?;
+        let mut context = match self.read_vcpu() {
+            Ok(context) => context,
+            Err(err) => {
+                if self.loaded == Some(key) {
+                    self.loaded = None;
+                }
+                let sched = smp.lock();
+                if sched
+                    .tasks
+                    .get(&key)
+                    .is_some_and(|task| task.loaded == Some(self.index))
+                {
+                    log::error!(
+                        "HVF platform: vCPU {}: {err}; task {key}, loaded in it, ends",
+                        self.index
+                    );
+                    smp.lose(sched, key);
+                } else {
+                    smp.wake_loop();
+                }
+                return Err(host_err(err));
+            }
+        };
         let mut sched = smp.lock();
         if let Some(task) = sched.tasks.get_mut(&key) {
             if task.loaded == Some(self.index) {
+                if let Some(x0) = task.x0.take() {
+                    context.x[0] = x0;
+                }
                 task.saved = Some(context);
                 task.loaded = None;
                 // Waiting to run, now on any vCPU.
@@ -1093,13 +1140,21 @@ impl Runner {
         match smp.change(root, current.asid, |phys| phys.demand(root, addr, access)) {
             Demand::Filled => None,
             // The TLB may still hold what the page was before it changed
-            // (here or by another vCPU): flush and retry, a few times.
+            // (here or by another vCPU, as when two threads touch a new
+            // page at once and this one came second): invalidate and
+            // retry, a few times. That page only at first; the whole TLB
+            // if that did not help.
             Demand::Present if retries.0 != addr >> 12 || retries.1 < 4 => {
                 *retries = match *retries {
                     (page, n) if page == addr >> 12 => (page, n + 1),
                     _ => (addr >> 12, 1),
                 };
-                self.flush = true;
+                let operand = page_operand(current.asid, addr);
+                match self.flush_page {
+                    None if retries.1 == 1 => self.flush_page = Some(operand),
+                    Some(same) if same == operand && retries.1 == 1 => {}
+                    _ => self.flush = true,
+                }
                 None
             }
             Demand::Present | Demand::Unmapped => Some(fault(code)),
@@ -1148,6 +1203,8 @@ fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
     let index = runner.index;
     // Polled for work since it last ran a task.
     let mut spun = false;
+    // The vCPU failed: it runs no task any more.
+    let mut broken = false;
     let mut sched = smp.lock();
     loop {
         if sched.quit {
@@ -1158,13 +1215,14 @@ fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
                 drop(sched);
                 if let Err(err) = runner.unload(&smp, key) {
                     log::error!("HVF platform: vCPU {index}: {err}");
+                    broken = true;
                 }
                 sched = smp.lock();
             }
             smp.wake_loop();
             continue;
         }
-        let picked = if sched.killed {
+        let picked = if sched.killed || broken {
             None
         } else {
             sched.pick(index)
@@ -1172,10 +1230,10 @@ fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
         let Some((key, _)) = picked else {
             // Idle: poll for a while, then sleep. Wakers see it as idle
             // from here on.
-            sched.idle[index] = true;
+            sched.idle[index] = !broken;
             let slot = &smp.slots[index];
             let wakes = slot.wakes.load(SeqCst);
-            if !spun {
+            if !spun && !broken {
                 drop(sched);
                 spin_until(SPIN, None, || slot.wakes.load(SeqCst) != wakes);
                 sched = smp.lock();
@@ -1226,27 +1284,20 @@ fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
             Ok(Stop::Gone(why)) => {
                 log::error!("HVF platform: task {key}: {why}; ending it");
                 runner.loaded = None;
-                smp.remove(sched, key);
+                smp.lose(sched, key);
                 sched = smp.lock();
-                sched.events.push_back(Event {
-                    task: key,
-                    trap: Trap::Gone,
-                });
-                smp.notify_loop(&sched);
                 None
             }
             Err(err) => {
-                // The vCPU failed: the task goes, and so does this vCPU.
+                // The vCPU failed: the task goes, and this vCPU runs
+                // nothing any more. Its thread stays until the platform
+                // goes, as the others do.
                 log::error!("HVF platform: vCPU {index}: {err}; task {key} ends");
                 runner.loaded = None;
-                smp.remove(sched, key);
+                broken = true;
+                smp.lose(sched, key);
                 sched = smp.lock();
-                sched.events.push_back(Event {
-                    task: key,
-                    trap: Trap::Gone,
-                });
-                smp.notify_loop(&sched);
-                break;
+                None
             }
         };
         if let Some(trap) = event {
@@ -2287,6 +2338,70 @@ mod vm_tests {
                 "at +{at}"
             );
         }
+    }
+
+    /// The core answers a system call of a task whose registers are in
+    /// another vCPU, and reads the registers before that vCPU has run the
+    /// task again (as it does to deliver a signal that came in between):
+    /// they have the result, and so does the app when it runs.
+    #[test]
+    fn registers_read_before_the_task_runs_again_have_the_result() {
+        let _guard = VM.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = match HvfPlatform::new(HvfConfig {
+            vcpus: 2,
+            ..HvfConfig::default()
+        }) {
+            Ok(p) => p,
+            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
+                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
+            }
+            Err(err) => {
+                eprintln!("SKIPPING: {err}");
+                return;
+            }
+        };
+        let t = p.spawn().unwrap();
+        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
+        // Loop: svc.
+        let code: Vec<u8> = [0xd400_0001u32, 0x17ff_ffff]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        p.write(t, CODE, &code).unwrap();
+        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
+            .unwrap();
+        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
+            unreachable!()
+        };
+        ctx.pc = CODE;
+        ctx.x[0] = 0x1111;
+        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+        // Runnable without a call of `wait`, so that vCPU 1 runs it, not
+        // the event loop's.
+        {
+            let mut sched = p.lock();
+            sched.tasks.get_mut(&t).unwrap().state = State::Runnable;
+            p.smp.wake(1);
+        }
+        let start = Instant::now();
+        while p.lock().events.is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "vCPU 1 ran nothing"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(word(p.wait(None).unwrap().unwrap().trap), 0x1111);
+        assert_eq!(p.lock().tasks[&t].loaded, Some(1));
+        p.set_x0(t, 0x7777).unwrap();
+        let Context::Aarch64(ctx) = p.context(t).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(ctx.x[0], 0x7777, "the result is in the registers read");
+        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        assert_eq!(word(p.wait(None).unwrap().unwrap().trap), 0x7777);
+        p.kill(t).unwrap();
     }
 
     /// With ASIDs used up, new spaces share ASID 0, and switching between

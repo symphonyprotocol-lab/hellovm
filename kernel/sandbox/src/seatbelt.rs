@@ -55,10 +55,7 @@ const RULES: &str = r#"
     ;; memory (malloc)
     MSC__kernelrpc_mach_vm_map_trap MSC__kernelrpc_mach_vm_deallocate_trap
     MSC__kernelrpc_mach_vm_protect_trap
-    MSC_mach_vm_reclaim_update_kernel_accounting_trap
-    ;; a vCPU thread that ends (the platform's are joined when it goes):
-    ;; libpthread lets go of the thread's own port rights
-    MSC__kernelrpc_mach_port_mod_refs_trap MSC__kernelrpc_mach_port_destruct_trap))
+    MSC_mach_vm_reclaim_update_kernel_accounting_trap))
 "#;
 
 /// `apply` checks that `/` cannot be opened: not worth a report. Because
