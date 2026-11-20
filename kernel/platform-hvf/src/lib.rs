@@ -1,7 +1,7 @@
 //! The HVF platform: runs aarch64 Linux apps in a virtual machine of
 //! Hypervisor.framework, on macOS on Apple silicon: processes with
-//! `fork` (copy-on-write), `execve` and dynamic linking, on one vCPU (see
-//! README, "The HVF platform").
+//! `fork` (copy-on-write), `execve` and dynamic linking, with threads in
+//! parallel on several vCPUs (see README, "The HVF platform").
 //!
 //! # How app code runs
 //!
@@ -16,16 +16,20 @@
 //! runs on the way back unless page tables changed, when the vCPU first
 //! runs one of the shim's flush routines (the whole TLB, or one page).
 //!
-//! The vCPU belongs to the thread that made the platform, the kernel's
-//! event-loop thread, and runs inside [`Platform::wait`]: the core's
+//! vCPU 0 belongs to the thread that made the platform, the kernel's
+//! event-loop thread, and runs inside [`Platform::wait`]; every other
+//! vCPU has a host thread of its own, made with the platform. The core's
 //! "resume never blocks" holds because `resume` only marks a task
 //! runnable. Tasks (every thread of every process) are register contexts
-//! multiplexed on that one vCPU: the runnable task that has run least
-//! goes next, and while another one is runnable a task runs for one slice
-//! at most. A timeout of `wait`, or the end of a slice, is the guest's
-//! virtual timer, which makes the vCPU exit
-//! (`HV_EXIT_REASON_VTIMER_ACTIVATED`); a [`Waker`] or the [`AppKiller`]
-//! calls `hv_vcpus_exit`.
+//! that the vCPUs take from one scheduler: the runnable task that has run
+//! least goes next, a task whose registers are still in a vCPU waits for
+//! that one, and a task runs for one slice at most (on vCPU 0 alone: while
+//! another one is runnable). A timeout of `wait`, or the end of a slice,
+//! is the guest's virtual timer, which makes the vCPU exit
+//! (`HV_EXIT_REASON_VTIMER_ACTIVATED`); a [`Waker`], the [`AppKiller`], a
+//! trap on another vCPU for the event loop, or a change to page tables
+//! that a running vCPU may hold in its TLB, calls `hv_vcpus_exit`. The
+//! other vCPUs report their traps to `wait` through a queue.
 //!
 //! # Address spaces
 //!
@@ -33,8 +37,11 @@
 //! levels) itself, in a pool of host memory the VM maps read only at stage
 //! 2; app pages come from another pool that stage 2 maps read, write and
 //! execute, and get memory on first touch. A process's address space has
-//! its own ASID. `fork` copies the tables and shares every frame
-//! copy-on-write; frames have reference counts on the host side. See
+//! its own ASID. The tables and pools are behind one lock, held from a
+//! change until every vCPU that may hold a stale TLB entry of it has
+//! left the VM, and every vCPU invalidates before it runs an app again.
+//! `fork` copies the tables and shares every frame copy-on-write; frames
+//! have reference counts on the host side. See
 //! `mmu` (and what keeps address spaces apart) and `layout` for the
 //! guest-physical layout, the descriptor bits and the system registers.
 //!
@@ -61,7 +68,7 @@ mod layout;
 mod mmu;
 mod sys;
 
-pub use app::{AppKiller, Flushes, HvfConfig, HvfPlatform};
+pub use app::{AppKiller, Flushes, HvfConfig, HvfPlatform, MAX_VCPUS};
 
 /// Whether this process may use Hypervisor.framework: `Ok` if a VM could
 /// be created (and was destroyed again), otherwise why not. A process

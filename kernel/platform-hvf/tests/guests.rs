@@ -25,6 +25,21 @@ static VM: Mutex<()> = Mutex::new(());
 /// when no app runs.
 const SHIM_TABLES: u64 = 4 * 4096;
 
+/// `HELLOVM_HVF_VCPUS`, if set, overrides the vCPU count of a config that
+/// leaves it to the default, so that the whole suite runs with one vCPU
+/// or with several.
+fn with_test_vcpus(mut config: HvfConfig) -> HvfConfig {
+    if config.vcpus == 0 {
+        if let Some(n) = std::env::var("HELLOVM_HVF_VCPUS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+        {
+            config.vcpus = n;
+        }
+    }
+    config
+}
+
 fn require() -> bool {
     std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1")
 }
@@ -44,7 +59,7 @@ fn setup(config: HvfConfig) -> Option<(MutexGuard<'static, ()>, HvfPlatform, Pat
         "{} is not an image made by build-guests.sh",
         root.display()
     );
-    match HvfPlatform::new(config) {
+    match HvfPlatform::new(with_test_vcpus(config)) {
         Ok(p) => Some((guard, p, root)),
         Err(err) if require() => {
             panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
@@ -185,11 +200,11 @@ fn signals() {
     );
 }
 
-/// Threads share the address space and take turns on the one vCPU
-/// (shared-memory `clone` is what `vfork` needs too): the same lines as
-/// `hellovm/tests/threads.rs` expects on the seccomp platform.
+/// Threads share the address space and run on the default vCPUs (or
+/// `HELLOVM_HVF_VCPUS`): the same lines as `hellovm/tests/threads.rs`
+/// expects on the seccomp platform.
 #[test]
-fn threads_on_one_vcpu() {
+fn threads() {
     let Some((_guard, mut p, root)) = setup(HvfConfig::default()) else {
         return;
     };
@@ -206,6 +221,168 @@ fn threads_on_one_vcpu() {
             "fork: child-threads=1",
         ],
         "{out:?}"
+    );
+}
+
+/// A platform with `vcpus` vCPUs, and the image.
+fn setup_vcpus(vcpus: usize) -> Option<(MutexGuard<'static, ()>, HvfPlatform, PathBuf)> {
+    let (guard, p, root) = setup(HvfConfig {
+        vcpus,
+        ..HvfConfig::default()
+    })?;
+    assert_eq!(p.vcpus(), vcpus);
+    Some((guard, p, root))
+}
+
+/// Threads that run at the same time, on 1, 2 and 4 vCPUs: the checks of
+/// `kernel/test-guest/c/smp.c` (fork, `mprotect` and `munmap` while other
+/// threads write, copy-on-write with concurrent writers, futex ping-pong,
+/// a signal to a thread that never makes a system call, system calls
+/// next to 16 spinning threads, and `exit_group` from the main thread or
+/// another one and `execve`, while threads spin), CPython's `threading`
+/// and a busybox pipeline. The same lines as on the seccomp platform
+/// (`hellovm/tests/smp.rs`); after each program every frame and table is
+/// back in its pool.
+#[test]
+fn threads_in_parallel() {
+    for vcpus in [1, 2, 4] {
+        let Some((guard, mut p, root)) = setup_vcpus(vcpus) else {
+            return;
+        };
+        let out = run(&mut p, &root, &["/guests/smp", "all"]);
+        assert_eq!(out.status, ExitStatus::Exited(0), "{vcpus} vCPUs: {out:?}");
+        assert_eq!(
+            lines(&out),
+            [
+                "fork-while-writing: ok",
+                "mprotect-while-writing: ok rounds=20",
+                "munmap-while-writing: ok rounds=20",
+                "cow-concurrent-writers: ok rounds=10",
+                "futex-ping-pong: ok rounds=20000",
+                "signal-to-running-thread: ok rounds=20",
+                "syscalls-next-to-spinners: ok",
+            ],
+            "{vcpus} vCPUs: {out:?}"
+        );
+        eprintln!("{vcpus} vCPUs: {}", out.stderr.trim_end());
+        for (check, status, line) in [
+            ("exit-group", 7, "exit-group: exiting"),
+            (
+                "exit-group-from-thread",
+                8,
+                "exit-group-from-thread: exiting",
+            ),
+            ("exec", 0, "exec-while-spinning: ok"),
+        ] {
+            let out = run(&mut p, &root, &["/guests/smp", check]);
+            assert_eq!(
+                out.status,
+                ExitStatus::Exited(status),
+                "{vcpus} vCPUs: {out:?}"
+            );
+            assert_eq!(lines(&out), [line], "{vcpus} vCPUs: {out:?}");
+        }
+        let out = run(&mut p, &root, &["/usr/bin/python3", "-c", PY_THREADS]);
+        assert_eq!(out.status, ExitStatus::Exited(0), "{vcpus} vCPUs: {out:?}");
+        assert_eq!(out.stdout, "threads: 8 results 39999600000 ok\n", "{out:?}");
+        let out = run(
+            &mut p,
+            &root,
+            &[
+                "/bin/sh",
+                "-c",
+                "seq 1 20000 | grep 7 | sort -rn | uniq | head -3",
+            ],
+        );
+        assert_eq!(out.status, ExitStatus::Exited(0), "{vcpus} vCPUs: {out:?}");
+        assert_eq!(out.stdout, "19997\n19987\n19979\n", "{out:?}");
+        drop(p);
+        drop(guard);
+    }
+}
+
+/// CPython threads: a queue, a lock, eight workers.
+const PY_THREADS: &str = r#"
+import queue, threading
+q = queue.Queue()
+lock = threading.Lock()
+total = []
+def work(n):
+    s = sum(range(n))
+    with lock:
+        total.append(s)
+    q.put(n)
+ts = [threading.Thread(target=work, args=(100000,)) for _ in range(8)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+assert sorted(q.get() for _ in range(8)) == [100000] * 8
+print("threads: %d results %d ok" % (len(total), sum(total)))
+"#;
+
+/// What `smp scale` computes (`work` in `kernel/test-guest/c/smp.c`).
+fn scale_sum(threads: u64, iters: u64) -> u64 {
+    let mut sum = 0u64;
+    for id in 0..threads {
+        let mut x = id.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+        let mut acc = 0u64;
+        for _ in 0..iters {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            acc = acc.wrapping_add(x >> 3);
+        }
+        sum = sum.wrapping_add(acc);
+    }
+    sum
+}
+
+/// `smp scale THREADS ITERS`: checks its sum, returns its time in ms.
+fn scale(p: &mut HvfPlatform, root: &PathBuf, threads: u64, iters: u64) -> u64 {
+    let (t, i) = (threads.to_string(), iters.to_string());
+    let out = run(p, root, &["/guests/smp", "scale", &t, &i]);
+    assert_eq!(out.status, ExitStatus::Exited(0), "{out:?}");
+    let line = out.stdout.trim_end();
+    let want = format!(
+        "scale: threads={threads} sum={:016x} ms=",
+        scale_sum(threads, iters)
+    );
+    let ms = line
+        .strip_prefix(&want)
+        .unwrap_or_else(|| panic!("wrong result: {line} (want {want}...)"));
+    ms.parse().unwrap()
+}
+
+/// Four threads of CPU work take clearly less time on four vCPUs than on
+/// one, and compute the same.
+#[test]
+fn cpu_work_scales_with_vcpus() {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cpus < 4 {
+        eprintln!("SKIPPING: {cpus} host CPUs");
+        return;
+    }
+    let (threads, iters) = (4, 20_000_000);
+    let mut best = Vec::new();
+    for vcpus in [1, 4] {
+        let Some((guard, mut p, root)) = setup_vcpus(vcpus) else {
+            return;
+        };
+        let ms = (0..3)
+            .map(|_| scale(&mut p, &root, threads, iters))
+            .min()
+            .unwrap();
+        eprintln!("{threads} threads of CPU work, {vcpus} vCPUs: {ms} ms (best of 3)");
+        best.push(ms);
+        drop(p);
+        drop(guard);
+    }
+    assert!(
+        best[1] * 10 < best[0] * 6,
+        "4 vCPUs took {} ms, 1 vCPU {} ms",
+        best[1],
+        best[0]
     );
 }
 
@@ -320,6 +497,7 @@ fn fork_bomb_is_bounded_by_the_pools() {
     let config = HvfConfig {
         memory: 128 << 20,
         table_memory: 2 << 20,
+        ..HvfConfig::default()
     };
     let Some((_guard, mut p, root)) = setup(config) else {
         return;

@@ -61,8 +61,9 @@
 //!   its frame's count is 1. Counts only grow in [`Phys::fork`], which
 //!   makes every such page read only in both address spaces first.
 //! * Whenever a valid descriptor changes or goes, or a table is freed,
-//!   [`Phys::take_stale`] reports it, and the platform invalidates the
-//!   TLB before the app runs again: the whole TLB, or only that page's
+//!   [`Phys::take_stale`] reports it, and every vCPU invalidates the TLB
+//!   before it runs an app again (a vCPU running that address space is
+//!   made to leave the VM first): the whole TLB, or only that page's
 //!   entries in that address space when nothing else changed (a
 //!   copy-on-write page that was written; making such a page writable
 //!   would not need it for safety, but a stale read-only entry would
@@ -84,6 +85,36 @@ pub trait Backing {
     /// Makes code written to `offset..offset + len` visible to the guest's
     /// instruction fetch.
     fn sync_icache(&mut self, offset: usize, len: usize);
+
+    /// Copies the bytes at `offset` into `buf`. App memory may be written
+    /// by the app on another vCPU at the same time: an implementation for
+    /// guest memory copies without making a reference to it.
+    fn read_at(&self, offset: usize, buf: &mut [u8]) {
+        buf.copy_from_slice(&self.bytes()[offset..offset + buf.len()]);
+    }
+
+    /// Copies `data` to `offset` (see [`Backing::read_at`]).
+    fn write_at(&mut self, offset: usize, data: &[u8]) {
+        self.bytes_mut()[offset..offset + data.len()].copy_from_slice(data);
+    }
+
+    /// Copies `len` bytes from `from` to `to`, which do not overlap.
+    fn copy_at(&mut self, from: usize, to: usize, len: usize) {
+        self.bytes_mut().copy_within(from..from + len, to);
+    }
+
+    /// Zeroes `len` bytes at `offset`.
+    fn zero_at(&mut self, offset: usize, len: usize) {
+        self.bytes_mut()[offset..offset + len].fill(0);
+    }
+
+    /// Stores a descriptor at `offset` (a multiple of 8). The table walk
+    /// of a vCPU may read it at any time: an implementation for guest
+    /// memory stores it with one 64-bit access, so that no walk sees half
+    /// of it.
+    fn store_u64(&mut self, offset: usize, value: u64) {
+        self.bytes_mut()[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -405,7 +436,7 @@ impl<B: Backing> Phys<B> {
     fn set_entry(&mut self, table: u64, idx: usize, value: u64) {
         let old = self.entry(table, idx);
         let off = (table - TABLES_IPA) as usize + idx * 8;
-        self.tables.bytes_mut()[off..off + 8].copy_from_slice(&value.to_le_bytes());
+        self.tables.store_u64(off, value);
         let used = &mut self.used[Self::table_index(table)];
         match (old != 0, value != 0) {
             (false, true) => *used += 1,
@@ -476,8 +507,7 @@ impl<B: Backing> Phys<B> {
     fn new_frame(&mut self) -> Option<u64> {
         let (ipa, dirty) = self.ram_pool.alloc()?;
         if dirty {
-            let off = (ipa - RAM_IPA) as usize;
-            self.ram.bytes_mut()[off..off + PAGE as usize].fill(0);
+            self.ram.zero_at((ipa - RAM_IPA) as usize, PAGE as usize);
         }
         self.refs[Self::frame_index(ipa)] = 1;
         Some(ipa)
@@ -514,14 +544,10 @@ impl<B: Backing> Phys<B> {
         leaf(frame, prot, shared, exclusive)
     }
 
+    #[cfg(test)]
     fn frame(&self, ipa: u64) -> &[u8] {
         let off = (ipa - RAM_IPA) as usize;
         &self.ram.bytes()[off..off + PAGE as usize]
-    }
-
-    fn frame_mut(&mut self, ipa: u64) -> &mut [u8] {
-        let off = (ipa - RAM_IPA) as usize;
-        &mut self.ram.bytes_mut()[off..off + PAGE as usize]
     }
 
     fn sync_frame(&mut self, ipa: u64) {
@@ -855,9 +881,7 @@ impl<B: Backing> Phys<B> {
         }
         let copy = self.new_frame().ok_or(MmuError::NoMemory)?;
         let (from, to) = ((frame - RAM_IPA) as usize, (copy - RAM_IPA) as usize);
-        self.ram
-            .bytes_mut()
-            .copy_within(from..from + PAGE as usize, to);
+        self.ram.copy_at(from, to, PAGE as usize);
         if prot.contains(Prot::EXEC) {
             self.sync_frame(copy);
         }
@@ -889,9 +913,9 @@ impl<B: Backing> Phys<B> {
             let frame = leaf_frame(desc)
                 .or_else(|| self.object_frame(leaf_object(desc)?, va & !(PAGE - 1)));
             match frame {
-                Some(frame) => {
-                    buf[at..at + n].copy_from_slice(&self.frame(frame)[page_off..page_off + n])
-                }
+                Some(frame) => self
+                    .ram
+                    .read_at((frame - RAM_IPA) as usize + page_off, &mut buf[at..at + n]),
                 None => buf[at..at + n].fill(0),
             }
             va += n as u64;
@@ -944,7 +968,8 @@ impl<B: Backing> Phys<B> {
             }
             .ok_or(MmuError::NoMemory)?;
             let at = (va - addr) as usize;
-            self.frame_mut(frame)[page_off..page_off + n].copy_from_slice(&data[at..at + n]);
+            self.ram
+                .write_at((frame - RAM_IPA) as usize + page_off, &data[at..at + n]);
             if leaf_prot(desc).contains(Prot::EXEC) {
                 self.sync_frame(frame);
             }
