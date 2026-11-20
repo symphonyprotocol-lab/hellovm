@@ -233,6 +233,10 @@ struct Shared {
     /// helper threads waiting on `cv`.
     #[cfg(target_os = "macos")]
     poller: Option<Arc<poll::Poller>>,
+    /// The kernel's side changed something the I/O thread has not looked
+    /// at yet (macOS): set before the thread is kicked.
+    #[cfg(target_os = "macos")]
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Shared {
@@ -252,6 +256,7 @@ impl Shared {
         self.cv.notify_all();
         #[cfg(target_os = "macos")]
         if let Some(poller) = &self.poller {
+            self.dirty.store(true, Ordering::Release);
             poller.kick();
         }
     }
@@ -420,6 +425,8 @@ impl StreamTable {
                 live: Arc::clone(&self.inbound_live),
                 #[cfg(target_os = "macos")]
                 poller: None,
+                #[cfg(target_os = "macos")]
+                dirty: std::sync::atomic::AtomicBool::new(false),
             });
             self.streams.insert(id, shared);
             self.adopted.insert(id, Conn::Unix(UnixStream::from(fd)));
@@ -563,6 +570,8 @@ impl StreamTable {
             live: Arc::clone(&self.live),
             #[cfg(target_os = "macos")]
             poller: self.poller.clone(),
+            #[cfg(target_os = "macos")]
+            dirty: std::sync::atomic::AtomicBool::new(false),
         });
         #[cfg(target_os = "macos")]
         if let Some(poller) = &self.poller {

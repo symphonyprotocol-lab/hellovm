@@ -206,6 +206,10 @@ struct Entry {
     read_done: bool,
     /// Nothing more is written (half-closed).
     write_done: bool,
+    /// What to wait for in `poll` and until when at most: [`Entry::interest`]
+    /// as of the last step. Only a step or the kernel's side changes it,
+    /// and the kernel's side marks the stream dirty, which is a step.
+    waits: (libc::c_short, Option<Instant>),
     /// Counts it, as a helper thread is counted, for the tests.
     _guard: HelperGuard,
 }
@@ -246,6 +250,7 @@ impl Entry {
             idle_since: None,
             read_done: false,
             write_done: false,
+            waits: (0, None),
             _guard: helper_guard(),
         }
     }
@@ -533,16 +538,27 @@ impl Poller {
         let mut buf = vec![0u8; CHUNK];
         let mut pollfds: Vec<libc::pollfd> = Vec::new();
         let mut kicked = true;
+        // Look at every stream, whatever `poll` said.
+        let mut rescan = false;
         loop {
             if kicked {
-                self.kicked.store(false, Ordering::Release);
+                // The pipe first, then the flag: a kick after the flag is
+                // cleared writes a byte that stays in the pipe. The other
+                // way round, a byte written in between would be taken
+                // here with the flag left set, and no later kick would
+                // write one.
                 let mut sink = [0u8; 64];
                 while matches!(read(wake.as_raw_fd(), &mut sink), Ok(n) if n > 0) {}
+                self.kicked.store(false, Ordering::Release);
                 let jobs =
                     std::mem::take(&mut *self.jobs.lock().unwrap_or_else(|e| e.into_inner()));
                 for job in jobs {
                     match dial(&job.endpoint) {
-                        Ok(sock) => entries.push_back(Entry::new(job, sock)),
+                        Ok(sock) => {
+                            // New: looked at in this round.
+                            job.shared.dirty.store(true, Ordering::Release);
+                            entries.push_back(Entry::new(job, sock));
+                        }
                         Err(err) => {
                             {
                                 let mut inner =
@@ -555,19 +571,27 @@ impl Poller {
                     }
                 }
             }
-            // Every stream is looked at after a kick (the kernel's side
-            // changed something, which `poll` cannot see), only those
-            // `poll` named otherwise.
+            // A stream is looked at when the kernel's side changed
+            // something for it (which `poll` cannot see: it is marked
+            // dirty, and the thread kicked), when `poll` named it, or
+            // when a deadline of it passed; every stream after `poll`
+            // failed.
             let mut i = 0;
             entries.retain_mut(|entry| {
                 let revents = pollfds.get(i + 1).map_or(0, |p| p.revents);
                 i += 1;
-                if !kicked && revents == 0 && !entry.due() {
+                let dirty = kicked && entry.shared.dirty.swap(false, Ordering::AcqRel);
+                if !rescan && !dirty && revents == 0 && !entry.due() {
                     return true;
                 }
                 let readable = revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
-                matches!(entry.step(readable, &mut buf), Next::Keep)
+                if matches!(entry.step(readable, &mut buf), Next::Drop) {
+                    return false;
+                }
+                entry.waits = entry.interest();
+                true
             });
+            rescan = false;
             pollfds.clear();
             pollfds.push(libc::pollfd {
                 fd: wake.as_raw_fd(),
@@ -576,7 +600,7 @@ impl Poller {
             });
             let mut deadline: Option<Instant> = None;
             for entry in &entries {
-                let (events, until) = entry.interest();
+                let (events, until) = entry.waits;
                 pollfds.push(libc::pollfd {
                     // Nothing to wait for: left out (a negative fd), or a
                     // peer that hung up would wake `poll` again and again
@@ -611,6 +635,7 @@ impl Poller {
                     p.revents = 0;
                 }
                 kicked = true;
+                rescan = true;
                 continue;
             }
             kicked = pollfds[0].revents != 0;

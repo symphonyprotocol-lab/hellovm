@@ -266,10 +266,11 @@ its peer (below). Differences, all on the kernel process's side:
   symlink, and the resolved path must fit a Unix socket address (103
   bytes); otherwise `hellovm` refuses to start (exit 125).
 - The proxy learns the peer's process id with `LOCAL_PEERPID` in place
-  of `SO_PEERCRED`, and its start time for `--stats` from
-  `proc_pidinfo` (microseconds since the epoch, in place of clock ticks
-  since boot), so audit lines carry `peer=PID` and bytes are counted per
-  kernel process as on Linux. `noded`, which reads those counters, is
+  of `SO_PEERCRED`, and for `--stats` the system's unique id of that
+  process from `proc_pidinfo` (in place of its start time in clock ticks
+  since boot; the system tells it of another user's process too), so
+  audit lines carry `peer=PID` and bytes are counted per kernel process
+  as on Linux. `noded`, which reads those counters, is
   Linux-only.
 
 *Policy*: deny by default. A rule is `NAME[:PORT[,PORT...]]` or

@@ -95,14 +95,40 @@ pub fn seal_process() -> std::io::Result<()> {
     Ok(())
 }
 
-/// When process `pid` started, in microseconds since the epoch (macOS:
-/// `pbi_start_tvsec` and `pbi_start_tvusec` of `proc_bsdinfo`).
+/// The system's unique id of process `pid` (macOS: `p_uniqueid` of
+/// `proc_uniqidentifierinfo`), never given to another process until the
+/// host restarts. Unlike the start time in `proc_bsdinfo`, the system
+/// tells it of any process, also one of another user: the proxy and the
+/// kernel processes should not share a uid.
 #[cfg(target_os = "macos")]
-pub fn start_micros(pid: u32) -> Option<u64> {
-    let info = bsdinfo(i32::try_from(pid).ok()?).ok()?;
-    info.pbi_start_tvsec
-        .checked_mul(1_000_000)?
-        .checked_add(info.pbi_start_tvusec)
+pub fn unique_id(pid: u32) -> Option<u64> {
+    /// `struct proc_uniqidentifierinfo` of `sys/proc_info.h`.
+    #[repr(C)]
+    struct UniqIdentifierInfo {
+        uuid: [u8; 16],
+        uniqueid: u64,
+        puniqueid: u64,
+        idversion: i32,
+        orig_ppidversion: i32,
+        reserve2: u64,
+        reserve3: u64,
+    }
+    const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: zeroed plain-old-data struct.
+    let mut info: UniqIdentifierInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<UniqIdentifierInfo>() as libc::c_int;
+    // SAFETY: the buffer is one proc_uniqidentifierinfo of `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDUNIQIDENTIFIERINFO,
+            0,
+            (&mut info as *mut UniqIdentifierInfo).cast(),
+            size,
+        )
+    };
+    (got == size && info.uniqueid > 0).then_some(info.uniqueid)
 }
 
 #[cfg(target_os = "macos")]
@@ -152,9 +178,12 @@ mod macos_tests {
         let pid = super::peer_pid(&conn).unwrap();
         assert_eq!(pid, std::process::id());
         // The usage key of a process: stable, and not that of another.
-        let start = super::start_micros(pid).unwrap();
-        assert_eq!(super::start_micros(pid), Some(start));
-        assert_ne!(super::start_micros(1), Some(start));
+        let id = super::unique_id(pid).unwrap();
+        assert_eq!(super::unique_id(pid), Some(id));
+        // Also of a process of another user (launchd, root's).
+        let launchd = super::unique_id(1).expect("the id of another user's process");
+        assert_ne!(launchd, id);
+        assert_eq!(super::unique_id(u32::MAX), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

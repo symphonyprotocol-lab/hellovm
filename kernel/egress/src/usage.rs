@@ -4,7 +4,8 @@
 //! A flow is counted against the process that connected (`SO_PEERCRED`;
 //! `LOCAL_PEERPID` on macOS), named by its process id and its start time
 //! (on Linux field 22 of `/proc/PID/stat`, clock ticks since boot; on
-//! macOS microseconds since the epoch, from `proc_pidinfo`): the pair
+//! macOS, in its place, the system's unique id of the process, from
+//! `proc_pidinfo`, which it tells of any user's process): the pair
 //! names one process for the life of the host, where a process id alone
 //! is reused. The
 //! sandbox id in the flow header is not used: the connecting process
@@ -56,8 +57,8 @@ const MAX_QUESTIONS: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key {
     pub pid: u32,
-    /// When it started: clock ticks since boot (Linux), microseconds
-    /// since the epoch (macOS).
+    /// When it started, in clock ticks since boot (Linux); the system's
+    /// unique id of the process (macOS).
     pub start: u64,
 }
 
@@ -66,7 +67,7 @@ impl Key {
     /// `proc_pidinfo` (macOS).
     pub fn of(pid: u32) -> Option<Key> {
         #[cfg(target_os = "macos")]
-        let start = crate::peer::start_micros(pid)?;
+        let start = crate::peer::unique_id(pid)?;
         #[cfg(not(target_os = "macos"))]
         let start = {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
