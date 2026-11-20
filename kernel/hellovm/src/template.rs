@@ -116,7 +116,7 @@ pub fn run(
     host.close_input();
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(addr) = options.splice_to {
-        host.set_splice_endpoint(addr);
+        host.set_splice_endpoint(addr)?;
     }
     let image = host.image_mut().expect("the host has the image");
     let (egress, landlock) = harden(options, image, egress, fds, true)?;
@@ -135,7 +135,7 @@ pub fn run(
         log::warn!("{why}; use it for one tenant only");
     }
     if let Some(path) = egress {
-        host.set_egress(path);
+        host.set_egress(path)?;
     }
     let sandbox_id = match options.sandbox_id {
         Some(id) => id,

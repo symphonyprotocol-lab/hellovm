@@ -42,6 +42,12 @@ use std::time::{Duration, Instant};
 
 use hellovm_egress_wire::{Request, Status, REPLY};
 
+/// macOS: one I/O thread instead of helper threads per stream.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+#[path = "stream_poll.rs"]
+mod poll;
+
 /// How long the helper waits for the egress proxy's verdict. The proxy
 /// bounds its own work (header 5 s, resolution 5 s, upstream connect 10 s),
 /// so this only fires when the proxy is wedged. Reported as `TimedOut`.
@@ -223,6 +229,10 @@ struct Shared {
     /// The table's count of streams whose helpers are still alive, including
     /// ones the guest closed that are still draining.
     live: Arc<AtomicUsize>,
+    /// The I/O thread that moves this stream's bytes (macOS), instead of
+    /// helper threads waiting on `cv`.
+    #[cfg(target_os = "macos")]
+    poller: Option<Arc<poll::Poller>>,
 }
 
 impl Drop for Shared {
@@ -236,12 +246,27 @@ impl Shared {
     fn wake(self: &Arc<Self>) {
         self.waker.lock().unwrap_or_else(|e| e.into_inner()).wake();
     }
+
+    /// The kernel's side changed something: tells whatever moves the bytes.
+    fn notify(&self) {
+        self.cv.notify_all();
+        #[cfg(target_os = "macos")]
+        if let Some(poller) = &self.poller {
+            poller.kick();
+        }
+    }
 }
 
 /// Streams whose helper threads may be alive at once (two threads each),
 /// counting closed streams that are still draining. Past this, a guest
 /// `connect` fails with `EAGAIN` instead of exhausting host threads.
+#[cfg(not(target_os = "macos"))]
 const MAX_LIVE_STREAMS: usize = 512;
+/// On macOS one fd each, within the confined process's 256
+/// (`hellovm-sandbox`'s `RLIMIT_NOFILE`), next to stdio, the image's
+/// cached fds and the I/O thread's pipe.
+#[cfg(target_os = "macos")]
+const MAX_LIVE_STREAMS: usize = 160;
 
 /// Inbound streams whose helper threads may be alive at once, counting
 /// closed ones still draining; past this an inbound connection is refused.
@@ -346,6 +371,9 @@ pub struct StreamTable {
     adopted: HashMap<u64, Conn>,
     /// Like `live`, for inbound streams.
     inbound_live: Arc<AtomicUsize>,
+    /// The I/O thread of outbound streams (macOS).
+    #[cfg(target_os = "macos")]
+    poller: Option<Arc<poll::Poller>>,
 }
 
 impl StreamTable {
@@ -390,6 +418,8 @@ impl StreamTable {
                 cv: Condvar::new(),
                 waker: Mutex::new(Waker::noop()),
                 live: Arc::clone(&self.inbound_live),
+                #[cfg(target_os = "macos")]
+                poller: None,
             });
             self.streams.insert(id, shared);
             self.adopted.insert(id, Conn::Unix(UnixStream::from(fd)));
@@ -454,8 +484,16 @@ impl StreamTable {
         }
     }
 
-    pub fn set_endpoint(&mut self, endpoint: Endpoint) {
+    /// Sends outbound streams to `endpoint`. On macOS this starts the
+    /// I/O thread (see `stream_poll.rs`), so call it before the process
+    /// confines itself.
+    pub fn set_endpoint(&mut self, endpoint: Endpoint) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if self.poller.is_none() {
+            self.poller = Some(poll::Poller::start()?);
+        }
         self.endpoint = Some(endpoint);
+        Ok(())
     }
 
     pub fn configured(&self) -> bool {
@@ -523,7 +561,19 @@ impl StreamTable {
             cv: Condvar::new(),
             waker: Mutex::new(waker),
             live: Arc::clone(&self.live),
+            #[cfg(target_os = "macos")]
+            poller: self.poller.clone(),
         });
+        #[cfg(target_os = "macos")]
+        if let Some(poller) = &self.poller {
+            poller.add(poll::Job {
+                endpoint,
+                header,
+                shared: Arc::clone(&shared),
+            });
+            self.streams.insert(id, shared);
+            return Ok(HostStreamId(id));
+        }
         let helper = Arc::clone(&shared);
         // Register only once the helper runs: a failed spawn must not leave
         // an entry the kernel will never close.
@@ -587,7 +637,7 @@ impl StreamTable {
             *dst = src;
         }
         drop(inner);
-        shared.cv.notify_all();
+        shared.notify();
         Ok(n)
     }
 
@@ -613,7 +663,7 @@ impl StreamTable {
         let n = data.len().min(room);
         inner.outbound.extend(&data[..n]);
         drop(inner);
-        shared.cv.notify_all();
+        shared.notify();
         Ok(n)
     }
 
@@ -622,7 +672,7 @@ impl StreamTable {
         let mut inner = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.shut_wr = true;
         drop(inner);
-        shared.cv.notify_all();
+        shared.notify();
         Ok(())
     }
 
@@ -649,7 +699,7 @@ impl StreamTable {
                 let _ = control.shutdown(Shutdown::Read);
             }
         }
-        shared.cv.notify_all();
+        shared.notify();
     }
 }
 
@@ -681,7 +731,7 @@ impl StreamTable {
             if start.elapsed() >= limit {
                 return false;
             }
-            thread::sleep(Duration::from_millis(10));
+            pause(Duration::from_millis(10));
         }
         true
     }
@@ -698,7 +748,7 @@ impl StreamTable {
             if !self.streams.is_empty() || start.elapsed() >= limit {
                 return false;
             }
-            thread::sleep(Duration::from_millis(10));
+            pause(Duration::from_millis(10));
         }
     }
 
@@ -709,6 +759,14 @@ impl StreamTable {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "outbound stream is closed"))
     }
 }
+
+/// Waits a little while the kernel waits for streams to finish.
+#[cfg(not(target_os = "macos"))]
+fn pause(duration: Duration) {
+    thread::sleep(duration);
+}
+#[cfg(target_os = "macos")]
+pub use poll::pause;
 
 fn drive(endpoint: Endpoint, header: Option<Vec<u8>>, shared: Arc<Shared>) {
     let connected = match &endpoint {
@@ -941,7 +999,7 @@ mod tests {
         });
         let baseline = LIVE_HELPERS.load(std::sync::atomic::Ordering::Relaxed);
         let mut table = StreamTable::default();
-        table.set_endpoint(Endpoint::Splice(addr));
+        table.set_endpoint(Endpoint::Splice(addr)).unwrap();
         let id = table
             .open(
                 OutboundFlow {
@@ -1010,7 +1068,7 @@ mod tests {
             drop(sock);
         });
         let mut table = StreamTable::default();
-        table.set_endpoint(Endpoint::Splice(addr));
+        table.set_endpoint(Endpoint::Splice(addr)).unwrap();
         let id = table
             .open(
                 OutboundFlow {
@@ -1041,6 +1099,84 @@ mod tests {
         }
         let _ = release.send(());
         server.join().unwrap();
+    }
+
+    /// A stream whose peer never reads, filled until it blocks, holds up
+    /// no other stream: on macOS both are on the one I/O thread.
+    #[test]
+    fn a_stalled_stream_does_not_hold_up_another() {
+        let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+        let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (stalled_addr, echo_addr) = (stalled.local_addr().unwrap(), echo.local_addr().unwrap());
+        let (release, wait) = mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            let (sock, _) = stalled.accept().unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+            drop(sock);
+        });
+        let echoer = thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = echo.accept().unwrap();
+            let mut buf = [0u8; 5];
+            sock.read_exact(&mut buf).unwrap();
+            sock.write_all(&buf).unwrap();
+        });
+        let flow = || OutboundFlow {
+            sandbox_id: 0,
+            guest_pid: 1,
+            dest_ip: [198, 51, 100, 1],
+            dest_port: 9,
+            host: None,
+        };
+        let connected = |table: &mut StreamTable, id| {
+            let start = Instant::now();
+            while table.connect_result(id).is_err() {
+                assert!(start.elapsed() < Duration::from_secs(2), "connect");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let mut table = StreamTable::default();
+        table.set_endpoint(Endpoint::Splice(stalled_addr)).unwrap();
+        let a = table.open(flow(), Waker::new(|| {})).unwrap();
+        connected(&mut table, a);
+        // Until the host's socket buffers and the stream's are full.
+        let block = vec![0u8; 64 * 1024];
+        let start = Instant::now();
+        let mut idle = 0;
+        while idle < 20 {
+            match table.write(a, &block) {
+                Ok(_) => idle = 0,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    idle += 1;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("write: {err}"),
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "never blocked");
+        }
+        table.set_endpoint(Endpoint::Splice(echo_addr)).unwrap();
+        let b = table.open(flow(), Waker::new(|| {})).unwrap();
+        connected(&mut table, b);
+        assert_eq!(table.write(b, b"hello").unwrap(), 5);
+        let start = Instant::now();
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            let mut buf = [0u8; 16];
+            match table.read(b, &mut buf) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    assert!(start.elapsed() < Duration::from_secs(2), "held up");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("read: {err}"),
+            }
+        }
+        assert_eq!(got, b"hello");
+        table.close(a);
+        table.close(b);
+        let _ = release.send(());
+        holder.join().unwrap();
+        echoer.join().unwrap();
     }
 }
 
@@ -1122,7 +1258,9 @@ mod egress_tests {
             &format!("echo.test 127.0.0.1:{port}"),
         );
         let mut table = StreamTable::default();
-        table.set_endpoint(Endpoint::Egress(proxy.path().to_path_buf()));
+        table
+            .set_endpoint(Endpoint::Egress(proxy.path().to_path_buf()))
+            .unwrap();
         let id = table
             .open(flow(Some("echo.test"), 443), Waker::new(|| {}))
             .unwrap();
@@ -1173,7 +1311,9 @@ mod egress_tests {
     fn refusals_are_connection_refused() {
         let (proxy, _audit) = proxy("deny", "allow other.test", "");
         let mut table = StreamTable::default();
-        table.set_endpoint(Endpoint::Egress(proxy.path().to_path_buf()));
+        table
+            .set_endpoint(Endpoint::Egress(proxy.path().to_path_buf()))
+            .unwrap();
         let id = table
             .open(flow(Some("evil.test"), 443), Waker::new(|| {}))
             .unwrap();
@@ -1191,7 +1331,9 @@ mod egress_tests {
     #[test]
     fn a_missing_proxy_is_connection_refused() {
         let mut table = StreamTable::default();
-        table.set_endpoint(Endpoint::Egress(sock("absent")));
+        table
+            .set_endpoint(Endpoint::Egress(sock("absent")))
+            .unwrap();
         let id = table
             .open(flow(Some("a.test"), 443), Waker::new(|| {}))
             .unwrap();
@@ -1202,7 +1344,9 @@ mod egress_tests {
     #[test]
     fn a_flow_without_a_name_is_not_opened() {
         let mut table = StreamTable::default();
-        table.set_endpoint(Endpoint::Egress(sock("noname")));
+        table
+            .set_endpoint(Endpoint::Egress(sock("noname")))
+            .unwrap();
         let err = table.open(flow(None, 443), Waker::new(|| {})).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(table.flows().is_empty());
