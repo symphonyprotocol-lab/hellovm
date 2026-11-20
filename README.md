@@ -241,6 +241,37 @@ then keeps a compromised sandbox host process from signalling it. `--sandbox-id`
 number; random by default) names the sandbox in every flow and audit
 line.
 
+*On macOS* (the HVF platform) `--egress` works the same way, with the
+same proxy, policy, audit lines and guest-visible outcomes; the proxy
+builds and runs there unchanged but for what it asks the host about
+its peer (below). Differences, all on the kernel process's side:
+
+- The kernel process moves the bytes of every outbound stream on one
+  thread, `hellovm-net`, made with `--egress` before the process
+  confines itself, instead of two helper threads per stream: it keeps
+  every stream's socket non-blocking and waits in `poll` on them and on
+  a pipe the kernel's thread writes a byte to when a guest wrote, read
+  or closed. It never waits on one stream, so a peer that stops reading
+  or a proxy that never answers holds up no other stream. What it moves
+  reaches the kernel through the platform's waker, as a stdin byte
+  does. The confined process thus makes and ends no thread per
+  connection (ending a thread can need Mach traps the profile does not
+  allow), and uses one fd per stream.
+- At most 160 streams are open or draining at once (512 on Linux): each
+  takes an fd, and the confined process may hold 256.
+- `SOCKET` is resolved once at start-up: made absolute, its directory's
+  symlinks resolved (`/tmp` is `/private/tmp`). The Seatbelt profile
+  names that path (see **Hardening**), so a restarted proxy's new socket
+  at the same path is reached, but the socket itself must not be a
+  symlink, and the resolved path must fit a Unix socket address (103
+  bytes); otherwise `hellovm` refuses to start (exit 125).
+- The proxy learns the peer's process id with `LOCAL_PEERPID` in place
+  of `SO_PEERCRED`, and its start time for `--stats` from
+  `proc_pidinfo` (microseconds since the epoch, in place of clock ticks
+  since boot), so audit lines carry `peer=PID` and bytes are counted per
+  kernel process as on Linux. `noded`, which reads those counters, is
+  Linux-only.
+
 *Policy*: deny by default. A rule is `NAME[:PORT[,PORT...]]` or
 `*.SUFFIX[:PORT[,PORT...]]`, given with `--allow RULE` or as `allow RULE`
 lines in a `--policy FILE` (`#` comments and blank lines ignored; several
@@ -326,7 +357,7 @@ new process past that is relayed but not counted).
 | Upstream connect | 10 s across all addresses (`--connect-timeout`), at most 4 addresses tried |
 | SNI / `Host` sniffing | 16 KiB within 10 s |
 | Relay | 16 KiB buffered per direction in the proxy; idle (no byte either way) 300 s closes the flow (`--idle-timeout`) |
-| Kernel side | 30 s for the proxy's verdict; at most 512 outbound streams open or draining (past that, `connect` is `EAGAIN`); 64 KiB buffered each way per stream; a closed stream keeps flushing while the peer makes progress, and gives up after 45 s without |
+| Kernel side | 30 s for the proxy's verdict; at most 512 outbound streams open or draining (160 on macOS; past that, `connect` is `EAGAIN`); 64 KiB buffered each way per stream; a closed stream keeps flushing while the peer makes progress, and gives up after 45 s without |
 | At exit | hellovm closes the remaining streams and waits at most 10 s for queued bytes to reach the proxy |
 
 Bytes waiting on an outbound stream are visible to `poll`, `select` and
@@ -635,8 +666,9 @@ On the Mac, `hellovm --root DIR PROGRAM [ARGS...]` works with `--trace`,
 to 64, at most what Hypervisor.framework allows; by default one per host
 CPU, at most 8) and `--sandbox
 require|best-effort|off` (the kernel process confines itself with a
-Seatbelt profile, see **Hardening**). `--egress`, `--template` and
-`--clone` are refused. `hellovm-noded` and the API stay Linux-only.
+Seatbelt profile, see **Hardening**) and `--egress SOCKET` (see
+**Egress**). `--template` and `--clone` are refused. `hellovm-noded` and
+the API stay Linux-only.
 
 The test guests for the Mac (`kernel/test-guest/asm`, and
 `kernel/test-guest/asm/hvf` for the HVF tests) are built by
@@ -667,6 +699,7 @@ kernel/platform-hvf/build-guests.sh
 cd kernel
 HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm-platform-hvf
 HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_cli
+HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_egress
 target/debug/hellovm --sandbox require --root target/hvf-guests/root /bin/sh -c 'seq 100 | grep 7 | wc -l'
 ```
 
@@ -987,7 +1020,10 @@ open (32 and 16), so a lookup does not walk from the root each time.
 *The egress proxy.* `hellovm-egress` makes itself non-dumpable with no
 core dumps at start-up, so that no other process of its user (a
 compromised sandbox host process, say) can attach to it or read or write
-its memory, where the allowlist lives. It is not hardened further yet.
+its memory, where the allowlist lives. On macOS it sets `RLIMIT_CORE` 0
+and `PT_DENY_ATTACH` instead (skipped when a debugger already traces
+it); getting another process's task port takes root or a debugger's
+entitlement there anyway. It is not hardened further yet.
 It parses the flow header and the first bytes of every flow (SNI,
 `Host`), so it would benefit from more of the same treatment:
 `no_new_privs` and an fd limit are trivial; Landlock would allow reading the
@@ -1022,8 +1058,9 @@ is the second. Before the kernel reads any guest input, and once the
 image directory, the VM and its vCPUs, `/dev/urandom` and the terminal's
 settings and window size are set up, `hellovm` applies the macOS layers
 of `kernel/sandbox` (`macos.rs`, `seatbelt.rs`), while the only other
-threads are the HVF platform's vCPU threads (made with the platform,
-idle, and reading no environment):
+threads are the HVF platform's vCPU threads (made with the platform)
+and, with `--egress`, the outbound streams' I/O thread (made with the
+egress endpoint), all idle and reading no environment:
 
 | Layer | What it does | Required by `--sandbox require` |
 |---|---|---|
@@ -1046,6 +1083,8 @@ hellovm: debug: sandbox: environment cleared: active (31 removed)
 hellovm: debug: sandbox: no debugger (PT_DENY_ATTACH): active ()
 hellovm: debug: sandbox: Seatbelt profile: active (7 rules)
 ```
+
+(10 rules with `--egress`.)
 
 *Why Seatbelt, self-applied.* macOS offers no seccomp, Landlock or
 namespaces. What it has: the Seatbelt sandbox (the kernel's `Sandbox`
@@ -1094,8 +1133,27 @@ fails, the first time the platform's mutex is contended.
 | `syscall-mach`: `_kernelrpc_mach_vm_map_trap`, `_kernelrpc_mach_vm_deallocate_trap`, `_kernelrpc_mach_vm_protect_trap`, `mach_vm_reclaim_update_kernel_accounting_trap` | memory (`malloc`). The vCPU threads are never ended or joined (the process exits with them; a joined thread that ends gives up port rights with two more Mach traps, which are not allowed) |
 | any other `syscall-unix`, `syscall-mach` or `syscall-mig`: `(deny ... (with send-signal SIGKILL))` | a system call or Mach trap outside the lists kills the process, as seccomp does on Linux |
 
+With `--egress SOCKET`, and only then, three more rules (and a second
+parameter, `EGRESS`, the socket's resolved path; see **Egress**):
+
+| Rule | Why |
+|---|---|
+| `file-test-existence`, `network-outbound` of exactly that path (`(literal (param "EGRESS"))`) | `connect` of a Unix socket looks the path up, then connects; the rule names the path, not a file, so a restarted proxy's new socket there is reached |
+| `system-fcntl` `F_SETFL` | making each stream's socket non-blocking (`std`'s `set_nonblocking` is an `ioctl`, not allowed) |
+| `syscall-unix`: `socket`, `connect`, `shutdown`, `poll` | the I/O thread: a Unix stream socket per flow, half-close, waiting on all of them |
+
+Seatbelt does not check making a socket (`socket` of any domain and type
+succeeds once the call is allowed); what it checks is reaching something
+through it. So with `--egress` the confined process can still make a TCP
+or UDP socket, but connecting it anywhere, or connecting a Unix socket to
+any other path, fails with `EPERM` (`network-outbound` is denied by
+default), and sending a datagram kills it (`sendto` and `sendmsg` are not
+on the list). There is no `network-bind` or `network-inbound`: it cannot
+listen. Without `--egress` the profile is exactly the one above: `socket`
+itself kills the process.
 Everything else is denied: every other file (read, write, create,
-metadata), every network operation, process creation and `exec`,
+metadata), every network operation (with `--egress`: but a connect to
+the egress socket), process creation and `exec`,
 signals to other processes, `process-info` of other processes, every
 Mach service lookup and IOKit user client, every sysctl, POSIX IPC. No
 Mach message trap is allowed at all (`mach_msg2_trap` is not on the
@@ -1156,7 +1214,19 @@ directory outside the image (an absolute path, a `..` path, `openat` with
 `..` from every fd it holds, the user's home, `/etc/passwd`), create or
 write any file (outside the image or in it), connect a TCP or Unix socket
 or send a UDP datagram, resolve a name, signal another process; and
-inherited fds and the environment are gone. Enforced by the profile but
+inherited fds and the environment are gone. With `--egress` the profile's
+network rules are tested from inside a process that applied it with
+`hellovm_sandbox::apply` but holds no VM
+(`kernel/sandbox/tests/seatbelt_network.rs`, its own binary with no test
+harness): the egress socket connects, and again after a proxy restart
+made a new socket at the path; another Unix socket and a listening
+loopback TCP port are refused with `EPERM` (and the port sees no
+connection); a datagram to the other socket, to the egress path or over
+UDP, and resolving `localhost`, kill the process; without `--egress`,
+making a socket kills it. `kernel/hellovm/tests/hvf_egress.rs` runs
+guests through the command line with `--sandbox require` against a
+proxy started by the test (see **Egress**). Neither adds attempts to the
+hook of `hvf_hardening.rs`. Enforced by the profile but
 *not* tested from inside: process creation (`fork`, `posix_spawn`,
 `exec`), task ports (`task_for_pid`, `task_name_for_pid`), `ptrace` and
 `proc_pidinfo` of other processes, sysctls, IOKit, Mach service lookups,
@@ -1219,6 +1289,16 @@ kernel: (Sandbox) Sandbox: hellovm(4242) deny(1) file-test-existence /etc/passwd
 A killed kernel process (a system call outside the lists) shows up there
 as `deny(1) syscall-unix NUMBER` and exits with `SIGKILL` (status 137).
 
+*Open:* in one burst of seven runs, on a Mac under heavy load right after
+a long build, `hellovm --sandbox require` was killed about 5 s into a run
+with `deny(1) syscall-unix 368` (`workq_kernreturn`, the call a
+libdispatch worker thread makes to park); the same runs passed more than
+twenty times before and after. Nothing in `hellovm` uses libdispatch; a
+likely source is the memory pressure handler libSystem installs in every
+process, whose worker would park this way, but simulating memory pressure
+needs root and this was not confirmed. The call is not added to the
+profile until it is measured.
+
 *Compared with Linux, line by line:*
 
 | Linux | macOS |
@@ -1227,12 +1307,12 @@ as `deny(1) syscall-unix NUMBER` and exits with `SIGKILL` (status 137).
 | Namespaces (user, mount, network, IPC; empty root) | none on macOS; the Seatbelt profile's file and network rules take their place |
 | Resource limits: core 0, nofile 4096, memlock 0, msgqueue 0 | core 0, nofile 256, nproc 1 (no processes to make, see above); no memlock or message queue limits (the profile denies `mlock` and POSIX IPC) |
 | `no_new_privs` | nothing to do: the process cannot `exec` at all |
-| Landlock: read the image only, no TCP, scoped signals | Seatbelt: read the image only, no network at all (TCP, UDP, Unix, name resolution), no signals to others, no Mach services |
+| Landlock: read the image only, no TCP, scoped signals | Seatbelt: read the image only, no network (TCP, UDP, Unix, name resolution) but a connect to the egress socket's path with `--egress`, no signals to others, no Mach services |
 | Not dumpable | `RLIMIT_CORE` 0 and `PT_DENY_ATTACH` (no core dump, no debugger attaching); other processes of the user cannot get its task port without a debugger's rights in any case |
 | Seccomp allowlist with argument checks, measured | Seatbelt's `syscall-unix` and `syscall-mach` lists, measured, by number only (no argument checks), with an undocumented set of calls exempt; the operation rules (files, `fcntl`, `ioctl`, `process-info`) check some arguments |
 | Seccomp's instruction-pointer trick for stacked app filters | not needed: app processes are not host processes |
 | Environment kept | cleared |
-| Egress socket allowed | no egress on macOS yet |
+| Egress socket allowed: its directory is bind-mounted into the empty root, so a restarted proxy's socket is found; without a mount namespace any pathname Unix socket can be connected to | its path, resolved at start-up, is the one place `connect` may reach (`network-outbound`); a restarted proxy's socket at that path is reached; the outbound streams' I/O is one thread made before the profile is entered |
 
 *Cost.* The hardening runs once at start-up: a few `setrlimit`s, the
 environment, `PT_DENY_ATTACH`, compiling and entering the profile, and
