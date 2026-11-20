@@ -577,15 +577,14 @@ cd kernel
 cargo build -p hellovm
 codesign --force --sign - --entitlements platform-hvf/hellovm.entitlements target/debug/hellovm
 mkdir -p /tmp/image && cp target/debug/build/hellovm-test-guest-*/out/hello /tmp/image/
-target/debug/hellovm --sandbox off --root /tmp/image /hello
+target/debug/hellovm --sandbox require --root /tmp/image /hello
 ```
 
 On the Mac, `hellovm --root DIR PROGRAM [ARGS...]` works with `--trace`,
-`--timeout`, `--env`, `--fs-limit` and `--tty`/`--no-tty`. `--egress`,
-`--template`, `--clone` and `--sandbox require` are refused: nothing
-hardens the kernel process on macOS yet (the default `best-effort` says
-so with a warning; `--sandbox off` silences it). `hellovm-noded` and the
-API stay Linux-only.
+`--timeout`, `--env`, `--fs-limit`, `--tty`/`--no-tty` and `--sandbox
+require|best-effort|off` (the kernel process confines itself with a
+Seatbelt profile, see **Hardening**). `--egress`, `--template` and
+`--clone` are refused. `hellovm-noded` and the API stay Linux-only.
 
 The test guests for the Mac (`kernel/test-guest/asm`, and
 `kernel/test-guest/asm/hvf` for the HVF tests) are built by
@@ -616,7 +615,7 @@ kernel/platform-hvf/build-guests.sh
 cd kernel
 HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm-platform-hvf
 HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_cli
-target/debug/hellovm --sandbox off --root target/hvf-guests/root /bin/sh -c 'seq 100 | grep 7 | wc -l'
+target/debug/hellovm --sandbox require --root target/hvf-guests/root /bin/sh -c 'seq 100 | grep 7 | wc -l'
 ```
 
 The tests (`kernel/platform-hvf/tests/hvf.rs` and `guests.rs`, the unit
@@ -732,7 +731,7 @@ and `mprotect` RELRO), busybox shells and CPython with `subprocess`.
 Threads run, one at a time. Not yet: more than one vCPU (threads in
 parallel); x86_64 programs (Rosetta is not used); memory returned to the
 host (the pools only grow to their high-water mark); warm clones;
-hardening of the kernel process; `AT_HWCAP2` (zero) and emulated `mrs` of
+`AT_HWCAP2` (zero) and emulated `mrs` of
 ID registers (`HWCAP_CPUID` is not reported, so programs do not try).
 A process that writes a copy-on-write page when the pool is used up gets
 `SIGKILL` rather than an error.
@@ -887,6 +886,228 @@ on their own where the host has them. In the dev container and in an Ubuntu 26.0
 (Docker's default seccomp profile) the namespaces are skipped and every
 other layer is active; with `--security-opt seccomp=unconfined` all
 seven are.
+
+**On macOS (the HVF platform).** The threat model is the same: assume a
+guest has taken over the kernel process (arbitrary code in it). The VM
+stays the first boundary (see **The HVF platform**); the kernel process
+is the second. Before the kernel reads any guest input, and once the
+image directory, the VM and its vCPU, `/dev/urandom` and the terminal's
+settings and window size are set up, `hellovm` applies the macOS layers
+of `kernel/sandbox` (`macos.rs`, `seatbelt.rs`), while the process still
+has one thread:
+
+| Layer | What it does | Required by `--sandbox require` |
+|---|---|---|
+| Inherited fds | Every fd above 2 is closed first thing in `main` (listed with `proc_pidinfo(PROC_PIDLISTFDS)`, then checked again: macOS has no `close_range`) | yes |
+| Resource limits | `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256, `RLIMIT_NPROC` 1 (only ever lowered). macOS checks `RLIMIT_NPROC` against the user's whole process count, so `fork` and `posix_spawn` fail whatever the profile says; the kernel process never makes a process (app processes are register contexts in its one VM) | yes |
+| Environment cleared | Every environment variable is removed: nothing reads one after start-up, and an operator's environment (tokens, keys) is not for a compromised kernel process to read. The program's environment comes from `--env` only | yes |
+| No debugger | `ptrace(PT_DENY_ATTACH)`: no debugger can attach afterwards. Skipped (and so `require` refuses) when a debugger already traces the process, which `PT_DENY_ATTACH` would kill | yes |
+| Seatbelt profile | The process enters a Seatbelt sandbox itself (`sandbox_init_with_parameters`) with the profile below, then checks from inside that `/` cannot be opened (`EPERM`) | yes |
+
+`--sandbox require` refuses to start (exit 125, listing the layers) when
+any layer is unavailable or the check fails; `best-effort` (the default)
+runs anyway and warns, saying the kernel process is not confined when the
+Seatbelt layer is the one missing; `off` applies none. A hardened run
+prints nothing; `HELLOVM_LOG=debug` lists the layers:
+
+```text
+hellovm: debug: sandbox: inherited fds closed: active (0 closed)
+hellovm: debug: sandbox: resource limits: active (core 0, nofile 256, nproc 1)
+hellovm: debug: sandbox: environment cleared: active (31 removed)
+hellovm: debug: sandbox: no debugger (PT_DENY_ATTACH): active ()
+hellovm: debug: sandbox: Seatbelt profile: active (7 rules)
+```
+
+*Why Seatbelt, self-applied.* macOS offers no seccomp, Landlock or
+namespaces. What it has: the Seatbelt sandbox (the kernel's `Sandbox`
+policy module, configured with a profile in SBPL), entered either at
+launch through App Sandbox entitlements, by `sandbox-exec`, or by the
+process itself with `sandbox_init_with_parameters`; resource limits;
+`PT_DENY_ATTACH`; the hardened runtime (a code-signing flag that keeps
+other processes from injecting libraries or getting the task port, i.e.
+protects the process from others, not others from it); and running as
+another user, which needs root. App Sandbox was rejected: it applies at
+`exec`, before the kernel process has opened anything, so the profile
+would have to allow opening any `--root` the user names (App Sandbox
+expects that through user-selected-file extensions), it brings Apple's
+large application profile (many Mach services, `application.sb`), and
+it filters no system calls. `sandbox-exec` has the same timing problem.
+Self-applying after start-up lets the profile be tighter than anything
+applied at launch: it never needs `dyld`, frameworks, the executable, the
+hypervisor set-up or the terminal's device node, because all of that is
+done when it is entered. Browsers confine their renderer processes the
+same way (Chromium's and Firefox's macOS sandboxes are built on
+`sandbox_init_with_parameters` with their own SBPL profiles).
+
+*The profile* (`kernel/sandbox/src/seatbelt.rs`), measured, not guessed:
+the real workloads (the C guests, the busybox pipeline, CPython with
+`subprocess`, the fork bomb, `--timeout`, `--trace`, `--fs-limit`, stdin
+from a pipe, stdout to a file, a terminal through script(1)) ran under a
+learning variant (`HELLOVM_SEATBELT_LEARN=1`, a test-hooks build) that
+denies without killing, and the denials were read from the unified log
+until there were none and every run matched its `--sandbox off` output.
+`(version 3)` and `(deny default)`, then:
+
+| Rule | Why |
+|---|---|
+| `file-read-data`, `file-read-metadata`, `file-test-existence` beneath the image (`(subpath (param "IMAGE"))`, its canonical path) | the image: lookups walk it with `openat`/`fstatat`/`readlinkat` from the directory fd; a missing name is a test for existence |
+| `system-info` `vfs.disk-space` | listing an image directory: `opendir` checks the file system's flags (`fstatfs`) |
+| `system-fcntl` `F_GETFD`, `F_SETFD` | close-on-exec of the image fds |
+| `file-ioctl` `TIOCSETA` | restoring the host terminal's settings at exit (they and the window size were read before) |
+| `process-info-setcontrol` of itself | naming its own threads (`hellovm-stdin`) |
+| `syscall-unix`: `write`, `ioctl`; `read`, `pread`, `fstat64`, `fstatat64`, `fstatfs64`, `getdirentries64`, `readlinkat`; `mmap`, `munmap`, `mprotect`, `madvise`; `bsdthread_create`, `bsdthread_terminate`, `thread_selfid`, `__disable_threadsignal`, `sigaltstack`; `psynch_cvbroad`, `psynch_cvsignal`, `psynch_cvwait`, `ulock_wait`, `ulock_wake` | stdio and the terminal; reading the image; memory; the stdin reader and `--timeout` watchdog threads; locks between them |
+| `syscall-mach`: `_kernelrpc_mach_vm_map_trap`, `_kernelrpc_mach_vm_deallocate_trap`, `_kernelrpc_mach_vm_protect_trap`, `mach_vm_reclaim_update_kernel_accounting_trap` | memory (`malloc`) |
+| any other `syscall-unix`, `syscall-mach` or `syscall-mig`: `(deny ... (with send-signal SIGKILL))` | a system call or Mach trap outside the lists kills the process, as seccomp does on Linux |
+
+Everything else is denied: every other file (read, write, create,
+metadata), every network operation, process creation and `exec`,
+signals to other processes, `process-info` of other processes, every
+Mach service lookup and IOKit user client, every sysctl, POSIX IPC. No
+Mach message trap is allowed at all (`mach_msg2_trap` is not on the
+list), so the process cannot talk to any Mach service or call any MIG
+kernel routine, `task_for_pid` and `task_name_for_pid` (Mach traps) kill
+it, and so does `sysctl`. To keep it that way the `--timeout` watchdog
+does not use `thread::sleep`: `nanosleep` asks the kernel's clock service
+through Mach IPC, a timed condition variable wait does not. The self-check
+at start-up (`/` cannot be opened) is silenced in the log with a rule of
+its own, `(with no-report)`; because of that rule it shows that a
+profile was entered, not that the profile denies by default. A unit test
+pins the operations the profile allows.
+
+*Does a guest-chosen path reach the host?* Only as plain names relative to
+the image's directory fd (see *Image directory* above: every component
+checked, `O_NOFOLLOW` everywhere, symlinks never followed on the host).
+File access cannot be narrowed to descriptors opened before the profile
+is entered, because Seatbelt checks the path each `openat` resolves to,
+not the directory fd it starts from, and the guest can name any file of
+its image; so the profile allows reading beneath the image's canonical
+path and nothing else. A hard link inside the image to a file outside it
+would be readable (the operator builds the image; the confined process
+cannot make links, nor write anywhere).
+
+*Hypervisor.framework inside the sandbox* needs nothing from the profile:
+measured with a test program, `hv_vm_create`, `hv_vcpu_create`,
+`hv_vm_map` and `hv_vcpu_run` work under `(deny default)` before or after
+the sandbox is entered (on Apple silicon they are hypervisor traps
+checked against the entitlement, not IOKit or Mach services, and
+Seatbelt's system call lists do not cover them). `hellovm` makes the VM
+and its vCPU first anyway, so that the profile never has to allow what
+creating them might need on another macOS release. The consequence: the
+confined process keeps the whole hypervisor interface. It can destroy its
+VM and create another, map any memory of its own into it and run code at
+EL1 there. It gains no memory it did not have (a VM maps only memory of
+the process that made it, and only one VM per process exists at a time),
+but the hypervisor's own code (in the macOS kernel and below it) is
+attack surface a compromised kernel process can reach, as KVM is on
+Linux. There is no way to give up the entitlement at run time.
+
+*What a compromised kernel process can still do:* read every file beneath
+the image directory; read stdin and write stdout and stderr (whatever the
+operator connected: a terminal, a pipe, a file) and change the terminal's
+settings (`TIOCSETA`); use its own memory, threads and the hypervisor as
+above; spend CPU and memory (macOS has no memory cgroup, and the platform's
+fixed pools bound the guest, not code running in the kernel process);
+make the system calls the kernel exempts from Seatbelt's
+system call lists. That exempt set is not documented; measured, it
+includes at least `open`, `openat`, `close`, `fcntl`, `kill`,
+`proc_info` and `exit`, which still go through their own checks (a file
+open outside the image fails with `EPERM`, `kill` of another process with
+`EPERM`, `proc_info` of another process with `EPERM`). What it cannot do,
+tested from inside the confined process (below): read or list a file or
+directory outside the image (an absolute path, a `..` path, `openat` with
+`..` from every fd it holds, the user's home, `/etc/passwd`), create or
+write any file (outside the image or in it), connect a TCP or Unix socket
+or send a UDP datagram, resolve a name, signal another process; and
+inherited fds and the environment are gone. Enforced by the profile but
+*not* tested from inside: process creation (`fork`, `posix_spawn`,
+`exec`), task ports (`task_for_pid`, `task_name_for_pid`), `ptrace` and
+`proc_pidinfo` of other processes, sysctls, IOKit, Mach service lookups,
+and what the hypervisor allows (a second VM while one exists fails with
+`HV_BUSY`; destroying the VM and making another works). These attempts
+were in the first version of the test and each behaved as described
+when run by hand one at a time, but two runs of the whole test file
+(attempts in parallel) on macOS 27.2 (Darwin 27.2.0, M3 Max) coincided
+with kernel panics of the host ("Kernel data abort" in `kernel_task`, no
+kernel extension in the backtrace), and it is not known which attempt,
+or which combination, caused them. They were removed from the test hook;
+the tests that remain run one at a time whatever `--test-threads` says
+(a lock in the test process and a lock file between the two test
+binaries) and log each step to `kernel/target/hvf-test-steps.log`
+(synced) before it starts.
+
+*Not covered:* bugs in the macOS kernel reachable through the allowed and
+exempt system calls, and in the hypervisor; denial of service (CPU,
+memory, filling the disk through a stdout the operator redirected to a
+file; `RLIMIT_FSIZE` is not set because it would cut off legitimate
+output, and the profile lets the process write no other file); a hard
+link the operator put in the image; side channels.
+
+*Deprecated and undocumented interfaces relied on.* The SDK's
+`sandbox.h` declares only `sandbox_init` with a named profile and marks
+it deprecated ("No longer supported", macOS 10.8). `sandbox_init_with_parameters`
+(an SBPL string with parameters) is exported by `libsystem_sandbox` but
+declared in no header; `hellovm` looks it up with `dlsym`, so a macOS
+without it still runs `hellovm`, and `--sandbox require` refuses to start
+there. SBPL itself is undocumented; `(version 3)`, `syscall-unix`,
+`syscall-mach`, `syscall-mig`, `machtrap-number`, `(with send-signal
+SIGKILL)` and `(with no-report)` are what Apple's own profiles use
+(`/System/Library/Sandbox/Profiles`, e.g. `com.apple.mtlcompilerservice.sb`).
+If Apple removes the function or rejects the profile, the Seatbelt layer
+fails and `require` refuses (tested by a hook that hands Seatbelt a
+profile it rejects). If Apple kept accepting the profile but stopped
+enforcing part of it, nothing at start-up would notice: the self-check
+(`/` is not readable) only fails when no profile is in force at all.
+Only the tests would show it. Rerun them after a macOS update.
+
+*Violations* are reported by the kernel to the unified log, one line per
+operation and target. Do not rely on it: a denial reported recently is
+counted, not reported again, and after the tests' burst of denials the
+log showed none from `hellovm` (any operation, any path, a renamed or
+re-signed copy too) for the rest of the more than 15 minutes it was
+watched, while other processes' denials still appeared. Why is not
+known (a limit on reports per program would explain it; this was not
+confirmed), and the test of the log is not run by default for that
+reason. So the log shows what was denied, not every denial, and its
+absence proves nothing:
+
+```sh
+log show --last 10m --predicate 'sender == "Sandbox" AND eventMessage CONTAINS "hellovm("'
+```
+
+```text
+kernel: (Sandbox) Sandbox: hellovm(4242) deny(1) file-test-existence /etc/passwd
+```
+
+A killed kernel process (a system call outside the lists) shows up there
+as `deny(1) syscall-unix NUMBER` and exits with `SIGKILL` (status 137).
+
+*Compared with Linux, line by line:*
+
+| Linux | macOS |
+|---|---|
+| Inherited fds: `close_range` | the same, by listing fds with `proc_pidinfo` |
+| Namespaces (user, mount, network, IPC; empty root) | none on macOS; the Seatbelt profile's file and network rules take their place |
+| Resource limits: core 0, nofile 4096, memlock 0, msgqueue 0 | core 0, nofile 256, nproc 1 (no processes to make, see above); no memlock or message queue limits (the profile denies `mlock` and POSIX IPC) |
+| `no_new_privs` | nothing to do: the process cannot `exec` at all |
+| Landlock: read the image only, no TCP, scoped signals | Seatbelt: read the image only, no network at all (TCP, UDP, Unix, name resolution), no signals to others, no Mach services |
+| Not dumpable | `RLIMIT_CORE` 0 and `PT_DENY_ATTACH` (no core dump, no debugger attaching); other processes of the user cannot get its task port without a debugger's rights in any case |
+| Seccomp allowlist with argument checks, measured | Seatbelt's `syscall-unix` and `syscall-mach` lists, measured, by number only (no argument checks), with an undocumented set of calls exempt; the operation rules (files, `fcntl`, `ioctl`, `process-info`) check some arguments |
+| Seccomp's instruction-pointer trick for stacked app filters | not needed: app processes are not host processes |
+| Environment kept | cleared |
+| Egress socket allowed | no egress on macOS yet |
+
+*Cost.* The hardening runs once at start-up: a few `setrlimit`s, the
+environment, `PT_DENY_ATTACH`, compiling and entering the profile, and
+the self-check. A guest's system call is a VM exit handled inside the
+kernel process and never becomes a host system call, so the hot path
+does not pass through Seatbelt; the host system calls the kernel process
+makes on behalf of a guest (reading the image, writing stdout) are each
+checked against the profile's lists. Measured on the M3 Max (release
+build, through the command line, wall clock, best of 10, three runs):
+starting `hellovm` and running the hello world takes 5.8 ms with
+`--sandbox off` and 11.2 to 11.8 ms with `--sandbox require`; a `getpid`
+round trip (`getpid_loop`, 1,000,000 calls minus 0, best of 5) takes 977
+to 980 ns either way.
 
 ## Warm clones
 
