@@ -969,7 +969,10 @@ kernel routine, `task_for_pid` and `task_name_for_pid` (Mach traps) kill
 it, and so does `sysctl`. To keep it that way the `--timeout` watchdog
 does not use `thread::sleep`: `nanosleep` asks the kernel's clock service
 through Mach IPC, a timed condition variable wait does not. The self-check
-of `/` is silenced in the log with `(with no-report)`.
+at start-up (`/` cannot be opened) is silenced in the log with a rule of
+its own, `(with no-report)`; because of that rule it shows that a
+profile was entered, not that the profile denies by default. A unit test
+pins the operations the profile allows.
 
 *Does a guest-chosen path reach the host?* Only as plain names relative to
 the image's directory fd (see *Image directory* above: every component
@@ -1027,8 +1030,10 @@ when run by hand one at a time, but two runs of the whole test file
 with kernel panics of the host ("Kernel data abort" in `kernel_task`, no
 kernel extension in the backtrace), and it is not known which attempt,
 or which combination, caused them. They were removed from the test hook;
-the tests that remain run one at a time (`--test-threads=1`) and log
-each step to `kernel/target/p1c-progress.log` (synced) before it starts.
+the tests that remain run one at a time whatever `--test-threads` says
+(a lock in the test process and a lock file between the two test
+binaries) and log each step to `kernel/target/hvf-test-steps.log`
+(synced) before it starts.
 
 *Not covered:* bugs in the macOS kernel reachable through the allowed and
 exempt system calls, and in the hypervisor; denial of service (CPU,
@@ -1050,18 +1055,20 @@ SIGKILL)` and `(with no-report)` are what Apple's own profiles use
 If Apple removes the function or rejects the profile, the Seatbelt layer
 fails and `require` refuses (tested by a hook that hands Seatbelt a
 profile it rejects). If Apple kept accepting the profile but stopped
-enforcing part of it, only the self-check (`/` is not readable) would
-notice; the system call lists would silently stop working. Rerun the
-tests after a macOS update.
+enforcing part of it, nothing at start-up would notice: the self-check
+(`/` is not readable) only fails when no profile is in force at all.
+Only the tests would show it. Rerun them after a macOS update.
 
 *Violations* are reported by the kernel to the unified log, one line per
-operation and target. Reporting is best effort: a denial reported
-recently is counted, not reported again, and after the tests' burst of
-denials the kernel reported none from `hellovm` (any operation, any
-path, a renamed or re-signed copy too) for the rest of the more than 15
-minutes it was watched, while other processes' denials still appeared.
-So the log shows what was denied, not every denial, and its absence
-proves nothing:
+operation and target. Do not rely on it: a denial reported recently is
+counted, not reported again, and after the tests' burst of denials the
+log showed none from `hellovm` (any operation, any path, a renamed or
+re-signed copy too) for the rest of the more than 15 minutes it was
+watched, while other processes' denials still appeared. Why is not
+known (a limit on reports per program would explain it; this was not
+confirmed), and the test of the log is not run by default for that
+reason. So the log shows what was denied, not every denial, and its
+absence proves nothing:
 
 ```sh
 log show --last 10m --predicate 'sender == "Sandbox" AND eventMessage CONTAINS "hellovm("'

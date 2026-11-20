@@ -356,8 +356,12 @@ pub fn enter(profile: &str, params: &[(&str, &[u8])]) -> Result<(), String> {
     Err(format!("sandbox_init_with_parameters: {message}"))
 }
 
-/// Checks from inside that the profile holds: a directory outside the
-/// image cannot be opened.
+/// Checks from inside that a profile is in force: `/` cannot be opened.
+/// This shows that the sandbox was entered, no more: the profile denies
+/// `/` with a rule of its own (so that the check is not reported), so it
+/// does not show that everything else is denied by default. What the
+/// profile allows is pinned by the tests of `seatbelt`, and what it
+/// refuses in a running process by `hellovm/tests/hvf_hardening.rs`.
 fn verify() -> Result<(), String> {
     // SAFETY: open with a valid C string.
     let fd = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };

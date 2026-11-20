@@ -9,9 +9,10 @@
 //! they would work otherwise. Only files, sockets, name resolution and
 //! signals are tried: see `fence_macos.rs` for what was removed and why.
 //!
-//! Run these one at a time (`-- --test-threads=1`); the tests are named
-//! in the order to run them, mildest first. Before every attempt the test
-//! appends a line to `kernel/target/p1c-progress.log` and syncs it.
+//! The tests run one at a time, whatever `--test-threads` says
+//! (`hvf_support::serial`), and are named mildest first. Before every
+//! attempt the test appends a line to `kernel/target/hvf-test-steps.log`
+//! and syncs it.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
@@ -124,6 +125,7 @@ fn run(exe: &Path, root: &Path, mode: &str, argv: &[&str], env: &[(&str, &str)])
 /// but the program's own output (no warning) in every mode.
 #[test]
 fn s1_hello_world_under_require() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -154,6 +156,7 @@ fn s1_hello_world_under_require() {
 /// or inside it) are refused.
 #[test]
 fn s2_files_outside_the_image_are_refused() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -188,6 +191,7 @@ fn s2_files_outside_the_image_are_refused() {
 /// the listeners.
 #[test]
 fn s3_sockets_are_refused() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -223,6 +227,7 @@ fn s3_sockets_are_refused() {
 /// lives on; unconfined, it ends it.
 #[test]
 fn s4_signals_are_refused() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -245,6 +250,7 @@ fn s4_signals_are_refused() {
 /// confined process; the debug log lists every layer as active.
 #[test]
 fn s5_fds_environment_and_layers() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -296,6 +302,7 @@ fn s5_fds_environment_and_layers() {
 /// confined.
 #[test]
 fn s6_require_fails_when_the_sandbox_cannot_be_entered() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -326,6 +333,7 @@ fn s6_require_fails_when_the_sandbox_cannot_be_entered() {
 /// process runs the program as the console and restores the terminal.
 #[test]
 fn s7_a_terminal_works_under_require() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -352,13 +360,17 @@ fn s7_a_terminal_works_under_require() {
 /// Step 8: a denial in the confined process reaches the unified log, where
 /// an operator sees it with
 /// `log show --predicate 'sender == "Sandbox" AND eventMessage CONTAINS "hellovm("'`.
-/// The kernel limits Sandbox reports: after the burst of denials the other
-/// tests cause, it reported none from hellovm for more than 15 minutes.
-/// Run this one alone, long after the others:
+/// Not run by default because it does not pass reliably, for a reason
+/// that is not known: it passed in the first run, and after the denials
+/// the other tests cause, the log showed none from hellovm for the more
+/// than 15 minutes it was watched. The kernel limiting Sandbox reports
+/// would explain that, but this was not confirmed. Try it alone, long
+/// after the others:
 /// `cargo test -p hellovm --test hvf_hardening -- --ignored s8`.
 #[test]
-#[ignore = "Sandbox reports are rate-limited: run it alone"]
+#[ignore = "denials stopped reaching the log after the other tests; cause unknown"]
 fn s8_denials_reach_the_unified_log() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -456,6 +468,7 @@ fn same_under_require(argv: &[&str], status: i32, expected: &str) {
 /// Step 9: the busybox pipeline of `platform-hvf/tests/guests.rs`.
 #[test]
 fn s9a_busybox_pipeline_under_require() {
+    let _serial = hvf_support::serial();
     same_under_require(
         &[
             "/bin/sh",
@@ -474,6 +487,7 @@ fn s9a_busybox_pipeline_under_require() {
 /// Step 9: CPython with files and `subprocess`.
 #[test]
 fn s9b_python_under_require() {
+    let _serial = hvf_support::serial();
     let script = r#"
 import os, sys, json, hashlib, subprocess, tempfile
 d = tempfile.mkdtemp()
@@ -501,6 +515,7 @@ print("python child of", out.stdout.strip())
 /// threads), each its own run.
 #[test]
 fn s9c_c_guests_under_require() {
+    let _serial = hvf_support::serial();
     for (argv, status, expected) in [
         (
             &["/guests/smoke", "one", "two words"][..],
@@ -529,6 +544,7 @@ fn s9c_c_guests_under_require() {
 /// the watchdog thread.
 #[test]
 fn s9d_fork_bomb_and_timeout_under_require() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };

@@ -1,5 +1,5 @@
-//! What the HVF command-line tests share: the `hellovm` binary signed
-//! with the hypervisor entitlement (as `kernel/platform-hvf/sign-and-run.sh`
+//! What the HVF command-line tests share: a copy of the `hellovm` binary
+//! signed with the hypervisor entitlement (as `kernel/platform-hvf/sign-and-run.sh`
 //! signs test binaries), images, and the guest image of
 //! `kernel/platform-hvf/build-guests.sh`. Without the entitlement, or the
 //! guests, the tests skip, unless `HELLOVM_REQUIRE_E2E=1`.
@@ -14,7 +14,13 @@ pub fn hellovm() -> Option<&'static Path> {
     static SIGNED: OnceLock<Option<PathBuf>> = OnceLock::new();
     SIGNED
         .get_or_init(|| {
-            let exe = PathBuf::from(env!("CARGO_BIN_EXE_hellovm"));
+            let Some(exe) = copy_to_sign() else {
+                if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") {
+                    panic!("HELLOVM_REQUIRE_E2E=1 but hellovm could not be copied");
+                }
+                eprintln!("SKIPPING: hellovm could not be copied to sign it");
+                return None;
+            };
             // Empty when this Mac lacks the tools to build the guests.
             if hellovm_test_guest::HELLO.is_empty() {
                 if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") {
@@ -42,6 +48,21 @@ pub fn hellovm() -> Option<&'static Path> {
             None
         })
         .as_deref()
+}
+
+/// A copy of the `hellovm` binary to sign, `kernel/target/hvf-signed/hellovm`.
+/// Not the binary cargo built: every cargo invocation puts the unsigned
+/// one back in its place, also while another test process is running
+/// its signed one. The copy is replaced (a rename) by each test process,
+/// under the lock of `serial`, so never while a test runs it.
+fn copy_to_sign() -> Option<PathBuf> {
+    let dir = target_dir().join("hvf-signed");
+    std::fs::create_dir_all(&dir).ok()?;
+    let fresh = dir.join(format!("hellovm.{}", std::process::id()));
+    std::fs::copy(env!("CARGO_BIN_EXE_hellovm"), &fresh).ok()?;
+    let exe = dir.join("hellovm");
+    std::fs::rename(&fresh, &exe).ok()?;
+    Some(exe)
 }
 
 /// Runs the hello world once to see whether the signed binary may use the
@@ -80,34 +101,98 @@ pub fn guest_image() -> Option<PathBuf> {
     }
 }
 
-/// Appends `what` to `kernel/target/p1c-progress.log` and syncs it to disk
-/// before the caller starts the step, so that if the host goes down the
-/// last line names what was running. (Two runs of these tests coincided
-/// with kernel panics of the host; see README, "Hardening".)
-pub fn progress(what: &str) {
-    use std::io::Write;
-    static DIR_SYNCED: OnceLock<()> = OnceLock::new();
+/// The step log: `kernel/target/hvf-test-steps.log`.
+const STEP_LOG: &str = "hvf-test-steps.log";
+/// Past this size the step log is moved aside (`.old`) and started anew.
+const STEP_LOG_MAX: u64 = 1 << 20;
+
+fn target_dir() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("p1c-progress.log");
-    let line = format!(
-        "{:?} pid {} {what}\n",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default(),
-        std::process::id()
-    );
+    dir
+}
+
+/// Held by a test while it runs.
+pub struct Serial {
+    _process: std::sync::MutexGuard<'static, ()>,
+    /// Closing it releases the lock between processes.
+    _file: Option<std::fs::File>,
+}
+
+/// One test with a VM at a time, whatever `--test-threads` says and
+/// however many test binaries cargo starts: a lock in this process and a
+/// lock file under `kernel/target` between processes (`hvf_cli` and
+/// `hvf_hardening` are separate binaries). Every test here takes it first.
+/// Two runs of an earlier version of these tests, in parallel, coincided
+/// with kernel panics of the host (README, "Hardening").
+pub fn serial() -> Serial {
+    use std::os::fd::AsRawFd;
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that failed while it held the lock leaves nothing to repair.
+    let process = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let path = target_dir().join("hvf-tests.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    loop {
+        // SAFETY: flock on an fd this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        // Without the lock the tests must not run side by side.
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "locking {}: {err}",
+            path.display()
+        );
+    }
+    Serial {
+        _process: process,
+        _file: Some(file),
+    }
+}
+
+/// Appends `what` to the step log and syncs it to disk before the caller
+/// starts the step, so that if the host goes down the last line names
+/// what was running. The first line a test process writes says that a
+/// new run starts there.
+pub fn progress(what: &str) {
+    use std::io::Write;
+    static STARTED: OnceLock<()> = OnceLock::new();
+    let dir = target_dir();
+    let path = dir.join(STEP_LOG);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let pid = std::process::id();
+    let mut text = String::new();
+    let first = STARTED.set(()).is_ok();
+    if first {
+        if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > STEP_LOG_MAX) {
+            let _ = std::fs::rename(&path, dir.join(format!("{STEP_LOG}.old")));
+        }
+        let exe = std::env::current_exe().unwrap_or_default();
+        let name = exe.file_name().unwrap_or_default().to_string_lossy();
+        text = format!("{now:?} pid {pid} ---- run starts: {name}\n");
+    }
+    text.push_str(&format!("{now:?} pid {pid} {what}\n"));
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = file.write_all(line.as_bytes());
+        // One write, so that lines of two processes do not interleave.
+        let _ = file.write_all(text.as_bytes());
         let _ = file.sync_all();
     }
-    DIR_SYNCED.get_or_init(|| {
+    if first {
         if let Ok(dir) = std::fs::File::open(&dir) {
             let _ = dir.sync_all();
         }
-    });
+    }
 }

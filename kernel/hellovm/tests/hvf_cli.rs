@@ -2,7 +2,8 @@
 //! platform): a program's output and exit status come through, and
 //! `--timeout` stops a program that never makes a syscall. Every run is
 //! hardened (`--sandbox require`); `hvf_hardening.rs` tests the hardening
-//! itself. See `hvf_support` for signing and skipping.
+//! itself. See `hvf_support` for signing, skipping, and why the tests run
+//! one at a time.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
@@ -28,6 +29,7 @@ fn run(exe: &Path, name: &str, guest: &str, extra: &[&str]) -> Output {
 
 #[test]
 fn hello_world_through_the_command_line() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -45,6 +47,7 @@ fn hello_world_through_the_command_line() {
 
 #[test]
 fn timeout_stops_a_spinning_program() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -57,6 +60,7 @@ fn timeout_stops_a_spinning_program() {
 
 #[test]
 fn unsupported_options_are_refused() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
@@ -82,6 +86,7 @@ fn unsupported_options_are_refused() {
 /// through the signed command line.
 #[test]
 fn shell_pipeline_and_python_through_the_command_line() {
+    let _serial = hvf_support::serial();
     let Some(exe) = hellovm() else {
         return;
     };
