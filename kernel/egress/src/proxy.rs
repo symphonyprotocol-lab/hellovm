@@ -96,7 +96,7 @@ impl Config {
 /// Who a flow is counted against. The sandbox id in the header is whatever
 /// the connecting process wrote, so it cannot be the only key: a kernel
 /// process that a guest took over could send a new id with every flow. The
-/// peer's process id comes from the host kernel (`SO_PEERCRED`) and cannot
+/// peer's process id comes from the host kernel (`SO_PEERCRED`, `LOCAL_PEERPID`) and cannot
 /// be chosen, and one kernel process serves one sandbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Owner {
