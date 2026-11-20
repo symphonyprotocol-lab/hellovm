@@ -50,8 +50,10 @@
 //! On macOS (`macos`, `seatbelt`) the layers are: inherited fds closed,
 //! resource limits (including `RLIMIT_NPROC` 1), the environment cleared,
 //! `PT_DENY_ATTACH`, and a Seatbelt profile the process enters itself:
-//! reading the image is the only file access, no network, no processes,
-//! no Mach IPC, and system call and Mach trap allowlists. All are required
+//! reading the image is the only file access, no network (with
+//! `--egress`, connecting to the egress socket's path is the one
+//! exception), no processes, no Mach IPC, and system call and Mach trap
+//! allowlists. All are required
 //! for `--sandbox=require`. See README, "Hardening".
 
 #[cfg(target_os = "linux")]

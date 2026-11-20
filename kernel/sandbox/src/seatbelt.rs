@@ -58,6 +58,23 @@ const RULES: &str = r#"
     MSC_mach_vm_reclaim_update_kernel_accounting_trap))
 "#;
 
+/// With `--egress`: the outbound streams' I/O thread (`hellovm-host`,
+/// `stream_poll.rs`) connects Unix stream sockets to the proxy's socket,
+/// a parameter, and to nothing else. `connect` looks the path up first
+/// (`file-test-existence`). The rules name the path, not a file: a proxy
+/// that restarts and binds a new socket there is reached again. Making a
+/// socket is not checked by Seatbelt for any domain, but connecting one
+/// anywhere else is `network-outbound`, denied by default, and `sendto`
+/// (datagrams) is not in the system call list; name resolution would
+/// need Mach IPC. Measured by `tests/seatbelt_network.rs`.
+const EGRESS_RULES: &str = r#"
+;; --egress: Unix stream sockets, non-blocking, to the proxy's path only.
+(allow file-test-existence network-outbound (literal (param "EGRESS")))
+(allow system-fcntl (fcntl-command F_SETFL))
+(allow syscall-unix (syscall-number
+    SYS_socket SYS_connect SYS_shutdown SYS_poll))
+"#;
+
 /// `apply` checks that `/` cannot be opened: not worth a report. Because
 /// of this rule the check passes whatever the rest of the profile says;
 /// it shows that the profile was entered, not that it denies by default.
@@ -66,10 +83,15 @@ const SELF_CHECK: &str = "(deny file-read* file-test-existence (literal \"/\") (
 /// A system call outside the three lists kills the process.
 const KILL: &str = "(deny syscall-unix syscall-mach syscall-mig (with send-signal SIGKILL))\n";
 
-pub fn profile(kind: Kind) -> String {
+/// The profile; `egress`: with the rules for `--egress` (the `EGRESS`
+/// parameter must then be given).
+pub fn profile(kind: Kind, egress: bool) -> String {
+    let egress = if egress { EGRESS_RULES } else { "" };
     match kind {
-        Kind::Enforce => format!("(version 3)\n(deny default)\n{RULES}\n{SELF_CHECK}{KILL}"),
-        Kind::Learn => format!("(version 3)\n(deny default)\n{RULES}"),
+        Kind::Enforce => {
+            format!("(version 3)\n(deny default)\n{RULES}{egress}\n{SELF_CHECK}{KILL}")
+        }
+        Kind::Learn => format!("(version 3)\n(deny default)\n{RULES}{egress}"),
     }
 }
 
@@ -117,7 +139,7 @@ mod tests {
             "syscall-mach",
         ];
         for kind in [Kind::Enforce, Kind::Learn] {
-            let text = profile(kind);
+            let text = profile(kind, false);
             assert_eq!(allowed(&text), expected, "{kind:?}");
             assert_eq!(rule_count(&text), 7, "{kind:?}");
             assert!(
@@ -147,11 +169,72 @@ mod tests {
         }
     }
 
+    /// With `--egress`, exactly the egress rules are added, after the
+    /// others: the one path (a parameter) and four system calls.
+    #[test]
+    fn egress_adds_the_egress_socket_and_nothing_else() {
+        for kind in [Kind::Enforce, Kind::Learn] {
+            let without = profile(kind, false);
+            let with = profile(kind, true);
+            assert!(!without.contains("EGRESS"), "{kind:?}");
+            assert!(!without.contains("SYS_socket"), "{kind:?}");
+            assert!(!without.contains("SYS_connect"), "{kind:?}");
+            assert!(!without.contains("SYS_poll"), "{kind:?}");
+            assert!(!without.contains("F_SETFL"), "{kind:?}");
+            assert_eq!(with.replacen(EGRESS_RULES, "", 1), without, "{kind:?}");
+            assert_eq!(
+                allowed(EGRESS_RULES),
+                [
+                    "file-test-existence",
+                    "network-outbound",
+                    "system-fcntl",
+                    "syscall-unix"
+                ]
+            );
+            assert_eq!(rule_count(&with), 10, "{kind:?}");
+            let rules: String = EGRESS_RULES
+                .lines()
+                .map(|line| line.split(";;").next().unwrap_or_default())
+                .collect();
+            assert_eq!(rules.matches("(param ").count(), 1);
+            assert_eq!(rules.matches("(literal (param \"EGRESS\"))").count(), 1);
+            assert!(!rules.contains('/'));
+            for never in [
+                "network*",
+                "network-bind",
+                "network-inbound",
+                "(remote",
+                "(subpath",
+                "(regex",
+                "system-socket",
+                "SYS_sendto",
+                "SYS_sendmsg",
+                "SYS_bind",
+                "SYS_listen",
+                "SYS_accept",
+                "mach",
+            ] {
+                assert!(!rules.contains(never), "{never}");
+            }
+            let calls: Vec<&str> = rules
+                .split("(syscall-number")
+                .nth(1)
+                .unwrap()
+                .split(|c: char| c.is_whitespace() || c == ')')
+                .filter(|w| !w.is_empty())
+                .collect();
+            assert_eq!(
+                calls,
+                ["SYS_socket", "SYS_connect", "SYS_shutdown", "SYS_poll"]
+            );
+        }
+    }
+
     /// Files are allowed only under the image, and it is a parameter: no
     /// path is written into the profile.
     #[test]
     fn files_are_allowed_only_under_the_image() {
-        let text = profile(Kind::Enforce);
+        let text = profile(Kind::Enforce, false);
         assert_eq!(text.matches("(subpath ").count(), 1);
         assert_eq!(text.matches("(subpath (param \"IMAGE\"))").count(), 1);
         assert_eq!(text.matches("(param ").count(), 1);
@@ -166,10 +249,10 @@ mod tests {
     /// comes last; learning does not kill.
     #[test]
     fn only_enforcing_kills() {
-        let enforce = profile(Kind::Enforce);
+        let enforce = profile(Kind::Enforce, false);
         assert!(enforce.ends_with(KILL));
         assert!(enforce.contains(SELF_CHECK));
-        let learn = profile(Kind::Learn);
+        let learn = profile(Kind::Learn, false);
         assert!(!learn.contains("SIGKILL"));
         assert!(!learn.contains("(deny file-read*"));
     }
