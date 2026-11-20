@@ -382,8 +382,9 @@ virtual machine of Hypervisor.framework (`kernel/platform-hvf`). Since
 milestone P1b it runs processes: `fork` with copy-on-write, `execve`,
 `vfork`, shared memory and dynamically linked programs, so a busybox
 shell runs pipelines and CPython runs scripts that start subprocesses.
-Everything runs on one vCPU. The same kernel core handles every system
-call; only the platform differs.
+Since P1d the threads of a program run in parallel on several vCPUs
+(`--vcpus`, by default one per host CPU, at most 8). The same kernel
+core handles every system call; only the platform differs.
 
 **How it works.** The program runs at EL0 of a VM that has no guest kernel.
 At EL1 there is only a shim: a 4 KiB page whose 16 exception vectors are
@@ -400,17 +401,42 @@ and page number the kernel process put in `x0`, whose value it saved in
 `TPIDR_EL1` for the routine to restore). hellovm writes the program's
 page tables itself; the VM never does.
 
-The vCPU belongs to the kernel's event-loop thread and runs inside the
-platform's `wait`; tasks (every thread of every process) are register
-contexts multiplexed on it. The runnable task that has spent the least
-time in the vCPU runs next, so a process that mostly waits for a pipe or
-a child runs as soon as it can. While another task is runnable, a task
-runs for one 5 ms slice at most: the guest's virtual timer ends the
-slice, so a program that never makes a system call cannot keep the
-others from running. A task that becomes runnable starts at most one
-slice behind the others' least run time, so time spent waiting gives no
-claim on the vCPU later. A `wait` timeout is the same timer; a waker or
-`--timeout` calls `hv_vcpus_exit` from another thread.
+**vCPUs and scheduling.** vCPU 0 belongs to the kernel's event-loop
+thread and runs inside the platform's `wait`, as the only vCPU did
+before P1d; each other vCPU has a host thread of its own (`hellovm-vcpuN`),
+made with the platform, before the kernel process hardens itself. Tasks
+(every thread of every process) are register contexts that the vCPUs
+take from one scheduler, behind one lock: the runnable task that has
+spent the least time in a vCPU runs next, so a process that mostly
+waits for a pipe or a child runs as soon as it can. A task runs for one
+5 ms slice at most (on a single vCPU: while another task is runnable):
+the guest's virtual timer ends the slice, so a program that never makes
+a system call cannot keep the others from running; a task keeps its
+slice across the system calls it makes in between. A task that becomes
+runnable starts at most one slice behind the others' least run time, so
+time spent waiting gives no claim on a vCPU later. A task's registers
+stay in the vCPU that last ran it until that vCPU runs another task, and
+until then only that vCPU runs it (a system call round trip then moves
+no registers); the core asking for the registers of such a task (signal
+delivery, `clone`) has the vCPU save them first. A task made runnable
+that vCPU 0 would run next is left to it (a system call round trip on
+vCPU 0 moves nothing between host threads); any other wakes the thread
+of the vCPU its registers are in, or one idle vCPU thread, and busy ones
+pick up work when their slice ends. What vCPU 0 would run next goes to
+another vCPU once it has waited 50 µs while the event loop handles other
+vCPUs' traps. An idle vCPU thread, and the event loop with nothing to
+run, poll for 50 µs before they sleep. A trap on another
+vCPU goes into a queue that `wait` returns from, and makes vCPU 0 leave
+the VM if it is running a task (`hv_vcpus_exit`), so that the event loop
+sees it at once; when `wait` returns, a runnable task whose registers are
+in vCPU 0 is saved, so that another vCPU can run it while the core does
+something else. No lock is held while a vCPU runs. `kill` (`exit_group`,
+`execve` of a sibling) and `interrupt` (a signal for a thread that makes
+no system call) of a task running on another vCPU kick that vCPU out of
+the VM, and `kill` waits until it has let go of the task. A `wait`
+timeout is the same timer as the slice; a waker or `--timeout` calls
+`hv_vcpus_exit` from another thread (for `--timeout`, on every vCPU).
+Address spaces that found no ASID (see below) run on vCPU 0 only.
 
 **The VM layout.**
 
@@ -508,8 +534,8 @@ allocates nothing beyond its pools and the core's bounded per-process
 state.
 
 Threads work too, because they need nothing beyond what `vfork` needs
-(the platform cannot tell the two apart): they share an address space
-and take turns on the one vCPU, so they never run in parallel.
+(the platform cannot tell the two apart): they share an address space,
+and run in parallel when there is more than one vCPU.
 
 **What keeps processes apart.** The stage-1 tables hellovm writes are the
 boundary between processes, so these are the invariants (each checked by
@@ -527,15 +553,39 @@ the tests below):
   entry can only be stale if the tables changed after it was cached, and
   every such change is recorded: a descriptor that goes, changes or
   points at another frame, or a table that is freed. Before the next
-  instruction of any program runs, the kernel process invalidates the
+  instruction of any program runs on any vCPU, that vCPU invalidates the
   whole TLB, or only that page's entries of that ASID when one page
   changed (a copy-on-write page that was written; making a page writable
   again needs it too, or the old read-only entry would fault once more).
   After `fork`, which made the parent's writable pages read only, the
   whole TLB goes. An ASID is reused only after its address space is gone,
   which freed its tables and so flushed the TLB. When no ASID is free,
-  new address spaces share ASID 0, and switching between two of them
-  flushes the whole TLB (correct, and as slow as the prototype was).
+  new address spaces share ASID 0, run on vCPU 0 only, and switching
+  between two of them flushes the whole TLB (correct, and as slow as the
+  prototype was).
+* With several vCPUs, other threads of a process may be running while
+  its tables change: a page fault on one vCPU (memory on first touch, a
+  copy-on-write copy), or the core's `mmap`, `munmap`, `mprotect`,
+  `write` into the process, `fork` or the end of the address space. The
+  tables and the frame and table pools are behind one lock, and a
+  change that left TLB entries stale adds the invalidation to every
+  vCPU's pending set and then makes every vCPU that is running that
+  address space leave the VM (`hv_vcpus_exit`, repeated until its run
+  count has moved), still holding the lock. A vCPU's run count is odd
+  from just before it takes its pending invalidations until
+  `hv_vcpu_run` returns; the pending ones are added before the counts are
+  read (both sequentially consistent), so every vCPU either takes them
+  before its next run or is seen running and waited for. The shim's
+  `tlbi ...is` reaches every CPU of the host, so the first vCPU to run
+  the space again cleans the TLB of every CPU, wherever the others run.
+  Because no other change gets the lock in between, no frame a stale
+  entry still reaches is handed out again before every vCPU that could
+  use it has left the VM and will invalidate first; and once `munmap`,
+  `mprotect` or `fork` returns, no thread of the process writes through
+  an entry the change made stale. Descriptors are written with single
+  64-bit stores, since a vCPU's table walk may read them at any time, and
+  app memory is copied in and out with raw copies (another vCPU may be
+  writing it), never through references.
 
 **What the program can and cannot touch.** The isolation boundary is the
 stage-2 mapping, which Hypervisor.framework enforces: the VM's whole
@@ -581,7 +631,9 @@ target/debug/hellovm --sandbox require --root /tmp/image /hello
 ```
 
 On the Mac, `hellovm --root DIR PROGRAM [ARGS...]` works with `--trace`,
-`--timeout`, `--env`, `--fs-limit`, `--tty`/`--no-tty` and `--sandbox
+`--timeout`, `--env`, `--fs-limit`, `--tty`/`--no-tty`, `--vcpus N` (1
+to 64, at most what Hypervisor.framework allows; by default one per host
+CPU, at most 8) and `--sandbox
 require|best-effort|off` (the kernel process confines itself with a
 Seatbelt profile, see **Hardening**). `--egress`, `--template` and
 `--clone` are refused. `hellovm-noded` and the API stay Linux-only.
@@ -596,7 +648,7 @@ the build prints a warning, and the tests that need the guests skip (or
 fail under `HELLOVM_REQUIRE_E2E=1`). Everything that needs a Linux libc
 comes from the dev container: `kernel/platform-hvf/build-guests.sh`
 builds the C guests of `kernel/test-guest/c` there (`smoke`, `pie`,
-`signals`, `threads`, `forks` statically, with the flags of
+`signals`, `threads`, `forks`, `smp` statically, with the flags of
 `test-guest/build.rs`, and `dynamic` linked dynamically) with the
 container's gcc and glibc, and assembles one image directory,
 `kernel/target/hvf-guests/root`: the guests under `/guests`, the
@@ -634,15 +686,32 @@ shared memory written by both sides, fork then `execve`, `vfork`,
 `posix_spawn`, a fork of a fork, 64 MiB copied, five children at once, a
 pipe between two children, and a child that never makes a system call
 next to a parent that must still run), `signals.c` (every check, its
-children and `vfork` included), `threads.c` (every check, on the one
-vCPU), `pie.c`, `dynamic.c` (its interpreter maps libc and libm), the C
+children and `vfork` included), `threads.c` (every check), `pie.c`, `dynamic.c` (its interpreter maps libc and libm), the C
 `smoke.c`, a busybox shell running pipelines of up to five processes, a
 loop, command substitution and a background job, CPython importing
 standard modules, computing, writing and reading files and running a
 shell and itself with `subprocess`, a fork bomb in a sandbox with 2 MiB
 of tables, which ends with `EAGAIN`, and a child that runs out of memory
 on a copy-on-write fault, which gets `SIGKILL` while its parent goes on.
-After every program the test checks that every frame and table (but the
+Threads in parallel, on 1, 2 and 4 vCPUs (`kernel/test-guest/c/smp.c`,
+`threads_in_parallel`): a `fork` while three threads write, whose child's
+copy must not change (the writers on other vCPUs held writable entries),
+20 times; `mprotect` to read only and `munmap` of a page another thread
+writes without a system call, after which no write may land and the
+writer must fault, and for `munmap` none of its writes may reach 256
+pages mapped next (where its frame may be reused), 20 rounds each; four
+threads writing every page of 64 copy-on-write pages at once after a
+`fork`, ten times, with no write lost, the child's copy unchanged, and a
+flag written after data on another copy-on-write page never seen before
+the data; futex ping-pong between two threads (20,000 rounds); `SIGUSR1`
+to a thread that spins without a system call (20 rounds); 300 system
+calls next to 16 spinning threads; `exit_group` from the main thread and
+from another thread while eight threads spin; `execve` while four spin;
+CPython's `threading` (eight threads, a lock, a queue); and a busybox
+pipeline. `cpu_work_scales_with_vcpus` checks that four threads of CPU
+work give the right sum and take less than 0.6 of the time on four vCPUs
+than on one. The whole platform suite runs with any vCPU count
+(`HELLOVM_HVF_VCPUS`). After every program the test checks that every frame and table (but the
 shim's) went back to its pool. On the platform alone: after `fork`, the
 parent stores through the writable entry its TLB held before the fork
 and the child does not see it, and 400 switches between the two read
@@ -652,8 +721,12 @@ reached through what the TLB held for the first; the core's write into a
 copy-on-write page whose read-only entry the program's TLB holds is what
 the program reads next; tasks sharing memory see each other's stores;
 two spinning tasks share the vCPU fairly while a third, making system
-calls, gets more than 1000 round trips in 500 ms; and when ASIDs run out
-each process still reads its own page. `mmu.rs` has unit tests for
+calls, gets more than 1000 round trips in 500 ms; when ASIDs run out
+each process still reads its own page; and a slice that ends while the
+vCPU is in an exception vector (on its way out with a page fault that
+needs nothing from the core) still ends the run (it did not before P1d:
+the run went on with no timer, and a program that kept touching new
+pages and then spun kept the vCPU until something else stopped it). `mmu.rs` has unit tests for
 reference counts, forks of forks, shared mappings, writes by the core,
 frames freed exactly once and pools exhausted in the middle of a `fork`
 (nothing is left half-copied), and a randomized test against a model: 3
@@ -674,7 +747,8 @@ not copying, `mprotect` making a shared frame writable) makes it fail. A test bi
 (not signed) prints `SKIPPING` and passes, unless
 `HELLOVM_REQUIRE_E2E=1`. Hypervisor.framework allows one VM per process,
 so the tests take turns. The same `forks.c` runs on the seccomp platform
-in `kernel/hellovm/tests/forks.rs` and prints the same lines.
+in `kernel/hellovm/tests/forks.rs`, and `smp.c` in
+`kernel/hellovm/tests/smp.rs`, and print the same lines.
 
 **Performance.** One system call round trip (the program's `svc` to the
 platform's next trap, with the trap reported to and answered by the
@@ -722,19 +796,73 @@ when every switch between processes flushes the whole TLB, as the
 prototype did; with ASIDs it takes 8 µs. A pipeline or a `fork` loop
 showed no difference.
 
+Several vCPUs (P1d), same Mac and method, measured on 2026-11-20 while
+the host had a load average of 4 to 6 from other work, so the `main`
+build (before P1d) was measured again alongside. CPU work scales with the
+vCPUs: `smp scale 8 50000000` (eight threads, each 50 million rounds of
+xorshift, best of 3) takes 606 ms on 1 vCPU, 311 ms on 2, 167 ms on 4
+and 84 ms on 8 (7.2 times faster), and four threads take 309 ms on 1
+vCPU and 83 ms on 4; the sums are the same. What crosses the core costs
+about the same or a little more (medians of five runs; the in-guest
+times are the guest's own clock):
+
+| | `main` (1 vCPU) | 1 vCPU | 2 vCPUs | 8 vCPUs |
+|---|---|---|---|---|
+| `getpid` through the command line | 946 ns | 969 ns | | 991 ns |
+| system call round trip, platform only (`syscall_round_trip`) | | 884 ns | | 906 ns |
+| `fork` + `exit` + `wait` | 31 µs | 31 µs | 38 µs | 40 µs |
+| `fork` with 256 MiB touched | 0.45 ms | 0.49 ms | 0.49 ms | 0.54 ms |
+| ... and the child writing all of it | 139 ms | 143 ms | 142 ms | 150 ms |
+| pipe round trip between two processes | 7.9 µs | 7.4 µs | 5.7 µs | 7.4 µs |
+| futex ping-pong between two threads | | 3.7 µs | 4.2 µs | 3.6 µs |
+| `getppid` from one thread (its main thread in `pthread_join`) | | 0.98 µs | 1.4 µs | 1.3 µs |
+| `getppid` from two threads at once, per call | | 1.85 µs | 1.57 µs | 1.66 µs |
+| `getppid` from four threads at once, per call | | 1.88 µs | 2.27 µs | 1.88 µs |
+| `hellovm ... /usr/bin/python3 -c pass` (best of 10) | 19.2 ms | 17.6 ms | | 18.1 ms |
+| `hellovm ... /bin/sh -c 'seq 1 20000 \| grep 7 \| sort -rn \| uniq \| head -3'` | 16.0 ms | 15.6 ms | | 12.7 ms |
+
+On one vCPU nothing measurably changed (a few tens of nanoseconds per
+system call for the locks and atomics). With more vCPUs a task that runs
+on a vCPU other than vCPU 0 pays a hop between host threads for each
+system call (about 0.4 µs, thanks to the idle threads polling for 50 µs
+before they sleep: without that, a pipe round trip took 18 µs), and
+system calls of several threads do not get faster in total, since one
+event loop handles them all. A `fork` costs about 7 µs more, as parent
+and child end up on different vCPUs.
+
 **What works, and what does not yet.** Static and dynamically linked
 aarch64 Linux programs, any number of processes: `fork`, `execve`,
 `vfork`, `posix_spawn`, `wait`, pipes between processes, signals between
 them, `MAP_SHARED` anonymous memory, file-backed private mappings of
 shared objects (the interpreter's relocations write copy-on-write pages
-and `mprotect` RELRO), busybox shells and CPython with `subprocess`.
-Threads run, one at a time. Not yet: more than one vCPU (threads in
-parallel); x86_64 programs (Rosetta is not used); memory returned to the
-host (the pools only grow to their high-water mark); warm clones;
-`AT_HWCAP2` (zero) and emulated `mrs` of
-ID registers (`HWCAP_CPUID` is not reported, so programs do not try).
-A process that writes a copy-on-write page when the pool is used up gets
-`SIGKILL` rather than an error.
+and `mprotect` RELRO), busybox shells and CPython with `subprocess`,
+threads in parallel on up to 64 vCPUs. Not yet: x86_64 programs
+(Rosetta is not used); memory returned to the host (the pools only grow
+to their high-water mark); warm clones; `AT_HWCAP2` (zero) and emulated
+`mrs` of ID registers (`HWCAP_CPUID` is not reported, so programs do not
+try). A process that writes a copy-on-write page when the pool is used
+up gets `SIGKILL` rather than an error.
+
+What several vCPUs do not do yet, or not well. The core is one event
+loop on one host thread: system calls of threads on different vCPUs are
+handled one at a time, so system-call-heavy threads do not scale (see
+**Performance**), and a thread that runs on a vCPU other than vCPU 0
+pays a hop between host threads per system call. Tasks have no affinity
+beyond keeping their registers in the last vCPU, and there is no load
+balancing beyond "an idle vCPU takes the task that has run least"; a
+task's slice is 5 ms on every vCPU. Address spaces beyond the ASIDs the
+vCPU has (255 on the M3) share ASID 0 and run on vCPU 0 only, so their
+threads do not run in parallel. A copy-on-write copy replaces a valid
+descriptor with another (a different frame) while other vCPUs may hold
+the old one, without the architecture's break-before-make sequence: the
+other vCPUs are made to leave the VM and invalidate right after, and
+the old frame stays valid memory of the other process until then, but
+a CPU could in principle report a TLB conflict abort in that window
+(none was seen; it would reach the program as `SIGSEGV`). App memory
+that another vCPU writes while the core reads it (a `write` system call
+from a buffer another thread is filling) is copied as it is at that
+moment, as on Linux. `--vcpus` does not limit how many host CPUs the VM
+uses at once beyond its own count; macOS schedules the vCPU threads.
 
 ## Hardening
 
@@ -891,10 +1019,11 @@ seven are.
 guest has taken over the kernel process (arbitrary code in it). The VM
 stays the first boundary (see **The HVF platform**); the kernel process
 is the second. Before the kernel reads any guest input, and once the
-image directory, the VM and its vCPU, `/dev/urandom` and the terminal's
+image directory, the VM and its vCPUs, `/dev/urandom` and the terminal's
 settings and window size are set up, `hellovm` applies the macOS layers
-of `kernel/sandbox` (`macos.rs`, `seatbelt.rs`), while the process still
-has one thread:
+of `kernel/sandbox` (`macos.rs`, `seatbelt.rs`), while the only other
+threads are the HVF platform's vCPU threads (made with the platform,
+idle, and reading no environment):
 
 | Layer | What it does | Required by `--sandbox require` |
 |---|---|---|
@@ -946,6 +1075,12 @@ from a pipe, stdout to a file, a terminal through script(1)) ran under a
 learning variant (`HELLOVM_SEATBELT_LEARN=1`, a test-hooks build) that
 denies without killing, and the denials were read from the unified log
 until there were none and every run matched its `--sandbox off` output.
+For several vCPUs (P1d) the same was done with 1, 2 and 8 of them over
+`smp.c` (every check, CPU work, `exit_group`, `execve`), `forks.c`,
+`threads.c`, `signals.c`, a busybox pipeline and CPython threads; then
+the same runs enforced. The first multi-vCPU run under the old profile
+was killed: libpthread traps (`EXC_BREAKPOINT`) when `psynch_mutexwait`
+fails, the first time the platform's mutex is contended.
 `(version 3)` and `(deny default)`, then:
 
 | Rule | Why |
@@ -955,8 +1090,8 @@ until there were none and every run matched its `--sandbox off` output.
 | `system-fcntl` `F_GETFD`, `F_SETFD` | close-on-exec of the image fds |
 | `file-ioctl` `TIOCSETA` | restoring the host terminal's settings at exit (they and the window size were read before) |
 | `process-info-setcontrol` of itself | naming its own threads (`hellovm-stdin`) |
-| `syscall-unix`: `write`, `ioctl`; `read`, `pread`, `fstat64`, `fstatat64`, `fstatfs64`, `getdirentries64`, `readlinkat`; `mmap`, `munmap`, `mprotect`, `madvise`; `bsdthread_create`, `bsdthread_terminate`, `thread_selfid`, `__disable_threadsignal`, `sigaltstack`; `psynch_cvbroad`, `psynch_cvsignal`, `psynch_cvwait`, `ulock_wait`, `ulock_wake` | stdio and the terminal; reading the image; memory; the stdin reader and `--timeout` watchdog threads; locks between them |
-| `syscall-mach`: `_kernelrpc_mach_vm_map_trap`, `_kernelrpc_mach_vm_deallocate_trap`, `_kernelrpc_mach_vm_protect_trap`, `mach_vm_reclaim_update_kernel_accounting_trap` | memory (`malloc`) |
+| `syscall-unix`: `write`, `ioctl`; `read`, `pread`, `fstat64`, `fstatat64`, `fstatfs64`, `getdirentries64`, `readlinkat`; `mmap`, `munmap`, `mprotect`, `madvise`; `gettimeofday`; `bsdthread_create`, `bsdthread_terminate`, `thread_selfid`, `__disable_threadsignal`, `sigaltstack`; `psynch_cvbroad`, `psynch_cvsignal`, `psynch_cvwait`, `ulock_wait`, `ulock_wake`; `psynch_mutexwait`, `psynch_mutexdrop`, `psynch_cvclrprepost`, `ulock_wait2` | stdio and the terminal; reading the image; memory; the wall clock (libc reads it from the commpage and makes the call only while the kernel updates it there: rare, and before P1d it killed the process when it happened); the stdin reader and `--timeout` watchdog threads; locks between them; the vCPU threads: the platform's mutex contended (libpthread traps when these fail), a timed condition variable wait that times out as another thread signals, a lock wait with a 64-bit timeout |
+| `syscall-mach`: `_kernelrpc_mach_vm_map_trap`, `_kernelrpc_mach_vm_deallocate_trap`, `_kernelrpc_mach_vm_protect_trap`, `mach_vm_reclaim_update_kernel_accounting_trap`; `_kernelrpc_mach_port_mod_refs_trap`, `_kernelrpc_mach_port_destruct_trap` | memory (`malloc`); a vCPU thread that ends when the platform goes (libpthread lets go of the thread's own port rights; neither trap can get a right the process does not hold) |
 | any other `syscall-unix`, `syscall-mach` or `syscall-mig`: `(deny ... (with send-signal SIGKILL))` | a system call or Mach trap outside the lists kills the process, as seccomp does on Linux |
 
 Everything else is denied: every other file (read, write, create,
@@ -991,8 +1126,11 @@ measured with a test program, `hv_vm_create`, `hv_vcpu_create`,
 the sandbox is entered (on Apple silicon they are hypervisor traps
 checked against the entitlement, not IOKit or Mach services, and
 Seatbelt's system call lists do not cover them). `hellovm` makes the VM
-and its vCPU first anyway, so that the profile never has to allow what
-creating them might need on another macOS release. The consequence: the
+and its vCPUs (and their threads) first anyway, so that the profile never
+has to allow what creating them might need on another macOS release; the
+confined process makes no thread and no vCPU of its own afterwards
+(`hv_vcpus_exit`, which other threads call to stop a vCPU, needs nothing
+either). The consequence: the
 confined process keeps the whole hypervisor interface. It can destroy its
 VM and create another, map any memory of its own into it and run code at
 EL1 there. It gains no memory it did not have (a VM maps only memory of
