@@ -129,3 +129,56 @@ fn unsupported_options_are_refused() {
         assert!(out.stdout.is_empty());
     }
 }
+
+/// The image `kernel/platform-hvf/build-guests.sh` assembles (busybox,
+/// CPython), from `HELLOVM_HVF_GUESTS`.
+fn guest_image() -> Option<PathBuf> {
+    match std::env::var_os("HELLOVM_HVF_GUESTS") {
+        Some(root) => Some(PathBuf::from(root)),
+        None if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
+            panic!("HELLOVM_REQUIRE_E2E=1 but HELLOVM_HVF_GUESTS is not set")
+        }
+        None => {
+            eprintln!("SKIPPING: set HELLOVM_HVF_GUESTS (see platform-hvf/build-guests.sh)");
+            None
+        }
+    }
+}
+
+/// A busybox shell pipeline and a CPython script that starts processes,
+/// through the signed command line.
+#[test]
+fn shell_pipeline_and_python_through_the_command_line() {
+    let Some(exe) = hellovm() else {
+        return;
+    };
+    let Some(root) = guest_image() else {
+        return;
+    };
+    let run = |argv: &[&str]| {
+        Command::new(exe)
+            .args(["--sandbox", "off", "--no-tty", "--root"])
+            .arg(&root)
+            .args(argv)
+            .output()
+            .unwrap()
+    };
+    let out = run(&[
+        "/bin/sh",
+        "-c",
+        "seq 1 1000 | grep 9 | sort -rn | head -2 | tr 9 n; echo $(ls /guests | wc -l) guests",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "nnn\nnn8\n6 guests\n",
+        "{out:?}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let out = run(&[
+        "/usr/bin/python3",
+        "-c",
+        "import subprocess; print(subprocess.check_output(['/bin/sh', '-c', 'echo $((6 * 7))'], text=True).strip())",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n", "{out:?}");
+    assert_eq!(out.status.code(), Some(0));
+}

@@ -378,10 +378,12 @@ Linux host.
 ## The HVF platform (macOS)
 
 On macOS on Apple silicon, `hellovm` runs aarch64 Linux programs in a
-virtual machine of Hypervisor.framework (`kernel/platform-hvf`). It is a
-prototype (milestone P1a): one process, with no `fork` and no threads
-yet. The same kernel core handles every system call; only the platform
-differs.
+virtual machine of Hypervisor.framework (`kernel/platform-hvf`). Since
+milestone P1b it runs processes: `fork` with copy-on-write, `execve`,
+`vfork`, shared memory and dynamically linked programs, so a busybox
+shell runs pipelines and CPython runs scripts that start subprocesses.
+Everything runs on one vCPU. The same kernel core handles every system
+call; only the platform differs.
 
 **How it works.** The program runs at EL0 of a VM that has no guest kernel.
 At EL1 there is only a shim: a 4 KiB page whose 16 exception vectors are
@@ -391,21 +393,30 @@ undefined instruction, enters a vector, which leaves the VM at once:
 registers (untouched by the exception) and `ESR_EL1`, `FAR_EL1`,
 `ELR_EL1`, and hands the core a syscall or a fault. To resume, the kernel
 process sets the program counter and `CPSR` (EL0) itself; nothing runs at
-EL1 on the way back, except the shim's flush routine (`tlbi vmalle1is`,
-`ic ialluis`, `eret`) after page tables changed. hellovm writes the
-program's page tables itself; the VM never does.
+EL1 on the way back, except one of the shim's two flush routines after
+page tables changed: the whole TLB (`tlbi vmalle1is`, `ic ialluis`,
+`eret`), or one page of one address space (`tlbi vae1is` with the ASID
+and page number the kernel process put in `x0`, whose value it saved in
+`TPIDR_EL1` for the routine to restore). hellovm writes the program's
+page tables itself; the VM never does.
 
 The vCPU belongs to the kernel's event-loop thread and runs inside the
-platform's `wait`; tasks are register contexts multiplexed on it. A
-`wait` timeout is the guest's virtual timer (the vCPU exits when it
-fires); a waker or `--timeout` calls `hv_vcpus_exit` from another
-thread.
+platform's `wait`; tasks (every thread of every process) are register
+contexts multiplexed on it. The runnable task that has spent the least
+time in the vCPU runs next, so a process that mostly waits for a pipe or
+a child runs as soon as it can. While another task is runnable, a task
+runs for one 5 ms slice at most: the guest's virtual timer ends the
+slice, so a program that never makes a system call cannot keep the
+others from running. A task that becomes runnable starts at most one
+slice behind the others' least run time, so time spent waiting gives no
+claim on the vCPU later. A `wait` timeout is the same timer; a waker or
+`--timeout` calls `hv_vcpus_exit` from another thread.
 
 **The VM layout.**
 
 | Guest-physical | Size | Stage 2 | What |
 |---|---|---|---|
-| `0x1_0000` | 16 KiB | read, execute | The shim page (vectors at 0, flush routine at `0x800`) |
+| `0x1_0000` | 16 KiB | read, execute | The shim page (vectors at 0, flush routines at `0x800` and `0x900`) |
 | `0x4000_0000` | 64 MiB | read | Page tables, written only by the kernel process |
 | `0x1_0000_0000` | 2 GiB | read, write, execute | The program's memory |
 
@@ -433,7 +444,9 @@ programs expect; the host's 16 KiB pages only matter to `hv_vm_map`,
 which maps the three regions once. Memory is allocated a 4 KiB page at a
 time when the program first touches it (a translation fault the platform
 resolves without telling the core), from the 2 GiB pool; a sandbox that
-uses it up is ended. Freed pages go back to the pool, not to the host.
+uses it up gets `SIGKILL`, the process that needed the page, as the OOM
+killer would kill it on Linux; the others go on. Freed pages go back to
+the pool, not to the host.
 
 Address space costs page tables only where it is used. A mapped range
 with no memory yet that covers the whole span of a table entry above the
@@ -447,6 +460,82 @@ page by page at one time (32 GiB), not what was ever mapped. A cache
 maintenance instruction (`ic ivau`, `dc cvau`: `__clear_cache`) on a page
 with no memory yet is taken as a read, as on Linux, whatever its syndrome
 says of writing.
+
+**Processes and copy-on-write.** The core makes every process change
+through the platform: `fork` is `clone_task` without shared memory,
+`execve` loads the new program into a new address space (`spawn`) and
+then ends the old task, and `vfork` and threads are `clone_task` with
+the same address space. `clone_task` copies the parent's table tree at
+once: a new table for each of the parent's tables, the same descriptors,
+and each frame shared between the two. Each frame of program memory has
+a reference count, kept in the kernel process (not in guest memory): the
+number of page descriptors, in all address spaces, that point at it.
+Private writable pages become read only in both trees: their software
+`PROT_*` bits still allow writing, and that difference is what makes a
+page copy-on-write. The first write faults; if the frame is still
+shared, the page gets a copy, otherwise (the other process exited or
+wrote its own copy) the page is just made writable again. The core's own
+writes into a process's memory (`Platform::write`: `read` results,
+signal frames, file-backed mappings) copy the same way, and its reads
+follow the same descriptors, so they see the process's own copy.
+Reservations and pages that never had memory are copied as descriptors,
+with no memory. Pages of `MAP_SHARED` mappings carry a software bit
+(`DBM`, bit 51, which the hardware ignores while `TCR_EL1.HD` is clear)
+and are never copied: both processes keep the same frame. A shared page
+(or a whole reservation) with no memory yet takes none at the `fork`
+either, as on Linux: the `fork` marks it, in both address spaces, as
+taking its memory from a shared object made for that `fork`, a table on
+the host side from page address to frame. Whoever touches the page first
+gets a frame and enters it there, the others find it there, and the
+object keeps what was written for those who have not touched the page
+yet, until the last descriptor that names it is gone. So a `fork` with
+gigabytes of untouched shared memory costs no memory and no table. `execve` frees the old address space with its last
+task: each frame's count goes down, a frame with no users left goes back
+to the pool, and every table goes back too.
+
+Copying the tables at once, rather than sharing lower-level tables
+copy-on-write, keeps one owner per table and one rule for every page;
+it costs the parent's tables and a pass over their descriptors. A `fork`
+of a process with 256 MiB touched (65,536 pages, 128 last-level tables)
+takes about 0.3 ms through the core (below), which did not justify the
+extra state of shared tables. The tables are counted before anything is
+copied: when the table pool cannot hold the copy, `fork` fails with
+`EAGAIN` and nothing changed. Memory is counted in frames, not mappings:
+a `fork` takes only tables, and each copy on a write takes one frame from
+the pool. A fork bomb therefore ends with `EAGAIN` once the table pool
+(or the core's limit of 1024 processes) is used up; the kernel process
+allocates nothing beyond its pools and the core's bounded per-process
+state.
+
+Threads work too, because they need nothing beyond what `vfork` needs
+(the platform cannot tell the two apart): they share an address space
+and take turns on the one vCPU, so they never run in parallel.
+
+**What keeps processes apart.** The stage-1 tables hellovm writes are the
+boundary between processes, so these are the invariants (each checked by
+the tests below):
+
+* A frame is reachable only through the descriptors its reference count
+  counts, and goes back to the pool only when that count reaches zero.
+  Frames and tables are zeroed before they are handed out again.
+* A private page is writable in hardware only if its frame has one user.
+  Counts only grow in `fork`, which first makes every such page read only
+  in both trees.
+* Each address space has its own ASID, so switching between processes
+  flushes nothing. The M3's vCPU reports 8-bit ASIDs (16-bit ones are
+  used where a vCPU has them), so 255 address spaces have their own. A TLB
+  entry can only be stale if the tables changed after it was cached, and
+  every such change is recorded: a descriptor that goes, changes or
+  points at another frame, or a table that is freed. Before the next
+  instruction of any program runs, the kernel process invalidates the
+  whole TLB, or only that page's entries of that ASID when one page
+  changed (a copy-on-write page that was written; making a page writable
+  again needs it too, or the old read-only entry would fault once more).
+  After `fork`, which made the parent's writable pages read only, the
+  whole TLB goes. An ASID is reused only after its address space is gone,
+  which freed its tables and so flushed the TLB. When no ASID is free,
+  new address spaces share ASID 0, and switching between two of them
+  flushes the whole TLB (correct, and as slow as the prototype was).
 
 **What the program can and cannot touch.** The isolation boundary is the
 stage-2 mapping, which Hypervisor.framework enforces: the VM's whole
@@ -492,9 +581,7 @@ target/debug/hellovm --sandbox off --root /tmp/image /hello
 ```
 
 On the Mac, `hellovm --root DIR PROGRAM [ARGS...]` works with `--trace`,
-`--timeout`, `--env`, `--fs-limit` and `--tty`/`--no-tty` (the terminal
-console reads and writes; a shell still cannot start commands, for want
-of `fork`). `--egress`,
+`--timeout`, `--env`, `--fs-limit` and `--tty`/`--no-tty`. `--egress`,
 `--template`, `--clone` and `--sandbox require` are refused: nothing
 hardens the kernel process on macOS yet (the default `best-effort` says
 so with a warning; `--sandbox off` silences it). `hellovm-noded` and the
@@ -507,32 +594,88 @@ The test guests for the Mac (`kernel/test-guest/asm`, and
 the linker: no Linux toolchain is needed. On a Mac without those (a Rust
 that is not rustup's may lack `rust-lld`) the workspace still builds:
 the build prints a warning, and the tests that need the guests skip (or
-fail under `HELLOVM_REQUIRE_E2E=1`). A C program needs a Linux libc,
-so the one C guest, `kernel/test-guest/c/smoke.c` (prints its arguments,
-reads a file, uses `malloc` and an 8 MiB `mmap`, exits with 3), is built
-statically with glibc in the dev container and passed to the test by
-path:
+fail under `HELLOVM_REQUIRE_E2E=1`). Everything that needs a Linux libc
+comes from the dev container: `kernel/platform-hvf/build-guests.sh`
+builds the C guests of `kernel/test-guest/c` there (`smoke`, `pie`,
+`signals`, `threads`, `forks` statically, with the flags of
+`test-guest/build.rs`, and `dynamic` linked dynamically) with the
+container's gcc and glibc, and assembles one image directory,
+`kernel/target/hvf-guests/root`: the guests under `/guests`, the
+container's busybox (Debian `busybox-static`) with applet links in
+`/bin`, the container's CPython (Debian `python3`) with its standard
+library and extension modules, and every shared library and the program
+interpreter they need (from `ldd`), at the paths they have in the
+container. Its `MANIFEST` records the image id and the versions (for the
+measurements below: Debian 12.15, gcc 12.2.0, glibc 2.36, busybox 1.35.0,
+Python 3.11.2). No binary is checked in; the tests find the image through
+`HELLOVM_HVF_GUESTS`:
 
 ```sh
 docker build -t hellovm-dev kernel/dev
-kernel/platform-hvf/build-c-guest.sh
+kernel/platform-hvf/build-guests.sh
 cd kernel
-HELLOVM_HVF_C_GUEST=$PWD/target/hvf-guests/smoke cargo test -p hellovm-platform-hvf
-cargo test -p hellovm --test hvf_cli
+HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm-platform-hvf
+HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_cli
+target/debug/hellovm --sandbox off --root target/hvf-guests/root /bin/sh -c 'seq 100 | grep 7 | wc -l'
 ```
 
-The tests (`kernel/platform-hvf/tests/hvf.rs`, `kernel/hellovm/tests/hvf_cli.rs`)
+The tests (`kernel/platform-hvf/tests/hvf.rs` and `guests.rs`, the unit
+tests in `kernel/platform-hvf/src`, and `kernel/hellovm/tests/hvf_cli.rs`)
 cover the hello world end to end (through the core and through the
-command line), the C program, `SIGSEGV` delivery, fault events from
-unmapped and protected memory (and that `mprotect` and `munmap` reach a
-program whose TLB already held the page), the EL1 and shim probes above,
-registers (every general, SIMD and FP register, `SP`, `TPIDR_EL0`, the
-flags) surviving exits for two tasks sharing the vCPU, odd register
-values at exits (system calls with all-ones arguments and number, odd
-`PC`, `SP` and `PSTATE`, and 300 random contexts), wait timeouts, wakers,
-interrupts and the killer. A test binary that cannot use the hypervisor
-(not signed) prints `SKIPPING` and passes, unless `HELLOVM_REQUIRE_E2E=1`.
-Hypervisor.framework allows one VM per process, so the tests take turns.
+command line), `SIGSEGV` delivery, fault events from unmapped and
+protected memory (and that `mprotect` and `munmap` reach a program whose
+TLB already held the page), the EL1 and shim probes above, registers
+(every general, SIMD and FP register, `SP`, `TPIDR_EL0`, the flags)
+surviving exits for two tasks sharing the vCPU, odd register values at
+exits (system calls with all-ones arguments and number, odd `PC`, `SP` and
+`PSTATE`, and 300 random contexts), wait timeouts, wakers, interrupts and
+the killer. For processes: `kernel/test-guest/c/forks.c` (fork and wait,
+copy-on-write of `.data`, `.bss`, heap and stack in both directions,
+shared memory written by both sides, fork then `execve`, `vfork`,
+`posix_spawn`, a fork of a fork, 64 MiB copied, five children at once, a
+pipe between two children, and a child that never makes a system call
+next to a parent that must still run), `signals.c` (every check, its
+children and `vfork` included), `threads.c` (every check, on the one
+vCPU), `pie.c`, `dynamic.c` (its interpreter maps libc and libm), the C
+`smoke.c`, a busybox shell running pipelines of up to five processes, a
+loop, command substitution and a background job, CPython importing
+standard modules, computing, writing and reading files and running a
+shell and itself with `subprocess`, a fork bomb in a sandbox with 2 MiB
+of tables, which ends with `EAGAIN`, and a child that runs out of memory
+on a copy-on-write fault, which gets `SIGKILL` while its parent goes on.
+After every program the test checks that every frame and table (but the
+shim's) went back to its pool. On the platform alone: after `fork`, the
+parent stores through the writable entry its TLB held before the fork
+and the child does not see it, and 400 switches between the two read
+each its own page without a flush; a frame freed with one process and
+handed to another (with the same ASID, at the same address) is not
+reached through what the TLB held for the first; the core's write into a
+copy-on-write page whose read-only entry the program's TLB holds is what
+the program reads next; tasks sharing memory see each other's stores;
+two spinning tasks share the vCPU fairly while a third, making system
+calls, gets more than 1000 round trips in 500 ms; and when ASIDs run out
+each process still reads its own page. `mmu.rs` has unit tests for
+reference counts, forks of forks, shared mappings, writes by the core,
+frames freed exactly once and pools exhausted in the middle of a `fork`
+(nothing is left half-copied), and a randomized test against a model: 3
+fixed seeds, 4000 steps each, of map, unmap, protect, write, read, touch
+(an access by the program), fork and destroy over up to six address
+spaces, checked after every step against a map of each address space's
+pages (protection, sharing, contents), against the invariants above
+(every reference count, every table's count of used entries, no frame or
+table leaked or freed twice, no writable shared private page) and
+against a simulated TLB that keeps what each touch cached until the
+platform says it may be stale; a second run with tiny pools makes 42%
+of the operations fail and checks the same invariants and that nothing
+leaks. Breaking the code on purpose in any of eight ways (no read-only
+parent after `fork`, no invalidation after a copy, an early free, a
+frame not zeroed, shared pages without memory not tied to one shared
+object at `fork`, that object not keeping its frames, the core's writes
+not copying, `mprotect` making a shared frame writable) makes it fail. A test binary that cannot use the hypervisor
+(not signed) prints `SKIPPING` and passes, unless
+`HELLOVM_REQUIRE_E2E=1`. Hypervisor.framework allows one VM per process,
+so the tests take turns. The same `forks.c` runs on the seccomp platform
+in `kernel/hellovm/tests/forks.rs` and prints the same lines.
 
 **Performance.** One system call round trip (the program's `svc` to the
 platform's next trap, with the trap reported to and answered by the
@@ -554,22 +697,45 @@ stop goes through that VM's kernel) took about 23 µs per `getpid` with
 the same loop and method. That is not what seccomp costs on a native Linux
 host, which this Mac cannot measure.
 
-**What works, and what does not yet.** Static aarch64 Linux programs that
-run as one process: the libc-free test guests and a static glibc program
-(arguments, files, `brk`, `mmap`, `mprotect`, `getrandom`, stdio). Not
-Signals work as far as one process goes: the dev container's static
-build of `kernel/test-guest/c/signals.c` passes every check before its
-first `fork` (a `SIGSEGV` handler, masks, `alarm`, `sigsuspend`, the
-alternate stack, FP state across asynchronous handlers); static-PIE
-programs (`pie.c`) and busybox applets that do not fork run. Not yet:
-`fork`, `vfork`, `clone` and threads (`clone_task` reports
-"unsupported"), so no shell commands, pipelines or `subprocess`; shared
-anonymous memory across processes; dynamic linking and `execve` have not
-been tested (`execve` replaces the task through `spawn`, which works);
-x86_64 programs (Rosetta is not used);
-memory returned to the host; warm clones; hardening of the kernel
-process; `AT_HWCAP2` (zero) and emulated `mrs` of ID registers (`HWCAP_CPUID`
-is not reported, so programs do not try).
+Processes, on the same Mac (release builds; the in-guest times are the
+guest's own `CLOCK_MONOTONIC`, `kernel/test-guest/c/forks.c bench 1000
+256`, and the Python benchmark is `PY_BENCH` in
+`kernel/platform-hvf/tests/guests.rs`: recursion, a dictionary of
+200,000 entries, sorting and formatting, best of 3; command-line times are
+wall clock, best of 10; each line is the typical one of three runs):
+
+| | HVF | seccomp, Docker Desktop (different environment) |
+|---|---|---|
+| `fork` + `exit` + `wait` | 36 µs | 870 µs |
+| `fork` with 256 MiB touched | 0.3 ms | 8.5 ms |
+| ... and the child writing all of it | 180 ms (2.8 µs a page) | 290 to 480 ms |
+| pipe round trip between two processes | 8 µs | 120 to 270 µs |
+| `hellovm ... /usr/bin/python3 -c pass` | 22 ms | 125 ms |
+| `hellovm ... /bin/sh -c 'seq 1 20000 \| grep 7 \| sort -rn \| uniq \| head -3'` | 19 ms | 59 ms |
+| Python benchmark | 43 ms | 151 ms |
+
+The same Python benchmark run natively in the container, without
+hellovm, takes 140 ms and `python3 -c pass` 18 ms there: the container's
+own CPU speed accounts for most of the Python difference, so the second
+column says little about seccomp on a native Linux host. The pipe round
+trip (each side touching 64 pages between messages) takes 14 µs on HVF
+when every switch between processes flushes the whole TLB, as the
+prototype did; with ASIDs it takes 8 µs. A pipeline or a `fork` loop
+showed no difference.
+
+**What works, and what does not yet.** Static and dynamically linked
+aarch64 Linux programs, any number of processes: `fork`, `execve`,
+`vfork`, `posix_spawn`, `wait`, pipes between processes, signals between
+them, `MAP_SHARED` anonymous memory, file-backed private mappings of
+shared objects (the interpreter's relocations write copy-on-write pages
+and `mprotect` RELRO), busybox shells and CPython with `subprocess`.
+Threads run, one at a time. Not yet: more than one vCPU (threads in
+parallel); x86_64 programs (Rosetta is not used); memory returned to the
+host (the pools only grow to their high-water mark); warm clones;
+hardening of the kernel process; `AT_HWCAP2` (zero) and emulated `mrs` of
+ID registers (`HWCAP_CPUID` is not reported, so programs do not try).
+A process that writes a copy-on-write page when the pool is used up gets
+`SIGKILL` rather than an error.
 
 ## Hardening
 
@@ -2528,7 +2694,7 @@ compiler with a static libc (`cc`, used to build the test guests) is also
 required. No root or extra capabilities are required, and it works inside a
 container with the default Docker seccomp profile (ptrace of one's own
 child is allowed there). On macOS on Apple silicon `hellovm` runs
-single-process aarch64 Linux programs on the HVF platform (see **The HVF
+aarch64 Linux programs on the HVF platform (see **The HVF
 platform (macOS)** for signing and its own tests); there the Linux
 end-to-end tests are compiled out. On other hosts the workspace builds,
 but `hellovm` cannot run programs.
@@ -2602,7 +2768,7 @@ cargo run -p hellovm -- --root /tmp/image /bin/busybox sh -i
 The container's own root works as an image too, e.g. for CPython:
 `hellovm --root / /usr/bin/python3 -c 'print(42)'`.
 
-For everything beyond the HVF prototype on macOS, use a Linux container. `kernel/dev/Dockerfile` starts from
+For everything beyond the HVF platform on macOS, use a Linux container. `kernel/dev/Dockerfile` starts from
 `rust:1.99.1-bookworm` (matching `rust-toolchain.toml`) and adds clippy,
 rustfmt, `busybox-static` and an x86_64 cross toolchain. The base image
 already has `python3`, its standard library and `ldd`:

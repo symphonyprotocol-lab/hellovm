@@ -28,6 +28,8 @@ pub const RAM_IPA: u64 = 0x1_0000_0000;
 pub const SHIM_VA: u64 = 0xffff_0000_0000_0000;
 /// Offset of the TLB flush routine in the shim page.
 pub const FLUSH_OFFSET: u64 = 0x800;
+/// Offset of the routine that invalidates one page's TLB entries.
+pub const FLUSH_PAGE_OFFSET: u64 = 0x900;
 
 /// Exception vector offsets come in 16 slots of 0x80 bytes; slot `i`
 /// executes `hvc #i`. Slots 8 to 11 are exceptions from EL0 (AArch64):
@@ -45,6 +47,8 @@ const IC_IALLUIS: u32 = 0xd508_711f;
 const DSB_ISH: u32 = 0xd503_3b9f;
 const ISB: u32 = 0xd503_3fdf;
 const ERET: u32 = 0xd69f_03e0;
+const TLBI_VAE1IS_X0: u32 = 0xd508_8320;
+const MRS_X0_TPIDR_EL1: u32 = 0xd538_d080;
 
 /// The shim page: 4 KiB of machine code.
 ///
@@ -58,6 +62,11 @@ const ERET: u32 = 0xd69f_03e0;
 ///   changed page tables: invalidates this VM's stage-1 TLB entries and
 ///   instruction cache on every core, then `eret`s to the app with
 ///   `ELR_EL1` and `SPSR_EL1` the host set.
+/// * `0x900`, the page flush routine: invalidates the TLB entries of one
+///   page of one address space (`tlbi vae1is`, with the ASID and page
+///   number the host put in `x0`), restores the app's `x0` from
+///   `TPIDR_EL1` (where the host saved it; EL0 cannot read it), then
+///   `eret`s like the flush routine.
 /// * The rest is zero, which is `udf #0`.
 pub fn shim_code() -> Vec<u8> {
     let mut words = vec![0u32; (PAGE / 4) as usize];
@@ -69,6 +78,16 @@ pub fn shim_code() -> Vec<u8> {
     let flush = [DSB_ISHST, TLBI_VMALLE1IS, IC_IALLUIS, DSB_ISH, ISB, ERET];
     let at = (FLUSH_OFFSET / 4) as usize;
     words[at..at + flush.len()].copy_from_slice(&flush);
+    let page = [
+        DSB_ISHST,
+        TLBI_VAE1IS_X0,
+        DSB_ISH,
+        MRS_X0_TPIDR_EL1,
+        ISB,
+        ERET,
+    ];
+    let at = (FLUSH_PAGE_OFFSET / 4) as usize;
+    words[at..at + page.len()].copy_from_slice(&page);
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
@@ -113,8 +132,10 @@ pub const SCTLR_EL1: u64 = {
 };
 
 /// `TCR_EL1` for both halves, with `ips` (`TCR_EL1.IPS`, the
-/// intermediate physical address size) from `ID_AA64MMFR0_EL1.PARange`.
-pub const fn tcr_el1(ips: u64) -> u64 {
+/// intermediate physical address size) from `ID_AA64MMFR0_EL1.PARange`,
+/// and 16-bit ASIDs if `asid16` (else 8-bit). The ASID is taken from
+/// `TTBR0_EL1` (`A1` clear).
+pub const fn tcr_el1(ips: u64, asid16: bool) -> u64 {
     const T0SZ: u64 = 16; // 48-bit EL0 addresses
     const IRGN0_WBWA: u64 = 1 << 8;
     const ORGN0_WBWA: u64 = 1 << 10;
@@ -126,7 +147,12 @@ pub const fn tcr_el1(ips: u64) -> u64 {
     const SH1_INNER: u64 = 3 << 28;
     const TG1_4K: u64 = 2 << 30;
     const TBI0: u64 = 1 << 37; // top-byte-ignore for EL0, as Linux
-    T0SZ | IRGN0_WBWA
+    const AS: u64 = 1 << 36;
+    // Not set: HA and HD (bits 39 and 40), so the hardware never updates
+    // descriptors and `pte::SW_SHARED` (DBM) stays a software bit.
+    (if asid16 { AS } else { 0 })
+        | T0SZ
+        | IRGN0_WBWA
         | ORGN0_WBWA
         | SH0_INNER
         | TG0_4K
@@ -175,6 +201,18 @@ pub mod pte {
     /// Access flag: set up front, so no access-flag faults happen.
     pub const AF: u64 = 1 << 10;
     pub const NG: u64 = 1 << 11;
+    /// Software bit: the page belongs to a shared mapping (`MAP_SHARED`),
+    /// so a copy of its address space shares its memory instead of
+    /// copying it. In hardware this is `DBM`, which is ignored while
+    /// `TCR_EL1.HD` is clear, as it is here (Linux uses the same bit as a
+    /// software bit for the same reason).
+    pub const SW_SHARED: u64 = 1 << 51;
+    /// Software bit of a descriptor that is not valid (the hardware
+    /// ignores all of such a descriptor): a shared page, or reservation,
+    /// with no memory of its own yet that was there when its address
+    /// space was copied. Its address field is then not a frame but the
+    /// number of the shared object it takes its memory from (see `mmu`).
+    pub const SW_LAZY: u64 = 1 << 2;
     pub const PXN: u64 = 1 << 53;
     pub const UXN: u64 = 1 << 54;
     /// Software bit: the page is part of the address space (the core
@@ -202,17 +240,26 @@ mod tests {
         assert_eq!(word(0x780), 0xd400_01e2, "hvc #15");
         assert_eq!(word(0x404), B_BACK);
         assert_eq!(word(FLUSH_OFFSET as usize + 20), ERET);
+        assert_eq!(word(FLUSH_PAGE_OFFSET as usize + 4), TLBI_VAE1IS_X0);
+        assert_eq!(word(FLUSH_PAGE_OFFSET as usize + 20), ERET);
         assert_eq!(word(0xffc), 0, "udf");
     }
 
     #[test]
     fn tcr_fields() {
-        let tcr = tcr_el1(2);
+        let tcr = tcr_el1(2, false);
         assert_eq!(tcr & 0x3f, 16);
         assert_eq!((tcr >> 16) & 0x3f, 16);
         assert_eq!((tcr >> 14) & 3, 0, "TG0 4K");
         assert_eq!((tcr >> 30) & 3, 2, "TG1 4K");
         assert_eq!((tcr >> 32) & 7, 2);
         assert_eq!((tcr >> 37) & 1, 1);
+        assert_eq!((tcr >> 36) & 1, 0, "8-bit ASIDs");
+        assert_eq!(
+            (tcr >> 39) & 3,
+            0,
+            "no hardware access or dirty flag updates"
+        );
+        assert_eq!((tcr_el1(2, true) >> 36) & 1, 1, "16-bit ASIDs");
     }
 }

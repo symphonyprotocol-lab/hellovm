@@ -13,13 +13,19 @@ use hellovm_core::platform::{
 };
 
 use crate::exit::{self, AppException, SEGV_ACCERR, SEGV_MAPERR};
-use crate::layout::{self, FLUSH_OFFSET, MAX_ADDR, MIN_ADDR, PAGE, SHIM_VA};
-use crate::mmu::{Backing, Demand, MmuError, Phys};
+use crate::layout::{self, FLUSH_OFFSET, FLUSH_PAGE_OFFSET, MAX_ADDR, MIN_ADDR, PAGE, SHIM_VA};
+use crate::mmu::{Access, Backing, Demand, MmuError, Phys, Stale};
 use crate::sys::{
     self, sysreg, HostMem, HvVcpuExit, Vcpu, VcpuKicker, Vm, HV_EXIT_REASON_CANCELED,
     HV_EXIT_REASON_EXCEPTION, HV_EXIT_REASON_VTIMER_ACTIVATED, HV_MEMORY_EXEC, HV_MEMORY_READ,
     HV_MEMORY_WRITE, HV_REG_CPSR, HV_REG_FPCR, HV_REG_FPSR, HV_REG_PC,
 };
+
+const SIGKILL: u32 = 9;
+const SI_KERNEL: i32 = 0x80;
+
+/// How long a task runs before another runnable task gets the vCPU.
+const SLICE: Duration = Duration::from_millis(5);
 
 /// How much memory a platform reserves for its apps.
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +60,15 @@ impl Backing for HostMem {
     }
 }
 
+/// How often the platform invalidated TLB entries ([`HvfPlatform::flushes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flushes {
+    /// The whole TLB (and the instruction cache).
+    pub all: u64,
+    /// One page of one address space.
+    pub page: u64,
+}
+
 /// Where an asynchronous exit found the vCPU.
 enum Interrupted {
     /// The app's position is saved: resume it later.
@@ -86,11 +101,17 @@ struct Task {
     saved: Option<Box<Aarch64Context>>,
     /// [`Platform::interrupt`] was called.
     interrupt: bool,
+    /// How long it ran, in nanoseconds, give or take (see
+    /// [`HvfPlatform::next_runnable`]).
+    runtime: u64,
 }
 
 struct Space {
     /// The guest-physical address of its level-0 table.
     root: u64,
+    /// Its address space identifier; 0 is shared by the spaces that found
+    /// none free (see [`HvfPlatform::load`]).
+    asid: u16,
     users: usize,
 }
 
@@ -162,6 +183,14 @@ pub struct HvfPlatform {
     spaces: HashMap<u64, Space>,
     next_key: TaskKey,
     next_space: u64,
+    /// ASIDs of spaces that are gone, and the lowest never used.
+    free_asids: Vec<u16>,
+    next_asid: u32,
+    /// One past the highest ASID (256 or 65536).
+    asid_limit: u32,
+    /// The space that last ran with ASID 0 since the TLB was last
+    /// flushed, if any.
+    asid0_root: Option<u64>,
     /// The task whose registers are in the vCPU.
     loaded: Option<TaskKey>,
     /// `TTBR0_EL1` as last set.
@@ -169,9 +198,14 @@ pub struct HvfPlatform {
     /// Page tables changed in a way the TLB may have cached: run the
     /// shim's flush routine before the app.
     flush: bool,
+    /// Only one page changed: the `tlbi vae1is` operand (ASID and page
+    /// number) for the shim's page flush routine.
+    flush_page: Option<u64>,
+    /// How often each flush routine ran.
+    flushes: Flushes,
     timer_armed: bool,
-    /// Round-robin position among runnable tasks.
-    cursor: TaskKey,
+    /// The least runtime of a task chosen to run (it only grows).
+    min_runtime: u64,
     /// `mach_absolute_time` ticks per second.
     ticks_per_sec: u64,
     shared: Arc<Shared>,
@@ -297,6 +331,7 @@ impl HvfPlatform {
         // The guest-physical layout fits in 36 bits; use what the vCPU has
         // up to 48 (`IPS` takes the `PARange` encoding).
         let ips = (mmfr0 & 0xf).min(5);
+        let asid16 = (mmfr0 >> 4) & 0xf == 2;
         let cpu = CpuInfo {
             hwcap: hwcap(
                 vcpu.sys_reg(sysreg::ID_AA64PFR0_EL1)?,
@@ -307,7 +342,7 @@ impl HvfPlatform {
         };
         for (reg, value) in [
             (sysreg::MAIR_EL1, layout::MAIR_EL1),
-            (sysreg::TCR_EL1, layout::tcr_el1(ips)),
+            (sysreg::TCR_EL1, layout::tcr_el1(ips, asid16)),
             (sysreg::TTBR1_EL1, shim_root),
             (sysreg::TTBR0_EL1, 0),
             (sysreg::VBAR_EL1, SHIM_VA),
@@ -348,11 +383,17 @@ impl HvfPlatform {
             spaces: HashMap::new(),
             next_key: 1,
             next_space: 1,
+            free_asids: Vec::new(),
+            next_asid: 1,
+            asid_limit: if asid16 { 1 << 16 } else { 1 << 8 },
+            asid0_root: None,
             loaded: None,
             ttbr0: 0,
             flush: true,
+            flush_page: None,
+            flushes: Flushes::default(),
             timer_armed: false,
-            cursor: 0,
+            min_runtime: 0,
             ticks_per_sec,
             shared,
             _not_send: PhantomData,
@@ -369,6 +410,11 @@ impl HvfPlatform {
     /// App memory and page-table memory in use, in bytes.
     pub fn memory_in_use(&self) -> (u64, u64) {
         (self.phys.ram_in_use(), self.phys.tables_in_use())
+    }
+
+    /// How often TLB entries were invalidated so far.
+    pub fn flushes(&self) -> Flushes {
+        self.flushes
     }
 
     fn task(&mut self, key: TaskKey) -> Result<&mut Task, PlatformError> {
@@ -402,7 +448,45 @@ impl HvfPlatform {
         Ok(())
     }
 
+    /// An ASID for a new space: 0 when none is free.
+    fn alloc_asid(&mut self) -> u16 {
+        if let Some(asid) = self.free_asids.pop() {
+            return asid;
+        }
+        if self.next_asid < self.asid_limit {
+            self.next_asid += 1;
+            return (self.next_asid - 1) as u16;
+        }
+        0
+    }
+
+    /// A new space with the tables at `root`.
+    fn add_space(&mut self, root: u64) -> u64 {
+        let id = self.next_space;
+        self.next_space += 1;
+        let asid = self.alloc_asid();
+        self.spaces.insert(
+            id,
+            Space {
+                root,
+                asid,
+                users: 1,
+            },
+        );
+        id
+    }
+
     /// Puts `key`'s registers and address space into the vCPU.
+    ///
+    /// Each space has its own ASID, so the TLB may hold entries of every
+    /// space at once and a switch needs no flush. An entry is stale only
+    /// if a space's tables changed since it was cached, and every such
+    /// change makes the next entry into the app invalidate it: the whole
+    /// TLB, or that page of that ASID (`Phys::take_stale`, [`Self::enter`]).
+    /// An ASID is reused only after its space is
+    /// gone, which frees the space's tables and so flushes too. Spaces
+    /// that found no free ASID share ASID 0: switching between two of
+    /// them flushes.
     fn load(&mut self, key: TaskKey) -> Result<(), PlatformError> {
         if self.loaded != Some(key) {
             self.unload()?;
@@ -414,15 +498,20 @@ impl HvfPlatform {
             self.write_vcpu(&context).map_err(host_err)?;
             self.loaded = Some(key);
         }
-        let space = self.tasks[&key].space;
-        let root = self.spaces[&space].root;
-        if self.ttbr0 != root {
+        let space = &self.spaces[&self.tasks[&key].space];
+        let (root, asid) = (space.root, space.asid);
+        let ttbr0 = root | u64::from(asid) << 48;
+        if self.ttbr0 != ttbr0 {
             self.vcpu
-                .set_sys_reg(sysreg::TTBR0_EL1, root)
+                .set_sys_reg(sysreg::TTBR0_EL1, ttbr0)
                 .map_err(host_err)?;
-            self.ttbr0 = root;
-            // No ASIDs: another address space's entries must go.
-            self.flush = true;
+            self.ttbr0 = ttbr0;
+        }
+        if asid == 0 {
+            if self.asid0_root.is_some_and(|other| other != root) {
+                self.flush = true;
+            }
+            self.asid0_root = Some(root);
         }
         Ok(())
     }
@@ -483,14 +572,20 @@ impl HvfPlatform {
         let space = self.spaces.get_mut(&task.space).expect("task's space");
         space.users -= 1;
         if space.users == 0 {
-            let root = space.root;
+            let (root, asid) = (space.root, space.asid);
             self.spaces.remove(&task.space);
+            // Frees its tables, so the TLB is flushed before the app runs
+            // again: its frames and its ASID can be reused safely.
             self.phys.destroy(root);
-            if self.ttbr0 == root {
+            if self.ttbr0 & layout::pte::ADDR_MASK == root {
                 self.ttbr0 = 0;
             }
-            // Its frames may be reused by another space.
-            self.flush = true;
+            if self.asid0_root == Some(root) {
+                self.asid0_root = None;
+            }
+            if asid != 0 {
+                self.free_asids.push(asid);
+            }
         }
     }
 
@@ -522,14 +617,49 @@ impl HvfPlatform {
     /// Points the vCPU at the app: straight to EL0, or through the shim's
     /// flush routine if page tables changed.
     fn enter(&mut self, key: TaskKey) -> Result<(), sys::HvError> {
+        // The only way into the app: no stale entry survives to run it.
+        match self.phys.take_stale() {
+            Stale::Clean => {}
+            Stale::All => self.flush = true,
+            Stale::Page { root, va } => {
+                let asid = self
+                    .spaces
+                    .values()
+                    .find(|s| s.root == root)
+                    .map(|s| s.asid);
+                match (asid, self.flush_page) {
+                    (Some(asid), None) => {
+                        self.flush_page = Some(u64::from(asid) << 48 | (va >> 12) & 0xfff_ffff_ffff)
+                    }
+                    _ => self.flush = true,
+                }
+            }
+        }
         let task = &self.tasks[&key];
         let (pc, pstate) = (task.pc, task.pstate & layout::PSTATE_APP_MASK);
         if self.flush {
+            let asid = self.spaces[&task.space].asid;
+            if asid != 0 {
+                self.asid0_root = None;
+            }
             self.vcpu.set_sys_reg(sysreg::ELR_EL1, pc)?;
             self.vcpu.set_sys_reg(sysreg::SPSR_EL1, pstate)?;
             self.vcpu.set_reg(HV_REG_PC, SHIM_VA + FLUSH_OFFSET)?;
             self.vcpu.set_reg(HV_REG_CPSR, layout::PSTATE_EL1H_MASKED)?;
             self.flush = false;
+            self.flush_page = None;
+            self.flushes.all += 1;
+        } else if let Some(operand) = self.flush_page.take() {
+            // The routine takes its operand in x0 and gives the app its
+            // own back from TPIDR_EL1.
+            let x0 = self.vcpu.reg(0)?;
+            self.vcpu.set_sys_reg(sysreg::TPIDR_EL1, x0)?;
+            self.vcpu.set_reg(0, operand)?;
+            self.vcpu.set_sys_reg(sysreg::ELR_EL1, pc)?;
+            self.vcpu.set_sys_reg(sysreg::SPSR_EL1, pstate)?;
+            self.vcpu.set_reg(HV_REG_PC, SHIM_VA + FLUSH_PAGE_OFFSET)?;
+            self.vcpu.set_reg(HV_REG_CPSR, layout::PSTATE_EL1H_MASKED)?;
+            self.flushes.page += 1;
         } else {
             self.vcpu.set_reg(HV_REG_PC, pc)?;
             self.vcpu.set_reg(HV_REG_CPSR, pstate)?;
@@ -537,14 +667,33 @@ impl HvfPlatform {
         Ok(())
     }
 
-    /// The next runnable task after the last one run.
-    fn next_runnable(&self) -> Option<TaskKey> {
-        let runnable =
-            |(&key, task): (&TaskKey, &Task)| (task.state == State::Runnable).then_some(key);
-        self.tasks
-            .range(self.cursor + 1..)
-            .find_map(runnable)
-            .or_else(|| self.tasks.range(..=self.cursor).find_map(runnable))
+    /// The runnable task to run next, and whether another one is waiting.
+    ///
+    /// Scheduling on the one vCPU: each task has a runtime, the time it
+    /// spent in the vCPU, and the runnable task with the least runtime
+    /// runs next. A task that mostly waits (for a pipe, a child) runs as
+    /// soon as it can; a task that never traps uses up its slice and lets
+    /// the others run (see [`Platform::wait`]). A task that becomes
+    /// runnable starts at most one slice behind the least runtime of a
+    /// task chosen to run, so time it spent waiting gives it no claim on
+    /// the vCPU later.
+    fn next_runnable(&self) -> Option<(TaskKey, bool)> {
+        let mut best: Option<(u64, TaskKey)> = None;
+        let mut runnable = 0;
+        for (&key, task) in &self.tasks {
+            if task.state == State::Runnable {
+                runnable += 1;
+                if best.is_none_or(|best| task.runtime < best.0) {
+                    best = Some((task.runtime, key));
+                }
+            }
+        }
+        best.map(|(_, key)| (key, runnable > 1))
+    }
+
+    /// The runtime a task that becomes runnable starts from.
+    fn catch_up(&self, runtime: u64) -> u64 {
+        runtime.max(self.min_runtime.saturating_sub(SLICE.as_nanos() as u64))
     }
 
     /// No task to run: waits for a waker or the deadline.
@@ -603,7 +752,8 @@ impl HvfPlatform {
     ) -> Result<Option<Event>, PlatformError> {
         self.load(key)?;
         self.arm_timer(deadline).map_err(host_err)?;
-        let mut retries = 0u32;
+        // Faults on a page that is ready, in a row: (page, count).
+        let mut retries = (u64::MAX, 0u32);
         let mut reenter = true;
         loop {
             if reenter {
@@ -655,6 +805,15 @@ impl HvfPlatform {
         if (SHIM_VA..SHIM_VA + FLUSH_OFFSET).contains(&pc) {
             return Ok(Interrupted::InVector);
         }
+        if (SHIM_VA + FLUSH_PAGE_OFFSET..SHIM_VA + PAGE).contains(&pc) {
+            // In the page flush routine: x0 may still be its operand. The
+            // app's own is in TPIDR_EL1; it starts over from `task.pc`,
+            // with a whole flush.
+            let x0 = self.vcpu.sys_reg(sysreg::TPIDR_EL1).map_err(host_err)?;
+            self.vcpu.set_reg(0, x0).map_err(host_err)?;
+            self.flush = true;
+            return Ok(Interrupted::Settled);
+        }
         if (SHIM_VA + FLUSH_OFFSET..SHIM_VA + PAGE).contains(&pc) {
             // In the flush routine, before the app ran: it starts over
             // from `task.pc`, flushing again.
@@ -667,13 +826,12 @@ impl HvfPlatform {
     }
 
     /// Decodes an exception exit. `None` means: resume the app.
-    /// `retries` counts translation faults on pages that were already
-    /// backed in this run.
+    /// `retries` counts faults in a row on a page that was ready.
     fn on_exception(
         &mut self,
         key: TaskKey,
         exit: &HvVcpuExit,
-        retries: &mut u32,
+        retries: &mut (u64, u32),
     ) -> Result<Option<Event>, PlatformError> {
         let v = &self.vcpu;
         let (esr, far, pc) = match exit::hvc_immediate(exit.syndrome) {
@@ -749,29 +907,60 @@ impl HvfPlatform {
             }
             AppException::Fault(fault) => Ok(self.stop(key, Trap::Fault(fault))),
             AppException::Translation { addr, access } => {
-                let space = self.tasks[&key].space;
-                let root = self.spaces[&space].root;
-                let fault = |code| {
-                    Trap::Fault(Fault {
-                        signal: 11,
-                        code,
-                        addr: Some(addr),
-                    })
+                Ok(self.page_fault(key, addr, access, SEGV_MAPERR, retries))
+            }
+            AppException::Permission { addr, access } => {
+                Ok(self.page_fault(key, addr, access, SEGV_ACCERR, retries))
+            }
+        }
+    }
+
+    /// A translation or permission fault at `addr`: memory on first touch,
+    /// a copy for a copy-on-write page, or `SIGSEGV` (with `code` when the
+    /// page is not mapped, or allows the access after all).
+    fn page_fault(
+        &mut self,
+        key: TaskKey,
+        addr: u64,
+        access: Access,
+        code: i32,
+        retries: &mut (u64, u32),
+    ) -> Option<Event> {
+        let space = self.tasks[&key].space;
+        let root = self.spaces[&space].root;
+        let fault = |code| {
+            Trap::Fault(Fault {
+                signal: 11,
+                code,
+                addr: Some(addr),
+            })
+        };
+        match self.phys.demand(root, addr, access) {
+            Demand::Filled => None,
+            // The TLB may still hold what the page was before it changed:
+            // flush and retry, a few times.
+            Demand::Present if retries.0 != addr >> 12 || retries.1 < 4 => {
+                *retries = match *retries {
+                    (page, n) if page == addr >> 12 => (page, n + 1),
+                    _ => (addr >> 12, 1),
                 };
-                match self.phys.demand(root, addr, access) {
-                    Demand::Filled => Ok(None),
-                    // The TLB may still hold what the page was before the
-                    // core changed it: flush and retry, a few times.
-                    Demand::Present if *retries < 4 => {
-                        *retries += 1;
-                        self.flush = true;
-                        Ok(None)
-                    }
-                    Demand::Present => Ok(self.stop(key, fault(SEGV_MAPERR))),
-                    Demand::Unmapped => Ok(self.stop(key, fault(SEGV_MAPERR))),
-                    Demand::Denied => Ok(self.stop(key, fault(SEGV_ACCERR))),
-                    Demand::NoMemory => Ok(Some(self.gone(key, "out of memory"))),
-                }
+                self.flush = true;
+                None
+            }
+            Demand::Present | Demand::Unmapped => self.stop(key, fault(code)),
+            Demand::Denied => self.stop(key, fault(SEGV_ACCERR)),
+            // The sandbox's memory is used up: this process ends, as the
+            // OOM killer would end it on Linux, and the others go on.
+            Demand::NoMemory => {
+                log::warn!("HVF platform: task {key}: out of memory at {addr:#x}; killing it");
+                self.stop(
+                    key,
+                    Trap::Fault(Fault {
+                        signal: SIGKILL,
+                        code: SI_KERNEL,
+                        addr: Some(addr),
+                    }),
+                )
             }
         }
     }
@@ -792,9 +981,7 @@ impl Platform for HvfPlatform {
 
     fn spawn(&mut self) -> Result<TaskKey, PlatformError> {
         let root = self.phys.new_space().map_err(|err| mmu_err(err, 0, 0))?;
-        let space = self.next_space;
-        self.next_space += 1;
-        self.spaces.insert(space, Space { root, users: 1 });
+        let space = self.add_space(root);
         let key = self.next_key;
         self.next_key += 1;
         let Context::Aarch64(saved) = Context::zeroed(Arch::Aarch64) else {
@@ -809,6 +996,7 @@ impl Platform for HvfPlatform {
                 pstate: 0,
                 saved: Some(saved),
                 interrupt: false,
+                runtime: self.min_runtime,
             },
         );
         Ok(key)
@@ -819,10 +1007,39 @@ impl Platform for HvfPlatform {
         parent: TaskKey,
         share_memory: bool,
     ) -> Result<TaskKey, PlatformError> {
-        let _ = (parent, share_memory);
-        Err(PlatformError::Unsupported(
-            "clone (fork and threads) on the HVF platform, not yet",
-        ))
+        let Context::Aarch64(saved) = self.context(parent)? else {
+            unreachable!("aarch64 contexts only");
+        };
+        let task = self.stopped(parent)?;
+        let (pc, pstate, space) = (task.pc, task.pstate, task.space);
+        let space = if share_memory {
+            self.spaces.get_mut(&space).expect("task's space").users += 1;
+            space
+        } else {
+            let root = self.spaces[&space].root;
+            let copy = self.phys.fork(root).map_err(|err| match err {
+                MmuError::NoMemory => PlatformError::NoResources(
+                    "the sandbox's memory or page tables are used up".into(),
+                ),
+                MmuError::BadAddress => PlatformError::Violation("bad address space".into()),
+            })?;
+            self.add_space(copy)
+        };
+        let key = self.next_key;
+        self.next_key += 1;
+        self.tasks.insert(
+            key,
+            Task {
+                space,
+                state: State::Stopped,
+                pc,
+                pstate,
+                saved: Some(saved),
+                interrupt: false,
+                runtime: self.min_runtime,
+            },
+        );
+        Ok(key)
     }
 
     fn kill(&mut self, key: TaskKey) -> Result<(), PlatformError> {
@@ -877,7 +1094,11 @@ impl Platform for HvfPlatform {
             Resume::Return(value) => self.set_x0(key, value as u64)?,
             Resume::Continue => {}
         }
-        self.task(key)?.state = State::Runnable;
+        let runtime = self.task(key)?.runtime;
+        let runtime = self.catch_up(runtime);
+        let task = self.task(key)?;
+        task.state = State::Runnable;
+        task.runtime = runtime;
         Ok(())
     }
 
@@ -888,47 +1109,71 @@ impl Platform for HvfPlatform {
 
     fn wait(&mut self, timeout: Option<Duration>) -> Result<Option<Event>, PlatformError> {
         let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
-        if self.shared.lock().killed {
-            let Some(&key) = self.tasks.keys().next() else {
+        loop {
+            if self.shared.lock().killed {
+                let Some(&key) = self.tasks.keys().next() else {
+                    return Ok(self.idle(deadline));
+                };
+                self.remove(key);
+                return Ok(Some(Event {
+                    task: key,
+                    trap: Trap::Gone,
+                }));
+            }
+            let interrupted = self
+                .tasks
+                .iter_mut()
+                .find(|(_, task)| task.interrupt && task.state == State::Runnable);
+            if let Some((&key, task)) = interrupted {
+                task.interrupt = false;
+                task.state = State::Stopped;
+                return Ok(Some(Event {
+                    task: key,
+                    trap: Trap::Interrupted,
+                }));
+            }
+            let Some((key, contended)) = self.next_runnable() else {
                 return Ok(self.idle(deadline));
             };
-            self.remove(key);
-            return Ok(Some(Event {
-                task: key,
-                trap: Trap::Gone,
-            }));
-        }
-        let interrupted = self
-            .tasks
-            .iter_mut()
-            .find(|(_, task)| task.interrupt && task.state == State::Runnable);
-        if let Some((&key, task)) = interrupted {
-            task.interrupt = false;
-            task.state = State::Stopped;
-            return Ok(Some(Event {
-                task: key,
-                trap: Trap::Interrupted,
-            }));
-        }
-        let Some(key) = self.next_runnable() else {
-            return Ok(self.idle(deadline));
-        };
-        self.cursor = key;
-        {
-            let mut state = self.shared.lock();
-            if state.woken {
-                state.woken = false;
-                return Ok(None);
+            let started = Instant::now();
+            self.min_runtime = self.min_runtime.max(self.tasks[&key].runtime);
+            // Preemption: while another task waits to run, this one runs
+            // for one slice at most, so an app that never traps cannot
+            // keep the others from running.
+            let slice_end = contended
+                .then(|| Instant::now().checked_add(SLICE))
+                .flatten();
+            let until = match (deadline, slice_end) {
+                (Some(deadline), Some(slice_end)) => Some(deadline.min(slice_end)),
+                (deadline, slice_end) => deadline.or(slice_end),
+            };
+            {
+                let mut state = self.shared.lock();
+                if state.woken {
+                    state.woken = false;
+                    return Ok(None);
+                }
+                state.in_run = true;
             }
-            state.in_run = true;
+            let result = self.run(key, until);
+            if let Some(task) = self.tasks.get_mut(&key) {
+                let ran = started.elapsed().as_nanos() as u64;
+                task.runtime = task.runtime.saturating_add(ran);
+            }
+            let mut state = self.shared.lock();
+            state.in_run = false;
+            match result {
+                Ok(None) => {
+                    if std::mem::take(&mut state.woken)
+                        || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        return Ok(None);
+                    }
+                    // The slice ended: on to the next runnable task.
+                }
+                other => return other,
+            }
         }
-        let result = self.run(key, deadline);
-        let mut state = self.shared.lock();
-        state.in_run = false;
-        if let Ok(None) = result {
-            state.woken = false;
-        }
-        result
     }
 
     fn waker(&self) -> Waker {
@@ -958,22 +1203,17 @@ impl Platform for HvfPlatform {
         prot: Prot,
         sharing: Sharing,
     ) -> Result<(), PlatformError> {
-        // Shared and private memory differ only once an address space is
-        // copied, which this platform does not do yet.
-        let _ = sharing;
         let root = self.root(key)?;
-        // After an error, pages may have changed all the same.
-        let result = self.phys.map(root, addr, len, prot);
-        self.flush |= result.unwrap_or(true);
-        result.map(drop).map_err(|err| mmu_err(err, addr, len))
+        self.phys
+            .map(root, addr, len, prot, sharing == Sharing::Shared)
+            .map_err(|err| mmu_err(err, addr, len))
     }
 
     fn unmap(&mut self, key: TaskKey, addr: GuestAddr, len: u64) -> Result<(), PlatformError> {
         let root = self.root(key)?;
-        // After an error, pages may have changed all the same.
-        let result = self.phys.unmap(root, addr, len);
-        self.flush |= result.unwrap_or(true);
-        result.map(drop).map_err(|err| mmu_err(err, addr, len))
+        self.phys
+            .unmap(root, addr, len)
+            .map_err(|err| mmu_err(err, addr, len))
     }
 
     fn protect(
@@ -984,10 +1224,9 @@ impl Platform for HvfPlatform {
         prot: Prot,
     ) -> Result<(), PlatformError> {
         let root = self.root(key)?;
-        // After an error, pages may have changed all the same.
-        let result = self.phys.protect(root, addr, len, prot);
-        self.flush |= result.unwrap_or(true);
-        result.map(drop).map_err(|err| mmu_err(err, addr, len))
+        self.phys
+            .protect(root, addr, len, prot)
+            .map_err(|err| mmu_err(err, addr, len))
     }
 }
 
@@ -1017,6 +1256,9 @@ mod breakdown {
     #[test]
     #[ignore = "benchmark"]
     fn exit_cost_breakdown() {
+        let _guard = super::vm_tests::VM
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut p = match HvfPlatform::new(HvfConfig::default()) {
             Ok(p) => p,
             Err(err) => {
@@ -1067,5 +1309,171 @@ mod breakdown {
         }
         let set = start.elapsed() / N;
         eprintln!("bare exit {bare:?}, get_reg {get:?}, get_sys_reg {sys:?}, set_reg {set:?}");
+    }
+}
+
+/// What needs the platform's insides: spaces beyond the ASIDs there are.
+#[cfg(test)]
+mod vm_tests {
+    use super::*;
+
+    /// One VM per process: the tests of this crate that make one take
+    /// turns.
+    pub(super) static VM: Mutex<()> = Mutex::new(());
+
+    const CODE: u64 = 0x10_000;
+    const DATA: u64 = 0x20_000;
+
+    fn word(trap: Trap) -> u64 {
+        match trap {
+            Trap::Syscall(SyscallTrap { args, .. }) => args[0],
+            other => panic!("not a syscall: {other:?}"),
+        }
+    }
+
+    /// The timer (or a waker) may stop the vCPU inside the page flush
+    /// routine, while `x0` holds the routine's operand and the app's own
+    /// `x0` waits in `TPIDR_EL1`: the app gets its own back, and the whole
+    /// TLB is flushed instead.
+    #[test]
+    fn an_interrupted_page_flush_gives_the_app_its_x0_back() {
+        let _guard = VM.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = match HvfPlatform::new(HvfConfig::default()) {
+            Ok(p) => p,
+            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
+                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
+            }
+            Err(err) => {
+                eprintln!("SKIPPING: {err}");
+                return;
+            }
+        };
+        let t = p.spawn().unwrap();
+        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
+        // Loop: svc.
+        let code: Vec<u8> = [0xd400_0001u32, 0x17ff_ffff]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        p.write(t, CODE, &code).unwrap();
+        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
+            .unwrap();
+        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
+            unreachable!()
+        };
+        ctx.pc = CODE;
+        ctx.x[0] = 0x1111;
+        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        assert_eq!(word(p.wait(None).unwrap().unwrap().trap), 0x1111);
+        // The vCPU as an exit inside the routine leaves it, at each of
+        // its instructions: before and after `x0` is the app's again.
+        for (at, x0) in [
+            (0u64, 0xdead_0000_0000_0123u64),
+            (12, 0xdead_0000_0000_0123),
+            (16, 0x2222),
+        ] {
+            p.flush = false;
+            p.vcpu.set_sys_reg(sysreg::TPIDR_EL1, 0x2222).unwrap();
+            p.vcpu.set_reg(0, x0).unwrap();
+            p.vcpu
+                .set_reg(HV_REG_PC, SHIM_VA + FLUSH_PAGE_OFFSET + at)
+                .unwrap();
+            p.vcpu
+                .set_reg(HV_REG_CPSR, layout::PSTATE_EL1H_MASKED)
+                .unwrap();
+            assert!(matches!(p.interrupted_at(t).unwrap(), Interrupted::Settled));
+            assert!(p.flush, "the whole TLB is flushed instead");
+            assert_eq!(p.vcpu.reg(0).unwrap(), 0x2222);
+            // And the app runs on with it.
+            p.resume(t, Resume::Continue).unwrap();
+            assert_eq!(
+                word(p.wait(None).unwrap().unwrap().trap),
+                0x2222,
+                "at +{at}"
+            );
+        }
+    }
+
+    /// With ASIDs used up, new spaces share ASID 0, and switching between
+    /// two of them flushes: each process still reads its own page.
+    #[test]
+    fn spaces_beyond_the_asids_share_one_and_flush() {
+        let _guard = VM.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = match HvfPlatform::new(HvfConfig::default()) {
+            Ok(p) => p,
+            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
+                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
+            }
+            Err(err) => {
+                eprintln!("SKIPPING: {err}");
+                return;
+            }
+        };
+        // ASID 1 only; every other space gets 0.
+        p.asid_limit = 2;
+        let t = p.spawn().unwrap();
+        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
+        // Loop: x0 = [x1]; svc; [x1] = x2; svc.
+        let code: Vec<u8> = [
+            0xf940_0020u32,
+            0xd400_0001,
+            0xf900_0022,
+            0xd400_0001,
+            0x17ff_fffc,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        p.write(t, CODE, &code).unwrap();
+        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
+            .unwrap();
+        p.map(t, DATA, PAGE, Prot::RW, Sharing::Private).unwrap();
+        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
+            unreachable!()
+        };
+        ctx.pc = CODE;
+        ctx.x[1] = DATA;
+        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        let ev = p.wait(None).unwrap().unwrap();
+        assert_eq!(word(ev.trap), 0);
+        let mut tasks = vec![t];
+        for _ in 0..3 {
+            tasks.push(p.clone_task(t, false).unwrap());
+        }
+        let asids: Vec<u16> = tasks
+            .iter()
+            .map(|t| p.spaces[&p.tasks[t].space].asid)
+            .collect();
+        assert_eq!(asids, [1, 0, 0, 0]);
+        // Each stores its own value, then all read theirs, in turn, many
+        // times.
+        for (i, &t) in tasks.iter().enumerate() {
+            let mut ctx = match p.context(t).unwrap() {
+                Context::Aarch64(c) => c,
+                Context::X86_64(_) => unreachable!(),
+            };
+            ctx.x[2] = 0x100 + i as u64;
+            p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+        }
+        let step = |p: &mut HvfPlatform, t: TaskKey| {
+            p.resume(t, Resume::Continue).unwrap();
+            let ev = p.wait(None).unwrap().unwrap();
+            assert_eq!(ev.task, t);
+            ev.trap
+        };
+        for &t in &tasks {
+            step(&mut p, t);
+        }
+        for round in 0..50 {
+            for (i, &t) in tasks.iter().enumerate() {
+                assert_eq!(word(step(&mut p, t)), 0x100 + i as u64, "round {round}");
+                step(&mut p, t);
+            }
+        }
+        for t in tasks {
+            p.kill(t).unwrap();
+        }
     }
 }

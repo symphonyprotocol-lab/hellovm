@@ -69,6 +69,7 @@ pub mod sysreg {
     pub const MAIR_EL1: u16 = 0xc510;
     pub const VBAR_EL1: u16 = 0xc600;
     pub const CNTKCTL_EL1: u16 = 0xc708;
+    pub const TPIDR_EL1: u16 = 0xc684;
     pub const TPIDR_EL0: u16 = 0xde82;
     pub const TPIDRRO_EL0: u16 = 0xde83;
     pub const CNTV_CTL_EL0: u16 = 0xdf19;
