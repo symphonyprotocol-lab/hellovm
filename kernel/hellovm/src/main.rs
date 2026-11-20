@@ -3,7 +3,7 @@
 //! ```text
 //! hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty]
 //!         [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES]
-//!         [--sandbox require|best-effort|off] --root DIR
+//!         [--vcpus N] [--sandbox require|best-effort|off] --root DIR
 //!         [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
 //!
@@ -20,7 +20,9 @@
 //! and makes hellovm exit with 124, like `timeout(1)`. `--trace` prints
 //! every syscall the kernel handled to stderr. `--fs-limit` caps the
 //! in-memory writable layer (file contents plus a small cost per file;
-//! default 2 GiB): writes past it fail with `ENOSPC`.
+//! default 2 GiB): writes past it fail with `ENOSPC`. `--vcpus` (macOS
+//! only) sets how many vCPUs run the program's threads in parallel (1 to
+//! 64; default one per host CPU, at most 8).
 //!
 //! `--egress SOCKET` sends the sandbox's outbound TCP flows to the
 //! `hellovm-egress` proxy listening on that Unix socket; without it nothing
@@ -99,7 +101,7 @@ mod fence;
 mod template;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
-     [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES] [--sandbox require|best-effort|off] --root DIR \
+     [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES] [--vcpus N] [--sandbox require|best-effort|off] --root DIR \
      [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
        hellovm --template SOCKET [options] --root DIR PROGRAM [ARGS...]
        hellovm --clone SOCKET [--sandbox-id ID] [--input DATA] [--timeout SECONDS] [--ready]";
@@ -160,6 +162,9 @@ struct Options {
     sandbox_id: Option<u64>,
     /// `--fs-limit BYTES`: the writable layer's limit.
     fs_limit: Option<u64>,
+    /// `--vcpus N`: vCPUs of the HVF platform (macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    vcpus: Option<usize>,
     /// Test hook: splice outbound TCP to this loopback address.
     #[cfg(feature = "insecure-test-hooks")]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -195,6 +200,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut egress = None;
     let mut sandbox_id = None;
     let mut fs_limit = None;
+    let mut vcpus = None;
     #[cfg(feature = "insecure-test-hooks")]
     let mut splice_to = None;
     #[cfg(feature = "insecure-test-hooks")]
@@ -289,6 +295,25 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 );
                 continue;
             }
+            Some("--vcpus") => {
+                args.next();
+                let value = args.next().ok_or("--vcpus needs a number")?;
+                let text = value.to_string_lossy();
+                vcpus = Some(
+                    text.parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=64).contains(n))
+                        .ok_or_else(|| format!("--vcpus {text}: expected 1 to 64"))?,
+                );
+                if !cfg!(target_os = "macos") {
+                    return Err(
+                        "--vcpus is for the HVF platform (macOS): on Linux every thread of \
+                         the program is a host thread of its own"
+                            .into(),
+                    );
+                }
+                continue;
+            }
             #[cfg(feature = "insecure-test-hooks")]
             Some("--splice-to") => {
                 args.next();
@@ -368,6 +393,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
             egress,
             sandbox_id,
             fs_limit,
+            vcpus,
             #[cfg(feature = "insecure-test-hooks")]
             splice_to,
             #[cfg(feature = "insecure-test-hooks")]
@@ -407,6 +433,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         egress,
         sandbox_id,
         fs_limit,
+        vcpus,
         #[cfg(feature = "insecure-test-hooks")]
         splice_to,
         #[cfg(feature = "insecure-test-hooks")]
@@ -791,12 +818,16 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
         return Err("--egress is not supported on macOS yet".into());
     }
     // Everything the kernel process needs from the host is opened before
-    // the hardening: the image directory, the VM and its vCPU, randomness
+    // the hardening: the image directory, the VM and its vCPUs (each on a
+    // thread of its own, made now), randomness
     // (`StdioHost`), the terminal's settings and size.
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
     let image_path = image.root().to_path_buf();
-    let mut app = HvfPlatform::new(HvfConfig::default())?;
+    let mut app = HvfPlatform::new(HvfConfig {
+        vcpus: options.vcpus.unwrap_or(0),
+        ..HvfConfig::default()
+    })?;
     let host = StdioHost::new(Some(image));
     let terminal = options
         .tty
@@ -881,8 +912,9 @@ fn sleep_confined(duration: std::time::Duration) {
     }
 }
 
-/// Applies `hellovm-sandbox` to this process (macOS). Call it while the
-/// process has one thread, before any guest input is read.
+/// Applies `hellovm-sandbox` to this process (macOS). Call it before any
+/// guest input is read, while the only other threads are the platform's
+/// vCPU threads (idle, reading no environment).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn harden(
     options: &Options,

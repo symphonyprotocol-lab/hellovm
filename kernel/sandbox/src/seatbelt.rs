@@ -37,17 +37,28 @@ const RULES: &str = r#"
     SYS_getdirentries64 SYS_readlinkat
     ;; memory (malloc, thread stacks)
     SYS_mmap SYS_munmap SYS_mprotect SYS_madvise
+    ;; the wall clock: libc reads it from the commpage, and makes this
+    ;; call when the kernel is updating it there
+    SYS_gettimeofday
     ;; threads: the stdin reader and the --timeout watchdog
     SYS_bsdthread_create SYS_bsdthread_terminate SYS_thread_selfid
     SYS___disable_threadsignal SYS_sigaltstack
     ;; locks and condition variables between them
     SYS_psynch_cvbroad SYS_psynch_cvsignal SYS_psynch_cvwait
-    SYS_ulock_wait SYS_ulock_wake))
+    SYS_ulock_wait SYS_ulock_wake
+    ;; the platform's vCPU threads: its mutex contended, condition
+    ;; variable waits that time out as another thread signals, and lock
+    ;; waits with a 64-bit timeout
+    SYS_psynch_mutexwait SYS_psynch_mutexdrop SYS_psynch_cvclrprepost
+    SYS_ulock_wait2))
 (allow syscall-mach (machtrap-number
     ;; memory (malloc)
     MSC__kernelrpc_mach_vm_map_trap MSC__kernelrpc_mach_vm_deallocate_trap
     MSC__kernelrpc_mach_vm_protect_trap
-    MSC_mach_vm_reclaim_update_kernel_accounting_trap))
+    MSC_mach_vm_reclaim_update_kernel_accounting_trap
+    ;; a vCPU thread that ends (the platform's are joined when it goes):
+    ;; libpthread lets go of the thread's own port rights
+    MSC__kernelrpc_mach_port_mod_refs_trap MSC__kernelrpc_mach_port_destruct_trap))
 "#;
 
 /// `apply` checks that `/` cannot be opened: not worth a report. Because
