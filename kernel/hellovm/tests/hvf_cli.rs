@@ -109,7 +109,7 @@ fn shell_pipeline_and_python_through_the_command_line() {
     ]);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "nnn\nnn8\n6 guests\n",
+        "nnn\nnn8\n7 guests\n",
         "{out:?}"
     );
     assert_eq!(out.status.code(), Some(0));
@@ -120,4 +120,59 @@ fn shell_pipeline_and_python_through_the_command_line() {
     ]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n", "{out:?}");
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// `--vcpus`: the checks of `kernel/test-guest/c/smp.c` and threads of
+/// CPU work on one vCPU and on four, confined (`--sandbox require`: the
+/// vCPU threads need nothing the profile refuses), `--timeout` stopping
+/// eight threads that never make a system call, and counts out of range
+/// refused.
+#[test]
+fn vcpus_through_the_command_line() {
+    let _serial = hvf_support::serial();
+    let Some(exe) = hellovm() else {
+        return;
+    };
+    let Some(root) = guest_image() else {
+        return;
+    };
+    let run = |args: &[&str]| {
+        progress(&format!("hvf_cli: {args:?}"));
+        Command::new(exe)
+            .args(["--sandbox", "require", "--no-tty", "--root"])
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for vcpus in ["1", "4"] {
+        let out = run(&["--vcpus", vcpus, "/guests/smp", "all"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{vcpus}: {out:?}");
+        assert_eq!(stdout.matches(": ok").count(), 7, "{vcpus}: {stdout}");
+        let out = run(&["--vcpus", vcpus, "/guests/smp", "scale", "4", "10000000"]);
+        assert_eq!(out.status.code(), Some(0), "{vcpus}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with("scale: threads=4 sum="),
+            "{out:?}"
+        );
+    }
+    let start = std::time::Instant::now();
+    let out = run(&[
+        "--vcpus",
+        "4",
+        "--timeout",
+        "0.3",
+        "/guests/smp",
+        "scale",
+        "8",
+        "1000000000000",
+    ]);
+    assert_eq!(out.status.code(), Some(124), "{out:?}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    for bad in ["0", "65", "many"] {
+        let out = run(&["--vcpus", bad, "/guests/smp", "all"]);
+        assert_eq!(out.status.code(), Some(2), "--vcpus {bad}: {out:?}");
+        assert!(out.stdout.is_empty());
+    }
 }

@@ -512,7 +512,7 @@ print("python child of", out.stdout.strip())
 }
 
 /// Step 9: the C guests (static, static-PIE, dynamic; processes, signals,
-/// threads), each its own run.
+/// threads, threads in parallel on the default vCPUs), each its own run.
 #[test]
 fn s9c_c_guests_under_require() {
     let _serial = hvf_support::serial();
@@ -529,6 +529,7 @@ fn s9c_c_guests_under_require() {
         ),
         (&["/guests/signals"], 0, "clone sharing refused: -1 1"),
         (&["/guests/threads"], 7, "fork: child-threads=1"),
+        (&["/guests/smp", "all"], 0, "syscalls-next-to-spinners: ok"),
         (&["/guests/pie", "arg"], 0, "pagesz=4096"),
         (
             &["/guests/dynamic", "hello"],

@@ -11,7 +11,7 @@
 # image (default hellovm-dev, built from kernel/dev/Dockerfile). Writes
 # kernel/target/hvf-guests/root:
 #
-#   guests/smoke, pie, signals, threads, forks
+#   guests/smoke, pie, signals, threads, forks, smp
 #                        kernel/test-guest/c, built by the container's gcc
 #                        and glibc with the flags of test-guest/build.rs
 #                        (static-PIE), except smoke (static, as before)
@@ -40,7 +40,7 @@ root=kernel/target/hvf-guests/root
 c=kernel/test-guest/c
 mkdir -p "$root/guests" "$root/bin" "$root/usr/bin" "$root/tmp" "$root/root" "$root/etc"
 gcc -static -O2 -Wl,--build-id=none -o "$root/guests/smoke" "$c/smoke.c"
-for guest in pie signals threads forks; do
+for guest in pie signals threads forks smp; do
     gcc -static-pie -fPIE -O2 -pthread -Wl,--build-id=none -o "$root/guests/$guest" "$c/$guest.c"
 done
 gcc -O2 -Wl,--build-id=none -o "$root/guests/dynamic" "$c/dynamic.c" -lm

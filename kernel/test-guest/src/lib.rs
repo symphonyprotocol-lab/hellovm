@@ -59,6 +59,16 @@ pub const THREADS: &str = env!("HELLOVM_GUEST_THREADS");
 #[cfg(target_os = "linux")]
 pub const FORKS: &str = env!("HELLOVM_GUEST_FORKS");
 
+/// A static-PIE glibc program whose threads run at the same time: CPU
+/// work (`smp scale THREADS ITERS`), and the checks of
+/// `hellovm/tests/smp.rs` (fork, mprotect and munmap while other threads
+/// write, copy-on-write with concurrent writers, futex ping-pong, a
+/// signal to a spinning thread, system calls next to spinners,
+/// `exit_group` and `execve` while threads spin). Empty when
+/// cross-compiling.
+#[cfg(target_os = "linux")]
+pub const SMP: &str = env!("HELLOVM_GUEST_SMP");
+
 /// Dynamically linked glibc program that exercises emulated IPv4 sockets: loopback,
 /// address classification, half-close, `MSG_NOSIGNAL`, ioctl, `/proc/net`,
 /// virtual DNS, and `getaddrinfo` / `getifaddrs`. Empty when cross-compiling.

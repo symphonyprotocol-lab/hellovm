@@ -12,6 +12,21 @@ use hellovm_platform_hvf::{HvfConfig, HvfPlatform};
 /// One VM per process: the tests take turns.
 static VM: Mutex<()> = Mutex::new(());
 
+/// `HELLOVM_HVF_VCPUS`, if set, overrides the vCPU count of a config that
+/// leaves it to the default, so that the whole suite runs with one vCPU
+/// or with several.
+fn with_test_vcpus(mut config: HvfConfig) -> HvfConfig {
+    if config.vcpus == 0 {
+        if let Some(n) = std::env::var("HELLOVM_HVF_VCPUS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+        {
+            config.vcpus = n;
+        }
+    }
+    config
+}
+
 fn platform() -> Option<(MutexGuard<'static, ()>, HvfPlatform)> {
     platform_with(HvfConfig::default())
 }
@@ -27,7 +42,7 @@ fn platform_with(config: HvfConfig) -> Option<(MutexGuard<'static, ()>, HvfPlatf
         eprintln!("SKIPPING: the test guests were not built on this Mac");
         return None;
     }
-    match HvfPlatform::new(config) {
+    match HvfPlatform::new(with_test_vcpus(config)) {
         Ok(p) => Some((guard, p)),
         Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
             panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
@@ -749,7 +764,13 @@ fn fork_keeps_address_spaces_apart_in_the_tlb() {
         }
     }
     let after = p.flushes();
-    assert_eq!(after, before, "switching address spaces flushed: {after:?}");
+    // Each other vCPU may still have had the fork's invalidations to do
+    // when it first ran one of them; switching flushed nothing.
+    let extra = (after.all + after.page) - (before.all + before.page);
+    assert!(
+        extra < p.vcpus() as u64,
+        "switching address spaces flushed: {before:?} then {after:?}"
+    );
     for (task, want) in [(t, 0xaaaau64), (c, 0xbbbb)] {
         p.read(task, DATA, &mut word).unwrap();
         assert_eq!(u64::from_le_bytes(word), want);

@@ -235,8 +235,8 @@ fn apply_limits() -> Result<String, String> {
 /// Removes every environment variable: the kernel process reads none after
 /// start-up, and an operator's environment (tokens, keys) is not for a
 /// compromised kernel process to read. The program's own environment is
-/// built from `--env`, never from this one. Must run while the process
-/// has one thread (see the caller).
+/// built from `--env`, never from this one. Must run while no other
+/// thread may read the environment (see the caller).
 fn clear_environment() -> Result<String, String> {
     let names: Vec<_> = std::env::vars_os().map(|(name, _)| name).collect();
     for name in &names {
@@ -403,9 +403,10 @@ fn seatbelt(config: &Config<'_>) -> Result<String, String> {
 }
 
 /// Applies every layer; see the crate documentation. Call it once the
-/// image directory, the VM and its vCPU, stdio and the terminal are set up
-/// and before the kernel reads any guest input, while the process still
-/// has one thread.
+/// image directory, the VM and its vCPUs, stdio and the terminal are set
+/// up and before the kernel reads any guest input, while the only other
+/// threads are the HVF platform's vCPU threads, which wait for a task to
+/// run and read no environment.
 pub fn apply(config: Config<'_>) -> Result<Report, Refused> {
     let mut report = Report::default();
     let layers = [

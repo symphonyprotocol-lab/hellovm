@@ -103,6 +103,7 @@ extern "C" {
     fn hv_vcpus_exit(vcpus: *const HvVcpu, count: u32) -> HvReturn;
     fn hv_vcpu_set_vtimer_mask(vcpu: HvVcpu, masked: bool) -> HvReturn;
     fn hv_vcpu_get_vtimer_offset(vcpu: HvVcpu, offset: *mut u64) -> HvReturn;
+    fn hv_vm_get_max_vcpu_count(max_vcpu_count: *mut u32) -> HvReturn;
 }
 
 extern "C" {
@@ -248,6 +249,21 @@ impl Vm {
         })
     }
 
+    /// Proof that the VM exists, for making vCPUs on other threads.
+    pub fn token(&self) -> VmToken {
+        VmToken { _private: () }
+    }
+
+    /// How many vCPUs the framework lets a VM have.
+    pub fn max_vcpus(&self) -> Result<u32, HvError> {
+        let mut max = 0;
+        // SAFETY: valid out-pointer.
+        check("hv_vm_get_max_vcpu_count", unsafe {
+            hv_vm_get_max_vcpu_count(&mut max)
+        })?;
+        Ok(max)
+    }
+
     pub fn unmap(&self, ipa: HvIpa, size: usize) -> Result<(), HvError> {
         // SAFETY: only changes the VM's stage-2 tables.
         check("hv_vm_unmap", unsafe { hv_vm_unmap(ipa, size) })
@@ -275,6 +291,13 @@ impl Drop for Vm {
 /// The vCPU, owned by the thread that created it: every call except
 /// [`VcpuKicker::kick`] must come from that thread, which the platform
 /// guarantees by being neither `Send` nor `Sync`.
+/// A [`Vm`] exists (see [`Vm::token`]); vCPUs are made with it, each
+/// on the thread that will run it.
+#[derive(Clone, Copy, Debug)]
+pub struct VmToken {
+    _private: (),
+}
+
 pub struct Vcpu {
     id: HvVcpu,
     exit: *const HvVcpuExit,
@@ -282,7 +305,7 @@ pub struct Vcpu {
 
 impl Vcpu {
     /// Creates a vCPU for the calling thread. The VM must exist.
-    pub fn create(_vm: &Vm) -> Result<Vcpu, HvError> {
+    pub fn create(_vm: VmToken) -> Result<Vcpu, HvError> {
         let mut id = 0;
         let mut exit = std::ptr::null();
         // SAFETY: both out-pointers are valid; a null config is the default.
@@ -486,10 +509,59 @@ impl HostMem {
     pub fn slice(&self, offset: usize, len: usize) -> &[u8] {
         assert!(offset <= self.len && len <= self.len - offset);
         // SAFETY: in bounds (checked); the mapping lives as long as `self`.
-        // The guest may write these bytes concurrently only while a vCPU
-        // runs, and the vCPU runs only inside `HvfPlatform::wait`, which
-        // holds `&mut` to the platform and so to `self`.
+        // Only for memory the guest cannot write (the shim, the page
+        // tables): app memory goes through the copies below, since an app
+        // on another vCPU may write it at any time.
         unsafe { std::slice::from_raw_parts(self.ptr.add(offset), len) }
+    }
+
+    /// Panics unless `offset..offset + len` is inside the mapping.
+    pub fn check_range(&self, offset: usize, len: usize) {
+        assert!(offset <= self.len && len <= self.len - offset);
+    }
+
+    /// Copies out of the mapping without a reference to it: the guest may
+    /// be writing the same bytes.
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) {
+        self.check_range(offset, buf.len());
+        // SAFETY: in bounds (checked); `buf` is host memory, never inside
+        // the mapping (the platform's buffers are its own).
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(offset), buf.as_mut_ptr(), buf.len()) }
+    }
+
+    /// Copies into the mapping without a reference to it.
+    pub fn write_at(&mut self, offset: usize, data: &[u8]) {
+        self.check_range(offset, data.len());
+        // SAFETY: as in `read_at`.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(offset), data.len()) }
+    }
+
+    /// Copies `len` bytes within the mapping; the ranges do not overlap.
+    pub fn copy_at(&mut self, from: usize, to: usize, len: usize) {
+        self.check_range(from, len);
+        self.check_range(to, len);
+        assert!(from + len <= to || to + len <= from);
+        // SAFETY: both in bounds and apart (checked).
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(from), self.ptr.add(to), len) }
+    }
+
+    pub fn zero_at(&mut self, offset: usize, len: usize) {
+        self.check_range(offset, len);
+        // SAFETY: in bounds (checked).
+        unsafe { std::ptr::write_bytes(self.ptr.add(offset), 0, len) }
+    }
+
+    /// One aligned 64-bit store, which a table walk on another vCPU sees
+    /// whole or not at all.
+    pub fn store_u64(&mut self, offset: usize, value: u64) {
+        self.check_range(offset, 8);
+        assert!(offset.is_multiple_of(8));
+        // SAFETY: in bounds and 8-aligned (the mapping is page aligned);
+        // an atomic store, which aarch64 makes single-copy atomic.
+        unsafe {
+            std::sync::atomic::AtomicU64::from_ptr(self.ptr.add(offset).cast())
+                .store(value.to_le(), Ordering::Release)
+        }
     }
 
     pub fn slice_mut(&mut self, offset: usize, len: usize) -> &mut [u8] {
@@ -498,6 +570,13 @@ impl HostMem {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.add(offset), len) }
     }
 }
+
+// SAFETY: a plain anonymous mapping, usable from any thread; access to
+// its bytes goes through `&self`/`&mut self` (and so through the mutex
+// the platform keeps its pools behind).
+unsafe impl Send for HostMem {}
+// SAFETY: as for `Send`: `&HostMem` only reads.
+unsafe impl Sync for HostMem {}
 
 impl Drop for HostMem {
     fn drop(&mut self) {
