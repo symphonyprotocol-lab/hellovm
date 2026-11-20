@@ -73,10 +73,12 @@
 //! On macOS on Apple silicon, programs run on the HVF platform
 //! (Hypervisor.framework; aarch64 Linux programs only, on one vCPU), and
 //! only the first form works, without
-//! `--egress` and `--template`/`--clone`. Nothing hardens the kernel
-//! process there: `--sandbox require` refuses to start. The executable
-//! must be signed with the hypervisor entitlement (see README, "The HVF
-//! platform").
+//! `--egress` and `--template`/`--clone`. There the hardening is closing
+//! inherited fds, resource limits, clearing the environment,
+//! `PT_DENY_ATTACH` and a Seatbelt profile the process enters itself once
+//! the VM is made (see README, "Hardening"); `--sandbox` works as on
+//! Linux. The executable must be signed with the hypervisor entitlement
+//! (see README, "The HVF platform").
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -86,6 +88,13 @@ use std::process::ExitCode;
 
 use hellovm_sandbox::Mode as SandboxMode;
 
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "insecure-test-hooks"
+))]
+#[path = "fence_macos.rs"]
+mod fence;
 #[cfg(target_os = "linux")]
 mod template;
 
@@ -434,14 +443,14 @@ fn main() -> ExitCode {
         ));
     }
     // Before anything opens an fd of its own.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let fds = if options.sandbox == SandboxMode::Off {
         Err("--sandbox=off".to_string())
     } else {
         hellovm_sandbox::close_inherited_fds()
     };
-    #[cfg(not(target_os = "linux"))]
-    let fds: Result<usize, String> = Err("not Linux".into());
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let fds: Result<usize, String> = Err("no hardening on this host".into());
     match run(&options, fds) {
         Ok(Ended::TimedOut(after)) => {
             eprintln!("hellovm: program timed out after {after:?}");
@@ -763,13 +772,11 @@ fn fence_test(test: &str) -> ! {
     }
 }
 
-/// macOS on Apple silicon: the HVF platform. No hardening, no egress, no
-/// warm clones.
+/// macOS on Apple silicon: the HVF platform, hardened by
+/// `hellovm-sandbox` (a Seatbelt profile and more). No egress, no warm
+/// clones.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn run(
-    options: &Options,
-    _fds: Result<usize, String>,
-) -> Result<Ended, Box<dyn std::error::Error>> {
+fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn std::error::Error>> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -783,21 +790,33 @@ fn run(
     if options.egress.is_some() {
         return Err("--egress is not supported on macOS yet".into());
     }
-    match options.sandbox {
-        SandboxMode::Require => {
-            return Err(
-                "--sandbox require: the kernel process cannot be hardened on macOS (yet)".into(),
-            )
-        }
-        SandboxMode::BestEffort => {
-            log::warn!("no hardening of the kernel process on macOS (--sandbox off to silence)")
-        }
-        SandboxMode::Off => {}
-    }
+    // Everything the kernel process needs from the host is opened before
+    // the hardening: the image directory, the VM and its vCPU, randomness
+    // (`StdioHost`), the terminal's settings and size.
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
+    let image_path = image.root().to_path_buf();
     let mut app = HvfPlatform::new(HvfConfig::default())?;
     let host = StdioHost::new(Some(image));
+    let terminal = options
+        .tty
+        .unwrap_or_else(|| host_tty::is_terminal(0) && host_tty::is_terminal(1));
+    let window = if terminal {
+        host_tty::window_size(1)
+    } else {
+        None
+    };
+    // Restores the host terminal when dropped.
+    let _raw = if terminal {
+        host_tty::RawMode::enter(0)
+    } else {
+        None
+    };
+    harden(options, &image_path, fds)?;
+    #[cfg(feature = "insecure-test-hooks")]
+    if let Some(test) = &options.fence_test {
+        fence::run(test, &image_path);
+    }
     let mut kernel = Kernel::new(host);
     if let Some(id) = options.sandbox_id {
         kernel = kernel.with_sandbox_id(id);
@@ -808,27 +827,19 @@ fn run(
     if options.trace {
         kernel = kernel.with_trace();
     }
-    let terminal = options
-        .tty
-        .unwrap_or_else(|| host_tty::is_terminal(0) && host_tty::is_terminal(1));
-    let _raw = if terminal {
-        kernel = kernel.with_console(hellovm_core::ConsoleMode::Terminal);
-        host_tty::RawMode::enter(0)
-    } else {
-        None
-    };
-    kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
     if terminal {
-        if let Some((rows, cols)) = host_tty::window_size(1) {
-            kernel.set_window_size(rows, cols);
-        }
+        kernel = kernel.with_console(hellovm_core::ConsoleMode::Terminal);
+    }
+    kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
+    if let Some((rows, cols)) = window {
+        kernel.set_window_size(rows, cols);
     }
     let timed_out = Arc::new(AtomicBool::new(false));
     if let Some(timeout) = options.timeout {
         let killer = app.killer();
         let timed_out = Arc::clone(&timed_out);
         std::thread::spawn(move || {
-            std::thread::sleep(timeout);
+            sleep_confined(timeout);
             timed_out.store(true, Ordering::SeqCst);
             killer.kill();
         });
@@ -846,6 +857,56 @@ fn run(
         }
         _ => Ok(Ended::Status(status)),
     }
+}
+
+/// Sleeps for `duration` in the confined kernel process (macOS).
+/// `std::thread::sleep` (`nanosleep`) asks the kernel's clock service
+/// through Mach IPC, which the Seatbelt profile does not allow; a timed
+/// condition variable wait needs only `psynch_cvwait`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn sleep_confined(duration: std::time::Duration) {
+    let deadline = std::time::Instant::now() + duration;
+    let lock = std::sync::Mutex::new(());
+    let never = std::sync::Condvar::new();
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        guard = match never.wait_timeout(guard, deadline - now) {
+            Ok((guard, _)) => guard,
+            Err(err) => err.into_inner().0,
+        };
+    }
+}
+
+/// Applies `hellovm-sandbox` to this process (macOS). Call it while the
+/// process has one thread, before any guest input is read.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn harden(
+    options: &Options,
+    image: &std::path::Path,
+    fds: Result<usize, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Read before the hardening clears the environment.
+    #[cfg(feature = "insecure-test-hooks")]
+    let (learn, broken) = (
+        // A fence test's attempts are what the profile must refuse:
+        // they are enforced, never recorded as something it should allow.
+        std::env::var_os("HELLOVM_SEATBELT_LEARN").is_some() && options.fence_test.is_none(),
+        std::env::var_os("HELLOVM_TEST_SEATBELT_BROKEN").is_some(),
+    );
+    #[cfg(not(feature = "insecure-test-hooks"))]
+    let (learn, broken) = (false, false);
+    hellovm_sandbox::apply(hellovm_sandbox::Config {
+        mode: options.sandbox,
+        image_path: image,
+        learn,
+        broken,
+        fds,
+    })?;
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
