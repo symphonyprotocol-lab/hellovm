@@ -1055,14 +1055,20 @@ notice; the system call lists would silently stop working. Rerun the
 tests after a macOS update.
 
 *Violations* are reported by the kernel to the unified log, one line per
-operation and process (repeats are counted, not repeated):
+operation and target. Reporting is best effort: a denial reported
+recently is counted, not reported again, and after the tests' burst of
+denials the kernel reported none from `hellovm` (any operation, any
+path, a renamed or re-signed copy too) for the rest of the more than 15
+minutes it was watched, while other processes' denials still appeared.
+So the log shows what was denied, not every denial, and its absence
+proves nothing:
 
 ```sh
 log show --last 10m --predicate 'sender == "Sandbox" AND eventMessage CONTAINS "hellovm("'
 ```
 
 ```text
-kernel: (Sandbox) Sandbox: hellovm(4242) deny(1) file-read-data /private/etc/passwd
+kernel: (Sandbox) Sandbox: hellovm(4242) deny(1) file-test-existence /etc/passwd
 ```
 
 A killed kernel process (a system call outside the lists) shows up there
@@ -1089,8 +1095,12 @@ the self-check. A guest's system call is a VM exit handled inside the
 kernel process and never becomes a host system call, so the hot path
 does not pass through Seatbelt; the host system calls the kernel process
 makes on behalf of a guest (reading the image, writing stdout) are each
-checked against the profile's lists, which are bitmaps. Start-up and
-round-trip times with and without the sandbox have not been measured yet.
+checked against the profile's lists. Measured on the M3 Max (release
+build, through the command line, wall clock, best of 10, three runs):
+starting `hellovm` and running the hello world takes 5.8 ms with
+`--sandbox off` and 11.2 to 11.8 ms with `--sandbox require`; a `getpid`
+round trip (`getpid_loop`, 1,000,000 calls minus 0, best of 5) takes 977
+to 980 ns either way.
 
 ## Warm clones
 
