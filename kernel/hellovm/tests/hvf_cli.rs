@@ -65,21 +65,17 @@ fn unsupported_options_are_refused() {
         return;
     };
     let root = image("refused", hellovm_test_guest::HELLO);
-    for args in [
-        &["--egress", "/nonexistent.sock"][..],
-        &["--template", "/nonexistent.sock"],
-    ] {
-        progress(&format!("hvf_cli: refused {args:?}"));
-        let out = Command::new(exe)
-            .args(args)
-            .arg("--root")
-            .arg(&root)
-            .arg("/refused")
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(125), "{args:?}");
-        assert!(out.stdout.is_empty());
-    }
+    let args = ["--template", "/nonexistent.sock"];
+    progress(&format!("hvf_cli: refused {args:?}"));
+    let out = Command::new(exe)
+        .args(args)
+        .arg("--root")
+        .arg(&root)
+        .arg("/refused")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(125), "{args:?}");
+    assert!(out.stdout.is_empty());
 }
 
 /// A busybox shell pipeline and a CPython script that starts processes,

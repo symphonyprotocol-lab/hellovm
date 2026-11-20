@@ -73,14 +73,14 @@
 //! `debug`, `trace`).
 //!
 //! On macOS on Apple silicon, programs run on the HVF platform
-//! (Hypervisor.framework; aarch64 Linux programs only, on one vCPU), and
-//! only the first form works, without
-//! `--egress` and `--template`/`--clone`. There the hardening is closing
-//! inherited fds, resource limits, clearing the environment,
+//! (Hypervisor.framework; aarch64 Linux programs only), and only the
+//! first form works, without `--template`/`--clone`. There the hardening
+//! is closing inherited fds, resource limits, clearing the environment,
 //! `PT_DENY_ATTACH` and a Seatbelt profile the process enters itself once
-//! the VM is made (see README, "Hardening"); `--sandbox` works as on
-//! Linux. The executable must be signed with the hypervisor entitlement
-//! (see README, "The HVF platform").
+//! the VM is made (see README, "Hardening"); with `--egress` the profile
+//! lets it connect to that one socket path and nothing else. `--sandbox`
+//! works as on Linux. The executable must be signed with the hypervisor
+//! entitlement (see README, "The HVF platform").
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -108,7 +108,7 @@ const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-
 
 /// How long hellovm waits, after the program ends, for outbound bytes the
 /// sandbox already wrote to be delivered.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 const EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Exit status when the program was killed by `--timeout`.
@@ -587,25 +587,17 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(addr) = options.splice_to {
         // Every issued fake IP is spliced here. The guest address is not dialed.
-        host.set_splice_endpoint(addr);
+        host.set_splice_endpoint(addr)?;
     }
     let image = host.image_mut().expect("the host has the image");
     if let (Some(path), _) = harden(options, image, egress, fds, false)? {
-        host.set_egress(path);
+        host.set_egress(path)?;
     }
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(test) = &options.fence_test {
         fence_test(test);
     }
-    let sandbox_id = match options.sandbox_id {
-        Some(id) => id,
-        None => {
-            let mut bytes = [0u8; 8];
-            hellovm_core::host::Host::random(&mut host, &mut bytes)?;
-            u64::from_be_bytes(bytes)
-        }
-    };
-    log::info!("sandbox id {sandbox_id:016x}");
+    let sandbox_id = sandbox_id(options, &mut host)?;
     let mut kernel = Kernel::new(host).with_sandbox_id(sandbox_id);
     if let Some(bytes) = options.fs_limit {
         kernel = kernel.with_fs_limit(bytes);
@@ -664,6 +656,22 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     }
 }
 
+/// `--sandbox-id`, or a random one: what names the sandbox to the egress
+/// proxy.
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+fn sandbox_id(options: &Options, host: &mut hellovm_host::StdioHost) -> std::io::Result<u64> {
+    let id = match options.sandbox_id {
+        Some(id) => id,
+        None => {
+            let mut bytes = [0u8; 8];
+            hellovm_core::host::Host::random(host, &mut bytes)?;
+            u64::from_be_bytes(bytes)
+        }
+    };
+    log::info!("sandbox id {id:016x}");
+    Ok(id)
+}
+
 /// `--insecure-test-session`: see `hellovm::session`.
 #[cfg(all(target_os = "linux", feature = "insecure-test-hooks"))]
 fn run_session(
@@ -677,7 +685,7 @@ fn run_session(
     let image = host.image_mut().expect("the host has the image");
     let (egress, _) = harden(options, image, egress, fds, false)?;
     if let Some(addr) = options.splice_to {
-        host.set_splice_endpoint(addr);
+        host.set_splice_endpoint(addr)?;
     }
     let mut kernel = hellovm_core::Kernel::new(host);
     if let Some(id) = options.sandbox_id {
@@ -687,7 +695,7 @@ fn run_session(
         kernel = kernel.with_trace();
     }
     if let Some(path) = egress {
-        kernel.host_mut().set_egress(path);
+        kernel.host_mut().set_egress(path)?;
     }
     hellovm::session::serve(kernel)?;
     Ok(Ended::Status(hellovm_core::ExitStatus::Exited(0)))
@@ -800,8 +808,7 @@ fn fence_test(test: &str) -> ! {
 }
 
 /// macOS on Apple silicon: the HVF platform, hardened by
-/// `hellovm-sandbox` (a Seatbelt profile and more). No egress, no warm
-/// clones.
+/// `hellovm-sandbox` (a Seatbelt profile and more). No warm clones.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn std::error::Error>> {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -814,13 +821,12 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     if options.template.is_some() || options.clone.is_some() {
         return Err("warm clones (--template, --clone) need Linux".into());
     }
-    if options.egress.is_some() {
-        return Err("--egress is not supported on macOS yet".into());
-    }
+    let egress = options.egress.as_deref().map(egress_socket).transpose()?;
     // Everything the kernel process needs from the host is opened before
     // the hardening: the image directory, the VM and its vCPUs (each on a
     // thread of its own, made now), randomness
-    // (`StdioHost`), the terminal's settings and size.
+    // (`StdioHost`), the I/O thread of outbound streams (with `--egress`),
+    // the terminal's settings and size.
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
     let image_path = image.root().to_path_buf();
@@ -834,7 +840,10 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
         ..HvfConfig::default()
     })?);
     let app: &mut HvfPlatform = &mut app;
-    let host = StdioHost::new(Some(image));
+    let mut host = StdioHost::new(Some(image));
+    if let Some(path) = &egress {
+        host.set_egress(path)?;
+    }
     let terminal = options
         .tty
         .unwrap_or_else(|| host_tty::is_terminal(0) && host_tty::is_terminal(1));
@@ -849,15 +858,13 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     } else {
         None
     };
-    harden(options, &image_path, fds)?;
+    harden(options, &image_path, egress.as_deref(), fds)?;
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(test) = &options.fence_test {
         fence::run(test, &image_path);
     }
-    let mut kernel = Kernel::new(host);
-    if let Some(id) = options.sandbox_id {
-        kernel = kernel.with_sandbox_id(id);
-    }
+    let sandbox_id = sandbox_id(options, &mut host)?;
+    let mut kernel = Kernel::new(host).with_sandbox_id(sandbox_id);
     if let Some(bytes) = options.fs_limit {
         kernel = kernel.with_fs_limit(bytes);
     }
@@ -876,7 +883,7 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
         let killer = app.killer();
         let timed_out = Arc::clone(&timed_out);
         std::thread::spawn(move || {
-            sleep_confined(timeout);
+            hellovm_host::sleep_confined(timeout);
             timed_out.store(true, Ordering::SeqCst);
             killer.kill();
         });
@@ -884,6 +891,11 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     let status = kernel.run(app);
     for record in kernel.trace() {
         eprintln!("hellovm: trace: {record}");
+    }
+    // The I/O thread delivers what the guest wrote: give it a bounded
+    // time before exit ends it.
+    if !kernel.host_mut().drain_streams(EXIT_DRAIN) {
+        log::warn!("outbound streams still had undelivered bytes after {EXIT_DRAIN:?}");
     }
     let status = status?;
     match (status, options.timeout) {
@@ -896,35 +908,45 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     }
 }
 
-/// Sleeps for `duration` in the confined kernel process (macOS).
-/// `std::thread::sleep` (`nanosleep`) asks the kernel's clock service
-/// through Mach IPC, which the Seatbelt profile does not allow; a timed
-/// condition variable wait needs only `psynch_cvwait`.
+/// The egress socket as the confined kernel process connects to it and
+/// its Seatbelt profile names it (macOS): absolute, its directory with
+/// symlinks resolved (`/tmp` is `/private/tmp`, and Seatbelt compares the
+/// resolved path). The socket itself need not exist yet, and a proxy may
+/// replace it; it must not be a symlink.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn sleep_confined(duration: std::time::Duration) {
-    let deadline = std::time::Instant::now() + duration;
-    let lock = std::sync::Mutex::new(());
-    let never = std::sync::Condvar::new();
-    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return;
-        }
-        guard = match never.wait_timeout(guard, deadline - now) {
-            Ok((guard, _)) => guard,
-            Err(err) => err.into_inner().0,
-        };
+fn egress_socket(path: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::absolute(path)?;
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("--egress {}: not a socket path", path.display()).into());
+    };
+    let dir = dir
+        .canonicalize()
+        .map_err(|err| format!("--egress {}: {err}", path.display()))?;
+    let socket = dir.join(name);
+    if std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(format!("--egress {}: a symlink, not the socket", socket.display()).into());
     }
+    // `sun_path` holds 104 bytes with the terminating NUL.
+    if socket.as_os_str().as_bytes().len() > 103 {
+        return Err(format!(
+            "--egress {}: longer than a Unix socket path may be (103 bytes)",
+            socket.display()
+        )
+        .into());
+    }
+    Ok(socket)
 }
 
 /// Applies `hellovm-sandbox` to this process (macOS). Call it before any
 /// guest input is read, while the only other threads are the platform's
-/// vCPU threads (idle, reading no environment).
+/// vCPU threads and, with `--egress`, the I/O thread of outbound streams
+/// (idle, reading no environment).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn harden(
     options: &Options,
     image: &std::path::Path,
+    egress: Option<&std::path::Path>,
     fds: Result<usize, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read before the hardening clears the environment.
@@ -940,6 +962,7 @@ fn harden(
     hellovm_sandbox::apply(hellovm_sandbox::Config {
         mode: options.sandbox,
         image_path: image,
+        egress,
         learn,
         broken,
         fds,
