@@ -50,7 +50,12 @@ const RULES: &str = r#"
     ;; variable waits that time out as another thread signals, and lock
     ;; waits with a 64-bit timeout
     SYS_psynch_mutexwait SYS_psynch_mutexdrop SYS_psynch_cvclrprepost
-    SYS_ulock_wait2))
+    SYS_ulock_wait2
+    ;; the system's worker threads: Hypervisor.framework and libSystem
+    ;; register event sources (memory pressure, notifications) in the
+    ;; process, and when one fires the kernel starts a thread here that
+    ;; handles it and gives itself back with this call
+    SYS_workq_kernreturn))
 (allow syscall-mach (machtrap-number
     ;; memory (malloc)
     MSC__kernelrpc_mach_vm_map_trap MSC__kernelrpc_mach_vm_deallocate_trap

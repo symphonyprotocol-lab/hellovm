@@ -1130,7 +1130,7 @@ fails, the first time the platform's mutex is contended.
 | `system-fcntl` `F_GETFD`, `F_SETFD` | close-on-exec of the image fds |
 | `file-ioctl` `TIOCSETA` | restoring the host terminal's settings at exit (they and the window size were read before) |
 | `process-info-setcontrol` of itself | naming its own threads (`hellovm-stdin`) |
-| `syscall-unix`: `write`, `ioctl`; `read`, `pread`, `fstat64`, `fstatat64`, `fstatfs64`, `getdirentries64`, `readlinkat`; `mmap`, `munmap`, `mprotect`, `madvise`; `gettimeofday`; `bsdthread_create`, `bsdthread_terminate`, `thread_selfid`, `__disable_threadsignal`, `sigaltstack`; `psynch_cvbroad`, `psynch_cvsignal`, `psynch_cvwait`, `ulock_wait`, `ulock_wake`; `psynch_mutexwait`, `psynch_mutexdrop`, `psynch_cvclrprepost`, `ulock_wait2` | stdio and the terminal; reading the image; memory; the wall clock (libc reads it from the commpage and makes the call only while the kernel updates it there: rare, and before P1d it killed the process when it happened); the stdin reader and `--timeout` watchdog threads; locks between them; the vCPU threads: the platform's mutex contended (libpthread traps when these fail), a timed condition variable wait that times out as another thread signals, a lock wait with a 64-bit timeout |
+| `syscall-unix`: `write`, `ioctl`; `read`, `pread`, `fstat64`, `fstatat64`, `fstatfs64`, `getdirentries64`, `readlinkat`; `mmap`, `munmap`, `mprotect`, `madvise`; `gettimeofday`; `bsdthread_create`, `bsdthread_terminate`, `thread_selfid`, `__disable_threadsignal`, `sigaltstack`; `psynch_cvbroad`, `psynch_cvsignal`, `psynch_cvwait`, `ulock_wait`, `ulock_wake`; `psynch_mutexwait`, `psynch_mutexdrop`, `psynch_cvclrprepost`, `ulock_wait2`; `workq_kernreturn` | stdio and the terminal; reading the image; memory; the wall clock (libc reads it from the commpage and makes the call only while the kernel updates it there: rare, and before P1d it killed the process when it happened); the stdin reader and `--timeout` watchdog threads; locks between them; the vCPU threads: the platform's mutex contended (libpthread traps when these fail), a timed condition variable wait that times out as another thread signals, a lock wait with a 64-bit timeout; the system's worker threads (see below) |
 | `syscall-mach`: `_kernelrpc_mach_vm_map_trap`, `_kernelrpc_mach_vm_deallocate_trap`, `_kernelrpc_mach_vm_protect_trap`, `mach_vm_reclaim_update_kernel_accounting_trap` | memory (`malloc`). The vCPU threads are never ended or joined (the process exits with them; a joined thread that ends gives up port rights with two more Mach traps, which are not allowed) |
 | any other `syscall-unix`, `syscall-mach` or `syscall-mig`: `(deny ... (with send-signal SIGKILL))` | a system call or Mach trap outside the lists kills the process, as seccomp does on Linux |
 
@@ -1290,15 +1290,23 @@ kernel: (Sandbox) Sandbox: hellovm(4242) deny(1) file-test-existence /etc/passwd
 A killed kernel process (a system call outside the lists) shows up there
 as `deny(1) syscall-unix NUMBER` and exits with `SIGKILL` (status 137).
 
-*Open:* in one burst of seven runs, on a Mac under heavy load right after
-a long build, `hellovm --sandbox require` was killed about 5 s into a run
-with `deny(1) syscall-unix 368` (`workq_kernreturn`, the call a
-libdispatch worker thread makes to park); the same runs passed more than
-twenty times before and after. Nothing in `hellovm` uses libdispatch; a
-likely source is the memory pressure handler libSystem installs in every
-process, whose worker would park this way, but simulating memory pressure
-needs root and this was not confirmed. The call is not added to the
-profile until it is measured.
+*The system's worker threads.* Hypervisor.framework and libSystem
+register event sources in every process that makes a VM (`lskq -p PID`
+lists them: memory pressure, the exit of `notifyd`, two Mach ports). When
+one fires, the kernel starts a worker thread in the process to handle it,
+and the thread gives itself back with `workq_kernreturn`. Until P1e that
+call was not in the list, so an event from outside killed the kernel
+process: seven runs in fifteen seconds on a Mac short of memory, each
+with `deny(1) syscall-unix 368` and a crash report whose last thread is
+`start_wqthread` in `__workq_kernreturn`. The call is allowed now. What a
+worker needs was measured by having one started in the confined process
+(`HELLOVM_TEST_WORKER`, test builds only): started, idle and ended, it
+makes no other call outside the lists, and `hvf_cli` keeps that as a
+test. What a handler of those sources calls when its event really fires
+was not measured beyond those seven reports, in which the handlers had
+returned before the kill; which of the sources fired then is not known
+(a simulated memory pressure warning held for 30 s did not reach the
+process).
 
 *Compared with Linux, line by line:*
 

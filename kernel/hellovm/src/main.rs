@@ -858,10 +858,17 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     } else {
         None
     };
+    // Read before the hardening clears the environment.
+    #[cfg(feature = "insecure-test-hooks")]
+    let worker = std::env::var_os("HELLOVM_TEST_WORKER").is_some();
     harden(options, &image_path, egress.as_deref(), fds)?;
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(test) = &options.fence_test {
         fence::run(test, &image_path);
+    }
+    #[cfg(feature = "insecure-test-hooks")]
+    if worker {
+        wake_a_worker();
     }
     let sandbox_id = sandbox_id(options, &mut host)?;
     let mut kernel = Kernel::new(host).with_sandbox_id(sandbox_id);
@@ -905,6 +912,40 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
             Ok(Ended::TimedOut(timeout))
         }
         _ => Ok(Ended::Status(status)),
+    }
+}
+
+/// Test hook (`HELLOVM_TEST_WORKER`): has the system start one of its
+/// worker threads in this process, as it does by itself when an event
+/// source that a system library registered fires (memory pressure, a
+/// notification): Hypervisor.framework and libSystem register some in
+/// every process that makes a VM. The thread runs nothing, gives itself
+/// back and, left idle, ends: what the confined process must survive.
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "insecure-test-hooks"
+))]
+#[allow(unsafe_code)]
+fn wake_a_worker() {
+    use std::ffi::c_void;
+    extern "C" {
+        fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
+        fn dispatch_async_f(
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+    extern "C" fn nothing(_: *mut c_void) {}
+    // SAFETY: the global queue of the default class always exists, and
+    // the work is a function that takes no context.
+    unsafe {
+        dispatch_async_f(
+            dispatch_get_global_queue(0, 0),
+            std::ptr::null_mut(),
+            nothing,
+        );
     }
 }
 
