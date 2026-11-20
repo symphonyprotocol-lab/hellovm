@@ -42,7 +42,11 @@ static void fail(const char *check, const char *why) {
     exit(1);
 }
 
+#ifdef __aarch64__
 static void load_relaxed_spin(void) { __asm__ volatile("yield" ::: "memory"); }
+#else
+static void load_relaxed_spin(void) { __asm__ volatile("pause" ::: "memory"); }
+#endif
 
 // Waits until *flag is set, or fails after `ms` milliseconds.
 static void wait_set(volatile int *flag, int ms, const char *check, const char *what) {
