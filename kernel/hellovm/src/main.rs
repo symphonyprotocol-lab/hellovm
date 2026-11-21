@@ -221,6 +221,10 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut clone = None;
     let mut input = Vec::new();
     let mut ready = false;
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(unused_mut)
+    )]
     let mut warm_role = None;
     let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
     let mut args = args.peekable();
