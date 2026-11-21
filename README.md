@@ -1816,13 +1816,16 @@ process started ahead of the request (made, loaded and confined while
 the previous clone runs) would take most of that off the path, but it
 means a second VM alive while a clone runs: not done (see below).
 
-What is not done or not verified on macOS: several clones (VMs) alive at
-once were not run on this Mac (the test that does,
-`clones_at_once_are_isolated_and_one_can_be_killed`, is ignored and runs
-only with `-- --ignored`; see **Hardening** for why HVF tests run one
-VM at a time); a clone started ahead of its request; sharing read-only
-pages between clones; ingress; confining the supervisor; `hellovm-noded`
-and the API on macOS.
+Several clones alive at once are several VMs at once, each in its own
+process. `clones_at_once_are_isolated_and_one_can_be_killed` keeps up to
+four alive: what one changes another does not see, one is killed while
+the others live, and four run together. The other HVF tests still run
+one VM at a time (see **Hardening**). More than four at once, and clones
+that live for long next to each other, were not run.
+
+What is not done or not verified on macOS: a clone started ahead of its
+request; sharing read-only pages between clones; ingress; confining the
+supervisor; `hellovm-noded` and the API on macOS.
 
 ## Control plane
 
