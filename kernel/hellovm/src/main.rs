@@ -90,6 +90,61 @@ use std::process::ExitCode;
 
 use hellovm_sandbox::Mode as SandboxMode;
 
+/// macOS: the allocator of a process that confines itself with Seatbelt.
+/// The system's `realloc` of a large block asks the kernel to grow or
+/// copy the mapping (`mach_vm_reallocate`, `mach_vm_copy`: Mach messages),
+/// which the profile refuses, killing the process; any buffer a guest can
+/// make grow (a file in the writable layer, a pipe) would get there. So a
+/// large block is never given to `realloc`: a new one is allocated, the
+/// bytes are copied and the old one is freed, with the calls every
+/// allocation makes anyway. Blocks grow by doubling, so the copies cost
+/// what `realloc`'s own would.
+#[cfg(target_os = "macos")]
+struct Confined;
+
+/// From this size on a block is not given to the system's `realloc`
+/// (well below where its allocator starts to use mappings of their own).
+#[cfg(target_os = "macos")]
+const REALLOC_BY_COPY: usize = 128 * 1024;
+
+#[cfg(target_os = "macos")]
+// SAFETY: every call is the system allocator's, with the caller's layout;
+// `realloc` keeps the contract of `GlobalAlloc::realloc` (the new block
+// has the old alignment and the first `min(old, new)` bytes; on failure
+// the old block is untouched).
+unsafe impl std::alloc::GlobalAlloc for Confined {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        std::alloc::System.alloc(layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        std::alloc::System.alloc_zeroed(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        std::alloc::System.dealloc(ptr, layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if layout.size().max(new_size) < REALLOC_BY_COPY {
+            return std::alloc::System.realloc(ptr, layout, new_size);
+        }
+        // SAFETY (of the layout): the caller guarantees that `new_size`,
+        // rounded up to the alignment, does not overflow `isize`.
+        let new_layout = std::alloc::Layout::from_size_align_unchecked(new_size, layout.align());
+        let new = std::alloc::System.alloc(new_layout);
+        if !new.is_null() {
+            std::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
+            std::alloc::System.dealloc(ptr, layout);
+        }
+        new
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOCATOR: Confined = Confined;
+
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 mod clone_client;
 #[cfg(all(
