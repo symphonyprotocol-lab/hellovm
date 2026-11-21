@@ -196,6 +196,13 @@ pub(crate) fn now<H: Host + ?Sized>(host: &mut H) -> Timespec {
     }
 }
 
+/// The first bytes of [`Kernel::save_frozen`]'s output: the format, which
+/// changes with the kernel's state (template and clones run one build).
+const SNAPSHOT_MAGIC: &[u8] =
+    concat!("hellovm-kernel-", env!("CARGO_PKG_VERSION"), "-1\0").as_bytes();
+
+crate::snap_enum!(ExitStatus { 0 => Exited(code), 1 => Signaled(sig) });
+
 /// How long freezing a template waits for outbound connections the guest
 /// already closed to deliver their last bytes.
 const STREAM_SETTLE: Duration = Duration::from_secs(10);
@@ -684,6 +691,65 @@ impl<H: Host> Kernel<H> {
         self.st.freeze_requested = false;
         self.st.changed = true;
         Ok(())
+    }
+
+    /// The kernel state of a template that [`Kernel::run_template`] froze,
+    /// as bytes: everything but the host, for a platform whose clones are
+    /// new processes rather than forks of this one (see [`crate::snap`]).
+    /// [`Kernel::load_frozen`] makes a kernel of it again, which
+    /// [`Kernel::thaw`] then makes a clone.
+    pub fn save_frozen(&self) -> Result<Vec<u8>, KernelError> {
+        use crate::snap::Snap;
+        let Some(frozen) = &self.frozen else {
+            return Err(KernelError::NotClonable("not a frozen template".into()));
+        };
+        if self.console_mode != ConsoleMode::Streams || self.st.console.tty.is_some() {
+            return Err(KernelError::NotClonable("the console is a terminal".into()));
+        }
+        let mut w = crate::snap::Writer::new();
+        w.bytes(SNAPSHOT_MAGIC);
+        self.trace.is_some().put(&mut w);
+        self.vfs.put(&mut w);
+        self.st.put(&mut w);
+        self.cwd.put(&mut w);
+        self.arch.put(&mut w);
+        frozen.put(&mut w);
+        Ok(w.into_inner())
+    }
+
+    /// A frozen template's kernel from [`Kernel::save_frozen`]'s bytes,
+    /// with `host` as its host. Fails on bytes that do not parse; see
+    /// [`crate::snap`] for what is checked.
+    pub fn load_frozen(host: H, bytes: &[u8]) -> Result<Self, crate::snap::Bad> {
+        use crate::snap::Snap;
+        let mut r = crate::snap::Reader::new(bytes);
+        if r.take(SNAPSHOT_MAGIC.len())? != SNAPSHOT_MAGIC {
+            return crate::snap::bad("not a kernel snapshot of this build");
+        }
+        let trace = bool::get(&mut r)?;
+        let vfs = Vfs::get(&mut r)?;
+        let st = State::get(&mut r)?;
+        let cwd = Ino::get(&mut r)?;
+        let arch = Option::<Arch>::get(&mut r)?;
+        let frozen = Vec::<Vec<Tid>>::get(&mut r)?;
+        r.finish()?;
+        if st.clone_point != ClonePoint::Template || !st.freeze_requested {
+            return crate::snap::bad("not a frozen template");
+        }
+        let known = |tid: &Tid| st.threads.contains_key(tid);
+        if !frozen.iter().flatten().all(known) {
+            return crate::snap::bad("a frozen task without a thread");
+        }
+        Ok(Kernel {
+            host,
+            trace: trace.then(Vec::new),
+            vfs,
+            st,
+            cwd,
+            console_mode: ConsoleMode::Streams,
+            arch,
+            frozen: Some(frozen),
+        })
     }
 
     /// Names this sandbox to the egress proxy, like
@@ -1530,6 +1596,17 @@ mod tests {
 
     #[test]
     fn a_template_freezes_and_its_clone_runs_on() {
+        a_template_freezes_and_its_clone_runs_on_with(false);
+    }
+
+    /// The same, with the kernel state written as a snapshot and read back
+    /// into a new kernel in between (macOS: clones are new processes).
+    #[test]
+    fn a_template_freezes_and_its_clone_runs_on_from_a_snapshot() {
+        a_template_freezes_and_its_clone_runs_on_with(true);
+    }
+
+    fn a_template_freezes_and_its_clone_runs_on_with(snapshot: bool) {
         let arch = Arch::Aarch64;
         let path = SCRATCH + 0x300;
         let ts = SCRATCH + 0x200;
@@ -1560,6 +1637,28 @@ mod tests {
         plat.ignore_interrupts = true;
         assert_eq!(kernel.run_template(&mut plat).unwrap(), TemplateEnd::Frozen);
         assert!(plat.task(INIT).killed && plat.task(2).killed);
+        if snapshot {
+            let bytes = kernel.save_frozen().unwrap();
+            let host = kernel.into_host();
+            kernel = Kernel::load_frozen(host, &bytes).unwrap();
+            // The same state gives the same bytes.
+            assert_eq!(kernel.save_frozen().unwrap(), bytes);
+            // A snapshot cut short or with a byte changed in its header is
+            // refused, never a panic.
+            for cut in [0, 5, bytes.len() / 2, bytes.len() - 1] {
+                assert!(Kernel::load_frozen(MockHost::default(), &bytes[..cut]).is_err());
+            }
+            let mut bent = bytes.clone();
+            bent[0] ^= 1;
+            assert!(Kernel::load_frozen(MockHost::default(), &bent).is_err());
+            // Every byte changed in turn: an error or a kernel, never a
+            // panic.
+            for at in (0..bytes.len()).step_by(7) {
+                let mut bent = bytes.clone();
+                bent[at] = bent[at].wrapping_add(0x55);
+                let _ = Kernel::load_frozen(MockHost::default(), &bent);
+            }
+        }
         kernel.thaw(&mut plat, b"in".to_vec()).unwrap();
         assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
         // The template's init, rebuilt as task 3: the clone point returned

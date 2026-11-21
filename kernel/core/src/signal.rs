@@ -632,6 +632,38 @@ pub fn x86_64_fpstate(frame: &[u8]) -> (u64, usize) {
 /// (glibc on aarch64 relies on the vDSO's for that, and there is no vDSO).
 pub const AARCH64_TRAMPOLINE: [u8; 8] = [0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4];
 
+// The snapshot of a frozen template (see `snap`).
+crate::snap_struct!(SigAction {
+    handler,
+    flags,
+    restorer,
+    mask
+});
+crate::snap_struct!(SigInfo {
+    signo,
+    code,
+    errno,
+    pid,
+    uid,
+    status,
+    addr,
+    value,
+});
+crate::snap_struct!(AltStack { sp, flags, size });
+
+impl crate::snap::Snap for SigQueue {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        crate::snap::Snap::put(&self.queue, w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        let queue: VecDeque<SigInfo> = crate::snap::Snap::get(r)?;
+        if queue.len() > MAX_QUEUED + SIGRTMIN as usize {
+            return crate::snap::bad("more queued signals than allowed");
+        }
+        Ok(SigQueue { queue })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

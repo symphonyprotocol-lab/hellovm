@@ -37,6 +37,8 @@ pub mod net;
 mod pipe;
 pub mod platform;
 pub mod signal;
+#[doc(hidden)]
+pub mod snap;
 mod syscall;
 mod task;
 #[cfg(any(test, feature = "testutil"))]

@@ -1001,6 +1001,89 @@ fn parse_question(msg: &[u8]) -> Option<Question> {
     })
 }
 
+// The snapshot of a frozen template (see `snap`).
+crate::snap_enum!(Domain { 0 => Inet, 1 => Unix });
+crate::snap_enum!(Proto { 0 => Tcp, 1 => Udp });
+crate::snap_enum!(Link {
+    0 => Socket(id),
+    1 => Host(id),
+    2 => Dns,
+    3 => Gone,
+});
+crate::snap_enum!(Phase {
+    0 => Open,
+    1 => Listening,
+    2 => Connecting(link),
+    3 => Connected(link),
+});
+crate::snap_struct!(Dgram {
+    src_ip,
+    src_port,
+    data
+});
+crate::snap_struct!(Socket {
+    domain,
+    proto,
+    phase,
+    local_ip,
+    local_port,
+    bound,
+    holds_port,
+    remote_ip,
+    remote_port,
+    udp_remote,
+    rx,
+    dgrams,
+    dns_in,
+    shut_rd,
+    shut_wr,
+    peer_fin,
+    peer_reset,
+    post_fin_write,
+    connect_failed,
+    so_error,
+    reuseaddr,
+    keepalive,
+    nodelay,
+    sndbuf,
+    rcvbuf,
+    backlog,
+    queue,
+    inbound,
+    owners,
+});
+
+impl crate::snap::Snap for Arena {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        crate::snap::Snap::put(&self.slots, w);
+        crate::snap::Snap::put(&self.free, w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        let arena = Arena {
+            slots: crate::snap::Snap::get(r)?,
+            free: crate::snap::Snap::get(r)?,
+        };
+        if arena.slots.len() - arena.free.len().min(arena.slots.len()) > MAX_SOCKETS {
+            return crate::snap::bad("more sockets than a sandbox may have");
+        }
+        Ok(arena)
+    }
+}
+
+crate::snap_struct!(Net {
+    sockets,
+    issued,
+    names,
+    by_ip,
+    last_used,
+    next_fake,
+    ephemeral,
+    held,
+    sandbox_id,
+    inbound,
+    inbound_port,
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
