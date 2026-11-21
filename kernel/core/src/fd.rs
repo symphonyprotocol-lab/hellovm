@@ -331,6 +331,50 @@ impl FdTable {
     }
 }
 
+// The snapshot of a frozen template (see `snap`).
+crate::snap_enum!(FileObject {
+    0 => Node(ino),
+    1 => ConsoleIn,
+    2 => ConsoleOut(stream),
+    3 => Tty,
+    4 => PipeRead(id),
+    5 => PipeWrite(id),
+    6 => Proc { dir },
+    7 => EventFd(id),
+    8 => Socket(id),
+});
+crate::snap_enum!(Access { 0 => Read, 1 => Write, 2 => ReadWrite, 3 => Path });
+crate::snap_struct!(OpenFile {
+    object,
+    access,
+    append,
+    nonblock,
+    offset,
+    listing,
+    path,
+    contents,
+    refs,
+});
+crate::snap_struct!(Slot { file, cloexec });
+crate::snap_struct!(FdTable { fds });
+
+impl crate::snap::Snap for Files {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        crate::snap::Snap::put(&self.slots, w);
+        crate::snap::Snap::put(&self.free, w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        let files = Files {
+            slots: crate::snap::Snap::get(r)?,
+            free: crate::snap::Snap::get(r)?,
+        };
+        if files.slots.len() > MAX_FILES {
+            return crate::snap::bad("more open files than a sandbox may have");
+        }
+        Ok(files)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

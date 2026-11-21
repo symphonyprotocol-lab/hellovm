@@ -638,3 +638,102 @@ impl State {
             .collect()
     }
 }
+
+// The snapshot of a frozen template (see `snap`).
+crate::snap_struct!(MmEntry {
+    mm,
+    users,
+    trampoline
+});
+crate::snap_enum!(ChildEvent { 0 => Stopped(sig), 1 => Continued });
+crate::snap_enum!(Life { 0 => Alive, 1 => Zombie(status) });
+crate::snap_struct!(Itimer { deadline, interval });
+crate::snap_struct!(Process {
+    pid,
+    ppid,
+    pgid,
+    sid,
+    threads,
+    mm,
+    fds,
+    cwd,
+    umask,
+    actions,
+    pending,
+    name,
+    exe,
+    cmdline,
+    rlimits,
+    life,
+    core_dumped,
+    stopped,
+    event,
+    vfork_parent,
+    itimer,
+    exit_signal,
+    start_time,
+    execed,
+});
+crate::snap_enum!(Restart { 0 => IfSaRestart, 1 => Never, 2 => Always });
+crate::snap_enum!(WaitKind {
+    0 => Retry,
+    1 => Futex { mm, addr, bitset },
+    2 => Sleep,
+    3 => Vfork(pid),
+    4 => ClonePoint,
+    5 => NotStarted,
+});
+crate::snap_enum!(ClonePoint { 0 => Off, 1 => Template, 2 => Clone(input) });
+crate::snap_struct!(Parked {
+    trap,
+    sysno,
+    kind,
+    deadline,
+    restart,
+    timed_out,
+});
+crate::snap_enum!(Next {
+    0 => Return(value),
+    1 => Interrupted(trap, restart),
+    2 => Continue,
+    3 => Start { entry, stack },
+});
+crate::snap_enum!(ThreadState {
+    0 => Running,
+    1 => Parked(parked),
+    2 => Ready(next),
+    3 => Held(next),
+});
+crate::snap_struct!(Thread {
+    tid,
+    pid,
+    task,
+    state,
+    sigmask,
+    saved_mask,
+    pending,
+    altstack,
+    clear_child_tid,
+    robust_list,
+    interrupt_sent,
+    io_done,
+});
+crate::snap_struct!(Mms { slots, free });
+crate::snap_struct!(State {
+    procs,
+    threads,
+    tasks,
+    files,
+    pipes,
+    eventfds,
+    net,
+    mms,
+    console,
+    next_pid,
+    proc_bytes,
+    changed,
+    init_status,
+    init_cwd,
+    clone_point,
+    freeze_requested,
+});

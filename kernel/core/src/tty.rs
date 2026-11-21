@@ -543,6 +543,23 @@ impl Console {
     }
 }
 
+/// The snapshot of a frozen template (see `snap`): a template's console is
+/// plain streams, never a terminal.
+impl crate::snap::Snap for Console {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        debug_assert!(self.tty.is_none(), "a template's console is no terminal");
+        crate::snap::Snap::put(&self.input, w);
+        crate::snap::Snap::put(&self.eof, w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        Ok(Console {
+            input: crate::snap::Snap::get(r)?,
+            eof: crate::snap::Snap::get(r)?,
+            tty: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

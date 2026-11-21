@@ -1263,6 +1263,86 @@ fn host_time((sec, nsec): (i64, u32)) -> Timespec {
     Timespec { sec, nsec }
 }
 
+// The snapshot of a frozen template (see `snap`).
+crate::snap_enum!(FileType {
+    0 => Regular,
+    1 => Directory,
+    2 => Symlink,
+    3 => CharDevice,
+});
+crate::snap_enum!(Device {
+    0 => Null,
+    1 => Zero,
+    2 => Full,
+    3 => Random,
+    4 => Urandom,
+    5 => Fd(fd),
+    6 => Unusable,
+    7 => Tty { console },
+    8 => Clone,
+});
+crate::snap_struct!(Timespec { sec, nsec });
+crate::snap_struct!(Dir {
+    parent,
+    entries,
+    hidden,
+    lower
+});
+crate::snap_enum!(FileData {
+    0 => Lower { path, size },
+    1 => Upper(data),
+});
+crate::snap_enum!(Content {
+    0 => Dir(dir),
+    1 => File(data),
+    2 => Symlink(target),
+    3 => Device(device),
+});
+crate::snap_struct!(Node {
+    perm,
+    uid,
+    gid,
+    nlink,
+    atime,
+    mtime,
+    ctime,
+    content,
+    open,
+    overhead,
+    charge,
+});
+crate::snap_struct!(DirEntry { name, ino, kind });
+
+impl crate::snap::Snap for Vfs {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        crate::snap::Snap::put(&self.nodes, w);
+        crate::snap::Snap::put(&self.next_ino, w);
+        crate::snap::Snap::put(&self.root, w);
+        crate::snap::Snap::put(&self.upper_used, w);
+        crate::snap::Snap::put(&self.upper_limit, w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        let vfs = Vfs {
+            nodes: crate::snap::Snap::get(r)?,
+            next_ino: crate::snap::Snap::get(r)?,
+            root: crate::snap::Snap::get(r)?,
+            upper_used: crate::snap::Snap::get(r)?,
+            upper_limit: crate::snap::Snap::get(r)?,
+        };
+        if !vfs.nodes.contains_key(&vfs.root) {
+            return crate::snap::bad("no root directory");
+        }
+        let too_big = vfs.nodes.values().any(|n| match &n.content {
+            Content::File(FileData::Upper(data)) => data.len() as u64 > MAX_FILE_SIZE,
+            _ => false,
+        });
+        if too_big {
+            return crate::snap::bad("a file larger than a sandbox file may be");
+        }
+        Ok(vfs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

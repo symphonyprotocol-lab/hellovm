@@ -439,6 +439,24 @@ impl<H: Host + ?Sized> Host for &mut H {
     }
 }
 
+// The snapshot of a frozen template (see `crate::snap`).
+crate::snap_enum!(ConsoleStream { 0 => Stdout, 1 => Stderr });
+crate::snap_newtype!(HostStreamId);
+
+impl crate::snap::Snap for ImagePath {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        crate::snap::Snap::put(&self.0, w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        let bytes: Vec<u8> = crate::snap::Snap::get(r)?;
+        // Only what `join` makes: plain names separated by single `/`.
+        if !bytes.is_empty() && !bytes.split(|&b| b == b'/').all(ImagePath::valid_name) {
+            return crate::snap::bad("an image path that is not a plain path");
+        }
+        Ok(ImagePath(bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

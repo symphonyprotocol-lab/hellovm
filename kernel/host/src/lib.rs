@@ -53,6 +53,9 @@ pub use stream::pause as sleep_confined;
 struct Common {
     image: Option<ImageDir>,
     start: Instant,
+    /// What the monotonic clock read at `start` (zero, but for a warm
+    /// clone that is a new process: its template's clock).
+    origin: Duration,
     /// `/dev/urandom`, opened once: a confined kernel process cannot open
     /// it later.
     urandom: Option<File>,
@@ -63,6 +66,7 @@ impl Common {
         Common {
             image,
             start: Instant::now(),
+            origin: Duration::ZERO,
             urandom: File::open("/dev/urandom").ok(),
         }
     }
@@ -129,7 +133,7 @@ macro_rules! common_host_methods {
         }
 
         fn clock_monotonic(&mut self) -> Duration {
-            self.common.start.elapsed()
+            self.common.origin + self.common.start.elapsed()
         }
     };
 }
@@ -208,7 +212,7 @@ enum InputSource {
     /// The process's stdin.
     Stdin,
     /// This file (a warm clone's stdin).
-    File(File),
+    File(#[cfg_attr(target_os = "macos", allow(dead_code))] File),
     /// Nothing: console input is at end of file (a warm-clone template).
     Closed,
 }
@@ -273,6 +277,11 @@ pub struct StdioHost {
     splice: StreamTable,
     /// Given to each inbound stream.
     inbound_waker: Option<Waker>,
+    /// macOS: the stdin reader's copy of a console input file, made by
+    /// [`StdioHost::set_console`]: a confined kernel process may not
+    /// duplicate an fd (`fcntl(F_DUPFD_CLOEXEC)`) when the reader starts.
+    #[cfg(target_os = "macos")]
+    reader_file: Option<File>,
 }
 
 impl std::fmt::Debug for StdioHost {
@@ -297,6 +306,8 @@ impl StdioHost {
             waker: None,
             splice: StreamTable::default(),
             inbound_waker: None,
+            #[cfg(target_os = "macos")]
+            reader_file: None,
         }
     }
 
@@ -313,6 +324,14 @@ impl StdioHost {
         self.splice.set_endpoint(Endpoint::Egress(path.into()))
     }
 
+    /// From now on the monotonic clock reads `now` and goes on from there
+    /// (a warm clone in a new process continues its template's clock,
+    /// which the kernel state it starts from counts in).
+    pub fn set_monotonic_clock(&mut self, now: Duration) {
+        self.common.start = Instant::now();
+        self.common.origin = now;
+    }
+
     /// Console input is at end of file from the start (a warm-clone
     /// template: its stdin belongs to no one, and no reader thread may
     /// exist when the template's process is forked).
@@ -324,6 +343,10 @@ impl StdioHost {
     /// stdio (a warm clone, in a fork of the template's process: the
     /// template had no reader thread, see [`StdioHost::close_input`]).
     pub fn set_console(&mut self, stdin: File, stdout: File, stderr: File) {
+        #[cfg(target_os = "macos")]
+        {
+            self.reader_file = stdin.try_clone().ok();
+        }
         self.input = InputSource::File(stdin);
         self.output = Some((stdout, stderr));
         self.stdin = None;
@@ -347,8 +370,14 @@ impl StdioHost {
     /// untouched for whoever comes next (the rest of a shell script, say).
     fn reader(&mut self) -> &Arc<StdinReader> {
         let waker = self.waker.clone();
+        #[cfg(not(target_os = "macos"))]
         let file = match &self.input {
             InputSource::File(file) => file.try_clone().ok(),
+            _ => None,
+        };
+        #[cfg(target_os = "macos")]
+        let file = match &self.input {
+            InputSource::File(_) if self.stdin.is_none() => self.reader_file.take(),
             _ => None,
         };
         self.stdin.get_or_insert_with(|| {

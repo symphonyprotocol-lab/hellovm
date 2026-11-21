@@ -154,6 +154,35 @@ impl Pipes {
     }
 }
 
+// The snapshot of a frozen template (see `snap`).
+crate::snap_struct!(Pipe {
+    buf,
+    readers,
+    writers
+});
+
+impl crate::snap::Snap for Pipes {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        crate::snap::Snap::put(&self.slots, w);
+        crate::snap::Snap::put(&self.free, w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        let pipes = Pipes {
+            slots: crate::snap::Snap::get(r)?,
+            free: crate::snap::Snap::get(r)?,
+        };
+        let full = pipes
+            .slots
+            .iter()
+            .flatten()
+            .any(|p| p.buf.len() > PIPE_CAPACITY);
+        if pipes.slots.len() > MAX_PIPES || full {
+            return crate::snap::bad("pipes beyond the limits");
+        }
+        Ok(pipes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

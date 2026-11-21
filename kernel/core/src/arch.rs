@@ -75,6 +75,10 @@ macro_rules! sysnos {
         }
 
         impl Sysno {
+            /// Every syscall, in declaration order (`Sysno::X as usize` is
+            /// its index).
+            pub const ALL: &'static [Sysno] = &[$(Sysno::$variant,)*];
+
             /// The syscall's Linux name, as used in traces.
             pub const fn name(self) -> &'static str {
                 match self {
@@ -695,6 +699,22 @@ syscall_table! {
         Personality = 92,
         RestartSyscall = 128,
         Vhangup = 58,
+    }
+}
+
+// The snapshot of a frozen template (see `crate::snap`).
+crate::snap_enum!(Arch { 0 => X86_64, 1 => Aarch64 });
+
+impl crate::snap::Snap for Sysno {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        crate::snap::Snap::put(&(*self as u32), w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        let index: u32 = crate::snap::Snap::get(r)?;
+        match Sysno::ALL.get(index as usize) {
+            Some(&sysno) => Ok(sysno),
+            None => crate::snap::bad(format!("no syscall {index}")),
+        }
     }
 }
 

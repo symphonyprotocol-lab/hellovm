@@ -77,6 +77,22 @@ impl EventFds {
     }
 }
 
+// The snapshot of a frozen template (see `snap`).
+crate::snap_struct!(EventFd { count, semaphore });
+
+impl crate::snap::Snap for EventFds {
+    fn put(&self, w: &mut crate::snap::Writer) {
+        crate::snap::Snap::put(&self.slots, w);
+    }
+    fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
+        let slots: Vec<Option<EventFd>> = crate::snap::Snap::get(r)?;
+        if slots.len() > MAX_EVENTFDS {
+            return crate::snap::bad("more eventfds than a sandbox may have");
+        }
+        Ok(EventFds { slots })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

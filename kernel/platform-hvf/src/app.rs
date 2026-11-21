@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use hellovm_core::arch::Arch;
 use hellovm_core::platform::{
-    Aarch64Context, AddressSpaceInfo, Context, CpuInfo, Event, Fault, GuestAddr, Platform,
-    PlatformError, Prot, Resume, Sharing, SyscallTrap, TaskKey, Trap, Waker,
+    Aarch64Context, AddressSpaceInfo, Context, CpuInfo, Event, Fault, FrozenSpace, GuestAddr,
+    Platform, PlatformError, Prot, Resume, Sharing, SyscallTrap, TaskKey, Trap, Waker,
 };
+use hellovm_core::snap::{Reader, Snap, Writer};
 
 use crate::exit::{self, AppException, SEGV_ACCERR, SEGV_MAPERR};
 use crate::layout::{self, FLUSH_OFFSET, FLUSH_PAGE_OFFSET, MAX_ADDR, MIN_ADDR, PAGE, SHIM_VA};
-use crate::mmu::{Access, Backing, Demand, MmuError, Phys, Stale};
+use crate::mmu::{Access, Backing, Demand, MmuError, Origin, Phys, SaveStats, Stale};
 use crate::sys::{
     self, sysreg, HostMem, HvVcpuExit, Vcpu, VcpuKicker, Vm, HV_EXIT_REASON_CANCELED,
     HV_EXIT_REASON_EXCEPTION, HV_EXIT_REASON_VTIMER_ACTIVATED, HV_MEMORY_EXEC, HV_MEMORY_READ,
@@ -1329,8 +1330,28 @@ pub struct HvfPlatform {
     vcpus: usize,
     /// Since when what vCPU 0 would run next has waited ([`Self::let_go`]).
     held_since: Option<Instant>,
+    /// A frozen template's tasks ([`Platform::freeze`]), or a clone's
+    /// before [`Platform::thaw`] ([`HvfPlatform::load_frozen`]).
+    frozen: Option<Vec<FrozenTasks>>,
+    config: HvfConfig,
     _not_send: PhantomData<*const ()>,
 }
+
+/// The tasks of one frozen address space: its tables and their registers.
+struct FrozenTasks {
+    root: u64,
+    /// Boxed as a task keeps them (`Task::saved`).
+    #[allow(clippy::vec_box)]
+    contexts: Vec<Box<Aarch64Context>>,
+}
+
+hellovm_core::snap_struct!(FrozenTasks { root, contexts });
+
+/// The first bytes of [`HvfPlatform::save_frozen`]'s output: a fingerprint
+/// of this crate's sources (`build.rs`); the core's follows it
+/// ([`hellovm_core::snap::BUILD`]: the registers and the pools' state are
+/// written with its encoding).
+const SNAPSHOT_MAGIC: &[u8] = concat!("hellovm-hvf-", env!("HELLOVM_BUILD"), "\0").as_bytes();
 
 /// `AT_HWCAP` from the ID registers the vCPU reports, limited to features
 /// that need nothing from the kernel. Not reported: `CPUID` (EL0 reads of
@@ -1535,6 +1556,12 @@ impl HvfPlatform {
             cpu,
             vcpus,
             held_since: None,
+            frozen: None,
+            config: HvfConfig {
+                memory,
+                table_memory,
+                vcpus: config.vcpus,
+            },
             _not_send: PhantomData,
         };
         // The other vCPUs, each made by its own thread (a vCPU belongs to
@@ -1596,6 +1623,96 @@ impl HvfPlatform {
     /// How many vCPUs the platform runs apps on.
     pub fn vcpus(&self) -> usize {
         self.vcpus
+    }
+
+    /// The bytes of app memory and of page tables, as made (rounded to
+    /// the host page): what a snapshot's two regions must hold.
+    pub fn pool_sizes(&self) -> (u64, u64) {
+        (self.config.memory, self.config.table_memory)
+    }
+
+    /// Saves a template that [`Platform::freeze`] froze, for its clones
+    /// (see the `mmu` module for how): the used page tables into `tables`,
+    /// the app frames that are not all zero into `ram` (each at its own
+    /// offset), both as large as [`HvfPlatform::pool_sizes`] says and
+    /// zero. Returns the rest, for [`HvfPlatform::load_frozen`].
+    pub fn save_frozen(
+        &mut self,
+        tables: &mut [u8],
+        ram: &mut [u8],
+        w: &mut Writer<'_>,
+    ) -> Result<SaveStats, PlatformError> {
+        let Some(frozen) = &self.frozen else {
+            return Err(PlatformError::Violation("nothing is frozen".into()));
+        };
+        let (memory, table_memory) = self.pool_sizes();
+        if ram.len() as u64 != memory || tables.len() as u64 != table_memory {
+            return Err(PlatformError::Violation(
+                "snapshot regions of the wrong size".into(),
+            ));
+        }
+        w.bytes(SNAPSHOT_MAGIC);
+        w.bytes(hellovm_core::snap::BUILD.as_bytes());
+        memory.put(w);
+        table_memory.put(w);
+        let stats = self.smp.phys().save(tables, ram, w);
+        frozen.put(w);
+        Ok(stats)
+    }
+
+    /// Makes this new platform (nothing spawned yet, made with the
+    /// template's [`HvfPlatform::pool_sizes`]) a clone of a saved
+    /// template, ready for [`Platform::thaw`]: `meta` from
+    /// [`HvfPlatform::save_frozen`], `tables` the saved page tables (the
+    /// used part), `origin` the saved app memory, copied page by page as
+    /// the clone touches it.
+    pub fn load_frozen(
+        &mut self,
+        meta: &[u8],
+        tables: &[u8],
+        origin: Box<dyn Origin>,
+    ) -> Result<(), String> {
+        let bad = |e: hellovm_core::snap::Bad| e.to_string();
+        let mut r = Reader::new(meta);
+        let core = hellovm_core::snap::BUILD.as_bytes();
+        if r.take(SNAPSHOT_MAGIC.len()).map_err(bad)? != SNAPSHOT_MAGIC
+            || r.take(core.len()).map_err(bad)? != core
+        {
+            return Err("not a snapshot of this build's HVF platform".into());
+        }
+        let memory = u64::get(&mut r).map_err(bad)?;
+        let table_memory = u64::get(&mut r).map_err(bad)?;
+        let pools = crate::mmu::Saved::get(&mut r).map_err(bad)?;
+        let frozen = Vec::<FrozenTasks>::get(&mut r).map_err(bad)?;
+        r.finish().map_err(bad)?;
+        if (memory, table_memory) != self.pool_sizes() {
+            return Err(format!(
+                "the template has {memory} bytes of memory and {table_memory} of page tables, \
+                 this VM {:?}",
+                self.pool_sizes()
+            ));
+        }
+        if !self.lock().tasks.is_empty() || self.frozen.is_some() {
+            return Err("the platform is in use".into());
+        }
+        if frozen.iter().any(|f| f.contexts.is_empty()) {
+            return Err("a frozen address space without tasks".into());
+        }
+        let roots: Vec<u64> = frozen.iter().map(|f| f.root).collect();
+        let mut sorted = roots.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() != roots.len() {
+            return Err("two frozen address spaces with the same tables".into());
+        }
+        self.smp.phys().load(pools, tables, origin, &roots)?;
+        self.frozen = Some(frozen);
+        Ok(())
+    }
+
+    /// App frames a clone copied from its template so far.
+    pub fn frames_loaded(&self) -> u64 {
+        self.smp.phys().loaded()
     }
 
     fn lock(&self) -> MutexGuard<'_, Sched> {
@@ -2098,6 +2215,85 @@ impl Platform for HvfPlatform {
             sched.woken = true;
             smp.notify_loop(&sched);
         })
+    }
+
+    /// Keeps the registers and the address space of every task: nothing
+    /// is ended, since the tasks' memory is what
+    /// [`HvfPlatform::save_frozen`] saves next. The kernel process then
+    /// exits; the clones are new processes ([`HvfPlatform::load_frozen`]).
+    fn freeze(&mut self, spaces: &[FrozenSpace]) -> Result<(), PlatformError> {
+        let mut frozen = Vec::new();
+        for space in spaces {
+            let mut contexts = Vec::new();
+            let mut root = None;
+            for &key in &space.tasks {
+                let Context::Aarch64(context) = self.context(key)? else {
+                    unreachable!("aarch64 contexts only");
+                };
+                let mut sched = self.lock();
+                let task = sched.stopped(key)?;
+                let at = task.space;
+                let at = sched.spaces[&at].root;
+                if root.is_some_and(|root| root != at) {
+                    return Err(PlatformError::Violation(
+                        "the threads of one address space are in two".into(),
+                    ));
+                }
+                root = Some(at);
+                contexts.push(context);
+            }
+            let Some(root) = root else {
+                return Err(PlatformError::Violation(
+                    "an address space without tasks".into(),
+                ));
+            };
+            frozen.push(FrozenTasks { root, contexts });
+        }
+        self.frozen = Some(frozen);
+        Ok(())
+    }
+
+    /// A clone's tasks, from [`HvfPlatform::load_frozen`]: one address
+    /// space per frozen one, with the template's tables, and a stopped
+    /// task per frozen task with its registers.
+    fn thaw(&mut self) -> Result<Vec<Vec<TaskKey>>, PlatformError> {
+        let frozen = self
+            .frozen
+            .take()
+            .ok_or_else(|| PlatformError::Violation("nothing to thaw".into()))?;
+        let mut sched = self.lock();
+        if !sched.tasks.is_empty() {
+            return Err(PlatformError::Violation("the platform is in use".into()));
+        }
+        let mut keys = Vec::new();
+        for space in frozen {
+            let id = sched.add_space(space.root);
+            sched.spaces.get_mut(&id).expect("just added").users = space.contexts.len();
+            let mut these = Vec::new();
+            for context in space.contexts {
+                let key = sched.next_key;
+                sched.next_key += 1;
+                sched.tasks.insert(
+                    key,
+                    Task {
+                        space: id,
+                        state: State::Stopped,
+                        pc: context.pc,
+                        pstate: context.pstate & layout::PSTATE_APP_MASK,
+                        saved: Some(context),
+                        loaded: None,
+                        x0: None,
+                        on: None,
+                        interrupt: false,
+                        kill: false,
+                        runtime: 0,
+                    },
+                );
+                these.push(key);
+            }
+            keys.push(these);
+        }
+        Ok(keys)
     }
 
     fn read(&mut self, key: TaskKey, addr: GuestAddr, buf: &mut [u8]) -> Result<(), PlatformError> {

@@ -633,3 +633,40 @@ impl<P: Platform + ?Sized> AddressSpace for TaskMem<'_, P> {
         self.platform.protect(self.task, addr, len, prot)
     }
 }
+
+// The snapshot of a frozen template (see `crate::snap`).
+crate::snap_newtype!(Prot);
+crate::snap_struct!(SyscallTrap { nr, args });
+crate::snap_struct!(Aarch64Context {
+    x,
+    sp,
+    pc,
+    pstate,
+    v,
+    fpsr,
+    fpcr,
+    tpidr,
+});
+crate::snap_struct!(X86_64Context {
+    r15,
+    r14,
+    r13,
+    r12,
+    rbp,
+    rbx,
+    r11,
+    r10,
+    r9,
+    r8,
+    rax,
+    rcx,
+    rdx,
+    rsi,
+    rdi,
+    rip,
+    rsp,
+    eflags,
+    fs_base,
+    fxsave,
+});
+crate::snap_enum!(Context { 0 => Aarch64(c), 1 => X86_64(c) });

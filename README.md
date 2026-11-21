@@ -64,8 +64,9 @@ Debian system.
   comm,task}`, `meminfo`, `cpuinfo`, `uptime`, `stat`, `loadavg`, `mounts`,
   `net/tcp`, `net/udp`; `ps` works.
 - **Warm clones**: a template sandbox loads its environment once (CPython
-  with its modules imported, say) and new sandboxes are forked from it in
-  a few milliseconds (see **Warm clones**).
+  with its modules imported, say) and new sandboxes are made from it in
+  a few milliseconds: forks on Linux, new processes loaded from its
+  snapshot on macOS (see **Warm clones**).
 - **Control plane**: `hellovm-api` and `hellovm-noded` create sandboxes
   with CPython already loaded over HTTP in 7 to 8 ms, run commands and
   Python in them, read, write and edit their files, and keep tenants
@@ -668,8 +669,8 @@ to 64, at most what Hypervisor.framework allows; by default one per host
 CPU, at most 8) and `--sandbox
 require|best-effort|off` (the kernel process confines itself with a
 Seatbelt profile, see **Hardening**) and `--egress SOCKET` (see
-**Egress**). `--template` and `--clone` are refused. `hellovm-noded` and
-the API stay Linux-only.
+**Egress**), and `--template`/`--clone` make warm clones (see **Warm
+clones on macOS**). `hellovm-noded` and the API stay Linux-only.
 
 The test guests for the Mac (`kernel/test-guest/asm`, and
 `kernel/test-guest/asm/hvf` for the HVF tests) are built by
@@ -688,8 +689,9 @@ container's gcc and glibc, and assembles one image directory,
 container's busybox (Debian `busybox-static`) with applet links in
 `/bin`, the container's CPython (Debian `python3`) with its standard
 library and extension modules, and every shared library and the program
-interpreter they need (from `ldd`), at the paths they have in the
-container. Its `MANIFEST` records the image id and the versions (for the
+interpreter they need (from `ldd`, and `libgcc_s`, which glibc loads
+for `pthread_exit`), at the paths they have in the container. Its
+`MANIFEST` records the image id and the versions (for the
 measurements below: Debian 12.15, gcc 12.2.0, glibc 2.36, busybox 1.35.0,
 Python 3.11.2). No binary is checked in; the tests find the image through
 `HELLOVM_HVF_GUESTS`:
@@ -701,6 +703,7 @@ cd kernel
 HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm-platform-hvf
 HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_cli
 HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_egress
+HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_warm
 target/debug/hellovm --sandbox require --root target/hvf-guests/root /bin/sh -c 'seq 100 | grep 7 | wc -l'
 ```
 
@@ -872,7 +875,7 @@ shared objects (the interpreter's relocations write copy-on-write pages
 and `mprotect` RELRO), busybox shells and CPython with `subprocess`,
 threads in parallel on up to 64 vCPUs. Not yet: x86_64 programs
 (Rosetta is not used); memory returned to the host (the pools only grow
-to their high-water mark); warm clones; `AT_HWCAP2` (zero) and emulated
+to their high-water mark); `AT_HWCAP2` (zero) and emulated
 `mrs` of ID registers (`HWCAP_CPUID` is not reported, so programs do not
 try). A process that writes a copy-on-write page when the pool is used
 up gets `SIGKILL` rather than an error.
@@ -1308,6 +1311,18 @@ returned before the kill; which of the sources fired then is not known
 (a simulated memory pressure warning held for 30 s did not reach the
 process).
 
+*Buffers that grow large.* The system's `realloc` of a large block asks
+the kernel to grow or copy the mapping (`mach_vm_reallocate`,
+`mach_vm_copy`: Mach messages, `deny(1) syscall-mach 47`), which the
+profile refuses. Until P1f that killed the kernel process as soon as a
+buffer a guest can make grow got large: a file in the writable layer
+written past a few MiB was enough. `hellovm`'s allocator on macOS
+(`Confined`, `kernel/hellovm/src/main.rs`) now never gives a block of
+128 KiB or more to `realloc`: it allocates a new one, copies and frees
+the old one, with the calls every allocation makes anyway. `hvf_cli`
+writes a 48 MiB file 64 KiB at a time as a test (signal 9 before, the
+file after).
+
 *Compared with Linux, line by line:*
 
 | Linux | macOS |
@@ -1592,6 +1607,222 @@ batching the injected `mmap`s, which the current one-syscall-per-stop
 injection does not do. A clone's exit takes longer than its
 start: CPython's finalization writes to most of its objects, and every
 first write to a page shared with the template is a copy.
+
+### Warm clones on macOS
+
+On a Mac (the HVF platform) `hellovm --template` and `hellovm --clone`
+take the same options, speak the same protocol (`hellovm::warm`, which
+builds on macOS too) and give the same guarantees as on Linux; the node
+daemon or any other requester needs to know nothing of how the clone is
+made. What differs is how: a Hypervisor.framework VM does not survive
+`fork`, a process has one VM, and forking a process that holds a VM, or
+destroying and re-creating a VM in one process, are the operations the
+break-out tests were near when this Mac panicked (see **Hardening**). So
+no process forks with a VM and every VM is made the ordinary way, by a
+freshly started `hellovm` before it confines itself, and a clone gets
+the template's memory and kernel state as data, not as a forked copy.
+
+```sh
+hellovm --template /tmp/t/py.sock --sandbox require --root kernel/target/hvf-guests/root \
+  /usr/bin/python3 -c 'import json; exec(open("/dev/hellovm-clone", "rb").read())' &
+hellovm --clone /tmp/t/py.sock --ready
+echo '{"a": 41}' | hellovm --clone /tmp/t/py.sock --input 'import sys; print(json.load(sys.stdin)["a"] + 1)'
+```
+
+**Three kinds of process**, all the same executable
+(`kernel/hellovm/src/template_macos.rs`):
+
+* The *supervisor* is `hellovm --template` itself. It binds the socket,
+  makes the snapshot (below) and starts the template's kernel process.
+  Once the template is frozen it serves the socket: for each clone
+  request a new clone's kernel process, to which it hands the request,
+  the requester's three fds and the connection, and a read-only fd of
+  the snapshot (`SCM_RIGHTS`). It makes no VM, runs no guest code, and
+  reads no byte a kernel process wrote, except the template's fixed-size
+  "frozen" message (13 bytes) and the exit statuses of its children.
+* The *template's kernel process* (`--warm-role template`, an internal
+  option the supervisor passes, with the template's other options) is an
+  ordinary hardened run, as `hellovm PROGRAM` would be, with no console
+  input. It runs the program to its clone point and freezes exactly as
+  on Linux (`Kernel::run_template`, the same checks); then it writes the
+  frozen template into the snapshot, reports, and exits. The supervisor
+  serves no request before it has exited.
+* A *clone's kernel process* (`--warm-role clone`) makes its own VM,
+  hardens itself like any run, loads the snapshot into the VM, rebuilds
+  the tasks (`Kernel::thaw`: the read of the clone point completes with
+  the input), sends `S` on the requester's connection, runs the clone
+  and sends `X` (or `E`) itself. It is confined before it reads anything
+  of the snapshot but the fixed-size header: the snapshot was written by
+  the template's kernel process, which ran guest code.
+
+Each kernel process has a socket pair to the supervisor as its stdin,
+read by a thread made before the hardening. When the supervisor dies
+(the socket closes) or stops a clone because its requester closed the
+connection or `--timeout` expired (it writes one byte), that thread ends
+the clone's apps with the platform's killer, as `--timeout` does in an
+ordinary run, and the process exits without sending `X` (a clone of a
+dead template dies, as on Linux); one that has not exited 10 s later is
+killed. The supervisor never waits for a kernel process: one that closed
+its socket, or wrote to it, without exiting is looked at again every
+2 ms and killed after the same 10 s, so a kernel process that guest code
+took over cannot hold up the other clones.
+
+Each kernel process is started from the executable's path, so it is
+another build than its template's if `hellovm` was replaced meanwhile.
+The kernel state and the platform's state each start with a fingerprint
+of the sources that define them (`build.rs` of `hellovm-core` and of
+`hellovm-platform-hvf`); a clone of another build refuses the snapshot
+and its requester gets `E`: the template has to be started again.
+
+**The snapshot** is one POSIX shared memory object (`shm_open`, its name
+removed at once: only fds reach it): a header, the kernel state, the
+page tables, and app memory, each frame at its own offset. It is as
+large as the VM's memory pools (2 GiB of app memory, 64 MiB of tables)
+plus the writable layer's limit and 256 MiB for the rest of the kernel
+state, but takes memory only for what is written. The template's kernel
+process maps it writable before it confines itself and writes everything
+with plain memory copies after the freeze: no system call, and no
+allocation that grows (a large `realloc` on macOS copies with
+`mach_vm_copy`, a MIG call the profile denies). What it writes:
+
+* the used part of the page-table pool (100 to 130 KiB for CPython), as
+  it is: a clone's VM has the template's size, so its guest-physical
+  layout, and every address space and descriptor in those tables, is the
+  same;
+* every app frame in use that is not all zero, and the pools' state
+  (which frames and tables are free, each frame's reference count, the
+  shared objects of `fork`ed `MAP_SHARED` memory);
+* the registers of every task, by address space;
+* the kernel state: `Kernel::save_frozen` encodes everything the core
+  holds (processes, threads with their parked system calls, those that
+  trapped during the freeze included, memory maps, fd tables, open file
+  descriptions, pipes and their bytes, sockets with their queues, the
+  writable layer, eventfds, signal state, interval timers, virtual DNS)
+  with `kernel/core/src/snap.rs`: each type's fields in order, written
+  by a few lines next to its definition, and read back with every count
+  checked against the bytes left, so that reading never panics and never
+  allocates more than the input holds (a test changes every byte of a
+  snapshot in turn). The host's side (console, image, streams) is not
+  in it: each clone has its own.
+
+**A clone's memory** comes from the snapshot one page at a time. Its
+kernel process maps the snapshot read only, makes its VM, copies the
+template's page tables into its own table pool and marks every frame
+that the template had as *pending*: each page descriptor that points at
+one is made not valid, so the first access to it faults, and the fault
+copies the frame (4 KiB) from the snapshot into the clone's own memory
+and makes the page valid again (`kernel/platform-hvf/src/mmu.rs`, "Warm
+clones"). Copy-on-write between the clone's own processes works as
+before; the kernel's own reads of a pending frame read the snapshot,
+its writes copy the frame first. Nothing of this asks anything unusual
+of Hypervisor.framework: the VM's memory is ordinary anonymous memory,
+mapped once at start as in every run. The kernel state is read into a
+new kernel (`Kernel::load_frozen`). The template's monotonic clock goes
+on: the clone's starts at the template's value at the freeze plus the
+time since (deadlines in the state count in it, as on Linux).
+
+**Isolation.** A clone writes only its own memory: its VM's pages, its
+own process's heap (the writable layer, pipes, sockets). The snapshot is
+complete and nothing can write it any more before the first clone
+exists: the template's kernel process, which had the only writable fd,
+has exited, and the supervisor and the clones hold read-only fds (the
+host refuses to map one writable: `EPERM`). Clones are no forks of each
+other or of the template: each is a separate process with a Seatbelt
+sandbox of its own, as two ordinary runs are, which may not signal,
+trace or inspect other processes (see **Hardening**), and the only
+memory they share is the read-only snapshot. On Linux the clones of a
+template are forks in one Landlock domain and need a nested domain each;
+here there is nothing to nest.
+
+**Hardening.** The template's and each clone's kernel process enter the
+same layers and the same Seatbelt profile as any run, byte for byte (7
+rules, 10 with `--egress`); nothing is added for templates or clones.
+Measured: the whole of `tests/hvf_warm.rs` in learn mode
+(`HVF_WARM_LEARN=1` sets `HELLOVM_SEATBELT_LEARN` for every kernel
+process): no denial reported. Three things keep it so: the snapshot is
+written and read through mappings made before the profile is entered;
+the kernel processes write and read their sockets with `write` and
+`read` (Rust's socket I/O is `sendto` and `recvfrom` on macOS, which the
+profile does not have); and a clone's console input is duplicated for
+its reader thread before the profile (a confined process may not
+`fcntl(F_DUPFD_CLOEXEC)`).
+
+The supervisor is not in a Seatbelt profile: it has to start processes,
+and a sandboxed parent's profile is inherited across `exec`, so every
+clone would make its VM inside an inherited sandbox, a combination of
+Hypervisor.framework and Seatbelt no test here has run. Its layers are
+inherited fds closed, `RLIMIT_CORE` 0, `PT_DENY_ATTACH`, and its soft
+`RLIMIT_NOFILE` raised to 1024 for its connections. What reaches it is
+what reaches the Linux template's kernel process (requests, parsed by
+the same code), and no guest or clone output. Confining it too (a
+confined process that parses requests and an unconfined one that only
+starts kernel processes, say) is not done.
+
+**Egress and ingress.** A clone's kernel process has its own egress I/O
+thread and connects to the proxy itself: its flows are named by the
+clone's sandbox id, and the proxy sees the clone's kernel process as
+their peer. As on Linux, a template with outbound connections open
+cannot be frozen. An ingress channel (the fourth fd) is refused with
+`E`: on macOS an inbound connection needs helper threads that a
+confined kernel process cannot end cleanly (see **Egress**); outbound
+flows have the one I/O thread instead.
+
+**Limits.** At most 128 connections at once (each clone a process with a
+VM of its own); 64 KiB of input and a complete request within 10 s, as
+on Linux. Clones are made with the VM of the default size (2 GiB of app
+memory) and the template's `--vcpus`. The kernel state, writable layer
+included, must fit the snapshot's state region (the writable layer's
+limit plus 256 MiB; past it the template is not clonable). Refused, with
+the reason, as on Linux: open outbound connections, `MAP_SHARED` memory
+with more than one address space, a terminal, a program that ends
+before its clone point; and here also an ingress channel.
+
+What a clone costs in memory: every frame it touches, read or written,
+becomes its own copy (16.5 MiB of the 33 MiB snapshot for the program
+below; its kernel process's footprint 21 MiB), where a Linux clone
+copies only what it writes. Sharing the pages a clone only reads would
+need its VM's memory to be a private mapping of the snapshot, which asks
+Hypervisor.framework to map memory that is not anonymous: not tried on
+this Mac. The snapshot itself lives as long as the supervisor
+(1.8 MiB).
+
+**Measured** with `tests/hvf_warm.rs` (`warm_clone_timings`, ignored by
+default: `HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test
+--release -p hellovm --test hvf_warm -- --ignored --nocapture
+warm_clone_timings`), the same CPython program as the Linux benchmark,
+from the guest image (Debian bookworm, CPython 3.11), release build,
+M3 Max, macOS 27.2, `--sandbox require`, one clone at a time, medians of
+30:
+
+| | macOS, HVF | Linux, Docker (above) |
+|---|---|---|
+| Cold `hellovm`, start to first line | 219.6 ms | 193.6 ms |
+| Template, start to frozen (once) | 304.9 ms | 222.5 ms |
+| Snapshot (stored pages, areas) | 33.0 MiB, 149 | 29.9 MiB, 128 |
+| Template, writing the snapshot | 5.5 ms | |
+| **Clone, request to first guest instruction** (`S`) | **11.8 ms** (11.2–14.3) | **7.0 ms** |
+| **Clone, request to first line** | **13.0 ms** (12.3–15.5) | **8.2 ms** |
+| Clone, request to exit status | 29.0 ms | 24.7 ms |
+| App memory a clone copied from the snapshot | 16.5 MiB | (pages written only) |
+
+Where a clone's 12 ms go (`HELLOVM_LOG=debug` on the template logs it
+per clone): starting the process (`posix_spawn` of `hellovm`, its start
+and receiving the request) about 3 ms; making the VM and its vCPUs
+0.9 ms; loading the page tables and the pools' state 0.6 ms; reading
+the kernel state (3.7 MB here) 0.7 ms; the hardening 5.3 ms, nearly all
+of it Seatbelt compiling the profile, which every hardened run pays
+(see **Hardening**); the thaw a few microseconds. A clone's kernel
+process started ahead of the request (made, loaded and confined while
+the previous clone runs) would take most of that off the path, but it
+means a second VM alive while a clone runs: not done (see below).
+
+What is not done or not verified on macOS: several clones (VMs) alive at
+once were not run on this Mac (the test that does,
+`clones_at_once_are_isolated_and_one_can_be_killed`, is ignored and runs
+only with `-- --ignored`; see **Hardening** for why HVF tests run one
+VM at a time); a clone started ahead of its request; sharing read-only
+pages between clones; ingress; confining the supervisor; `hellovm-noded`
+and the API on macOS.
 
 ## Control plane
 

@@ -292,6 +292,31 @@ fn deny_debugger() -> Result<String, String> {
     Ok(String::new())
 }
 
+/// The layers for the process that serves a warm-clone template's socket
+/// on macOS (`hellovm --template`), which runs no guest code and makes the
+/// clones' kernel processes: no core dump, no debugger, and enough fds for
+/// its connections (the soft `RLIMIT_NOFILE` raised to `nofile`, at most
+/// the hard limit). Not Seatbelt: its children would inherit the profile
+/// (see README, "Warm clones on macOS").
+pub fn seal_supervisor(nofile: u64) -> Result<(), String> {
+    lower(libc::RLIMIT_CORE, 0)?;
+    // SAFETY: getrlimit/setrlimit with a valid struct.
+    unsafe {
+        let mut cur: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut cur) != 0 {
+            return Err(format!("getrlimit: {}", io::Error::last_os_error()));
+        }
+        let want = nofile.min(cur.rlim_max);
+        if cur.rlim_cur < want {
+            cur.rlim_cur = want;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &cur) != 0 {
+                return Err(format!("setrlimit: {}", io::Error::last_os_error()));
+            }
+        }
+    }
+    deny_debugger().map(drop)
+}
+
 type SandboxInit = unsafe extern "C" fn(
     profile: *const c_char,
     flags: u64,

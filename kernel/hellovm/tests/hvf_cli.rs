@@ -151,6 +151,41 @@ fn shell_pipeline_and_python_through_the_command_line() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// A buffer of the confined kernel process that grows large (here a file
+/// in the writable layer, 48 MiB written 64 KiB at a time) does not get
+/// the process killed: the system's `realloc` of a large block makes Mach
+/// calls the profile refuses, so hellovm does not use it for large blocks
+/// (see `main.rs`, `Confined`).
+#[test]
+fn a_buffer_that_grows_large_does_not_kill_the_confined_process() {
+    let _serial = hvf_support::serial();
+    let Some(exe) = hellovm() else {
+        return;
+    };
+    let Some(root) = guest_image() else {
+        return;
+    };
+    progress("hvf_cli: a file that grows to 48 MiB");
+    let out = Command::new(exe)
+        .args(["--sandbox", "require", "--no-tty", "--root"])
+        .arg(&root)
+        .args([
+            "/usr/bin/python3",
+            "-c",
+            "import os\nf = open('/tmp/big', 'wb', buffering=0)\nfor _ in range(768):\n    f.write(b'x' * 65536)\nf.close()\nprint(os.path.getsize('/tmp/big'))",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "50331648\n",
+        "{:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// `--vcpus`: the checks of `kernel/test-guest/c/smp.c` and threads of
 /// CPU work on one vCPU and on four, confined (`--sandbox require`: the
 /// vCPU threads need nothing the profile refuses), `--timeout` stopping

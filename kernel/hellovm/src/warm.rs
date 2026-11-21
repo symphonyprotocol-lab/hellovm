@@ -67,6 +67,48 @@ const FLAG_INGRESS: u16 = 2;
 /// Longest frame payload a client accepts.
 const MAX_FRAME: u32 = 64 * 1024;
 
+/// Flags of [`send_frame`]'s sends: no `SIGPIPE` when the requester is
+/// gone. macOS has no such flag (a Rust program ignores `SIGPIPE` anyway,
+/// and [`no_sigpipe`] sets the socket option); there the send never
+/// blocks either: the template's process serves every connection, and
+/// shares each with a clone's kernel process, which needs it blocking.
+#[cfg(target_os = "linux")]
+const FRAME_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(target_os = "linux"))]
+const FRAME_FLAGS: libc::c_int = libc::MSG_DONTWAIT;
+
+/// Flags of [`send_with_fds`].
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(target_os = "linux"))]
+const SEND_FLAGS: libc::c_int = 0;
+
+/// Makes writes to a closed connection fail with `EPIPE` instead of
+/// raising `SIGPIPE` (macOS: `SO_NOSIGPIPE`; Linux passes `MSG_NOSIGNAL`
+/// with every send instead).
+pub fn no_sigpipe(stream: &UnixStream) -> io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let on: libc::c_int = 1;
+        // SAFETY: a valid socket and option value.
+        let ret = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&on as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let _ = stream;
+    Ok(())
+}
+
 /// What a request asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -276,7 +318,7 @@ pub fn send_frame(
                 stream.as_raw_fd(),
                 rest.as_ptr().cast(),
                 rest.len(),
-                libc::MSG_NOSIGNAL,
+                FRAME_FLAGS,
             )
         };
         if n >= 0 {
@@ -353,7 +395,7 @@ pub fn send_with_fds(stream: &UnixStream, data: &[u8], fds: &[RawFd]) -> io::Res
             }
         }
         // SAFETY: a valid message on a valid socket.
-        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, SEND_FLAGS) };
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -391,8 +433,14 @@ pub fn recv_with_fds(
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
     msg.msg_controllen = space as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    // macOS has no such flag: close-on-exec is set below, before this
+    // returns (nothing in a hellovm process spawns meanwhile).
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
     // SAFETY: valid buffers for the call.
-    let n = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    let n = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, flags) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -407,6 +455,8 @@ pub fn recv_with_fds(
                     / std::mem::size_of::<RawFd>();
                 for i in 0..count {
                     let fd = OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i)));
+                    #[cfg(not(target_os = "linux"))]
+                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
                     if fds.len() < max_fds {
                         fds.push(fd);
                     } else {
@@ -485,6 +535,7 @@ impl WarmClone {
             ));
         }
         let stream = UnixStream::connect(socket)?;
+        no_sigpipe(&stream)?;
         let request = Request {
             kind: Kind::Clone,
             sandbox_id,
@@ -526,6 +577,7 @@ impl WarmClone {
 /// how much of its memory the snapshot holds (bytes and areas).
 pub fn wait_ready(socket: &Path) -> io::Result<(u64, u32)> {
     let mut stream = UnixStream::connect(socket)?;
+    no_sigpipe(&stream)?;
     let request = Request {
         kind: Kind::Ping,
         sandbox_id: None,

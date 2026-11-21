@@ -4,5 +4,5 @@
 
 #[cfg(feature = "insecure-test-hooks")]
 pub mod session;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 pub mod warm;

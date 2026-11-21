@@ -569,6 +569,36 @@ impl Mm {
     }
 }
 
+// The snapshot of a frozen template (see `snap`).
+crate::snap_enum!(VmaKind {
+    0 => Image,
+    1 => Heap,
+    2 => Stack,
+    3 => Anonymous,
+    4 => Shared,
+    5 => File,
+    6 => Reserved,
+    7 => Vdso,
+});
+crate::snap_struct!(Vma {
+    start,
+    end,
+    prot,
+    kind,
+    zero
+});
+crate::snap_struct!(VmaMap { areas });
+crate::snap_struct!(Mm {
+    vmas,
+    page_size,
+    min_addr,
+    max_addr,
+    stack_top,
+    mmap_top,
+    brk_start,
+    brk,
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
