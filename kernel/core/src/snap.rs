@@ -9,8 +9,9 @@
 //! `bool` one byte (0 or 1), sequences and maps a `u64` count and the
 //! items (maps sorted by key, so that one state always gives the same
 //! bytes), `Option` and enums a tag byte and the fields of the variant.
-//! It is private to one build of hellovm: the template and its clones run
-//! the same binary, and a snapshot starts with a fingerprint of it.
+//! It is private to one build of hellovm: a snapshot starts with a
+//! fingerprint of the sources that define it ([`BUILD`]), and a clone
+//! whose executable is another build than its template's refuses it.
 //!
 //! Reading never panics and never allocates more than the input could
 //! hold: every count is checked against the bytes left, and anything that
@@ -21,6 +22,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::time::Duration;
+
+/// A fingerprint of this crate's sources (`build.rs`): the format of what
+/// is written here changes with them.
+pub const BUILD: &str = env!("HELLOVM_BUILD");
 
 /// Why a snapshot could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]

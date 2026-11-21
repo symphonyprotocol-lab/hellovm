@@ -1347,8 +1347,11 @@ struct FrozenTasks {
 
 hellovm_core::snap_struct!(FrozenTasks { root, contexts });
 
-/// The first bytes of [`HvfPlatform::save_frozen`]'s output.
-const SNAPSHOT_MAGIC: &[u8] = concat!("hellovm-hvf-", env!("CARGO_PKG_VERSION"), "-1\0").as_bytes();
+/// The first bytes of [`HvfPlatform::save_frozen`]'s output: a fingerprint
+/// of this crate's sources (`build.rs`); the core's follows it
+/// ([`hellovm_core::snap::BUILD`]: the registers and the pools' state are
+/// written with its encoding).
+const SNAPSHOT_MAGIC: &[u8] = concat!("hellovm-hvf-", env!("HELLOVM_BUILD"), "\0").as_bytes();
 
 /// `AT_HWCAP` from the ID registers the vCPU reports, limited to features
 /// that need nothing from the kernel. Not reported: `CPUID` (EL0 reads of
@@ -1649,6 +1652,7 @@ impl HvfPlatform {
             ));
         }
         w.bytes(SNAPSHOT_MAGIC);
+        w.bytes(hellovm_core::snap::BUILD.as_bytes());
         memory.put(w);
         table_memory.put(w);
         let stats = self.smp.phys().save(tables, ram, w);
@@ -1670,7 +1674,10 @@ impl HvfPlatform {
     ) -> Result<(), String> {
         let bad = |e: hellovm_core::snap::Bad| e.to_string();
         let mut r = Reader::new(meta);
-        if r.take(SNAPSHOT_MAGIC.len()).map_err(bad)? != SNAPSHOT_MAGIC {
+        let core = hellovm_core::snap::BUILD.as_bytes();
+        if r.take(SNAPSHOT_MAGIC.len()).map_err(bad)? != SNAPSHOT_MAGIC
+            || r.take(core.len()).map_err(bad)? != core
+        {
             return Err("not a snapshot of this build's HVF platform".into());
         }
         let memory = u64::get(&mut r).map_err(bad)?;

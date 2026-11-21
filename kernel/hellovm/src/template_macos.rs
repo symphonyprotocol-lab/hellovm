@@ -67,6 +67,10 @@ const FRAME_PATIENCE: Duration = Duration::from_secs(5);
 /// stop, before it is killed.
 const EXIT_PATIENCE: Duration = Duration::from_secs(10);
 
+/// How often the supervisor looks whether a kernel process that closed
+/// its control socket has exited.
+const REAP_EVERY: Duration = Duration::from_millis(2);
+
 /// The roles of a kernel process (`--warm-role`).
 pub const ROLE_TEMPLATE: &str = "template";
 pub const ROLE_CLONE: &str = "clone";
@@ -419,6 +423,10 @@ struct Client {
     clone: Option<(Child, UnixStream)>,
     /// Told to stop: killed if it has not exited by then.
     kill_at: Option<Instant>,
+    /// Its control socket closed (or said something, which a clone's
+    /// kernel process never does) and it had not exited yet: looked at
+    /// again every [`REAP_EVERY`], and killed at `kill_at`.
+    exiting: bool,
     gone: bool,
     done: bool,
 }
@@ -473,7 +481,10 @@ fn serve(
                 revents: 0,
             });
             polls.push(libc::pollfd {
-                fd: client.clone.as_ref().map_or(-1, |(_, c)| c.as_raw_fd()),
+                fd: match &client.clone {
+                    Some((_, control)) if !client.exiting => control.as_raw_fd(),
+                    _ => -1,
+                },
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -483,6 +494,7 @@ fn serve(
             .iter()
             .filter_map(|c| match c.clone {
                 None => Some(c.deadline),
+                Some(_) if c.exiting => Some(now + REAP_EVERY),
                 Some(_) => c.kill_at,
             })
             .map(|at| at.saturating_duration_since(now))
@@ -506,7 +518,7 @@ fn serve(
                     watch_requester(&mut clients[i]);
                 }
             }
-            if child != 0 {
+            if child != 0 || clients[i].exiting {
                 reap(&mut clients[i]);
             }
         }
@@ -543,6 +555,7 @@ fn serve(
                             fds: Vec::new(),
                             clone: None,
                             kill_at: None,
+                            exiting: false,
                             gone: false,
                             done: false,
                         });
@@ -744,7 +757,10 @@ fn watch_requester(client: &mut Client) {
 }
 
 /// A clone's kernel process closed its control socket (it ends): reaps it
-/// and reports a death it could not report itself.
+/// and reports a death it could not report itself. Never waits: one that
+/// has not exited yet is looked at again soon, and killed if it is still
+/// there after [`EXIT_PATIENCE`] (a kernel process that guest code took
+/// over must not hold up the others).
 fn reap(client: &mut Client) {
     let Some((child, _)) = &mut client.clone else {
         return;
@@ -752,11 +768,12 @@ fn reap(client: &mut Client) {
     let status = match child.try_wait() {
         Ok(Some(status)) => status,
         Ok(None) => {
-            // Closed, still exiting: it has nothing to say any more.
-            match child.wait() {
-                Ok(status) => status,
-                Err(_) => return,
+            if !client.exiting {
+                client.exiting = true;
+                let at = Instant::now() + EXIT_PATIENCE;
+                client.kill_at = Some(client.kill_at.map_or(at, |old| old.min(at)));
             }
+            return;
         }
         Err(_) => return,
     };
@@ -1013,6 +1030,13 @@ fn receive_setup(control: &UnixStream) -> Result<Setup, String> {
         }
         have += n;
         match Request::decode(&buf[..have]) {
+            // Anything behind the request is the supervisor's stop, sent
+            // before the thread that waits for it exists.
+            Ok(Some((mut request, used))) if used < have => {
+                warm::wipe(&mut request.input);
+                warm::wipe(&mut buf);
+                return Err("stopped before it started".into());
+            }
             Ok(Some((request, _))) => break request,
             Ok(None) => continue,
             Err(why) => return Err(why),
@@ -1160,14 +1184,6 @@ fn prepare_clone(
     })?));
     stop_with_supervisor(control, app.killer())?;
     let t2 = Instant::now();
-    let kernel_len = header.kernel_len as usize;
-    let platform = &state.bytes()[kernel_len..kernel_len + header.platform_len as usize];
-    app.load_frozen(
-        platform,
-        &tables.bytes()[..header.tables_len as usize],
-        Box::new(ram),
-    )?;
-    drop(tables);
     let mut host = StdioHost::new(Some(image));
     let [stdin, stdout, stderr] = stdio;
     host.set_console(stdin, stdout, stderr);
@@ -1177,14 +1193,24 @@ fn prepare_clone(
     if let Some(path) = &egress {
         host.set_egress(path)?;
     }
+    // Confined before anything but the header is read: the snapshot was
+    // written by the template's kernel process, which ran guest code.
+    harden(options, &image_path, egress.as_deref(), fds)?;
     let t3 = Instant::now();
+    let kernel_len = header.kernel_len as usize;
+    let platform = &state.bytes()[kernel_len..kernel_len + header.platform_len as usize];
+    app.load_frozen(
+        platform,
+        &tables.bytes()[..header.tables_len as usize],
+        Box::new(ram),
+    )?;
+    drop(tables);
+    let t4 = Instant::now();
     let kernel = Kernel::load_frozen(host, &state.bytes()[..kernel_len])?;
     drop(state);
-    let t4 = Instant::now();
-    harden(options, &image_path, egress.as_deref(), fds)?;
     log::debug!(
-        "clone: snapshot mapped in {:?}, VM made in {:?}, page tables loaded in {:?}, \
-         kernel state read in {:?}, hardened in {:?}",
+        "clone: snapshot mapped in {:?}, VM made in {:?}, hardened in {:?}, \
+         page tables loaded in {:?}, kernel state read in {:?}",
         t1 - t0,
         t2 - t1,
         t3 - t2,

@@ -197,9 +197,11 @@ pub(crate) fn now<H: Host + ?Sized>(host: &mut H) -> Timespec {
 }
 
 /// The first bytes of [`Kernel::save_frozen`]'s output: the format, which
-/// changes with the kernel's state (template and clones run one build).
-const SNAPSHOT_MAGIC: &[u8] =
-    concat!("hellovm-kernel-", env!("CARGO_PKG_VERSION"), "-1\0").as_bytes();
+/// changes with the kernel's state, so it names the build by a fingerprint
+/// of this crate's sources (`build.rs`). A clone's kernel process is
+/// started from the executable's path and may be another build than its
+/// template's: then it refuses the snapshot.
+const SNAPSHOT_MAGIC: &[u8] = concat!("hellovm-kernel-", env!("HELLOVM_BUILD"), "\0").as_bytes();
 
 crate::snap_enum!(ExitStatus { 0 => Exited(code), 1 => Signaled(sig) });
 

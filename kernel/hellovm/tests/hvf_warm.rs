@@ -10,8 +10,8 @@
 //! One VM at a time, as in every HVF test (`hvf_support::serial`): the
 //! template's kernel process has exited before the first clone starts,
 //! and each clone's kernel process is gone before the next one starts.
-//! The tests that need several clones alive at once (several VMs) run
-//! only with `HELLOVM_HVF_CONCURRENT=1`.
+//! The test that needs several clones alive at once (several VMs) is
+//! ignored: it runs only when asked for (`-- --ignored clones_at_once`).
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
@@ -919,25 +919,16 @@ fn many_clones_one_after_another() {
     eprintln!("30 clones one after another: {:?}", start.elapsed());
 }
 
-/// Several clones alive at once (several VMs): only with
-/// `HELLOVM_HVF_CONCURRENT=1`.
-fn concurrent() -> bool {
-    let on = std::env::var("HELLOVM_HVF_CONCURRENT").as_deref() == Ok("1");
-    if !on {
-        eprintln!("SKIPPING: several VMs at once need HELLOVM_HVF_CONCURRENT=1");
-    }
-    on
-}
-
+/// Several clones alive at once (several VMs). Ignored, so that a plain
+/// run does not count it as passed: parallel VM tests coincided with this
+/// Mac's kernel panics (see README, **Hardening**).
 #[test]
+#[ignore = "several VMs at once: run it with -- --ignored clones_at_once"]
 fn clones_at_once_are_isolated_and_one_can_be_killed() {
     let _serial = hvf_support::serial();
     let Some((exe, root)) = setup() else {
         return;
     };
-    if !concurrent() {
-        return;
-    }
     let template = python(exe, &root);
     template.ready_ok();
     progress("hvf_warm: concurrent: A changes, waits");

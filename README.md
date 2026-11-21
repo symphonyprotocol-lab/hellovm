@@ -1311,6 +1311,18 @@ returned before the kill; which of the sources fired then is not known
 (a simulated memory pressure warning held for 30 s did not reach the
 process).
 
+*Buffers that grow large.* The system's `realloc` of a large block asks
+the kernel to grow or copy the mapping (`mach_vm_reallocate`,
+`mach_vm_copy`: Mach messages, `deny(1) syscall-mach 47`), which the
+profile refuses. Until P1f that killed the kernel process as soon as a
+buffer a guest can make grow got large: a file in the writable layer
+written past a few MiB was enough. `hellovm`'s allocator on macOS
+(`Confined`, `kernel/hellovm/src/main.rs`) now never gives a block of
+128 KiB or more to `realloc`: it allocates a new one, copies and frees
+the old one, with the calls every allocation makes anyway. `hvf_cli`
+writes a 48 MiB file 64 KiB at a time as a test (signal 9 before, the
+file after).
+
 *Compared with Linux, line by line:*
 
 | Linux | macOS |
@@ -1636,10 +1648,12 @@ echo '{"a": 41}' | hellovm --clone /tmp/t/py.sock --input 'import sys; print(jso
   frozen template into the snapshot, reports, and exits. The supervisor
   serves no request before it has exited.
 * A *clone's kernel process* (`--warm-role clone`) makes its own VM,
-  loads the snapshot into it, hardens itself like any run, rebuilds the
-  tasks (`Kernel::thaw`: the read of the clone point completes with the
-  input), sends `S` on the requester's connection, runs the clone and
-  sends `X` (or `E`) itself.
+  hardens itself like any run, loads the snapshot into the VM, rebuilds
+  the tasks (`Kernel::thaw`: the read of the clone point completes with
+  the input), sends `S` on the requester's connection, runs the clone
+  and sends `X` (or `E`) itself. It is confined before it reads anything
+  of the snapshot but the fixed-size header: the snapshot was written by
+  the template's kernel process, which ran guest code.
 
 Each kernel process has a socket pair to the supervisor as its stdin,
 read by a thread made before the hardening. When the supervisor dies
@@ -1648,7 +1662,17 @@ connection or `--timeout` expired (it writes one byte), that thread ends
 the clone's apps with the platform's killer, as `--timeout` does in an
 ordinary run, and the process exits without sending `X` (a clone of a
 dead template dies, as on Linux); one that has not exited 10 s later is
-killed.
+killed. The supervisor never waits for a kernel process: one that closed
+its socket, or wrote to it, without exiting is looked at again every
+2 ms and killed after the same 10 s, so a kernel process that guest code
+took over cannot hold up the other clones.
+
+Each kernel process is started from the executable's path, so it is
+another build than its template's if `hellovm` was replaced meanwhile.
+The kernel state and the platform's state each start with a fingerprint
+of the sources that define them (`build.rs` of `hellovm-core` and of
+`hellovm-platform-hvf`); a clone of another build refuses the snapshot
+and its requester gets `E`: the template has to be started again.
 
 **The snapshot** is one POSIX shared memory object (`shm_open`, its name
 removed at once: only fds reach it): a header, the kernel state, the
@@ -1793,9 +1817,9 @@ the previous clone runs) would take most of that off the path, but it
 means a second VM alive while a clone runs: not done (see below).
 
 What is not done or not verified on macOS: several clones (VMs) alive at
-once were not run on this Mac (the tests that do,
-`clones_at_once_are_isolated_and_one_can_be_killed`, run only with
-`HELLOVM_HVF_CONCURRENT=1`; see **Hardening** for why HVF tests run one
+once were not run on this Mac (the test that does,
+`clones_at_once_are_isolated_and_one_can_be_killed`, is ignored and runs
+only with `-- --ignored`; see **Hardening** for why HVF tests run one
 VM at a time); a clone started ahead of its request; sharing read-only
 pages between clones; ingress; confining the supervisor; `hellovm-noded`
 and the API on macOS.
