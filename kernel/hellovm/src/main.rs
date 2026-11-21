@@ -90,6 +90,8 @@ use std::process::ExitCode;
 
 use hellovm_sandbox::Mode as SandboxMode;
 
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+mod clone_client;
 #[cfg(all(
     target_os = "macos",
     target_arch = "aarch64",
@@ -99,6 +101,8 @@ use hellovm_sandbox::Mode as SandboxMode;
 mod fence;
 #[cfg(target_os = "linux")]
 mod template;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod template_macos;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
      [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES] [--vcpus N] [--sandbox require|best-effort|off] --root DIR \
@@ -190,6 +194,11 @@ struct Options {
     /// `--ready` (with `--clone`).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ready: bool,
+    /// `--warm-role ROLE` (macOS, internal): this process is the kernel
+    /// process of a warm-clone template or of a clone, started by
+    /// `hellovm --template` (see `template_macos`).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    warm_role: Option<String>,
 }
 
 fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
@@ -212,6 +221,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut clone = None;
     let mut input = Vec::new();
     let mut ready = false;
+    let mut warm_role = None;
     let mut env: Vec<Vec<u8>> = DEFAULT_ENV.iter().map(|e| e.as_bytes().to_vec()).collect();
     let mut args = args.peekable();
     while let Some(arg) = args.peek() {
@@ -262,6 +272,17 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 continue;
             }
             Some("--ready") => ready = true,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Some("--warm-role") => {
+                args.next();
+                let role = args.next().ok_or("--warm-role needs a role")?;
+                let role = role.to_string_lossy().into_owned();
+                if role != template_macos::ROLE_TEMPLATE && role != template_macos::ROLE_CLONE {
+                    return Err(format!("--warm-role {role}: unknown role"));
+                }
+                warm_role = Some(role);
+                continue;
+            }
             Some("--egress") => {
                 args.next();
                 egress = Some(PathBuf::from(
@@ -407,10 +428,14 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
             clone: Some(clone),
             input,
             ready,
+            warm_role: None,
         });
     }
     if !input.is_empty() || ready {
         return Err(format!("--input and --ready go with --clone\n{USAGE}"));
+    }
+    if warm_role.is_some() && (template.is_some() || timeout.is_some()) {
+        return Err("--warm-role: an internal option of --template".into());
     }
     if template.is_some() && (tty == Some(true) || timeout.is_some()) {
         return Err(format!(
@@ -447,6 +472,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
         clone: None,
         input,
         ready,
+        warm_role,
     })
 }
 
@@ -459,9 +485,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
     if let Some(socket) = &options.clone {
-        return ExitCode::from(template::client(
+        return ExitCode::from(clone_client::client(
             socket,
             options.sandbox_id,
             &options.input,
@@ -818,8 +844,13 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     use hellovm_host::{ImageDir, StdioHost};
     use hellovm_platform_hvf::{HvfConfig, HvfPlatform};
 
-    if options.template.is_some() || options.clone.is_some() {
-        return Err("warm clones (--template, --clone) need Linux".into());
+    match options.warm_role.as_deref() {
+        Some(template_macos::ROLE_TEMPLATE) => template_macos::run_template_kernel(options, fds),
+        Some(_) => template_macos::run_clone_kernel(options, fds),
+        None => {}
+    }
+    if let Some(socket) = &options.template {
+        return template_macos::run(options, socket);
     }
     let egress = options.egress.as_deref().map(egress_socket).transpose()?;
     // Everything the kernel process needs from the host is opened before
