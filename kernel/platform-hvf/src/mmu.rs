@@ -90,7 +90,7 @@
 //! snapshot, its writes load the frame first. A frame that is freed is
 //! not pending any more.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use hellovm_core::platform::Prot;
 
@@ -125,6 +125,19 @@ pub trait Backing {
     fn zero_at(&mut self, offset: usize, len: usize) {
         self.bytes_mut()[offset..offset + len].fill(0);
     }
+
+    /// Gives the memory at `offset..offset + len` (whole host pages) back
+    /// to the host. What it holds is undefined from then on, until it is
+    /// written again: the bytes it had, or zeros. Only free memory, which
+    /// nothing in the VM reaches any more, is given back. The default, for
+    /// tests, overwrites it with garbage.
+    fn give_back(&mut self, offset: usize, len: usize) {
+        self.bytes_mut()[offset..offset + len].fill(0xdb);
+    }
+
+    /// Takes memory that was given back for use again (its bytes still
+    /// undefined).
+    fn take_back(&mut self, _offset: usize, _len: usize) {}
 
     /// Stores a descriptor at `offset` (a multiple of 8). The table walk
     /// of a vCPU may read it at any time: an implementation for guest
@@ -202,45 +215,218 @@ pub enum Demand {
     NoMemory,
 }
 
-/// A pool of 4 KiB frames at a guest-physical base.
+/// Frames in one host page (16 KiB): the unit in which a pool's memory
+/// goes back to the host.
+const CHUNK: u64 = 4;
+
+/// [`Pool`] chunk flags.
+const RETURNED: u8 = 1;
+const IN_PARTIAL: u8 = 2;
+const IN_WHOLE: u8 = 4;
+const IN_RETURNED: u8 = 8;
+
+/// A pool of 4 KiB frames at a guest-physical base, taken from the host
+/// a chunk (a host page, four frames) at a time.
+///
+/// A chunk that was taken is *partial* (some of its frames are free),
+/// *full* (none are), *whole* (all four are free, and the host memory
+/// behind them is still there) or *returned* (all four are free and
+/// their memory was given back to the host, see [`Pool::give_back`]).
+/// Frames are handed out from partial chunks first, then whole ones,
+/// then returned ones, then new chunks, so that freed memory gathers in
+/// whole chunks that can go back. Each list holds a chunk at most once
+/// (a flag says it is in it), and may hold chunks that left its state
+/// since: those are skipped when they come up.
 #[derive(Debug)]
 struct Pool {
     base: u64,
     frames: u64,
-    /// Frames below this were handed out at least once.
+    /// Chunks below this were taken.
     next: u64,
-    free: Vec<u64>,
+    /// Per chunk: its free frames (low four bits) and, of those, the ones
+    /// known to be zero (high four bits: never used since the chunk was
+    /// taken).
+    state: Vec<u8>,
+    flags: Vec<u8>,
+    partial: Vec<u32>,
+    whole: VecDeque<u32>,
+    returned: Vec<u32>,
+    /// Free frames in chunks taken.
+    free: u64,
+    /// Whole chunks (with their memory).
+    whole_count: u64,
+}
+
+/// A frame from [`Pool::alloc`].
+struct Alloc {
+    ipa: u64,
+    /// It may hold old bytes (frames never used are zero).
+    dirty: bool,
+    /// Its chunk's memory was given back and must be taken back first.
+    reuse: bool,
 }
 
 impl Pool {
     fn new(base: u64, bytes: u64) -> Pool {
+        let frames = bytes / PAGE;
+        let chunks = frames.div_ceil(CHUNK) as usize;
         Pool {
             base,
-            frames: bytes / PAGE,
+            frames,
             next: 0,
-            free: Vec::new(),
+            state: vec![0; chunks],
+            flags: vec![0; chunks],
+            partial: Vec::new(),
+            whole: VecDeque::new(),
+            returned: Vec::new(),
+            free: 0,
+            whole_count: 0,
         }
     }
 
-    /// A frame and whether it may hold old data (fresh ones are zero).
-    fn alloc(&mut self) -> Option<(u64, bool)> {
-        if let Some(ipa) = self.free.pop() {
-            return Some((ipa, true));
+    fn chunks(&self) -> u64 {
+        self.state.len() as u64
+    }
+
+    /// The frames chunk `c` has (four, but the last one may have fewer).
+    fn chunk_frames(&self, c: u64) -> u64 {
+        CHUNK.min(self.frames - c * CHUNK)
+    }
+
+    fn free_mask(&self, c: u64) -> u8 {
+        self.state[c as usize] & 0xf
+    }
+
+    /// Whether all four frames of `c` are free. A last chunk of fewer
+    /// frames never is: it is never given back.
+    fn is_whole(&self, c: u64) -> bool {
+        self.free_mask(c) == 0xf && self.chunk_frames(c) == CHUNK
+    }
+
+    fn is_partial(&self, c: u64) -> bool {
+        self.free_mask(c) != 0 && !self.is_whole(c)
+    }
+
+    fn returned(&self, c: u64) -> bool {
+        self.flags[c as usize] & RETURNED != 0
+    }
+
+    /// Frames below this were taken (handed out, or free in a chunk
+    /// taken).
+    fn taken(&self) -> u64 {
+        (self.next * CHUNK).min(self.frames)
+    }
+
+    fn push_partial(&mut self, c: u64) {
+        if self.is_partial(c) && self.flags[c as usize] & IN_PARTIAL == 0 {
+            self.flags[c as usize] |= IN_PARTIAL;
+            self.partial.push(c as u32);
         }
-        if self.next == self.frames {
-            return None;
+    }
+
+    /// Takes the lowest free frame of chunk `c`.
+    fn take(&mut self, c: u64, reuse: bool) -> Alloc {
+        let state = self.state[c as usize];
+        let bit = (state & 0xf).trailing_zeros() as u64;
+        let dirty = state & (0x10 << bit) == 0;
+        self.state[c as usize] = state & !(1 << bit) & !(0x10 << bit);
+        self.free -= 1;
+        self.push_partial(c);
+        Alloc {
+            ipa: self.base + (c * CHUNK + bit) * PAGE,
+            dirty,
+            reuse,
         }
-        let ipa = self.base + self.next * PAGE;
-        self.next += 1;
-        Some((ipa, false))
+    }
+
+    fn alloc(&mut self) -> Option<Alloc> {
+        while let Some(&c) = self.partial.last() {
+            let c = c as u64;
+            if self.is_partial(c) {
+                let frame = self.take(c, false);
+                if self.free_mask(c) == 0 {
+                    self.partial.pop();
+                    self.flags[c as usize] &= !IN_PARTIAL;
+                }
+                return Some(frame);
+            }
+            self.partial.pop();
+            self.flags[c as usize] &= !IN_PARTIAL;
+        }
+        // The most recently freed whole chunk: its memory is the likeliest
+        // to be in the caches still.
+        while let Some(c) = self.whole.pop_back() {
+            let c = c as u64;
+            self.flags[c as usize] &= !IN_WHOLE;
+            if self.is_whole(c) && !self.returned(c) {
+                self.whole_count -= 1;
+                return Some(self.take(c, false));
+            }
+        }
+        while let Some(c) = self.returned.pop() {
+            let c = c as u64;
+            self.flags[c as usize] &= !IN_RETURNED;
+            if self.is_whole(c) && self.returned(c) {
+                self.flags[c as usize] &= !RETURNED;
+                return Some(self.take(c, true));
+            }
+        }
+        if self.next < self.chunks() {
+            let c = self.next;
+            self.next += 1;
+            let mask = ((1u16 << self.chunk_frames(c)) - 1) as u8;
+            self.state[c as usize] = mask | (mask << 4);
+            self.free += self.chunk_frames(c);
+            return Some(self.take(c, false));
+        }
+        None
     }
 
     fn release(&mut self, ipa: u64) {
         debug_assert!(self.contains(ipa));
-        // `free` never holds more than `frames` entries: each frame is in
-        // it at most once (callers release a frame only when its last
-        // user goes).
-        self.free.push(ipa);
+        let i = (ipa - self.base) / PAGE;
+        let (c, bit) = (i / CHUNK, i % CHUNK);
+        debug_assert!(c < self.next && self.state[c as usize] & (1 << bit) == 0);
+        // Callers release a frame only when its last user goes, so each
+        // frame is free at most once.
+        self.state[c as usize] = (self.state[c as usize] | (1 << bit)) & !(0x10 << bit);
+        self.free += 1;
+        if self.is_whole(c) {
+            self.whole_count += 1;
+            if self.flags[c as usize] & IN_WHOLE == 0 {
+                self.flags[c as usize] |= IN_WHOLE;
+                self.whole.push_back(c as u32);
+            }
+        } else {
+            self.push_partial(c);
+        }
+    }
+
+    /// Marks whole chunks returned, the ones freed longest ago first,
+    /// until at most `keep` are left, and returns them: their memory is to
+    /// be given back to the host. A frame of one is dirty when it is
+    /// handed out again.
+    fn give_back(&mut self, keep: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        while self.whole_count > keep {
+            let Some(c) = self.whole.pop_front() else {
+                break;
+            };
+            let c = c as u64;
+            self.flags[c as usize] &= !IN_WHOLE;
+            if !self.is_whole(c) || self.returned(c) {
+                continue;
+            }
+            self.whole_count -= 1;
+            self.state[c as usize] &= 0xf;
+            self.flags[c as usize] |= RETURNED;
+            if self.flags[c as usize] & IN_RETURNED == 0 {
+                self.flags[c as usize] |= IN_RETURNED;
+                self.returned.push(c as u32);
+            }
+            out.push(c);
+        }
+        out
     }
 
     fn contains(&self, ipa: u64) -> bool {
@@ -248,12 +434,158 @@ impl Pool {
     }
 
     fn in_use(&self) -> u64 {
-        self.next - self.free.len() as u64
+        self.taken() - self.free
     }
 
     fn available(&self) -> u64 {
         self.frames - self.in_use()
     }
+
+    /// Checks the lists and counts against the chunks' states (tests).
+    #[cfg(test)]
+    fn check(&self) {
+        let mut free = 0;
+        let mut whole = 0;
+        let count =
+            |list: &mut dyn Iterator<Item = u32>, c: u64| list.filter(|&x| x as u64 == c).count();
+        for c in 0..self.chunks() {
+            let flags = self.flags[c as usize];
+            let state = self.state[c as usize];
+            if c >= self.next {
+                assert_eq!((state, flags), (0, 0), "chunk {c} not taken");
+                continue;
+            }
+            free += self.free_mask(c).count_ones() as u64;
+            assert_eq!(
+                state >> 4 & !state,
+                0,
+                "chunk {c}: a used frame known to be zero"
+            );
+            let in_partial = count(&mut self.partial.iter().copied(), c);
+            let in_whole = count(&mut self.whole.iter().copied(), c);
+            let in_returned = count(&mut self.returned.iter().copied(), c);
+            assert_eq!(in_partial, (flags & IN_PARTIAL != 0) as usize, "chunk {c}");
+            assert_eq!(in_whole, (flags & IN_WHOLE != 0) as usize, "chunk {c}");
+            assert_eq!(
+                in_returned,
+                (flags & IN_RETURNED != 0) as usize,
+                "chunk {c}"
+            );
+            if self.returned(c) {
+                assert!(self.is_whole(c) && in_returned == 1, "chunk {c} returned");
+                assert_eq!(state >> 4, 0, "chunk {c}: returned, yet known to be zero");
+            } else if self.is_whole(c) {
+                whole += 1;
+                assert_eq!(in_whole, 1, "whole chunk {c} not listed");
+            } else if self.is_partial(c) {
+                assert_eq!(in_partial, 1, "partial chunk {c} not listed");
+            }
+        }
+        assert_eq!(free, self.free, "free frames");
+        assert_eq!(whole, self.whole_count, "whole chunks");
+    }
+
+    /// The pool's state for a snapshot ([`Phys::save`]).
+    fn saved(&self) -> SavedPool {
+        let mut free = Vec::new();
+        for c in 0..self.next {
+            let mask = self.free_mask(c);
+            for bit in 0..self.chunk_frames(c) {
+                if mask & (1 << bit) != 0 {
+                    free.push(self.base + (c * CHUNK + bit) * PAGE);
+                }
+            }
+        }
+        SavedPool {
+            base: self.base,
+            frames: self.frames,
+            next: self.taken(),
+            free,
+        }
+    }
+
+    /// A pool like the saved one (checked by [`Phys::load`]), for a
+    /// clone: every frame free there is free here and dirty (a clone's
+    /// tables start as a copy of the template's), and every whole chunk
+    /// counts as returned (its memory was never touched here).
+    fn from_saved(saved: &SavedPool) -> Pool {
+        let mut pool = Pool::new(saved.base, saved.frames * PAGE);
+        pool.next = saved.next.div_ceil(CHUNK);
+        let free = |pool: &mut Pool, i: u64| {
+            pool.state[(i / CHUNK) as usize] |= 1 << (i % CHUNK);
+            pool.free += 1;
+        };
+        for i in saved.next..pool.taken() {
+            free(&mut pool, i);
+        }
+        for &ipa in &saved.free {
+            free(&mut pool, (ipa - saved.base) / PAGE);
+        }
+        for c in 0..pool.next {
+            if pool.is_whole(c) {
+                pool.flags[c as usize] |= RETURNED | IN_RETURNED;
+                pool.returned.push(c as u32);
+            } else {
+                pool.push_partial(c);
+            }
+        }
+        pool
+    }
+}
+
+/// A pool as it is saved: frames taken, and the free ones among them.
+#[derive(Debug)]
+pub struct SavedPool {
+    base: u64,
+    frames: u64,
+    next: u64,
+    free: Vec<u64>,
+}
+
+/// Bytes of one chunk (a host page).
+const HOST_PAGE: usize = (CHUNK * PAGE) as usize;
+
+/// The offset of the chunk that holds the frame at `offset`.
+fn chunk_offset(offset: u64) -> usize {
+    (offset - offset % (CHUNK * PAGE)) as usize
+}
+
+/// Whole free chunks each pool keeps (see [`Phys::trim`]): app memory
+/// is given back once more than 4 MiB of it is whole and free, down to
+/// 2 MiB, and page tables once more than 1 MiB, down to 512 KiB.
+pub const RAM_KEEP: (u64, u64) = (256, 128);
+pub const TABLES_KEEP: (u64, u64) = (64, 32);
+
+/// What [`Phys::trim`] gave back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Trimmed {
+    /// Host pages (16 KiB) of app memory and of page tables.
+    pub ram: u64,
+    pub tables: u64,
+    /// `madvise` calls (adjacent host pages go back in one).
+    pub calls: u64,
+    /// Time it took.
+    pub nanos: u64,
+}
+
+/// Gives back what `pool` returns above `keep` chunks, in runs of
+/// adjacent chunks. Returns the chunks and the runs.
+fn give_back<B: Backing>(pool: &mut Pool, backing: &mut B, keep: u64) -> (u64, u64) {
+    let mut chunks = pool.give_back(keep);
+    chunks.sort_unstable();
+    let mut runs = 0;
+    let mut i = 0;
+    while i < chunks.len() {
+        let mut j = i + 1;
+        while j < chunks.len() && chunks[j] == chunks[j - 1] + 1 {
+            j += 1;
+        }
+        let offset = (chunks[i] * CHUNK * PAGE) as usize;
+        backing.give_back(offset, (j - i) * HOST_PAGE);
+        runs += 1;
+        i = j;
+    }
+    (chunks.len() as u64, runs)
 }
 
 /// The two pools and the tables in them.
@@ -280,6 +612,8 @@ pub struct Phys<B> {
     pending: Vec<u64>,
     /// Frames copied from the origin so far.
     loaded: u64,
+    /// What [`Phys::trim`] did so far.
+    trimmed: Trimmed,
 }
 
 /// Where shared pages that had no memory when their address space was
@@ -420,6 +754,7 @@ impl<B: Backing> Phys<B> {
             origin: None,
             pending: Vec::new(),
             loaded: 0,
+            trimmed: Trimmed::default(),
         }
     }
 
@@ -431,6 +766,11 @@ impl<B: Backing> Phys<B> {
         &self.ram
     }
 
+    #[cfg(test)]
+    pub fn ram_backing_mut_for_probe(&mut self) -> &mut B {
+        &mut self.ram
+    }
+
     /// App memory in use, in bytes.
     pub fn ram_in_use(&self) -> u64 {
         self.ram_pool.in_use() * PAGE
@@ -439,6 +779,49 @@ impl<B: Backing> Phys<B> {
     /// Page-table memory in use, in bytes.
     pub fn tables_in_use(&self) -> u64 {
         self.table_pool.in_use() * PAGE
+    }
+
+    /// Gives the memory of whole free chunks back to the host, keeping
+    /// `ram` chunks of app memory and `tables` chunks of page tables (the
+    /// ones freed last). Call it only when no vCPU can reach a free frame
+    /// any more: after the invalidations that the changes which freed them
+    /// made necessary (see the module documentation).
+    pub fn trim(&mut self, ram: u64, tables: u64) -> Trimmed {
+        let start = std::time::Instant::now();
+        let (ram, ram_runs) = give_back(&mut self.ram_pool, &mut self.ram, ram);
+        let (tables, table_runs) = give_back(&mut self.table_pool, &mut self.tables, tables);
+        let trimmed = Trimmed {
+            ram,
+            tables,
+            calls: ram_runs + table_runs,
+            nanos: start.elapsed().as_nanos() as u64,
+        };
+        let total = &mut self.trimmed;
+        total.ram += trimmed.ram;
+        total.tables += trimmed.tables;
+        total.calls += trimmed.calls;
+        total.nanos += trimmed.nanos;
+        trimmed
+    }
+
+    /// [`Phys::trim`] down to [`RAM_KEEP`] and [`TABLES_KEEP`] when either
+    /// pool keeps more whole free chunks than their first number.
+    pub fn trim_some(&mut self) -> Trimmed {
+        if self.ram_pool.whole_count > RAM_KEEP.0 || self.table_pool.whole_count > TABLES_KEEP.0 {
+            self.trim(RAM_KEEP.1, TABLES_KEEP.1)
+        } else {
+            Trimmed::default()
+        }
+    }
+
+    /// Bytes of free memory still held in whole chunks (both pools).
+    pub fn whole_free(&self) -> u64 {
+        (self.ram_pool.whole_count + self.table_pool.whole_count) * CHUNK * PAGE
+    }
+
+    /// Everything [`Phys::trim`] did so far.
+    pub fn trimmed(&self) -> Trimmed {
+        self.trimmed
     }
 
     /// What the TLB may hold that changes since the last call made
@@ -516,7 +899,11 @@ impl<B: Backing> Phys<B> {
     }
 
     fn new_table(&mut self) -> Result<u64, MmuError> {
-        let (ipa, dirty) = self.table_pool.alloc().ok_or(MmuError::NoMemory)?;
+        let Alloc { ipa, dirty, reuse } = self.table_pool.alloc().ok_or(MmuError::NoMemory)?;
+        if reuse {
+            self.tables
+                .take_back(chunk_offset(ipa - TABLES_IPA), HOST_PAGE);
+        }
         if dirty {
             let off = (ipa - TABLES_IPA) as usize;
             self.tables.bytes_mut()[off..off + PAGE as usize].fill(0);
@@ -540,7 +927,10 @@ impl<B: Backing> Phys<B> {
 
     /// A zeroed frame with one user.
     fn new_frame(&mut self) -> Option<u64> {
-        let (ipa, dirty) = self.ram_pool.alloc()?;
+        let Alloc { ipa, dirty, reuse } = self.ram_pool.alloc()?;
+        if reuse {
+            self.ram.take_back(chunk_offset(ipa - RAM_IPA), HOST_PAGE);
+        }
         if dirty {
             self.ram.zero_at((ipa - RAM_IPA) as usize, PAGE as usize);
         }
@@ -1211,7 +1601,7 @@ impl<B: Backing> Phys<B> {
     }
 }
 
-hellovm_core::snap_struct!(Pool {
+hellovm_core::snap_struct!(SavedPool {
     base,
     frames,
     next,
@@ -1221,8 +1611,8 @@ hellovm_core::snap_struct!(Object { descs, frames });
 
 /// The state of the pools apart from their contents ([`Phys::save`]).
 pub struct Saved {
-    table_pool: Pool,
-    ram_pool: Pool,
+    table_pool: SavedPool,
+    ram_pool: SavedPool,
     used: Vec<u16>,
     refs: Vec<u32>,
     objects: HashMap<u64, Object>,
@@ -1269,7 +1659,7 @@ impl<B: Backing> Phys<B> {
         w: &mut hellovm_core::snap::Writer<'_>,
     ) -> SaveStats {
         use hellovm_core::snap::Snap;
-        let tables_len = (self.table_pool.next * PAGE) as usize;
+        let tables_len = (self.table_pool.taken() * PAGE) as usize;
         let mut stats = SaveStats {
             tables: tables_len as u64,
             ..SaveStats::default()
@@ -1281,7 +1671,7 @@ impl<B: Backing> Phys<B> {
             .refs
             .iter()
             .enumerate()
-            .take(self.ram_pool.next as usize)
+            .take(self.ram_pool.taken() as usize)
         {
             if refs == 0 {
                 continue;
@@ -1298,8 +1688,8 @@ impl<B: Backing> Phys<B> {
         }
         // The fields of `Saved`, in its order, without copying the pools'
         // state first.
-        self.table_pool.put(w);
-        self.ram_pool.put(w);
+        self.table_pool.saved().put(w);
+        self.ram_pool.saved().put(w);
         self.used.put(w);
         self.refs.put(w);
         self.objects.put(w);
@@ -1323,11 +1713,11 @@ impl<B: Backing> Phys<B> {
         origin: Box<dyn Origin>,
         roots: &[u64],
     ) -> Result<(), String> {
-        let same = |a: &Pool, b: &Pool| a.base == b.base && a.frames == b.frames;
+        let same = |a: &SavedPool, b: &Pool| a.base == b.base && a.frames == b.frames;
         if !same(&saved.table_pool, &self.table_pool) || !same(&saved.ram_pool, &self.ram_pool) {
             return Err("the snapshot is of a VM of another size".into());
         }
-        let pool_ok = |pool: &Pool| {
+        let pool_ok = |pool: &SavedPool| {
             let mut seen = vec![false; pool.frames as usize];
             pool.next <= pool.frames
                 && pool.free.len() as u64 <= pool.next
@@ -1346,6 +1736,11 @@ impl<B: Backing> Phys<B> {
             || saved.refs.len() != self.refs.len()
             || saved.stored.len() != self.refs.len().div_ceil(64)
             || saved.tables_len != saved.table_pool.next * PAGE
+            || saved
+                .ram_pool
+                .free
+                .iter()
+                .any(|&ipa| saved.refs[Self::frame_index(ipa)] != 0)
             || tables.len() as u64 != saved.tables_len
             || saved.next_object > MAX_OBJECTS
         {
@@ -1353,7 +1748,8 @@ impl<B: Backing> Phys<B> {
         }
         let frame_ok = |ipa: u64| {
             ipa.is_multiple_of(PAGE)
-                && saved.ram_pool.contains(ipa)
+                && ipa >= RAM_IPA
+                && (ipa - RAM_IPA) / PAGE < saved.ram_pool.frames
                 && saved.refs[Self::frame_index(ipa)] > 0
         };
         if !saved
@@ -1365,13 +1761,13 @@ impl<B: Backing> Phys<B> {
         }
         // The shim's tables, the only ones allocated so far, are the
         // first ones of both pools, with the same contents.
-        let shim = (self.table_pool.next * PAGE) as usize;
+        let shim = (self.table_pool.taken() * PAGE) as usize;
         if tables.len() < shim || tables[..shim] != self.tables.bytes()[..shim] {
             return Err("the snapshot's shim tables differ".into());
         }
         self.tables.bytes_mut()[..tables.len()].copy_from_slice(tables);
-        self.table_pool = saved.table_pool;
-        self.ram_pool = saved.ram_pool;
+        self.table_pool = Pool::from_saved(&saved.table_pool);
+        self.ram_pool = Pool::from_saved(&saved.ram_pool);
         self.used = saved.used;
         self.refs = saved.refs;
         self.objects = saved.objects;
@@ -1771,3 +2167,7 @@ mod tests {
 #[cfg(test)]
 #[path = "mmu_cow_tests.rs"]
 mod cow_tests;
+
+#[cfg(test)]
+#[path = "mmu_trim_tests.rs"]
+mod trim_tests;

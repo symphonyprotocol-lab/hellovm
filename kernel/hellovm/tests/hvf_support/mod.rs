@@ -196,3 +196,107 @@ pub fn progress(what: &str) {
         }
     }
 }
+
+/// A process's physical footprint (what Activity Monitor calls its
+/// memory), in bytes; 0 when it cannot be read.
+pub fn phys_footprint(pid: u32) -> u64 {
+    // SAFETY: zeroed plain-old-data; the call fills it.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid pointer to a rusage_info_v2 for RUSAGE_INFO_V2.
+    let ret = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            (&mut info as *mut libc::rusage_info_v2).cast(),
+        )
+    };
+    if ret == 0 {
+        info.ri_phys_footprint
+    } else {
+        0
+    }
+}
+
+/// Python for [`memory_goes_back`]: at each line it prints, it waits for
+/// one on stdin. It touches 256 MiB, frees it, then reads 256 MiB of new
+/// memory, which must be zero, and frees that; then 50 processes that
+/// each touch and free 8 MiB.
+pub const FREE_AND_REUSE: &str = r#"
+import os, sys
+def step(s):
+    print(s, flush=True)
+    sys.stdin.readline()
+step("start")
+b = b"\x01" * (256 << 20)
+step("touched")
+del b
+step("freed")
+c = bytearray(256 << 20)
+print("zero", c.count(0) == len(c), flush=True)
+sys.stdin.readline()
+del c
+for _ in range(50):
+    pid = os.fork()
+    if pid == 0:
+        x = b"\x02" * (8 << 20)
+        os._exit(0 if x[-1] == 2 else 1)
+    assert os.waitpid(pid, 0)[1] == 0
+step("forked")
+"#;
+
+/// Drives [`FREE_AND_REUSE`] in the kernel process `pid` (`line` reads
+/// its next line, `send` answers it) and checks that its footprint
+/// follows: up by 256 MiB, back to near the start once freed and once the
+/// 50 processes are done, and the new memory zero. Returns the footprints
+/// at start, touched, freed and at the end, in MiB.
+pub fn memory_goes_back(
+    pid: u32,
+    mut line: impl FnMut() -> String,
+    mut send: impl FnMut(),
+) -> [f64; 4] {
+    const MIB: f64 = 1024.0 * 1024.0;
+    // Some slack over the start: the pools keep up to 4 MiB of free app
+    // memory and 1 MiB of tables until the sandbox is idle for 20 ms, and
+    // the kernel's own heap and the guest's page cache move a little.
+    const SLACK: u64 = 24 << 20;
+    let settled = |limit: u64| {
+        let start = std::time::Instant::now();
+        loop {
+            let now = phys_footprint(pid);
+            if now <= limit || start.elapsed() > std::time::Duration::from_secs(5) {
+                return now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    assert_eq!(line(), "start\n");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let start = phys_footprint(pid);
+    assert!(start > 0, "no footprint for {pid}");
+    send();
+    assert_eq!(line(), "touched\n");
+    let touched = phys_footprint(pid);
+    assert!(
+        touched > start + (250 << 20),
+        "touched: {touched} from {start}"
+    );
+    send();
+    assert_eq!(line(), "freed\n");
+    let freed = settled(start + SLACK);
+    assert!(freed <= start + SLACK, "freed: {freed}, start {start}");
+    send();
+    assert_eq!(
+        line(),
+        "zero True\n",
+        "memory handed out again was not zero"
+    );
+    send();
+    assert_eq!(line(), "forked\n");
+    let end = settled(start + SLACK);
+    assert!(
+        end <= start + SLACK,
+        "after the forks: {end}, start {start}"
+    );
+    send();
+    [start, touched, freed, end].map(|b| b as f64 / MIB)
+}

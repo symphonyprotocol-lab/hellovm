@@ -115,30 +115,27 @@ fn check(p: &Phys<Vec<u8>>, roots: &[u64]) {
         }
     }
     assert_eq!(p.table_pool.in_use(), tables.len() as u64, "tables leaked");
-    let free: HashSet<u64> = p.ram_pool.free.iter().copied().collect();
-    assert_eq!(free.len(), p.ram_pool.free.len(), "a frame freed twice");
-    let free_tables: HashSet<u64> = p.table_pool.free.iter().copied().collect();
-    assert_eq!(
-        free_tables.len(),
-        p.table_pool.free.len(),
-        "a table freed twice"
-    );
+    p.ram_pool.check();
+    p.table_pool.check();
+    let ram_free = p.ram_pool.saved().free;
+    let free: HashSet<u64> = ram_free.iter().copied().collect();
+    assert_eq!(free.len(), ram_free.len(), "a frame freed twice");
     for (&frame, &count) in &refs {
         let i = Phys::<Vec<u8>>::frame_index(frame);
         assert!(
-            (i as u64) < p.ram_pool.next,
+            (i as u64) < p.ram_pool.taken(),
             "frame {frame:#x} never handed out"
         );
         assert_eq!(p.refs[i], count, "count of frame {frame:#x}");
     }
     // Every other frame handed out is free, with a count of 0.
-    let counted = p.refs[..p.ram_pool.next as usize]
+    let counted = p.refs[..p.ram_pool.taken() as usize]
         .iter()
         .filter(|&&n| n != 0)
         .count();
     assert_eq!(counted, refs.len(), "a frame with users that no page uses");
     assert_eq!(p.ram_pool.in_use(), refs.len() as u64, "frames leaked");
-    for &frame in &p.ram_pool.free {
+    for &frame in &ram_free {
         assert_eq!(
             p.refs[Phys::<Vec<u8>>::frame_index(frame)],
             0,
@@ -703,6 +700,7 @@ fn model_run(seed: u64, steps: usize) {
     // an app's accesses do, so that what the TLB holds gets changed.
     let mut hot: Vec<(u64, u64)> = Vec::new();
     let mut counts = [0usize; 8];
+    let mut trimmed = 0;
     for step in 0..steps {
         let which = rng.below(spaces.len() as u64) as usize;
         let root = spaces[which].0;
@@ -895,6 +893,12 @@ fn model_run(seed: u64, steps: usize) {
             }
         }
         tlb.flush(p.take_stale());
+        // Memory goes back to the host only after the flush; what was
+        // given back reads as garbage until handed out again (and then
+        // zeroed), which the comparisons below would see.
+        if rng.below(4) == 0 {
+            trimmed += p.trim(rng.below(8), rng.below(4)).ram;
+        }
         let live: Vec<u64> = spaces.iter().map(|(root, _)| *root).collect();
         tlb.check(&p, &live);
         check(&p, &live);
@@ -911,7 +915,8 @@ fn model_run(seed: u64, steps: usize) {
     compare_all(&p, &spaces);
     eprintln!(
         "seed {seed}: {steps} steps (map, unmap, protect, write, read, touch, fork, \
-         destroy: {counts:?}), {} spaces at the end, {} KiB of memory, {} tables",
+         destroy: {counts:?}), {} spaces at the end, {} KiB of memory, {} tables, \
+         {trimmed} host pages given back",
         spaces.len(),
         p.ram_in_use() / 1024,
         p.tables_in_use() / PAGE
@@ -921,6 +926,7 @@ fn model_run(seed: u64, steps: usize) {
     }
     check(&p, &[]);
     assert_eq!((p.ram_in_use(), p.tables_in_use()), (0, 0));
+    assert!(trimmed > 0, "nothing was given back");
 }
 
 #[test]
@@ -971,6 +977,10 @@ fn random_operations_with_exhausted_pools_leak_nothing() {
         match result {
             Ok(()) => ok += 1,
             Err(_) => failed += 1,
+        }
+        if rng.below(8) == 0 {
+            p.take_stale();
+            p.trim(rng.below(2), rng.below(2));
         }
         check(&p, &roots);
     }

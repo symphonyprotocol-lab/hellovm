@@ -564,6 +564,41 @@ impl HostMem {
         }
     }
 
+    /// Gives `offset..offset + len` (whole host pages) back to the host
+    /// (`MADV_FREE_REUSABLE`): the memory no longer counts in the
+    /// process's footprint, and the host takes it when it needs it. Until
+    /// written again it holds its old bytes or zeros. The VM's stage-2
+    /// mapping stays as it is: guest and host keep seeing the same bytes.
+    pub fn give_back(&mut self, offset: usize, len: usize) {
+        self.advise(offset, len, libc::MADV_FREE_REUSABLE);
+    }
+
+    /// Takes memory given back for use again (`MADV_FREE_REUSE`), so that
+    /// it counts in the footprint again.
+    pub fn take_back(&mut self, offset: usize, len: usize) {
+        self.advise(offset, len, libc::MADV_FREE_REUSE);
+    }
+
+    fn advise(&mut self, offset: usize, len: usize, advice: libc::c_int) {
+        self.check_range(offset, len);
+        assert!(offset.is_multiple_of(HOST_PAGE) && len.is_multiple_of(HOST_PAGE));
+        // SAFETY: whole host pages inside the mapping (checked); the
+        // advice changes what backs them, not whether they are mapped.
+        let rc = unsafe { libc::madvise(self.ptr.add(offset).cast(), len, advice) };
+        if rc != 0 {
+            // Memory that did not go back is only memory kept: frames are
+            // zeroed when handed out again either way.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "HVF platform: madvise {advice}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
     pub fn slice_mut(&mut self, offset: usize, len: usize) -> &mut [u8] {
         assert!(offset <= self.len && len <= self.len - offset);
         // SAFETY: as in `slice`, and `&mut self` makes this the only view.
