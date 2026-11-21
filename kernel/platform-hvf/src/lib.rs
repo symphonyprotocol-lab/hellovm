@@ -69,6 +69,8 @@ mod mmu;
 mod sys;
 
 pub use app::{AppKiller, Flushes, HvfConfig, HvfPlatform, MAX_VCPUS};
+pub use mmu::{Origin, SaveStats};
+pub use sys::SharedMap;
 
 /// Whether this process may use Hypervisor.framework: `Ok` if a VM could
 /// be created (and was destroyed again), otherwise why not. A process

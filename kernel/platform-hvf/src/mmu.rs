@@ -71,6 +71,24 @@
 //!
 //! Nothing here trusts app memory: descriptors are read only from the
 //! table pool, which the VM cannot write.
+//!
+//! # Warm clones
+//!
+//! A frozen template's pools are saved as they are ([`Phys::save`]): the
+//! tables, the counts, and the frames that are not all zero. A clone (a
+//! new process with a new VM of the same size) starts from that with
+//! [`Phys::load`]: its tables are a copy of the template's, so every
+//! address space and every descriptor is the same, at the same
+//! guest-physical addresses; its app memory starts empty, and each frame
+//! the template had is *pending*: copied from the template's snapshot
+//! (an [`Origin`]) when it is first used. A valid descriptor never points
+//! at a pending frame: [`Phys::load`] clears the valid bit of each such
+//! page, the first access faults, and [`Phys::demand`] loads the frame
+//! and makes the page valid again (a descriptor that is mapped, has a
+//! frame and a protection other than `PROT_NONE`, but is not valid is
+//! exactly that). The host's own reads of a pending frame read the
+//! snapshot, its writes load the frame first. A frame that is freed is
+//! not pending any more.
 
 use std::collections::HashMap;
 
@@ -137,6 +155,14 @@ pub enum MmuError {
     /// The range is not (fully) mapped, or not with the access asked for,
     /// or outside the app's addresses.
     BadAddress,
+}
+
+/// Where a clone's pending frames come from: the template's app memory,
+/// frame by frame (see the module documentation).
+pub trait Origin: Send {
+    /// Copies frame `index` of the template's app memory (one page) into
+    /// `out`, which is [`PAGE`] bytes long.
+    fn read_frame(&self, index: usize, out: &mut [u8]);
 }
 
 /// How the app touched a page.
@@ -248,6 +274,12 @@ pub struct Phys<B> {
     /// What changes since the last [`Phys::take_stale`] may have left
     /// stale in the TLB (see the module documentation).
     stale: Stale,
+    /// A clone's: the template's memory, and per app frame whether it
+    /// still has to be copied from it (one bit each).
+    origin: Option<Box<dyn Origin>>,
+    pending: Vec<u64>,
+    /// Frames copied from the origin so far.
+    loaded: u64,
 }
 
 /// Where shared pages that had no memory when their address space was
@@ -385,6 +417,9 @@ impl<B: Backing> Phys<B> {
             objects: HashMap::new(),
             next_object: 1,
             stale: Stale::Clean,
+            origin: None,
+            pending: Vec::new(),
+            loaded: 0,
         }
     }
 
@@ -527,6 +562,7 @@ impl<B: Backing> Phys<B> {
             0 => log::error!("HVF platform: frame {frame:#x} released twice; kept"),
             1 => {
                 *refs = 0;
+                self.clear_pending(frame);
                 self.ram_pool.release(frame);
             }
             _ => *refs -= 1,
@@ -541,7 +577,58 @@ impl<B: Backing> Phys<B> {
     /// The descriptor for a page with `frame`, as the frame's users allow.
     fn page(&self, frame: Option<u64>, prot: Prot, shared: bool) -> u64 {
         let exclusive = frame.is_none_or(|frame| self.exclusive(frame));
-        leaf(frame, prot, shared, exclusive)
+        let desc = leaf(frame, prot, shared, exclusive);
+        match frame {
+            // Valid only once loaded (see the module documentation).
+            Some(frame) if self.is_pending(frame) => desc & !pte::VALID,
+            _ => desc,
+        }
+    }
+
+    fn is_pending(&self, frame: u64) -> bool {
+        let i = Self::frame_index(frame);
+        self.pending
+            .get(i / 64)
+            .is_some_and(|word| word & (1 << (i % 64)) != 0)
+    }
+
+    fn clear_pending(&mut self, frame: u64) {
+        let i = Self::frame_index(frame);
+        if let Some(word) = self.pending.get_mut(i / 64) {
+            *word &= !(1 << (i % 64));
+        }
+    }
+
+    /// Copies a pending frame from the origin; nothing for any other.
+    fn load_frame(&mut self, frame: u64) {
+        if !self.is_pending(frame) {
+            return;
+        }
+        let mut page = [0u8; PAGE as usize];
+        if let Some(origin) = &self.origin {
+            origin.read_frame(Self::frame_index(frame), &mut page);
+        }
+        self.ram.write_at((frame - RAM_IPA) as usize, &page);
+        self.clear_pending(frame);
+        self.loaded += 1;
+    }
+
+    /// Copies bytes of `frame` at `offset` into `buf`: from the origin
+    /// while it is pending.
+    fn read_frame(&self, frame: u64, offset: usize, buf: &mut [u8]) {
+        match &self.origin {
+            Some(origin) if self.is_pending(frame) => {
+                let mut page = [0u8; PAGE as usize];
+                origin.read_frame(Self::frame_index(frame), &mut page);
+                buf.copy_from_slice(&page[offset..offset + buf.len()]);
+            }
+            _ => self.ram.read_at((frame - RAM_IPA) as usize + offset, buf),
+        }
+    }
+
+    /// Frames copied from the origin so far (a clone's).
+    pub fn loaded(&self) -> u64 {
+        self.loaded
     }
 
     #[cfg(test)]
@@ -821,7 +908,27 @@ impl<B: Backing> Phys<B> {
         if !access.allowed(prot) {
             return Demand::Denied;
         }
-        if leaf_frame(desc).is_some() {
+        if let Some(frame) = leaf_frame(desc) {
+            if desc & pte::VALID == 0 {
+                // Mapped, backed and accessible, but not valid: a page
+                // whose frame was pending (see the module documentation).
+                self.load_frame(frame);
+                let Ok(Some((table, idx))) = self.leaf_slot(root, va) else {
+                    return Demand::NoMemory;
+                };
+                if prot.contains(Prot::EXEC) {
+                    self.sync_frame(frame);
+                }
+                let new = self.page(Some(frame), prot, leaf_shared(desc));
+                self.set_entry(table, idx, new);
+                if access == Access::Write && new & pte::AP_RO != 0 {
+                    return match self.unshare(root, va) {
+                        Ok(_) => Demand::Filled,
+                        Err(_) => Demand::NoMemory,
+                    };
+                }
+                return Demand::Filled;
+            }
             if access == Access::Write && desc & pte::AP_RO != 0 {
                 return match self.unshare(root, va) {
                     Ok(_) => Demand::Filled,
@@ -840,6 +947,7 @@ impl<B: Backing> Phys<B> {
         let object = leaf_object(self.entry(table, idx));
         let frame = match object.and_then(|id| self.object_frame(id, va)) {
             Some(frame) => {
+                self.load_frame(frame);
                 self.get_frame(frame);
                 frame
             }
@@ -870,6 +978,7 @@ impl<B: Backing> Phys<B> {
         let (table, idx) = self.leaf_slot(root, va)?.ok_or(MmuError::BadAddress)?;
         let desc = self.entry(table, idx);
         let frame = leaf_frame(desc).ok_or(MmuError::BadAddress)?;
+        self.load_frame(frame);
         let (prot, shared) = (leaf_prot(desc), leaf_shared(desc));
         if shared || self.exclusive(frame) {
             let new = leaf(Some(frame), prot, shared, true);
@@ -913,9 +1022,7 @@ impl<B: Backing> Phys<B> {
             let frame = leaf_frame(desc)
                 .or_else(|| self.object_frame(leaf_object(desc)?, va & !(PAGE - 1)));
             match frame {
-                Some(frame) => self
-                    .ram
-                    .read_at((frame - RAM_IPA) as usize + page_off, &mut buf[at..at + n]),
+                Some(frame) => self.read_frame(frame, page_off, &mut buf[at..at + n]),
                 None => buf[at..at + n].fill(0),
             }
             va += n as u64;
@@ -964,7 +1071,10 @@ impl<B: Backing> Phys<B> {
                 Some(frame) if !leaf_shared(desc) && !self.exclusive(frame) => {
                     self.unshare(root, va & !(PAGE - 1)).ok()
                 }
-                Some(frame) => Some(frame),
+                Some(frame) => {
+                    self.load_frame(frame);
+                    Some(frame)
+                }
             }
             .ok_or(MmuError::NoMemory)?;
             let at = (va - addr) as usize;
@@ -1101,6 +1211,215 @@ impl<B: Backing> Phys<B> {
     }
 }
 
+hellovm_core::snap_struct!(Pool {
+    base,
+    frames,
+    next,
+    free
+});
+hellovm_core::snap_struct!(Object { descs, frames });
+
+/// The state of the pools apart from their contents ([`Phys::save`]).
+pub struct Saved {
+    table_pool: Pool,
+    ram_pool: Pool,
+    used: Vec<u16>,
+    refs: Vec<u32>,
+    objects: HashMap<u64, Object>,
+    next_object: u64,
+    /// Bytes of the table pool that were saved (all of it that was used).
+    tables_len: u64,
+    /// Per app frame, one bit: saved (not all zero).
+    stored: Vec<u64>,
+}
+
+hellovm_core::snap_struct!(Saved {
+    table_pool,
+    ram_pool,
+    used,
+    refs,
+    objects,
+    next_object,
+    tables_len,
+    stored,
+});
+
+/// What [`Phys::save`] wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SaveStats {
+    /// App frames in use.
+    pub frames: u64,
+    /// Of those, the ones saved (the others are all zero).
+    pub stored: u64,
+    /// Bytes of page tables saved.
+    pub tables: u64,
+}
+
+impl<B: Backing> Phys<B> {
+    /// Saves a frozen template's pools for its clones (see the module
+    /// documentation): the used part of the table pool into `tables`,
+    /// each app frame in use that is not all zero into `ram` at its own
+    /// offset (the rest of `ram` is left alone: zero), and returns the
+    /// rest of the state as bytes for [`Phys::load`]. `tables` and `ram`
+    /// are as large as the pools. Nothing may run meanwhile.
+    pub fn save(
+        &self,
+        tables: &mut [u8],
+        ram: &mut [u8],
+        w: &mut hellovm_core::snap::Writer<'_>,
+    ) -> SaveStats {
+        use hellovm_core::snap::Snap;
+        let tables_len = (self.table_pool.next * PAGE) as usize;
+        let mut stats = SaveStats {
+            tables: tables_len as u64,
+            ..SaveStats::default()
+        };
+        tables[..tables_len].copy_from_slice(&self.tables.bytes()[..tables_len]);
+        let mut stored = vec![0u64; self.refs.len().div_ceil(64)];
+        let mut page = [0u8; PAGE as usize];
+        for (i, &refs) in self
+            .refs
+            .iter()
+            .enumerate()
+            .take(self.ram_pool.next as usize)
+        {
+            if refs == 0 {
+                continue;
+            }
+            stats.frames += 1;
+            let off = i * PAGE as usize;
+            self.ram.read_at(off, &mut page);
+            if page.iter().all(|&b| b == 0) {
+                continue;
+            }
+            ram[off..off + PAGE as usize].copy_from_slice(&page);
+            stored[i / 64] |= 1 << (i % 64);
+            stats.stored += 1;
+        }
+        // The fields of `Saved`, in its order, without copying the pools'
+        // state first.
+        self.table_pool.put(w);
+        self.ram_pool.put(w);
+        self.used.put(w);
+        self.refs.put(w);
+        self.objects.put(w);
+        self.next_object.put(w);
+        (tables_len as u64).put(w);
+        stored.put(w);
+        stats
+    }
+
+    /// Makes these pools, made for a VM of the template's size and with
+    /// nothing allocated but the shim's tables, a clone of the saved
+    /// ones: `meta` from [`Phys::save`], `tables` the saved table pool,
+    /// `origin` the saved app memory, `roots` the address spaces the clone
+    /// will use. Checks that the tables of those spaces stay inside the
+    /// pools, and leaves each page whose frame is pending not valid (see
+    /// the module documentation).
+    pub fn load(
+        &mut self,
+        saved: Saved,
+        tables: &[u8],
+        origin: Box<dyn Origin>,
+        roots: &[u64],
+    ) -> Result<(), String> {
+        let same = |a: &Pool, b: &Pool| a.base == b.base && a.frames == b.frames;
+        if !same(&saved.table_pool, &self.table_pool) || !same(&saved.ram_pool, &self.ram_pool) {
+            return Err("the snapshot is of a VM of another size".into());
+        }
+        let pool_ok = |pool: &Pool| {
+            let mut seen = vec![false; pool.frames as usize];
+            pool.next <= pool.frames
+                && pool.free.len() as u64 <= pool.next
+                && pool.free.iter().all(|&ipa| {
+                    let i = ((ipa.wrapping_sub(pool.base)) / PAGE) as usize;
+                    ipa.is_multiple_of(PAGE)
+                        && ipa >= pool.base
+                        && (i as u64) < pool.next
+                        && !std::mem::replace(&mut seen[i], true)
+                })
+        };
+        if !pool_ok(&saved.table_pool) || !pool_ok(&saved.ram_pool) {
+            return Err("the snapshot's pools are inconsistent".into());
+        }
+        if saved.used.len() != self.used.len()
+            || saved.refs.len() != self.refs.len()
+            || saved.stored.len() != self.refs.len().div_ceil(64)
+            || saved.tables_len != saved.table_pool.next * PAGE
+            || tables.len() as u64 != saved.tables_len
+            || saved.next_object > MAX_OBJECTS
+        {
+            return Err("the snapshot's pools are inconsistent".into());
+        }
+        let frame_ok = |ipa: u64| {
+            ipa.is_multiple_of(PAGE)
+                && saved.ram_pool.contains(ipa)
+                && saved.refs[Self::frame_index(ipa)] > 0
+        };
+        if !saved
+            .objects
+            .values()
+            .all(|o| o.frames.values().all(|&f| frame_ok(f)))
+        {
+            return Err("a shared object of the snapshot holds a frame not in use".into());
+        }
+        // The shim's tables, the only ones allocated so far, are the
+        // first ones of both pools, with the same contents.
+        let shim = (self.table_pool.next * PAGE) as usize;
+        if tables.len() < shim || tables[..shim] != self.tables.bytes()[..shim] {
+            return Err("the snapshot's shim tables differ".into());
+        }
+        self.tables.bytes_mut()[..tables.len()].copy_from_slice(tables);
+        self.table_pool = saved.table_pool;
+        self.ram_pool = saved.ram_pool;
+        self.used = saved.used;
+        self.refs = saved.refs;
+        self.objects = saved.objects;
+        self.next_object = saved.next_object;
+        // Only frames in use are pending.
+        let mut pending = saved.stored;
+        for (i, &refs) in self.refs.iter().enumerate() {
+            if refs == 0 {
+                pending[i / 64] &= !(1 << (i % 64));
+            }
+        }
+        self.pending = pending;
+        self.origin = Some(origin);
+        for &root in roots {
+            self.adopt(root, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Checks the tree at `table` (of `level`) for [`Phys::load`] and
+    /// makes each of its pages with a pending frame not valid.
+    fn adopt(&mut self, table: u64, level: u32) -> Result<(), String> {
+        if !table.is_multiple_of(PAGE) || !self.table_pool.contains(table) {
+            return Err(format!("a table at {table:#x}, outside the table pool"));
+        }
+        for idx in 0..512 {
+            let desc = self.entry(table, idx);
+            if level < 3 {
+                if desc & pte::VALID != 0 {
+                    self.adopt(desc & pte::ADDR_MASK, level + 1)?;
+                }
+                continue;
+            }
+            let Some(frame) = leaf_frame(desc) else {
+                continue;
+            };
+            if desc & pte::SW_MAPPED == 0 || !self.ram_pool.contains(frame) {
+                return Err(format!("a page at {frame:#x}, outside app memory"));
+            }
+            if desc & pte::VALID != 0 && self.is_pending(frame) {
+                let off = (table - TABLES_IPA) as usize + idx * 8;
+                self.tables.store_u64(off, desc & !pte::VALID);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,6 +1429,123 @@ mod tests {
             vec![0; tables * PAGE as usize],
             vec![0; ram * PAGE as usize],
         )
+    }
+
+    /// The template's app memory as a clone's origin.
+    struct VecOrigin(Vec<u8>);
+
+    impl Origin for VecOrigin {
+        fn read_frame(&self, index: usize, out: &mut [u8]) {
+            let off = index * PAGE as usize;
+            out.copy_from_slice(&self.0[off..off + PAGE as usize]);
+        }
+    }
+
+    #[test]
+    fn a_clone_loads_frames_on_first_touch_and_keeps_its_writes() {
+        let (tables, ram) = (64, 64);
+        let mut t = phys(tables, ram);
+        t.shim_space().unwrap();
+        let a = t.new_space().unwrap();
+        t.map(a, 0x40_0000, 4 * PAGE, Prot::RW, false).unwrap();
+        t.map(a, 0x80_0000, 2 * PAGE, Prot::RW, true).unwrap();
+        t.write(a, 0x40_0000, b"private").unwrap();
+        t.write(a, 0x40_2000, &[0; 8]).unwrap(); // in use, all zero
+        t.write(a, 0x80_0000, b"shared").unwrap();
+        let b = t.fork(a).unwrap();
+        t.write(b, 0x40_1000, b"child's").unwrap();
+        let mut saved_tables = vec![0u8; tables * PAGE as usize];
+        let mut saved_ram = vec![0u8; ram * PAGE as usize];
+        let mut w = hellovm_core::snap::Writer::new();
+        let stats = t.save(&mut saved_tables, &mut saved_ram, &mut w);
+        let meta = w.into_inner();
+        let saved = |meta: &[u8]| {
+            let mut r = hellovm_core::snap::Reader::new(meta);
+            <Saved as hellovm_core::snap::Snap>::get(&mut r)
+        };
+        assert_eq!(stats.frames, 4);
+        assert_eq!(stats.stored, 3, "the zero frame is not stored");
+        saved_tables.truncate(stats.tables as usize);
+
+        let mut c = phys(tables, ram);
+        c.shim_space().unwrap();
+        c.load(
+            saved(&meta).unwrap(),
+            &saved_tables,
+            Box::new(VecOrigin(saved_ram.clone())),
+            &[a, b],
+        )
+        .unwrap();
+        // Same counts; nothing copied yet, and no valid page points at a
+        // pending frame.
+        assert_eq!(c.ram_in_use(), t.ram_in_use());
+        assert_eq!(c.loaded(), 0);
+        assert_eq!(c.lookup(a, 0x40_0000) & pte::VALID, 0);
+        // The host reads the origin without loading.
+        let mut buf = [0u8; 7];
+        c.read(a, 0x40_0000, &mut buf).unwrap();
+        assert_eq!(&buf, b"private");
+        assert_eq!(c.loaded(), 0);
+        // A read fault loads the frame and makes the page valid; it stays
+        // copy-on-write, being shared with the other space.
+        assert_eq!(c.demand(b, 0x40_0000, Access::Read), Demand::Filled);
+        assert_eq!(c.loaded(), 1);
+        let desc = c.lookup(b, 0x40_0000);
+        assert_ne!(desc & pte::VALID, 0);
+        assert_ne!(desc & pte::AP_RO, 0);
+        // The other space's page names the loaded frame: valid at its
+        // first fault, without another copy.
+        assert_eq!(c.demand(a, 0x40_0000, Access::Read), Demand::Filled);
+        assert_eq!(c.loaded(), 1);
+        // A write fault copies: the other space keeps the template's bytes.
+        assert_eq!(c.demand(a, 0x40_0000, Access::Write), Demand::Filled);
+        c.write(a, 0x40_0000, b"CHANGED").unwrap();
+        c.read(b, 0x40_0000, &mut buf).unwrap();
+        assert_eq!(&buf, b"private");
+        // The host's write to a pending, exclusive frame loads it first:
+        // the bytes around the write are the template's.
+        c.write(b, 0x40_1000, b"C").unwrap();
+        c.read(b, 0x40_1000, &mut buf).unwrap();
+        assert_eq!(&buf, b"Child's");
+        // Shared memory stays shared between the clone's spaces.
+        c.write(b, 0x80_0000, b"S").unwrap();
+        let mut six = [0u8; 6];
+        c.read(a, 0x80_0000, &mut six).unwrap();
+        assert_eq!(&six, b"Shared");
+        // The template's memory never changed.
+        assert_eq!(&saved_ram[..7], b"private");
+        // Freeing a pending frame forgets it; reallocated, it is zero.
+        c.unmap(a, 0x40_0000, 4 * PAGE).unwrap();
+        c.unmap(b, 0x40_0000, 4 * PAGE).unwrap();
+        c.map(a, 0x90_0000, PAGE, Prot::RW, false).unwrap();
+        let mut eight = [1u8; 8];
+        assert_eq!(c.demand(a, 0x90_0000, Access::Read), Demand::Filled);
+        c.read(a, 0x90_0000, &mut eight).unwrap();
+        assert_eq!(eight, [0; 8]);
+
+        // A snapshot of another size, or tables outside the pool, are
+        // refused.
+        let mut d = phys(tables, ram * 2);
+        d.shim_space().unwrap();
+        assert!(d
+            .load(
+                saved(&meta).unwrap(),
+                &saved_tables,
+                Box::new(VecOrigin(saved_ram.clone())),
+                &[a]
+            )
+            .is_err());
+        let mut e = phys(tables, ram);
+        e.shim_space().unwrap();
+        assert!(e
+            .load(
+                saved(&meta).unwrap(),
+                &saved_tables,
+                Box::new(VecOrigin(saved_ram)),
+                &[0x1234_5000]
+            )
+            .is_err());
+        assert!(saved(&meta[..meta.len() / 2]).is_err());
     }
 
     #[test]
