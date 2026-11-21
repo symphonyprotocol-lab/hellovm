@@ -192,6 +192,16 @@ macro_rules! int {
                 raw.copy_from_slice(bytes);
                 Ok(<$t>::from_le_bytes(raw))
             }
+            // In bulk: a clone reads arrays of counts as large as its VM.
+            fn get_vec(r: &mut Reader<'_>, n: usize) -> Result<Vec<Self>, Bad> {
+                const SIZE: usize = std::mem::size_of::<$t>();
+                let len = n.checked_mul(SIZE).ok_or_else(|| Bad("a count out of range".into()))?;
+                let bytes = r.take(len)?;
+                Ok(bytes
+                    .chunks_exact(SIZE)
+                    .map(|c| <$t>::from_le_bytes(c.try_into().expect("chunk of SIZE")))
+                    .collect())
+            }
         }
     )*};
 }

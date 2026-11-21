@@ -23,7 +23,8 @@
 #                        its test suite) and extension modules
 #   lib/..., usr/lib/... the shared libraries and the program interpreter
 #                        the dynamic programs need, from ldd, at the same
-#                        paths as in the container
+#                        paths as in the container, and libgcc_s (which
+#                        glibc loads for pthread_exit)
 #   greeting.txt         a file smoke reads
 #   MANIFEST             the image, compiler and package versions used
 #
@@ -78,6 +79,11 @@ for module in "/usr/lib/$version/lib-dynload/"*.so; do
     with_libs "$module"
 done
 with_libs "$root/guests/dynamic"
+# glibc loads it at run time (no ldd entry) to unwind a thread that ends
+# with pthread_exit, as the threads of CPython do at interpreter exit.
+for lib in /lib/*-linux-gnu/libgcc_s.so.1; do
+    [ -e "$lib" ] && copy "$lib"
+done
 echo "root:x:0:0:root:/root:/bin/sh" > "$root/etc/passwd"
 echo "hello from a file" > "$root/greeting.txt"
 

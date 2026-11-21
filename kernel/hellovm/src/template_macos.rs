@@ -790,6 +790,10 @@ fn control_socket() -> UnixStream {
     unsafe { UnixStream::from_raw_fd(0) }
 }
 
+/// The supervisor stopped this kernel process: a clone that its template
+/// or its requester left reports nothing (as on Linux, where it dies).
+static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Stops the sandbox as soon as the supervisor closes `control` (it died)
 /// or sends anything on it (stop): a thread, made before the hardening,
 /// blocked in `read` until then, ends every app with `killer` (the run
@@ -800,12 +804,14 @@ fn stop_with_supervisor(
     killer: hellovm_platform_hvf::AppKiller,
 ) -> io::Result<()> {
     let control = control.try_clone()?;
+    STOPPED.store(false, std::sync::atomic::Ordering::SeqCst);
     std::thread::Builder::new()
         .name("hellovm-supervisor".into())
         .spawn(move || {
             let mut byte = [0u8; 1];
             // Anything, or end of file, or an error.
             let _ = read_some(&control, &mut byte);
+            STOPPED.store(true, std::sync::atomic::Ordering::SeqCst);
             killer.kill();
             hellovm_host::sleep_confined(EXIT_PATIENCE);
             // SAFETY: ends the process at once.
@@ -1098,6 +1104,9 @@ fn clone_kernel(options: &Options, fds: Result<usize, String>, control: &UnixStr
         "clone: {} app frames copied from the template",
         app.frames_loaded()
     );
+    if STOPPED.load(std::sync::atomic::Ordering::SeqCst) {
+        return CLONE_FAILED;
+    }
     if !kernel.host_mut().drain_streams(EXIT_DRAIN) {
         log::warn!("outbound streams still had undelivered bytes after {EXIT_DRAIN:?}");
     }
@@ -1122,6 +1131,7 @@ fn prepare_clone(
     stdio: [File; 3],
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
     let layout = Layout::of(options);
+    let t0 = Instant::now();
     let head = SharedMap::map(snapshot.as_fd(), 0, HEADER as usize, false)?;
     let header = Header::decode(head.bytes(), &layout)?;
     drop(head);
@@ -1142,12 +1152,14 @@ fn prepare_clone(
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
     let image_path = image.root().to_path_buf();
+    let t1 = Instant::now();
     // Never dropped: see `run`.
     let mut app = std::mem::ManuallyDrop::new(Box::new(HvfPlatform::new(HvfConfig {
         vcpus: options.vcpus.unwrap_or(0),
         ..HvfConfig::default()
     })?));
     stop_with_supervisor(control, app.killer())?;
+    let t2 = Instant::now();
     let kernel_len = header.kernel_len as usize;
     let platform = &state.bytes()[kernel_len..kernel_len + header.platform_len as usize];
     app.load_frozen(
@@ -1165,8 +1177,19 @@ fn prepare_clone(
     if let Some(path) = &egress {
         host.set_egress(path)?;
     }
+    let t3 = Instant::now();
     let kernel = Kernel::load_frozen(host, &state.bytes()[..kernel_len])?;
     drop(state);
+    let t4 = Instant::now();
     harden(options, &image_path, egress.as_deref(), fds)?;
+    log::debug!(
+        "clone: snapshot mapped in {:?}, VM made in {:?}, page tables loaded in {:?}, \
+         kernel state read in {:?}, hardened in {:?}",
+        t1 - t0,
+        t2 - t1,
+        t3 - t2,
+        t4 - t3,
+        t4.elapsed()
+    );
     Ok((app, kernel))
 }
