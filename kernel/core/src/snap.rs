@@ -38,31 +38,79 @@ pub(crate) fn bad<T>(what: impl Into<String>) -> Result<T, Bad> {
     Err(Bad(what.into()))
 }
 
-/// The output.
-#[derive(Default)]
-pub struct Writer {
-    buf: Vec<u8>,
+/// The output: a growing buffer, or a fixed one (the snapshot's memory)
+/// that nothing is allocated for. A process that writes its snapshot
+/// after it confined itself must not grow large allocations: on macOS a
+/// large `realloc` copies with a Mach call the confined process may not
+/// make.
+pub struct Writer<'a> {
+    sink: Sink<'a>,
+    len: usize,
 }
 
-impl Writer {
-    pub fn new() -> Writer {
+enum Sink<'a> {
+    Owned(Vec<u8>),
+    Fixed(&'a mut [u8]),
+}
+
+impl Default for Writer<'_> {
+    fn default() -> Self {
+        Writer {
+            sink: Sink::Owned(Vec::new()),
+            len: 0,
+        }
+    }
+}
+
+impl<'a> Writer<'a> {
+    pub fn new() -> Writer<'a> {
         Writer::default()
     }
 
-    pub fn bytes(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
+    /// A writer into `buf`: what does not fit is counted, not written
+    /// (see [`Writer::written`]).
+    pub fn into_slice(buf: &'a mut [u8]) -> Writer<'a> {
+        Writer {
+            sink: Sink::Fixed(buf),
+            len: 0,
+        }
     }
 
+    pub fn bytes(&mut self, data: &[u8]) {
+        match &mut self.sink {
+            Sink::Owned(buf) => buf.extend_from_slice(data),
+            Sink::Fixed(buf) => {
+                if let Some(dst) = buf.get_mut(self.len..self.len + data.len()) {
+                    dst.copy_from_slice(data);
+                }
+            }
+        }
+        self.len += data.len();
+    }
+
+    /// The bytes written (a growing buffer's; empty for a fixed one).
     pub fn into_inner(self) -> Vec<u8> {
-        self.buf
+        match self.sink {
+            Sink::Owned(buf) => buf,
+            Sink::Fixed(_) => Vec::new(),
+        }
+    }
+
+    /// How many bytes were written: `Err` with how many there were for a
+    /// fixed buffer they did not fit.
+    pub fn written(&self) -> Result<usize, usize> {
+        match &self.sink {
+            Sink::Fixed(buf) if self.len > buf.len() => Err(self.len),
+            _ => Ok(self.len),
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.len == 0
     }
 }
 
@@ -524,6 +572,17 @@ mod tests {
             "a".to_string().put(&mut w);
         }
         assert!(<BTreeMap<u32, String> as Snap>::get(&mut Reader::new(&w.into_inner())).is_err());
+    }
+
+    #[test]
+    fn a_fixed_buffer_takes_what_fits_and_counts_the_rest() {
+        let mut buf = [0u8; 6];
+        let mut w = Writer::into_slice(&mut buf);
+        1u32.put(&mut w);
+        assert_eq!(w.written(), Ok(4));
+        2u32.put(&mut w);
+        assert_eq!(w.written(), Err(8));
+        assert_eq!(buf, [1, 0, 0, 0, 0, 0]);
     }
 
     #[test]

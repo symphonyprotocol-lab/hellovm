@@ -699,6 +699,13 @@ impl<H: Host> Kernel<H> {
     /// [`Kernel::load_frozen`] makes a kernel of it again, which
     /// [`Kernel::thaw`] then makes a clone.
     pub fn save_frozen(&self) -> Result<Vec<u8>, KernelError> {
+        let mut w = crate::snap::Writer::new();
+        self.save_frozen_to(&mut w)?;
+        Ok(w.into_inner())
+    }
+
+    /// [`Kernel::save_frozen`] into `w` (a fixed buffer, say).
+    pub fn save_frozen_to(&self, w: &mut crate::snap::Writer<'_>) -> Result<(), KernelError> {
         use crate::snap::Snap;
         let Some(frozen) = &self.frozen else {
             return Err(KernelError::NotClonable("not a frozen template".into()));
@@ -706,15 +713,42 @@ impl<H: Host> Kernel<H> {
         if self.console_mode != ConsoleMode::Streams || self.st.console.tty.is_some() {
             return Err(KernelError::NotClonable("the console is a terminal".into()));
         }
-        let mut w = crate::snap::Writer::new();
         w.bytes(SNAPSHOT_MAGIC);
-        self.trace.is_some().put(&mut w);
-        self.vfs.put(&mut w);
-        self.st.put(&mut w);
-        self.cwd.put(&mut w);
-        self.arch.put(&mut w);
-        frozen.put(&mut w);
-        Ok(w.into_inner())
+        self.trace.is_some().put(w);
+        self.vfs.put(w);
+        self.st.put(w);
+        self.cwd.put(w);
+        self.arch.put(w);
+        frozen.put(w);
+        Ok(())
+    }
+
+    /// How many memory areas the address spaces of a frozen template have
+    /// (address-space reservations not counted).
+    pub fn frozen_areas(&self) -> usize {
+        let Some(frozen) = &self.frozen else {
+            return 0;
+        };
+        let mut mms: Vec<crate::task::MmId> = frozen
+            .iter()
+            .filter_map(|tids| tids.first())
+            .filter_map(|tid| self.st.threads.get(tid))
+            .filter_map(|t| self.st.procs.get(&t.pid)?.mm)
+            .collect();
+        mms.sort_unstable();
+        mms.dedup();
+        mms.iter()
+            .map(|&mm| {
+                self.st
+                    .mms
+                    .get(mm)
+                    .mm
+                    .vmas()
+                    .iter()
+                    .filter(|v| v.kind != crate::mm::VmaKind::Reserved)
+                    .count()
+            })
+            .sum()
     }
 
     /// A frozen template's kernel from [`Kernel::save_frozen`]'s bytes,
