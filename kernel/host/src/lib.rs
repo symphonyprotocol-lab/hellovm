@@ -42,6 +42,11 @@ pub use stream::{
 
 pub use image::ImageDir;
 
+/// Sleeps without `nanosleep`, which the confined kernel process on macOS
+/// may not use (see `stream_poll.rs`).
+#[cfg(target_os = "macos")]
+pub use stream::pause as sleep_confined;
+
 /// The services every host implementation shares: the image, randomness and
 /// clocks.
 #[derive(Debug)]
@@ -302,8 +307,10 @@ impl StdioHost {
     }
 
     /// Sends every outbound flow to the egress proxy listening on `path`.
-    pub fn set_egress(&mut self, path: impl Into<std::path::PathBuf>) {
-        self.splice.set_endpoint(Endpoint::Egress(path.into()));
+    /// On macOS this starts the thread that moves outbound bytes, which
+    /// must exist before the kernel process confines itself.
+    pub fn set_egress(&mut self, path: impl Into<std::path::PathBuf>) -> io::Result<()> {
+        self.splice.set_endpoint(Endpoint::Egress(path.into()))
     }
 
     /// Console input is at end of file from the start (a warm-clone
@@ -325,8 +332,8 @@ impl StdioHost {
     /// Test hook: splice every issued-fake-IP TCP connect to `addr`, with
     /// no egress policy. The guest's destination is not dialed.
     #[cfg(feature = "insecure-test-hooks")]
-    pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) {
-        self.splice.set_endpoint(Endpoint::Splice(addr));
+    pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) -> io::Result<()> {
+        self.splice.set_endpoint(Endpoint::Splice(addr))
     }
 
     /// See [`StreamTable::drain`]: closes the remaining outbound streams and
@@ -443,14 +450,16 @@ impl CaptureHost {
     }
 
     /// Sends every outbound flow to the egress proxy listening on `path`.
-    pub fn set_egress(&mut self, path: impl Into<std::path::PathBuf>) {
-        self.splice.set_endpoint(Endpoint::Egress(path.into()));
+    /// On macOS this starts the thread that moves outbound bytes, which
+    /// must exist before the kernel process confines itself.
+    pub fn set_egress(&mut self, path: impl Into<std::path::PathBuf>) -> io::Result<()> {
+        self.splice.set_endpoint(Endpoint::Egress(path.into()))
     }
 
     /// Test hook: splice every issued-fake-IP TCP connect to `addr`.
     #[cfg(feature = "insecure-test-hooks")]
-    pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) {
-        self.splice.set_endpoint(Endpoint::Splice(addr));
+    pub fn set_splice_endpoint(&mut self, addr: std::net::SocketAddr) -> io::Result<()> {
+        self.splice.set_endpoint(Endpoint::Splice(addr))
     }
 
     /// Outbound flows the kernel opened (the last 1024), in order.

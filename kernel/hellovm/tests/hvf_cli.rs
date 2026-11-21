@@ -58,6 +58,39 @@ fn timeout_stops_a_spinning_program() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
 }
 
+/// The system starts a worker thread in the confined process when an
+/// event source fires that a system library registered there (memory
+/// pressure, a notification); the thread gives itself back with
+/// `workq_kernreturn` and ends when left idle. The profile once killed the
+/// process for that call. `HELLOVM_TEST_WORKER` has one started after the
+/// process confined itself; the program then runs long enough for the
+/// thread to come, go idle and end.
+#[test]
+fn a_worker_thread_of_the_system_does_not_kill_the_confined_process() {
+    let _serial = hvf_support::serial();
+    let Some(exe) = hellovm() else {
+        return;
+    };
+    progress("hvf_cli: spin with a system worker thread");
+    let root = image("spin", hellovm_test_guest::SPIN);
+    let out = Command::new(exe)
+        .env("HELLOVM_TEST_WORKER", "1")
+        .args(["--sandbox", "require", "--no-tty", "--timeout", "7"])
+        .arg("--root")
+        .arg(&root)
+        .arg("/spin")
+        .output()
+        .unwrap();
+    // Killed by the profile it would be signal 9, without a code.
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "{:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn unsupported_options_are_refused() {
     let _serial = hvf_support::serial();
@@ -65,21 +98,17 @@ fn unsupported_options_are_refused() {
         return;
     };
     let root = image("refused", hellovm_test_guest::HELLO);
-    for args in [
-        &["--egress", "/nonexistent.sock"][..],
-        &["--template", "/nonexistent.sock"],
-    ] {
-        progress(&format!("hvf_cli: refused {args:?}"));
-        let out = Command::new(exe)
-            .args(args)
-            .arg("--root")
-            .arg(&root)
-            .arg("/refused")
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(125), "{args:?}");
-        assert!(out.stdout.is_empty());
-    }
+    let args = ["--template", "/nonexistent.sock"];
+    progress(&format!("hvf_cli: refused {args:?}"));
+    let out = Command::new(exe)
+        .args(args)
+        .arg("--root")
+        .arg(&root)
+        .arg("/refused")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(125), "{args:?}");
+    assert!(out.stdout.is_empty());
 }
 
 /// A busybox shell pipeline and a CPython script that starts processes,

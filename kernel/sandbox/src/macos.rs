@@ -17,6 +17,10 @@ pub struct Config<'a> {
     /// The image directory's canonical host path: the only files the
     /// kernel process may read afterwards.
     pub image_path: &'a Path,
+    /// `--egress`: the egress proxy's socket, the one place the kernel
+    /// process may connect to (an absolute path without symlinks, as
+    /// the kernel process connects to it). `None`: no network at all.
+    pub egress: Option<&'a Path>,
     /// Test hook: measure what the profile lacks: denied system calls fail
     /// instead of killing the process (see `seatbelt::Kind::Learn`).
     pub learn: bool,
@@ -390,11 +394,18 @@ fn seatbelt(config: &Config<'_>) -> Result<String, String> {
     } else {
         crate::seatbelt::Kind::Enforce
     };
-    let mut text = profile(kind);
+    let mut params: Vec<(&str, &[u8])> = vec![("IMAGE", image)];
+    if let Some(egress) = config.egress {
+        if !egress.is_absolute() {
+            return Err("the egress socket path is not absolute".into());
+        }
+        params.push(("EGRESS", egress.as_os_str().as_bytes()));
+    }
+    let mut text = profile(kind, config.egress.is_some());
     if config.broken {
         text.push_str("(this-is-not-an-operation)");
     }
-    enter(&text, &[("IMAGE", image)])?;
+    enter(&text, &params)?;
     if config.learn {
         return Ok("LEARNING: denied system calls fail instead of killing".into());
     }
@@ -405,8 +416,9 @@ fn seatbelt(config: &Config<'_>) -> Result<String, String> {
 /// Applies every layer; see the crate documentation. Call it once the
 /// image directory, the VM and its vCPUs, stdio and the terminal are set
 /// up and before the kernel reads any guest input, while the only other
-/// threads are the HVF platform's vCPU threads, which wait for a task to
-/// run and read no environment.
+/// threads are the HVF platform's vCPU threads and, with an egress
+/// socket, the outbound streams' I/O thread, which wait and read no
+/// environment.
 pub fn apply(config: Config<'_>) -> Result<Report, Refused> {
     let mut report = Report::default();
     let layers = [

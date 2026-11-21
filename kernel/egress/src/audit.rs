@@ -21,7 +21,8 @@
 //!   upstream delivered to the guest;
 //! * `ms`: the flow's duration;
 //! * `peer`: the process id of the connecting kernel process as the host
-//!   kernel reports it (`SO_PEERCRED`), `-` where that is unavailable.
+//!   kernel reports it (`SO_PEERCRED`; `LOCAL_PEERPID` on macOS), `-`
+//!   where that is unavailable.
 //!   Unlike `sandbox`, the connecting process cannot choose it.
 //!
 //! Every allowed flow is logged. Refusals are rate-limited per peer

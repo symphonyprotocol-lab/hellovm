@@ -20,3 +20,9 @@ libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
+
+# Enters the Seatbelt profile in a process of its own and tries the
+# network from inside; no harness, so that process has no other thread.
+[[test]]
+name = "seatbelt_network"
+harness = false
