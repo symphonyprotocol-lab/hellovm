@@ -79,7 +79,8 @@ mod seatbelt;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    apply, close_inherited_fds, open_fds, profile, Config, Layer, LayerReport, Refused, Report,
+    apply, close_inherited_fds, open_fds, profile, seal_supervisor, Config, Layer, LayerReport,
+    Refused, Report,
 };
 #[cfg(target_os = "macos")]
 pub use seatbelt::Kind as ProfileKind;
