@@ -2620,12 +2620,13 @@ mod give_back_tests {
             ctx.x[3] = 0xa5a5_0000 + round + 1;
             ctx.x[5] = REGION;
             p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+            let untouched = footprint();
             p.resume(t, Resume::Continue).unwrap();
             next(&mut p);
             let touched = footprint();
             assert!(
-                touched > start + LEN - (4 << 20),
-                "round {round}: {touched} {start}"
+                touched > untouched + LEN - (8 << 20),
+                "round {round}: {touched} after the touch, {untouched} before"
             );
             // Freed, then mapped again with nothing in it.
             let (_, before) = p.memory_kept();
@@ -2637,10 +2638,13 @@ mod give_back_tests {
                 kept <= (2 << 20) + (512 << 10),
                 "round {round}: {kept} kept"
             );
+            // Other tests of this process allocate meanwhile: the drop is
+            // what is checked (the command-line tests compare with the
+            // start, from outside the process).
             let freed = footprint();
             assert!(
-                freed < start + (8 << 20),
-                "round {round}: {freed} after the unmap, {start} at the start; \
+                touched.saturating_sub(freed) > LEN - (8 << 20),
+                "round {round}: {freed} after the unmap, {touched} before; \
                  trimmed {before:?} -> {after:?}; resident {}",
                 resident_kib()
             );
