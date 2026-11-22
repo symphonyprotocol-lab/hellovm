@@ -243,9 +243,7 @@ struct Pool {
     frames: u64,
     /// Chunks below this were taken.
     next: u64,
-    /// Per chunk: its free frames (low four bits) and, of those, the ones
-    /// known to be zero (high four bits: never used since the chunk was
-    /// taken).
+    /// Per chunk: its free frames, one bit each.
     state: Vec<u8>,
     flags: Vec<u8>,
     partial: Vec<u32>,
@@ -260,8 +258,6 @@ struct Pool {
 /// A frame from [`Pool::alloc`].
 struct Alloc {
     ipa: u64,
-    /// It may hold old bytes (frames never used are zero).
-    dirty: bool,
     /// Its chunk's memory was given back and must be taken back first.
     reuse: bool,
 }
@@ -328,13 +324,11 @@ impl Pool {
     fn take(&mut self, c: u64, reuse: bool) -> Alloc {
         let state = self.state[c as usize];
         let bit = (state & 0xf).trailing_zeros() as u64;
-        let dirty = state & (0x10 << bit) == 0;
-        self.state[c as usize] = state & !(1 << bit) & !(0x10 << bit);
+        self.state[c as usize] = state & !(1 << bit);
         self.free -= 1;
         self.push_partial(c);
         Alloc {
             ipa: self.base + (c * CHUNK + bit) * PAGE,
-            dirty,
             reuse,
         }
     }
@@ -374,8 +368,7 @@ impl Pool {
         if self.next < self.chunks() {
             let c = self.next;
             self.next += 1;
-            let mask = ((1u16 << self.chunk_frames(c)) - 1) as u8;
-            self.state[c as usize] = mask | (mask << 4);
+            self.state[c as usize] = ((1u16 << self.chunk_frames(c)) - 1) as u8;
             self.free += self.chunk_frames(c);
             return Some(self.take(c, false));
         }
@@ -389,7 +382,7 @@ impl Pool {
         debug_assert!(c < self.next && self.state[c as usize] & (1 << bit) == 0);
         // Callers release a frame only when its last user goes, so each
         // frame is free at most once.
-        self.state[c as usize] = (self.state[c as usize] | (1 << bit)) & !(0x10 << bit);
+        self.state[c as usize] |= 1 << bit;
         self.free += 1;
         if self.is_whole(c) {
             self.whole_count += 1;
@@ -404,8 +397,7 @@ impl Pool {
 
     /// Marks whole chunks returned, the ones freed longest ago first,
     /// until at most `keep` are left, and returns them: their memory is to
-    /// be given back to the host. A frame of one is dirty when it is
-    /// handed out again.
+    /// be given back to the host.
     fn give_back(&mut self, keep: u64) -> Vec<u64> {
         let mut out = Vec::new();
         while self.whole_count > keep {
@@ -456,11 +448,6 @@ impl Pool {
                 continue;
             }
             free += self.free_mask(c).count_ones() as u64;
-            assert_eq!(
-                state >> 4 & !state,
-                0,
-                "chunk {c}: a used frame known to be zero"
-            );
             let in_partial = count(&mut self.partial.iter().copied(), c);
             let in_whole = count(&mut self.whole.iter().copied(), c);
             let in_returned = count(&mut self.returned.iter().copied(), c);
@@ -473,7 +460,6 @@ impl Pool {
             );
             if self.returned(c) {
                 assert!(self.is_whole(c) && in_returned == 1, "chunk {c} returned");
-                assert_eq!(state >> 4, 0, "chunk {c}: returned, yet known to be zero");
             } else if self.is_whole(c) {
                 whole += 1;
                 assert_eq!(in_whole, 1, "whole chunk {c} not listed");
@@ -505,8 +491,7 @@ impl Pool {
     }
 
     /// A pool like the saved one (checked by [`Phys::load`]), for a
-    /// clone: every frame free there is free here and dirty (a clone's
-    /// tables start as a copy of the template's), and every whole chunk
+    /// clone: every frame free there is free here, and every whole chunk
     /// counts as returned (its memory was never touched here).
     fn from_saved(saved: &SavedPool) -> Pool {
         let mut pool = Pool::new(saved.base, saved.frames * PAGE);
@@ -899,15 +884,13 @@ impl<B: Backing> Phys<B> {
     }
 
     fn new_table(&mut self) -> Result<u64, MmuError> {
-        let Alloc { ipa, dirty, reuse } = self.table_pool.alloc().ok_or(MmuError::NoMemory)?;
+        let Alloc { ipa, reuse } = self.table_pool.alloc().ok_or(MmuError::NoMemory)?;
         if reuse {
             self.tables
                 .take_back(chunk_offset(ipa - TABLES_IPA), HOST_PAGE);
         }
-        if dirty {
-            let off = (ipa - TABLES_IPA) as usize;
-            self.tables.bytes_mut()[off..off + PAGE as usize].fill(0);
-        }
+        let off = (ipa - TABLES_IPA) as usize;
+        self.tables.bytes_mut()[off..off + PAGE as usize].fill(0);
         self.used[Self::table_index(ipa)] = 0;
         Ok(ipa)
     }
@@ -926,14 +909,21 @@ impl<B: Backing> Phys<B> {
     }
 
     /// A zeroed frame with one user.
+    ///
+    /// Every frame is zeroed here, by the host, also one never used (whose
+    /// memory is zero already): what a frame holds when the app gets it
+    /// then never depends on what the host did with memory given back
+    /// ([`Backing::give_back`]), and memory the app gets is always
+    /// touched by the host first. On macOS that matters for giving it
+    /// back: a page whose first touch was the VM's (through stage 2)
+    /// stays in the process's footprint after `MADV_FREE_REUSABLE`, one
+    /// the host touched first does not (see the README).
     fn new_frame(&mut self) -> Option<u64> {
-        let Alloc { ipa, dirty, reuse } = self.ram_pool.alloc()?;
+        let Alloc { ipa, reuse } = self.ram_pool.alloc()?;
         if reuse {
             self.ram.take_back(chunk_offset(ipa - RAM_IPA), HOST_PAGE);
         }
-        if dirty {
-            self.ram.zero_at((ipa - RAM_IPA) as usize, PAGE as usize);
-        }
+        self.ram.zero_at((ipa - RAM_IPA) as usize, PAGE as usize);
         self.refs[Self::frame_index(ipa)] = 1;
         Some(ipa)
     }

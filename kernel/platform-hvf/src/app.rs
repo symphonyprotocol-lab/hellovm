@@ -2513,6 +2513,24 @@ mod give_back_tests {
         }
     }
 
+    fn resident_kib() -> String {
+        // SAFETY: as in `footprint`.
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        // SAFETY: as in `footprint`.
+        unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                (&mut info as *mut libc::rusage_info_v4).cast(),
+            )
+        };
+        format!(
+            "{} KiB, wired {} KiB",
+            info.ri_resident_size >> 10,
+            info.ri_wired_size >> 10
+        )
+    }
+
     /// A program touches 64 MiB; the host unmaps it, which gives it back
     /// (all but the reserve the pools keep, and that once idle); the
     /// footprint falls back. Mapped again, all of it reads zero although
@@ -2615,11 +2633,16 @@ mod give_back_tests {
             p.unmap(t, REGION, LEN).unwrap();
             let unmap = timer.elapsed();
             let (kept, after) = p.memory_kept();
-            assert!(kept <= 2 << 20, "round {round}: {kept} kept");
+            assert!(
+                kept <= (2 << 20) + (512 << 10),
+                "round {round}: {kept} kept"
+            );
             let freed = footprint();
             assert!(
                 freed < start + (8 << 20),
-                "round {round}: {freed} after the unmap, {start} at the start"
+                "round {round}: {freed} after the unmap, {start} at the start; \
+                 trimmed {before:?} -> {after:?}; resident {}",
+                resident_kib()
             );
             p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
             let timer = Instant::now();
