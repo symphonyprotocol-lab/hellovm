@@ -253,6 +253,10 @@ struct Pool {
     free: u64,
     /// Whole chunks (with their memory).
     whole_count: u64,
+    /// Per chunk: when it last became whole ([`Pool::clock`] then).
+    since: Vec<u64>,
+    /// The time now, in the caller's unit ([`Phys::set_clock`]).
+    clock: u64,
 }
 
 /// A frame from [`Pool::alloc`].
@@ -277,6 +281,8 @@ impl Pool {
             returned: Vec::new(),
             free: 0,
             whole_count: 0,
+            since: vec![0; chunks],
+            clock: 0,
         }
     }
 
@@ -386,6 +392,7 @@ impl Pool {
         self.free += 1;
         if self.is_whole(c) {
             self.whole_count += 1;
+            self.since[c as usize] = self.clock;
             if self.flags[c as usize] & IN_WHOLE == 0 {
                 self.flags[c as usize] |= IN_WHOLE;
                 self.whole.push_back(c as u32);
@@ -395,22 +402,43 @@ impl Pool {
         }
     }
 
-    /// Marks whole chunks returned, the ones freed longest ago first,
-    /// until at most `keep` are left, and returns them: their memory is to
-    /// be given back to the host.
-    fn give_back(&mut self, keep: u64) -> Vec<u64> {
+    /// Whether the chunk first in the whole list is whole and not
+    /// returned (the list may hold chunks that left that state since).
+    fn front_whole(&self) -> Option<u64> {
+        let &c = self.whole.front()?;
+        let c = c as u64;
+        (self.is_whole(c) && !self.returned(c)).then_some(c)
+    }
+
+    /// Drops chunks from the front of the whole list that are no longer
+    /// whole (so that its front is the one whole longest).
+    fn skip_stale(&mut self) {
+        while let Some(&c) = self.whole.front() {
+            if self.front_whole().is_some() {
+                return;
+            }
+            self.whole.pop_front();
+            self.flags[c as usize] &= !IN_WHOLE;
+        }
+    }
+
+    /// Marks whole chunks returned, the ones whole longest first, while
+    /// more than `keep` are left and the next one became whole at
+    /// `before` or earlier, and returns them: their memory is to be
+    /// given back to the host.
+    fn give_back(&mut self, keep: u64, before: u64) -> Vec<u64> {
         let mut out = Vec::new();
         while self.whole_count > keep {
-            let Some(c) = self.whole.pop_front() else {
+            self.skip_stale();
+            let Some(c) = self.front_whole() else {
                 break;
             };
-            let c = c as u64;
-            self.flags[c as usize] &= !IN_WHOLE;
-            if !self.is_whole(c) || self.returned(c) {
-                continue;
+            if self.since[c as usize] > before {
+                break;
             }
+            self.whole.pop_front();
+            self.flags[c as usize] &= !IN_WHOLE;
             self.whole_count -= 1;
-            self.state[c as usize] &= 0xf;
             self.flags[c as usize] |= RETURNED;
             if self.flags[c as usize] & IN_RETURNED == 0 {
                 self.flags[c as usize] |= IN_RETURNED;
@@ -535,11 +563,10 @@ fn chunk_offset(offset: u64) -> usize {
     (offset - offset % (CHUNK * PAGE)) as usize
 }
 
-/// Whole free chunks each pool keeps (see [`Phys::trim`]): app memory
-/// is given back once more than 4 MiB of it is whole and free, down to
-/// 2 MiB, and page tables once more than 1 MiB, down to 512 KiB.
-pub const RAM_KEEP: (u64, u64) = (256, 128);
-pub const TABLES_KEEP: (u64, u64) = (64, 32);
+/// Whole free chunks each pool keeps however long they have been free
+/// ([`Phys::trim_aged`]): 4 MiB of app memory, 1 MiB of page tables.
+pub const RAM_KEEP: u64 = 256;
+pub const TABLES_KEEP: u64 = 64;
 
 /// What [`Phys::trim`] gave back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -553,10 +580,10 @@ pub struct Trimmed {
     pub nanos: u64,
 }
 
-/// Gives back what `pool` returns above `keep` chunks, in runs of
+/// Gives back what `pool` returns ([`Pool::give_back`]), in runs of
 /// adjacent chunks. Returns the chunks and the runs.
-fn give_back<B: Backing>(pool: &mut Pool, backing: &mut B, keep: u64) -> (u64, u64) {
-    let mut chunks = pool.give_back(keep);
+fn give_back<B: Backing>(pool: &mut Pool, backing: &mut B, keep: u64, before: u64) -> (u64, u64) {
+    let mut chunks = pool.give_back(keep, before);
     chunks.sort_unstable();
     let mut runs = 0;
     let mut i = 0;
@@ -766,15 +793,44 @@ impl<B: Backing> Phys<B> {
         self.table_pool.in_use() * PAGE
     }
 
+    /// Sets the time, in any unit that only grows (the same for
+    /// [`Phys::trim_aged`]): chunks that become whole are stamped with it.
+    pub fn set_clock(&mut self, now: u64) {
+        self.ram_pool.clock = now;
+        self.table_pool.clock = now;
+    }
+
     /// Gives the memory of whole free chunks back to the host, keeping
     /// `ram` chunks of app memory and `tables` chunks of page tables (the
     /// ones freed last). Call it only when no vCPU can reach a free frame
     /// any more: after the invalidations that the changes which freed them
     /// made necessary (see the module documentation).
     pub fn trim(&mut self, ram: u64, tables: u64) -> Trimmed {
+        self.trim_before(ram, tables, u64::MAX)
+    }
+
+    /// [`Phys::trim`] of the chunks that have been whole and free for
+    /// `age` or longer at `now` (see [`Phys::set_clock`]), beyond
+    /// [`RAM_KEEP`] and [`TABLES_KEEP`]. Returns what it gave back and
+    /// when the next chunk beyond those will be that old, if one is.
+    pub fn trim_aged(&mut self, now: u64, age: u64) -> (Trimmed, Option<u64>) {
+        let trimmed = self.trim_before(RAM_KEEP, TABLES_KEEP, now.saturating_sub(age));
+        let due = |pool: &mut Pool, keep: u64| {
+            pool.skip_stale();
+            pool.front_whole()
+                .filter(|_| pool.whole_count > keep)
+                .map(|c| pool.since[c as usize].saturating_add(age))
+        };
+        let ram = due(&mut self.ram_pool, RAM_KEEP);
+        let tables = due(&mut self.table_pool, TABLES_KEEP);
+        (trimmed, ram.into_iter().chain(tables).min())
+    }
+
+    fn trim_before(&mut self, ram: u64, tables: u64, before: u64) -> Trimmed {
         let start = std::time::Instant::now();
-        let (ram, ram_runs) = give_back(&mut self.ram_pool, &mut self.ram, ram);
-        let (tables, table_runs) = give_back(&mut self.table_pool, &mut self.tables, tables);
+        let (ram, ram_runs) = give_back(&mut self.ram_pool, &mut self.ram, ram, before);
+        let (tables, table_runs) =
+            give_back(&mut self.table_pool, &mut self.tables, tables, before);
         let trimmed = Trimmed {
             ram,
             tables,
@@ -787,16 +843,6 @@ impl<B: Backing> Phys<B> {
         total.calls += trimmed.calls;
         total.nanos += trimmed.nanos;
         trimmed
-    }
-
-    /// [`Phys::trim`] down to [`RAM_KEEP`] and [`TABLES_KEEP`] when either
-    /// pool keeps more whole free chunks than their first number.
-    pub fn trim_some(&mut self) -> Trimmed {
-        if self.ram_pool.whole_count > RAM_KEEP.0 || self.table_pool.whole_count > TABLES_KEEP.0 {
-            self.trim(RAM_KEEP.1, TABLES_KEEP.1)
-        } else {
-            Trimmed::default()
-        }
     }
 
     /// Bytes of free memory still held in whole chunks (both pools).

@@ -40,6 +40,12 @@ const SPIN: Duration = Duration::from_micros(50);
 /// the pools still hold goes back to the host (see [`Phys::trim`]).
 const IDLE_TRIM: Duration = Duration::from_millis(20);
 
+/// How long memory beyond the pools' reserve stays free before it goes
+/// back to the host while the sandbox is busy: memory freed and used again
+/// sooner (a process that exits and the next one, an interpreter's heap
+/// that shrinks and grows) never makes the trip (see the README).
+const GIVE_BACK_AGE: Duration = Duration::from_millis(100);
+
 /// Polls `done` for at most `limit` (and not past `deadline`).
 fn spin_until(limit: Duration, deadline: Option<Instant>, done: impl Fn() -> bool) -> bool {
     let start = Instant::now();
@@ -391,6 +397,12 @@ struct Smp {
     ticks_per_sec: u64,
     flushes_all: AtomicU64,
     flushes_page: AtomicU64,
+    /// The pools' clock ([`Phys::set_clock`]) counts nanoseconds from this.
+    epoch: Instant,
+    /// When free memory the pools hold will have been free for
+    /// [`GIVE_BACK_AGE`] ([`Phys::trim_aged`]), on that clock; `u64::MAX`
+    /// when nothing will.
+    trim_due: AtomicU64,
 }
 
 impl Smp {
@@ -475,18 +487,39 @@ impl Smp {
     /// free and hand out a frame the stale entries still reach) comes in
     /// between.
     ///
-    /// Then, when the pools keep more free memory than they may
-    /// ([`Phys::trim_some`]), it goes back to the host: by now no vCPU can
-    /// reach a free frame (each one freed was reachable only through the
-    /// entries this or an earlier change made stale).
+    /// Then free memory that has been free for [`GIVE_BACK_AGE`] goes
+    /// back to the host ([`Smp::trim_aged`]): by now no vCPU can reach a
+    /// free frame (each one freed was reachable only through the entries
+    /// this or an earlier change made stale).
     fn change<R>(&self, root: u64, asid: u16, f: impl FnOnce(&mut Phys<HostMem>) -> R) -> R {
         let mut phys = self.phys();
+        phys.set_clock(self.clock());
         let result = f(&mut phys);
         let stale = phys.take_stale();
         self.invalidate(root, asid, stale);
-        phys.trim_some();
+        self.trim_aged(&mut phys);
         drop(phys);
         result
+    }
+
+    /// Nanoseconds since the platform was made.
+    fn clock(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// Gives back the free memory that has been free long enough, and
+    /// records when the next will be. Called with the tables locked,
+    /// when no vCPU can reach a free frame.
+    fn trim_aged(&self, phys: &mut Phys<HostMem>) {
+        let age = GIVE_BACK_AGE.as_nanos() as u64;
+        let (_, due) = phys.trim_aged(self.clock(), age);
+        self.trim_due.store(due.unwrap_or(u64::MAX), SeqCst);
+    }
+
+    /// When the event loop must call [`Smp::trim_aged`] next, if ever.
+    fn trim_deadline(&self) -> Option<Instant> {
+        let due = self.trim_due.load(SeqCst);
+        (due != u64::MAX).then(|| self.epoch + Duration::from_nanos(due))
     }
 
     /// See [`Smp::change`]. Called with the tables locked.
@@ -1558,6 +1591,8 @@ impl HvfPlatform {
             ticks_per_sec,
             flushes_all: AtomicU64::new(0),
             flushes_page: AtomicU64::new(0),
+            epoch: Instant::now(),
+            trim_due: AtomicU64::new(u64::MAX),
         });
         let mut platform = HvfPlatform {
             runner: Runner::new(0, vcpu),
@@ -1642,7 +1677,21 @@ impl HvfPlatform {
 
     /// Gives back to the host all the free memory the pools still hold.
     fn trim_all(&self) {
-        self.smp.phys().trim(0, 0);
+        let mut phys = self.smp.phys();
+        phys.trim(0, 0);
+        self.smp.trim_due.store(u64::MAX, SeqCst);
+    }
+
+    /// Gives back what has been free long enough once that is due.
+    fn trim_if_due(&self) {
+        if self
+            .smp
+            .trim_deadline()
+            .is_some_and(|due| due <= Instant::now())
+        {
+            let mut phys = self.smp.phys();
+            self.smp.trim_aged(&mut phys);
+        }
     }
 
     /// How often TLB entries were invalidated so far (by any vCPU).
@@ -2167,6 +2216,7 @@ impl Platform for HvfPlatform {
         let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         let smp = Arc::clone(&self.smp);
         loop {
+            self.trim_if_due();
             let mut sched = smp.lock();
             if sched.killed {
                 drop(sched);
@@ -2213,10 +2263,12 @@ impl Platform for HvfPlatform {
             } else {
                 None
             };
-            let until = match (deadline, slice_end) {
-                (Some(deadline), Some(slice_end)) => Some(deadline.min(slice_end)),
-                (deadline, slice_end) => deadline.or(slice_end),
-            };
+            // Memory due to go back ends the run in time, also of an app
+            // that never makes a system call.
+            let until = [deadline, slice_end, smp.trim_deadline()]
+                .into_iter()
+                .flatten()
+                .min();
             let result = self
                 .runner
                 .load(&smp, &current, claimed)
@@ -2531,13 +2583,30 @@ mod give_back_tests {
         )
     }
 
-    /// A program touches 64 MiB; the host unmaps it, which gives it back
-    /// (all but the reserve the pools keep, and that once idle); the
-    /// footprint falls back. Mapped again, all of it reads zero although
-    /// the host pages it gets were the ones given back (their old bytes
-    /// may still be there). Five rounds; with more than one vCPU, three
-    /// threads of the same process write their own pages without a
-    /// system call meanwhile, on the other vCPUs.
+    /// Lets the platform run (`t` is stopped) until what the pools keep
+    /// went back, for 300 ms at most: what they keep then, and how long
+    /// it took.
+    fn given_back(p: &mut HvfPlatform, t: TaskKey) -> (u64, Duration) {
+        let timer = Instant::now();
+        loop {
+            let (kept, _) = p.memory_kept();
+            if kept <= 512 << 10 || timer.elapsed() > Duration::from_millis(300) {
+                return (kept, timer.elapsed());
+            }
+            if let Some(ev) = p.wait(Some(Duration::from_millis(30))).unwrap() {
+                assert_ne!(ev.task, t, "the program is stopped");
+                p.resume(ev.task, Resume::Continue).unwrap();
+            }
+        }
+    }
+
+    /// A program touches 64 MiB; the host unmaps it, and it goes back
+    /// within `GIVE_BACK_AGE` (here, the program being stopped, once the
+    /// event loop is idle); the footprint falls back. Mapped again, all of
+    /// it reads zero although the host pages it gets were the ones given
+    /// back (their old bytes may still be there). Five rounds; with more
+    /// than one vCPU, three threads of the same process write their own
+    /// pages without a system call meanwhile, on the other vCPUs.
     fn run(vcpus: usize) {
         let _guard = super::vm_tests::VM
             .lock()
@@ -2633,11 +2702,12 @@ mod give_back_tests {
             let timer = Instant::now();
             p.unmap(t, REGION, LEN).unwrap();
             let unmap = timer.elapsed();
-            let (kept, after) = p.memory_kept();
-            assert!(
-                kept <= (2 << 20) + (512 << 10),
-                "round {round}: {kept} kept"
-            );
+            // Nothing goes back at once; it does within
+            // `GIVE_BACK_AGE` (here, with the program stopped, once the
+            // event loop is idle).
+            let (kept, back_after) = given_back(&mut p, t);
+            let (_, after) = p.memory_kept();
+            assert!(kept <= 512 << 10, "round {round}: {kept} kept");
             // Other tests of this process allocate meanwhile: the drop is
             // what is checked (the command-line tests compare with the
             // start, from outside the process).
@@ -2654,9 +2724,11 @@ mod give_back_tests {
             assert_eq!(next(&mut p), 0, "round {round}: old bytes in new memory");
             let reread = timer.elapsed();
             p.unmap(t, REGION, LEN).unwrap();
+            given_back(&mut p, t);
             eprintln!(
                 "{vcpus} vCPUs, round {round}: footprint {} MiB at the start, {} touched, {} freed; \
-                 unmap of 64 MiB {unmap:?} ({} host pages back in {} calls, {} µs), \
+                 unmap of 64 MiB {unmap:?}, back after {back_after:?} \
+                 ({} host pages in {} calls, {} µs), \
                  64 MiB read again {reread:?}",
                 start >> 20,
                 touched >> 20,
@@ -2678,6 +2750,75 @@ mod give_back_tests {
         }
         assert_eq!(p.memory_kept().0, 0);
         assert_eq!(p.memory_in_use().0, 0);
+    }
+
+    /// On the only vCPU a program spins without a system call, so the
+    /// event loop is never idle: what was freed goes back once it has been
+    /// free for `GIVE_BACK_AGE` (but the reserve), the run being ended for
+    /// it.
+    #[test]
+    fn freed_memory_goes_back_while_a_program_spins() {
+        let _guard = super::vm_tests::VM
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut p = match HvfPlatform::new(HvfConfig {
+            vcpus: 1,
+            ..HvfConfig::default()
+        }) {
+            Ok(p) => p,
+            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
+                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
+            }
+            Err(err) => {
+                eprintln!("SKIPPING: {err}");
+                return;
+            }
+        };
+        let t = p.spawn().unwrap();
+        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
+        // spin: [x6] = x3++ for ever.
+        let code: Vec<u8> = [0xf900_00c3u32, 0x9100_0463, 0x17ff_fffe]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        p.write(t, CODE, &code).unwrap();
+        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
+            .unwrap();
+        p.map(t, SPIN_DATA, PAGE, Prot::RW, Sharing::Private)
+            .unwrap();
+        p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
+        for i in 0..LEN / PAGE {
+            p.write(t, REGION + i * PAGE, &[1]).unwrap();
+        }
+        p.unmap(t, REGION, LEN).unwrap();
+        assert!(p.memory_kept().0 >= LEN - (1 << 20));
+        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
+            unreachable!()
+        };
+        ctx.pc = CODE;
+        ctx.x[6] = SPIN_DATA;
+        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        let timer = Instant::now();
+        let mut kept = p.memory_kept().0;
+        while kept > (crate::mmu::RAM_KEEP + crate::mmu::TABLES_KEEP) * 16384
+            && timer.elapsed() < Duration::from_secs(2)
+        {
+            // The program never stops: each wait ends with its deadline.
+            assert!(p.wait(Some(Duration::from_millis(20))).unwrap().is_none());
+            kept = p.memory_kept().0;
+        }
+        let took = timer.elapsed();
+        eprintln!("spinning: {kept} bytes kept after {took:?}");
+        assert!(
+            kept <= (crate::mmu::RAM_KEEP + crate::mmu::TABLES_KEEP) * 16384,
+            "{kept} kept after {took:?}"
+        );
+        assert!(
+            took >= GIVE_BACK_AGE - Duration::from_millis(10),
+            "{took:?}"
+        );
+        p.kill(t).unwrap();
     }
 
     #[test]

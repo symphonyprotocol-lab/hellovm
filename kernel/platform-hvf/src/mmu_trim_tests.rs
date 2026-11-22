@@ -138,21 +138,40 @@ fn a_host_page_with_a_frame_in_use_stays() {
     p.ram_pool.check();
 }
 
+/// Memory goes back once it has been free for the age given, the
+/// oldest first, beyond the reserve; what was freed later waits, and
+/// `trim_aged` says until when.
 #[test]
-fn trim_some_keeps_a_reserve() {
-    let host = (RAM_KEEP.0 + 10) * CHUNK;
-    let mut p = phys(64, (host + 64) as usize);
+fn trim_aged_gives_back_what_has_been_free_long_enough() {
+    let early = 100 * CHUNK;
+    let late = (RAM_KEEP + 50) * CHUNK;
+    let mut p = phys(64, (early + late + 64) as usize);
     let root = p.new_space().unwrap();
-    touch(&mut p, root, host);
-    p.unmap(root, BASE, host * PAGE).unwrap();
-    assert_eq!(p.ram_pool.whole_count, host / CHUNK);
-    let trimmed = p.trim_some();
-    assert_eq!(trimmed.ram, RAM_KEEP.0 + 10 - RAM_KEEP.1);
-    assert_eq!(p.ram_pool.whole_count, RAM_KEEP.1);
-    // Below the threshold: nothing.
-    assert_eq!(p.trim_some().ram, 0);
+    p.map(root, BASE, (early + late) * PAGE, Prot::RW, false)
+        .unwrap();
+    for i in 0..early + late {
+        p.write(root, BASE + i * PAGE, &[1]).unwrap();
+    }
+    p.set_clock(1000);
+    p.unmap(root, BASE, early * PAGE).unwrap();
+    p.set_clock(1500);
+    p.unmap(root, BASE + early * PAGE, late * PAGE).unwrap();
+    // Nothing is old enough yet: due when the first ones are.
+    let (trimmed, due) = p.trim_aged(1050, 100);
+    assert_eq!(trimmed.ram, 0);
+    assert_eq!(due, Some(1100));
+    // The early ones are; the late ones (more than the reserve) wait.
+    let (trimmed, due) = p.trim_aged(1100, 100);
+    assert_eq!(trimmed.ram, early / CHUNK);
+    assert_eq!(due, Some(1600));
+    assert_eq!(p.ram.given, [(0, (early / CHUNK) as usize * HOST_PAGE)]);
+    // Then the late ones, down to the reserve, which stays.
+    let (trimmed, due) = p.trim_aged(5000, 100);
+    assert_eq!(trimmed.ram, late / CHUNK - RAM_KEEP);
+    assert_eq!(due, None);
+    assert_eq!(p.ram_pool.whole_count, RAM_KEEP);
     // The reserve is used first; then the host pages given back.
-    touch(&mut p, root, RAM_KEEP.1 * CHUNK + 1);
+    touch(&mut p, root, RAM_KEEP * CHUNK + 1);
     assert_eq!(p.ram.taken.len(), 1);
     p.ram_pool.check();
 }

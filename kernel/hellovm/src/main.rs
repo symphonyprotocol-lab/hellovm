@@ -106,7 +106,11 @@ use hellovm_sandbox::Mode as SandboxMode;
 /// footprint, 265 MB still 35 s later), and a guest that writes and
 /// removes files would keep its peak for ever. `munmap` gives the memory
 /// back at once, and the part of a block that was never touched (a
-/// `Vec`'s spare capacity) costs nothing.
+/// `Vec`'s spare capacity) costs nothing. With 16 MiB the same file
+/// leaves 23 MB. Smaller blocks stay the system's: from 1 MiB on, every
+/// `execve` of busybox mapped and faulted in a new block of its own (a
+/// loop of 300 processes took 35,000 page faults instead of 1,300, 20%
+/// more time).
 #[cfg(target_os = "macos")]
 struct Confined;
 
@@ -117,7 +121,7 @@ const REALLOC_BY_COPY: usize = 128 * 1024;
 
 /// From this size on a block is a mapping of its own.
 #[cfg(target_os = "macos")]
-const OWN_MAPPING: usize = 1024 * 1024;
+const OWN_MAPPING: usize = 16 * 1024 * 1024;
 
 /// Whether a block of `layout` is a mapping of its own: large, and
 /// aligned no more than a page (the host's pages are 16 KiB).
