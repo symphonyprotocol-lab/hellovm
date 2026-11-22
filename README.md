@@ -752,9 +752,17 @@ on one vCPU and on four, checking the footprint read from outside.
   writing it anywhere. **Not verified: what happens when macOS really
   takes such a page while the VM's stage-2 mapping of it exists.** The
   guest must then see a new zero page or fault, never memory macOS gave
-  to someone else. None of the tests made macOS take one (that needs
-  memory pressure on the Mac); in every test the guest saw exactly what
-  the host saw. hellovm's own guarantee (a frame is zeroed by the host
+  to someone else. None of the tests made macOS take one. A test made
+  for it (`reclaimed_pages_behind_stage_2` in `madvise_probe.rs`, run only
+  with `HELLOVM_P1G_PRESSURE=1`) gives back 64 MiB the program had written
+  through stage 2, and as control 64 MiB of the process's own memory
+  never mapped into the VM, then allocates memory in 64 MiB steps up to
+  free memory + 1 GiB (2 GiB on this 36 GiB Mac, free memory down to
+  about 20 MiB at times) watching both with `mincore`: macOS took none
+  of either, it found memory elsewhere first. Afterwards the program got
+  the same host pages again and read zero, then exactly what the host
+  wrote. Making macOS take them needs more pressure than that, which was
+  not tried. In every test the guest saw exactly what the host saw. hellovm's own guarantee (a frame is zeroed by the host
   before the program gets it, and no vCPU has a translation to a frame
   that is free) holds either way; what macOS does with a page behind a
   stage-2 mapping that no translation of the program can reach is
@@ -766,7 +774,7 @@ on one vCPU and on four, checking the footprint read from outside.
   a frame in use; there is no compaction.
 * A sandbox idle in waits shorter than 20 ms (`sleep 0.01` in a loop)
   keeps the 5 MiB reserve.
-* Not run: anything under memory pressure, several VMs at once giving
+* Not run: more memory pressure than the test above, several VMs at once giving
   memory back, sandboxes much larger than 2 GiB of app memory, and the
   give-back on `hv_vm_unmap`/`hv_vm_map` (not used).
 

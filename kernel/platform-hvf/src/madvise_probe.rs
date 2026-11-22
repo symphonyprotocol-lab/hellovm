@@ -250,3 +250,253 @@ fn madvise_of_mapped_app_memory() {
     p.kill(t).unwrap();
     log.step("done");
 }
+
+fn sysctl_u64(name: &str) -> u64 {
+    let name = std::ffi::CString::new(name).unwrap();
+    let mut value = 0u64;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: a valid name and a buffer of `len` bytes.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0);
+    if len == 4 {
+        value & 0xffff_ffff
+    } else {
+        value
+    }
+}
+
+/// Of the host pages at `offsets` in app memory, how many are resident.
+fn resident_count(base: *const u8, offsets: &[usize]) -> usize {
+    offsets
+        .iter()
+        .filter(|&&off| resident(unsafe { base.add(off) }))
+        .count()
+}
+
+/// Memory pressure (P1g): 64 MiB the program wrote through stage 2 is
+/// freed and given back (`MADV_FREE_REUSABLE`) while the VM's stage-2
+/// mapping of it stays; then the process allocates and touches memory in
+/// 64 MiB steps until macOS takes one of those host pages (`mincore`), at
+/// most free memory + 1 GiB, and lets it go. Then the program gets the
+/// same host pages again (taken back and zeroed by the host) and must
+/// read zero; and what the host writes, the program must read. Runs only
+/// with `HELLOVM_P1G_PRESSURE=1`; each step is logged and synced first.
+#[test]
+fn reclaimed_pages_behind_stage_2() {
+    if std::env::var("HELLOVM_P1G_PRESSURE").as_deref() != Ok("1") {
+        eprintln!("SKIPPING: HELLOVM_P1G_PRESSURE not set");
+        return;
+    }
+    const REGION: u64 = 0x1000_0000;
+    const LEN: u64 = 64 << 20;
+    const STEP: usize = 64 << 20;
+    let mut log = Log::open();
+    log.step("pressure: start");
+    let _guard = super::vm_tests::VM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut p = HvfPlatform::new(HvfConfig {
+        vcpus: 1,
+        ..HvfConfig::default()
+    })
+    .unwrap();
+    let t = p.spawn().unwrap();
+    p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
+    // touch: [x1] = x3 every page up to x2; svc; then x0 = OR of the
+    // first and last word of every page from x5 up to x2; svc.
+    let code: Vec<u8> = [
+        0xf900_0023u32,
+        0x9140_0421,
+        0xeb02_003f,
+        0x54ff_ffa3,
+        0xd400_0001,
+        0xd280_0000,
+        0xf940_00a4,
+        0xaa04_0000,
+        0xf947_fca4,
+        0xaa04_0000,
+        0x9140_04a5,
+        0xeb02_00bf,
+        0x54ff_ff43,
+        0xd400_0001,
+        0x1400_0000,
+    ]
+    .iter()
+    .flat_map(|w| w.to_le_bytes())
+    .collect();
+    p.write(t, CODE, &code).unwrap();
+    p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
+        .unwrap();
+    let start = |p: &mut HvfPlatform, pc: u64| {
+        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
+            unreachable!()
+        };
+        ctx.pc = pc;
+        ctx.x[1] = REGION;
+        ctx.x[2] = REGION + LEN;
+        ctx.x[3] = 0x5eed_c0de_5eed_c0de;
+        ctx.x[5] = REGION;
+        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        word(p.wait(None).unwrap().unwrap().trap)
+    };
+    // The program writes every page through stage 2.
+    p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
+    log.step("pressure: the program writes 64 MiB");
+    start(&mut p, CODE);
+    let root = {
+        let sched = p.lock();
+        sched.spaces[&sched.tasks[&t].space].root
+    };
+    let mut offsets: Vec<usize> = {
+        let phys = p.smp.phys();
+        (0..LEN / PAGE)
+            .map(|i| {
+                let frame = phys.lookup(root, REGION + i * PAGE) & pte::ADDR_MASK;
+                ((frame - layout::RAM_IPA) as usize) & !(HOST_PAGE - 1)
+            })
+            .collect()
+    };
+    offsets.sort_unstable();
+    offsets.dedup();
+    let base = p.smp.phys().ram_backing().ptr() as *const u8;
+    // Freed and given back, all of it.
+    p.unmap(t, REGION, LEN).unwrap();
+    log.step("pressure: freed; giving it all back");
+    p.trim_all();
+    let given = p.memory_kept().1;
+    log.step(&format!(
+        "pressure: given back {given:?}; {} of {} host pages resident; free pages {}",
+        resident_count(base, &offsets),
+        offsets.len(),
+        sysctl_u64("vm.page_free_count")
+    ));
+    // A control: as much plain memory of the process, never mapped into
+    // the VM, written by the host and given back the same way.
+    // SAFETY: a fresh private anonymous mapping.
+    let control = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            LEN as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(control, libc::MAP_FAILED);
+    let control = control.cast::<u8>();
+    let control_offsets: Vec<usize> = (0..LEN as usize).step_by(HOST_PAGE).collect();
+    for &off in &control_offsets {
+        // SAFETY: inside the mapping.
+        unsafe { control.add(off).write_volatile(1) };
+    }
+    // SAFETY: the whole control mapping.
+    assert_eq!(
+        unsafe { libc::madvise(control.cast(), LEN as usize, libc::MADV_FREE_REUSABLE) },
+        0
+    );
+    // Pressure: ballast until macOS takes one of them.
+    let free = sysctl_u64("vm.page_free_count") * HOST_PAGE as u64;
+    let cap = (free + (1 << 30)) as usize;
+    let mut ballast: Vec<(*mut u8, usize)> = Vec::new();
+    let mut total = 0usize;
+    let mut resident_now = resident_count(base, &offsets);
+    while resident_now == offsets.len() && total + STEP <= cap {
+        log.step(&format!(
+            "pressure: ballast {} MiB of at most {} MiB",
+            (total + STEP) >> 20,
+            cap >> 20
+        ));
+        // SAFETY: a fresh private anonymous mapping.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                STEP,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let ptr = ptr.cast::<u8>();
+        for off in (0..STEP).step_by(HOST_PAGE) {
+            // SAFETY: inside the mapping just made.
+            unsafe { ptr.add(off).write_volatile(1) };
+        }
+        ballast.push((ptr, STEP));
+        total += STEP;
+        resident_now = resident_count(base, &offsets);
+        log.step(&format!(
+            "pressure: {} MiB: VM pages resident {resident_now} of {}, control {} of {}, free pages {}",
+            total >> 20,
+            offsets.len(),
+            resident_count(control, &control_offsets),
+            control_offsets.len(),
+            sysctl_u64("vm.page_free_count")
+        ));
+    }
+    let reclaimed = offsets.len() - resident_now;
+    log.step(&format!(
+        "pressure: {reclaimed} of {} host pages taken by macOS after {} MiB of ballast; free pages {}",
+        offsets.len(),
+        total >> 20,
+        sysctl_u64("vm.page_free_count")
+    ));
+    for (ptr, len) in ballast {
+        // SAFETY: unmaps exactly what was mapped above.
+        unsafe { libc::munmap(ptr.cast(), len) };
+    }
+    log.step("pressure: ballast freed; the program reads the memory again");
+    // The same host pages again: taken back, zeroed by the host.
+    p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
+    let or = start(&mut p, CODE + 0x14);
+    log.step(&format!(
+        "pressure: the program read OR {or:#x} (must be 0)"
+    ));
+    let reused = {
+        let phys = p.smp.phys();
+        (0..LEN / PAGE)
+            .filter(|i| {
+                let frame = phys.lookup(root, REGION + i * PAGE) & pte::ADDR_MASK;
+                offsets
+                    .binary_search(&(((frame - layout::RAM_IPA) as usize) & !(HOST_PAGE - 1)))
+                    .is_ok()
+            })
+            .count()
+    };
+    log.step(&format!(
+        "pressure: {reused} of {} pages got the same host pages",
+        LEN / PAGE
+    ));
+    assert_eq!(or, 0, "old or foreign bytes in memory handed out again");
+    // What the host writes, the program reads, page by page.
+    for i in 0..LEN / PAGE {
+        let cookie = 0xc0de_0000_0000_0000u64 | i;
+        p.write(t, REGION + i * PAGE, &cookie.to_le_bytes())
+            .unwrap();
+        p.write(t, REGION + i * PAGE + 4088, &cookie.to_le_bytes())
+            .unwrap();
+    }
+    let host_or = (0..LEN / PAGE).fold(0, |a, i| a | 0xc0de_0000_0000_0000u64 | i);
+    let or = start(&mut p, CODE + 0x14);
+    log.step(&format!(
+        "pressure: after the host's writes the program read OR {or:#x}, host {host_or:#x}"
+    ));
+    assert_eq!(or, host_or, "the program does not see the host's writes");
+    assert!(
+        reclaimed > 0,
+        "macOS took none of the pages: the case was not reached"
+    );
+    p.kill(t).unwrap();
+    log.step("pressure: done");
+}
