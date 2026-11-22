@@ -505,7 +505,8 @@ time when the program first touches it (a translation fault the platform
 resolves without telling the core), from the 2 GiB pool; a sandbox that
 uses it up gets `SIGKILL`, the process that needed the page, as the OOM
 killer would kill it on Linux; the others go on. Freed pages go back to
-the pool, not to the host.
+the pool, and from there to the host once they have been free for a
+while (see **Memory given back to the host** below).
 
 Address space costs page tables only where it is used. A mapped range
 with no memory yet that covers the whole span of a table entry above the
@@ -619,6 +620,155 @@ the tests below):
   64-bit stores, since a vCPU's table walk may read them at any time, and
   app memory is copied in and out with raw copies (another vCPU may be
   writing it), never through references.
+
+**Memory given back to the host.** Since P1g memory a program frees
+goes back to macOS, so that a sandbox's footprint follows what it uses
+and not its peak. A frame freed (`munmap`, `exit`, `execve`, the last
+user of a copy-on-write frame, a heap that shrinks) goes back to its
+pool as before; the pool then gives the host memory behind it back.
+
+*Granule.* The host's pages are 16 KiB, four frames. Both pools take
+host memory a host page (a *chunk*) at a time and hand frames out from
+chunks with some frames in use first, then from wholly free chunks
+(the one freed last first), then from chunks given back, then from new
+ones, so that freed frames gather in wholly free chunks. Only a wholly
+free chunk goes back; a chunk with one frame in use stays (at worst a
+quarter of what is free stays behind, when every chunk keeps one frame
+in use).
+
+*When.* Giving a chunk back and using it again costs about 2 µs more
+than keeping it (measured below), so memory freed and used again soon
+(a process that exits and the next one, an interpreter's heap that
+shrinks and grows) should not make the trip. So:
+
+* a chunk goes back once it has been wholly free for 100 ms (the oldest
+  first, adjacent chunks in one `madvise`), checked at every change to
+  the page tables, and at the latest when the next one is due: the
+  event loop ends the vCPU's run then, so a program that never makes a
+  system call does not keep the memory either;
+* 4 MiB of app memory and 1 MiB of tables in whole free chunks stay
+  however long they are free, for the next process; they go back too
+  once the event loop has had nothing to do for 20 ms.
+
+Memory freed is therefore back with the host within 100 ms (plus the
+time to give it back, about 1 µs a chunk), but for at most 5 MiB, which
+goes back when the sandbox is idle.
+
+*How.* `madvise(MADV_FREE_REUSABLE)` on the chunk's host memory: the
+memory stops counting in the process's footprint, and macOS takes it
+when it needs it. Before a frame of a chunk given back is handed out
+again, `madvise(MADV_FREE_REUSE)` takes the chunk back. The VM's
+stage-2 mapping of the pool is not touched: no `hv_vm_unmap`,
+`hv_vm_map` or `hv_vm_protect`. What this was chosen from, measured on
+the Mac (M3 Max, macOS 27.2): on one 16 KiB host page mapped into the VM
+(`kernel/platform-hvf/src/madvise_probe.rs`, run only with
+`HELLOVM_P1G_PROBE`), `MADV_FREE_REUSABLE` lowered the footprint and
+`MADV_FREE` did not; with either, the page stayed resident with its old
+bytes, and guest and host kept seeing the same bytes (the guest's write
+read by the host, the host's write read by the guest, the guest reading
+first after the advice). On 64 MiB: when the program's first touch of a
+page came through stage 2, `MADV_FREE_REUSABLE` left it in the footprint
+(66 MB before, 66 MB after); when the host had touched it first, the
+footprint fell to 6 MB. So the host zeroes every frame before the
+program gets it, also one never used whose memory is zero already: a
+frame handed out is zero because the host made it so, whatever macOS
+did with memory given back (old bytes or zeros), and every page is the
+host's first.
+
+*What guarantees that no one sees old bytes.* Every frame is zeroed by
+the host when it is handed out (also from a chunk given back, after it
+is taken back); a frame is free only when nothing maps it (its count is
+zero), and a chunk is given back only while all four frames are free,
+under the lock of the pools. Memory goes back only after the changes
+that freed it made every vCPU that could still hold a translation to
+it leave the VM and invalidate (see **What keeps processes apart**): in
+`Smp::change` after the invalidation, still holding the lock, in the
+event loop, or when it is idle; a frame freed was reachable only through
+descriptors such a change made stale. So no vCPU has a translation to a
+chunk given back, on any of its threads, and no cached bytes of it
+matter: the next use is the host's zeroing write. A shared page's frame
+is held by its shared object until the last descriptor that names it
+goes, and a copy-on-write frame by its count, so neither is free while
+anyone can read it. A warm clone's pending frames are in use, never
+free; a template's free frames are not saved (`Phys::save` saves
+frames in use), and a clone starts with every chunk the template had
+free counted as given back (the clone never touched that memory). The
+page-table pool works the same way: its tables are zeroed when freed and
+when handed out, and the VM maps it read only.
+
+*Seatbelt.* Nothing new: `madvise` was in the list (for `malloc`);
+learn mode over the new tests (a confined CPython that frees and
+reuses 256 MiB and forks 50 processes, on 4 vCPUs, and the same in a
+warm clone) reported no denial.
+
+*Measured* (M3 Max, macOS 27.2, release builds, `--sandbox require`;
+footprint read from outside with `proc_pid_rusage`):
+
+| | `main` | P1g |
+|---|---|---|
+| CPython started | 29 MiB | 31 MiB |
+| ... touched 256 MiB | 286 MiB | 544 MiB (counted twice, see below) |
+| ... freed it | 288 MiB | 32 MiB |
+| ... read 256 MiB of new memory (all zero) and freed it, then 50 processes that each touched and freed 8 MiB | 544 MiB | 32 MiB |
+| the same in a warm clone (after `del` of the template's 8 MiB) | | 20, 534, 22, 24 MiB |
+| `hellovm ... python3 -c pass` (best of 10, 1 / 8 vCPUs) | 22.7 / 22.9 ms | 22.6 / 23.1 ms |
+| `/bin/sh` loop of 300 processes | 129.8 / 136.4 ms | 131.5 / 136.0 ms |
+| CPython: a million strings freed, 100,000 byte strings, a dict of 300,000 | 188.0 / 190.3 ms | 194.6 / 198.2 ms |
+
+Giving back 64 MiB (4,096 chunks, in two calls) takes 2.6 to 6.2 ms,
+about 1 µs a chunk; the platform test (`give_back_tests` in `app.rs`)
+reports it each round: footprint 2 MiB, 130 touched, 2 to 3 after the
+memory went back (30 to 35 ms after the `munmap`, the program being
+stopped), on one vCPU and on four with three threads spinning on the
+other vCPUs while memory goes back. Giving memory back at once, without the 100 ms,
+made the allocation-heavy script 14% slower (216 ms); without any give
+back, or giving back only when idle, it took 193 ms: the remaining 3%
+is the host's zeroing of new frames and what goes back after 100 ms.
+
+*Tests.* `mmu.rs`'s randomized test against its model gives memory back
+between steps (to random reserves; given-back memory is filled with
+garbage, which the comparisons would see) and checks every list and
+count of the pools after every step; `mmu_trim_tests.rs` checks runs of
+adjacent chunks, a chunk with a frame in use staying, taking back before
+use, the 100 ms and the reserve, tables, and a template saved after
+giving back. Breaking the code on purpose (a frame from a chunk given
+back not zeroed, a chunk given back while still counted whole) makes
+them fail.
+On the Mac: the platform tests above, a program spinning on the only
+vCPU (what was freed goes back after 100 ms, the run being ended for
+it), and `hvf_cli`, `hvf_warm` (`freed_memory_goes_back_to_the_host`,
+`a_clone_gives_freed_memory_back`): the confined CPython and clone above,
+on one vCPU and on four, checking the footprint read from outside.
+
+*Limits and what was not verified.*
+
+* While a page is used by both the host (which zeroed it) and the
+  program, the process's footprint and resident size count it twice:
+  64 MiB in use reads as 130 MB. The system's free pages show it once
+  (holding 64 MiB took about 75 MiB of free memory). Footprints of
+  sandboxes on macOS therefore read high while memory is in use.
+* `MADV_FREE_REUSABLE` leaves the memory resident until macOS needs it;
+  it no longer counts in the footprint, and macOS may take it without
+  writing it anywhere. **Not verified: what happens when macOS really
+  takes such a page while the VM's stage-2 mapping of it exists.** The
+  guest must then see a new zero page or fault, never memory macOS gave
+  to someone else. None of the tests made macOS take one (that needs
+  memory pressure on the Mac); in every test the guest saw exactly what
+  the host saw. hellovm's own guarantee (a frame is zeroed by the host
+  before the program gets it, and no vCPU has a translation to a frame
+  that is free) holds either way; what macOS does with a page behind a
+  stage-2 mapping that no translation of the program can reach is
+  macOS's.
+* A page whose first touch was the VM's stays in the footprint after
+  `MADV_FREE_REUSABLE`; the host's zeroing of every frame avoids that,
+  and costs a host page fault and a 4 KiB write per new frame.
+* At most a quarter of the free memory may stay behind, in chunks with
+  a frame in use; there is no compaction.
+* A sandbox idle in waits shorter than 20 ms (`sleep 0.01` in a loop)
+  keeps the 5 MiB reserve.
+* Not run: anything under memory pressure, several VMs at once giving
+  memory back, sandboxes much larger than 2 GiB of app memory, and the
+  give-back on `hv_vm_unmap`/`hv_vm_map` (not used).
 
 **What the program can and cannot touch.** The isolation boundary is the
 stage-2 mapping, which Hypervisor.framework enforces: the VM's whole
@@ -774,7 +924,7 @@ pages (protection, sharing, contents), against the invariants above
 (every reference count, every table's count of used entries, no frame or
 table leaked or freed twice, no writable shared private page) and
 against a simulated TLB that keeps what each touch cached until the
-platform says it may be stale; a second run with tiny pools makes 42%
+platform says it may be stale; a second run with tiny pools makes 33%
 of the operations fail and checks the same invariants and that nothing
 leaks. Breaking the code on purpose in any of eight ways (no read-only
 parent after `fork`, no invalidation after a copy, an early free, a
@@ -874,8 +1024,7 @@ them, `MAP_SHARED` anonymous memory, file-backed private mappings of
 shared objects (the interpreter's relocations write copy-on-write pages
 and `mprotect` RELRO), busybox shells and CPython with `subprocess`,
 threads in parallel on up to 64 vCPUs. Not yet: x86_64 programs
-(Rosetta is not used); memory returned to the host (the pools only grow
-to their high-water mark); `AT_HWCAP2` (zero) and emulated
+(Rosetta is not used); `AT_HWCAP2` (zero) and emulated
 `mrs` of ID registers (`HWCAP_CPUID` is not reported, so programs do not
 try). A process that writes a copy-on-write page when the pool is used
 up gets `SIGKILL` rather than an error.
@@ -1133,7 +1282,7 @@ fails, the first time the platform's mutex is contended.
 | `system-fcntl` `F_GETFD`, `F_SETFD` | close-on-exec of the image fds |
 | `file-ioctl` `TIOCSETA` | restoring the host terminal's settings at exit (they and the window size were read before) |
 | `process-info-setcontrol` of itself | naming its own threads (`hellovm-stdin`) |
-| `syscall-unix`: `write`, `ioctl`; `read`, `pread`, `fstat64`, `fstatat64`, `fstatfs64`, `getdirentries64`, `readlinkat`; `mmap`, `munmap`, `mprotect`, `madvise`; `gettimeofday`; `bsdthread_create`, `bsdthread_terminate`, `thread_selfid`, `__disable_threadsignal`, `sigaltstack`; `psynch_cvbroad`, `psynch_cvsignal`, `psynch_cvwait`, `ulock_wait`, `ulock_wake`; `psynch_mutexwait`, `psynch_mutexdrop`, `psynch_cvclrprepost`, `ulock_wait2`; `workq_kernreturn` | stdio and the terminal; reading the image; memory; the wall clock (libc reads it from the commpage and makes the call only while the kernel updates it there: rare, and before P1d it killed the process when it happened); the stdin reader and `--timeout` watchdog threads; locks between them; the vCPU threads: the platform's mutex contended (libpthread traps when these fail), a timed condition variable wait that times out as another thread signals, a lock wait with a 64-bit timeout; the system's worker threads (see below) |
+| `syscall-unix`: `write`, `ioctl`; `read`, `pread`, `fstat64`, `fstatat64`, `fstatfs64`, `getdirentries64`, `readlinkat`; `mmap`, `munmap`, `mprotect`, `madvise`; `gettimeofday`; `bsdthread_create`, `bsdthread_terminate`, `thread_selfid`, `__disable_threadsignal`, `sigaltstack`; `psynch_cvbroad`, `psynch_cvsignal`, `psynch_cvwait`, `ulock_wait`, `ulock_wake`; `psynch_mutexwait`, `psynch_mutexdrop`, `psynch_cvclrprepost`, `ulock_wait2`; `workq_kernreturn` | stdio and the terminal; reading the image; memory (`madvise` also gives free app memory back to the host and takes it back, `MADV_FREE_REUSABLE` and `MADV_FREE_REUSE`, see **Memory given back to the host**; learn mode over that test found nothing new); the wall clock (libc reads it from the commpage and makes the call only while the kernel updates it there: rare, and before P1d it killed the process when it happened); the stdin reader and `--timeout` watchdog threads; locks between them; the vCPU threads: the platform's mutex contended (libpthread traps when these fail), a timed condition variable wait that times out as another thread signals, a lock wait with a 64-bit timeout; the system's worker threads (see below) |
 | `syscall-mach`: `_kernelrpc_mach_vm_map_trap`, `_kernelrpc_mach_vm_deallocate_trap`, `_kernelrpc_mach_vm_protect_trap`, `mach_vm_reclaim_update_kernel_accounting_trap` | memory (`malloc`). The vCPU threads are never ended or joined (the process exits with them; a joined thread that ends gives up port rights with two more Mach traps, which are not allowed) |
 | any other `syscall-unix`, `syscall-mach` or `syscall-mig`: `(deny ... (with send-signal SIGKILL))` | a system call or Mach trap outside the lists kills the process, as seccomp does on Linux |
 
@@ -1321,7 +1470,14 @@ written past a few MiB was enough. `hellovm`'s allocator on macOS
 128 KiB or more to `realloc`: it allocates a new one, copies and frees
 the old one, with the calls every allocation makes anyway. `hvf_cli`
 writes a 48 MiB file 64 KiB at a time as a test (signal 9 before, the
-file after).
+file after). Since P1g a block of 16 MiB or more is a mapping of its
+own (`mmap`, `munmap`, already in the list): the system's allocator
+kept the large blocks it was given back, so a guest that wrote a 256 MiB
+file and removed it left the kernel process with 456 MB of footprint
+(265 MB still 35 s later); now 23 MB, at once. From 1 MiB on (13 MB
+left) every `execve` mapped and faulted in a block of its own for the
+program it read, and a loop of 300 busybox processes took 35,000 page
+faults instead of 1,300 and 20% longer.
 
 *Compared with Linux, line by line:*
 
