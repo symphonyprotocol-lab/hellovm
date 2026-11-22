@@ -264,7 +264,9 @@ pub fn memory_goes_back(
         loop {
             let now = phys_footprint(pid);
             if now <= limit || start.elapsed() > std::time::Duration::from_secs(5) {
-                return now;
+                // Then what it settles at (the reserve goes once idle).
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                return phys_footprint(pid).min(now);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
