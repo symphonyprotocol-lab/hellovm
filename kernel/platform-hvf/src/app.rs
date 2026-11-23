@@ -2693,9 +2693,14 @@ mod give_back_tests {
             p.resume(t, Resume::Continue).unwrap();
             next(&mut p);
             let touched = footprint();
+            // The footprints are this test process's, in which other
+            // tests allocate meanwhile: they are reported, and what is
+            // checked is what the platform counts (the command-line tests
+            // check the footprint, from outside the process).
             assert!(
-                touched > untouched + LEN - (8 << 20),
-                "round {round}: {touched} after the touch, {untouched} before"
+                p.memory_in_use().0 >= LEN,
+                "round {round}: {} in use after the touch",
+                p.memory_in_use().0
             );
             // Freed, then mapped again with nothing in it.
             let (_, before) = p.memory_kept();
@@ -2708,15 +2713,10 @@ mod give_back_tests {
             let (kept, back_after) = given_back(&mut p, t);
             let (_, after) = p.memory_kept();
             assert!(kept <= 512 << 10, "round {round}: {kept} kept");
-            // Other tests of this process allocate meanwhile: the drop is
-            // what is checked (the command-line tests compare with the
-            // start, from outside the process).
             let freed = footprint();
             assert!(
-                touched.saturating_sub(freed) > LEN - (8 << 20),
-                "round {round}: {freed} after the unmap, {touched} before; \
-                 trimmed {before:?} -> {after:?}; resident {}",
-                resident_kib()
+                after.ram - before.ram >= LEN / 16384 - 64,
+                "round {round}: trimmed {before:?} -> {after:?}"
             );
             p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
             let timer = Instant::now();
@@ -2726,13 +2726,15 @@ mod give_back_tests {
             p.unmap(t, REGION, LEN).unwrap();
             given_back(&mut p, t);
             eprintln!(
-                "{vcpus} vCPUs, round {round}: footprint {} MiB at the start, {} touched, {} freed; \
-                 unmap of 64 MiB {unmap:?}, back after {back_after:?} \
+                "{vcpus} vCPUs, round {round}: footprint {} MiB at the start, {} before the \
+                 touch, {} touched, {} freed (resident {}); unmap of 64 MiB {unmap:?}, back after {back_after:?} \
                  ({} host pages in {} calls, {} µs), \
                  64 MiB read again {reread:?}",
                 start >> 20,
+                untouched >> 20,
                 touched >> 20,
                 freed >> 20,
+                resident_kib(),
                 after.ram - before.ram,
                 after.calls - before.calls,
                 (after.nanos - before.nanos) / 1000
@@ -2790,6 +2792,9 @@ mod give_back_tests {
         for i in 0..LEN / PAGE {
             p.write(t, REGION + i * PAGE, &[1]).unwrap();
         }
+        // From before the memory is freed: it cannot go back sooner than
+        // `GIVE_BACK_AGE` after this.
+        let timer = Instant::now();
         p.unmap(t, REGION, LEN).unwrap();
         assert!(p.memory_kept().0 >= LEN - (1 << 20));
         let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
@@ -2799,7 +2804,6 @@ mod give_back_tests {
         ctx.x[6] = SPIN_DATA;
         p.set_context(t, &Context::Aarch64(ctx)).unwrap();
         p.resume(t, Resume::Continue).unwrap();
-        let timer = Instant::now();
         let mut kept = p.memory_kept().0;
         while kept > (crate::mmu::RAM_KEEP + crate::mmu::TABLES_KEEP) * 16384
             && timer.elapsed() < Duration::from_secs(2)
@@ -2814,10 +2818,7 @@ mod give_back_tests {
             kept <= (crate::mmu::RAM_KEEP + crate::mmu::TABLES_KEEP) * 16384,
             "{kept} kept after {took:?}"
         );
-        assert!(
-            took >= GIVE_BACK_AGE - Duration::from_millis(10),
-            "{took:?}"
-        );
+        assert!(took >= GIVE_BACK_AGE, "{took:?}");
         p.kill(t).unwrap();
     }
 

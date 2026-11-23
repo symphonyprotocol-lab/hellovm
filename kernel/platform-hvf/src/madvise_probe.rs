@@ -1,5 +1,6 @@
 //! A probe of what `madvise` does to app memory that is mapped into the
-//! VM (P1g). Runs only with `HELLOVM_P1G_PROBE` set to the advice to try
+//! VM (P1g). Ignored; when asked for (`--ignored`), runs only with
+//! `HELLOVM_P1G_PROBE` set to the advice to try
 //! (`reusable` or `free`): one VM, one vCPU, stopped at a system call
 //! while one 16 KiB host page of app memory is advised. Each step is
 //! logged to `target/p1g/probe.log` and synced before it runs.
@@ -68,6 +69,7 @@ fn word(trap: Trap) -> u64 {
 }
 
 #[test]
+#[ignore = "an experiment on the host's memory: only on request"]
 fn madvise_of_mapped_app_memory() {
     let Ok(advice) = std::env::var("HELLOVM_P1G_PROBE") else {
         eprintln!("SKIPPING: HELLOVM_P1G_PROBE not set");
@@ -288,8 +290,10 @@ fn resident_count(base: *const u8, offsets: &[usize]) -> usize {
 /// most free memory + 1 GiB, and lets it go. Then the program gets the
 /// same host pages again (taken back and zeroed by the host) and must
 /// read zero; and what the host writes, the program must read. Runs only
-/// with `HELLOVM_P1G_PRESSURE=1`; each step is logged and synced first.
+/// when asked for (`--ignored`) and with `HELLOVM_P1G_PRESSURE=1`; each
+/// step is logged and synced first.
 #[test]
+#[ignore = "puts the whole machine under memory pressure: only on request"]
 fn reclaimed_pages_behind_stage_2() {
     if std::env::var("HELLOVM_P1G_PRESSURE").as_deref() != Ok("1") {
         eprintln!("SKIPPING: HELLOVM_P1G_PRESSURE not set");

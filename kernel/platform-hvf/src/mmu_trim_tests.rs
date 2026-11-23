@@ -49,11 +49,13 @@ impl Backing for Counting {
     }
 
     fn take_back(&mut self, offset: usize, len: usize) {
-        assert_eq!(len, HOST_PAGE);
-        assert!(
-            std::mem::replace(&mut self.out[offset / HOST_PAGE], false),
-            "not given back"
-        );
+        assert!(offset.is_multiple_of(HOST_PAGE) && len.is_multiple_of(HOST_PAGE));
+        for page in offset / HOST_PAGE..(offset + len) / HOST_PAGE {
+            assert!(
+                std::mem::replace(&mut self.out[page], false),
+                "not given back"
+            );
+        }
         self.taken.push((offset, len));
     }
 
@@ -98,8 +100,9 @@ fn whole_free_host_pages_go_back_in_runs_and_come_back_zero() {
     assert_eq!(p.trimmed().ram, 16);
     // Nothing more to give back.
     assert_eq!(p.trim(0, 64).ram, 0);
-    // Touched again: each host page is taken back before its first frame
-    // is used, and every page reads zero (the backing holds garbage).
+    // Touched again: the host pages are taken back, adjacent ones in one
+    // call, before the first frame of them is used, and every page reads
+    // zero (the backing holds garbage).
     p.map(root, BASE, 64 * PAGE, Prot::RW, false).unwrap();
     for i in 0..64 {
         let mut buf = [1u8; 16];
@@ -112,7 +115,7 @@ fn whole_free_host_pages_go_back_in_runs_and_come_back_zero() {
         p.read(root, BASE + i * PAGE + 4000, &mut buf[..8]).unwrap();
         assert_eq!(buf[..8], [0; 8], "page {i}");
     }
-    assert_eq!(p.ram.taken.len(), 16);
+    assert_eq!(p.ram.taken, [(0, 16 * HOST_PAGE)]);
     p.ram_pool.check();
     p.destroy(root);
 }

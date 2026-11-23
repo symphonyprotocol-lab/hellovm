@@ -657,27 +657,29 @@ goes back when the sandbox is idle.
 *How.* `madvise(MADV_FREE_REUSABLE)` on the chunk's host memory: the
 memory stops counting in the process's footprint, and macOS takes it
 when it needs it. Before a frame of a chunk given back is handed out
-again, `madvise(MADV_FREE_REUSE)` takes the chunk back. The VM's
+again, `madvise(MADV_FREE_REUSE)` takes the chunk back, and with it up
+to 15 chunks given back next to it, in one call. The VM's
 stage-2 mapping of the pool is not touched: no `hv_vm_unmap`,
 `hv_vm_map` or `hv_vm_protect`. What this was chosen from, measured on
 the Mac (M3 Max, macOS 27.2): on one 16 KiB host page mapped into the VM
-(`kernel/platform-hvf/src/madvise_probe.rs`, run only with
-`HELLOVM_P1G_PROBE`), `MADV_FREE_REUSABLE` lowered the footprint and
+(`kernel/platform-hvf/src/madvise_probe.rs`, an ignored test that runs
+only with `HELLOVM_P1G_PROBE`), `MADV_FREE_REUSABLE` lowered the footprint and
 `MADV_FREE` did not; with either, the page stayed resident with its old
 bytes, and guest and host kept seeing the same bytes (the guest's write
 read by the host, the host's write read by the guest, the guest reading
 first after the advice). On 64 MiB: when the program's first touch of a
 page came through stage 2, `MADV_FREE_REUSABLE` left it in the footprint
 (66 MB before, 66 MB after); when the host had touched it first, the
-footprint fell to 6 MB. So the host zeroes every frame before the
-program gets it, also one never used whose memory is zero already: a
+footprint fell to 6 MB. So the host writes every frame before the
+program gets it (zeros, or for a copy-on-write copy the bytes copied),
+also one never used whose memory is zero already: a
 frame handed out is zero because the host made it so, whatever macOS
 did with memory given back (old bytes or zeros), and every page is the
 host's first.
 
 *What guarantees that no one sees old bytes.* Every frame is zeroed by
 the host when it is handed out (also from a chunk given back, after it
-is taken back); a frame is free only when nothing maps it (its count is
+is taken back; a copy-on-write copy is overwritten whole instead); a frame is free only when nothing maps it (its count is
 zero), and a chunk is given back only while all four frames are free,
 under the lock of the pools. Memory goes back only after the changes
 that freed it made every vCPU that could still hold a translation to
@@ -753,8 +755,8 @@ on one vCPU and on four, checking the footprint read from outside.
   takes such a page while the VM's stage-2 mapping of it exists.** The
   guest must then see a new zero page or fault, never memory macOS gave
   to someone else. None of the tests made macOS take one. A test made
-  for it (`reclaimed_pages_behind_stage_2` in `madvise_probe.rs`, run only
-  with `HELLOVM_P1G_PRESSURE=1`) gives back 64 MiB the program had written
+  for it (`reclaimed_pages_behind_stage_2` in `madvise_probe.rs`, ignored, and
+  run only with `HELLOVM_P1G_PRESSURE=1`) gives back 64 MiB the program had written
   through stage 2, and as control 64 MiB of the process's own memory
   never mapped into the VM, then allocates memory in 64 MiB steps up to
   free memory + 1 GiB (2 GiB on this 36 GiB Mac, free memory down to
