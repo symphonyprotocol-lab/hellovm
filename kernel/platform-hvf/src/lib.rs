@@ -69,7 +69,7 @@ mod mmu;
 mod sys;
 
 pub use app::{AppKiller, Flushes, HvfConfig, HvfPlatform, MAX_VCPUS};
-pub use mmu::{Origin, SaveStats};
+pub use mmu::{Origin, SaveStats, Trimmed};
 pub use sys::SharedMap;
 
 /// Whether this process may use Hypervisor.framework: `Ok` if a VM could

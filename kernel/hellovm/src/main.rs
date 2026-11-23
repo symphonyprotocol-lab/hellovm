@@ -99,6 +99,18 @@ use hellovm_sandbox::Mode as SandboxMode;
 /// bytes are copied and the old one is freed, with the calls every
 /// allocation makes anyway. Blocks grow by doubling, so the copies cost
 /// what `realloc`'s own would.
+///
+/// A block of [`OWN_MAPPING`] or more is a mapping of its own (`mmap`,
+/// `munmap`), not the system allocator's: the system keeps large blocks
+/// that were freed (a file of 256 MiB written and removed left 521 MB of
+/// footprint, 265 MB still 35 s later), and a guest that writes and
+/// removes files would keep its peak for ever. `munmap` gives the memory
+/// back at once, and the part of a block that was never touched (a
+/// `Vec`'s spare capacity) costs nothing. With 16 MiB the same file
+/// leaves 23 MB. Smaller blocks stay the system's: from 1 MiB on, every
+/// `execve` of busybox mapped and faulted in a new block of its own (a
+/// loop of 300 processes took 35,000 page faults instead of 1,300, 20%
+/// more time).
 #[cfg(target_os = "macos")]
 struct Confined;
 
@@ -107,21 +119,58 @@ struct Confined;
 #[cfg(target_os = "macos")]
 const REALLOC_BY_COPY: usize = 128 * 1024;
 
+/// From this size on a block is a mapping of its own.
 #[cfg(target_os = "macos")]
-// SAFETY: every call is the system allocator's, with the caller's layout;
-// `realloc` keeps the contract of `GlobalAlloc::realloc` (the new block
-// has the old alignment and the first `min(old, new)` bytes; on failure
-// the old block is untouched).
+const OWN_MAPPING: usize = 16 * 1024 * 1024;
+
+/// Whether a block of `layout` is a mapping of its own: large, and
+/// aligned no more than a page (the host's pages are 16 KiB).
+#[cfg(target_os = "macos")]
+fn own_mapping(layout: std::alloc::Layout) -> bool {
+    layout.size() >= OWN_MAPPING && layout.align() <= 16 * 1024
+}
+
+#[cfg(target_os = "macos")]
+// SAFETY: every call is the system allocator's, with the caller's layout,
+// or, for a block that is a mapping of its own, `mmap` of at least its
+// size (page aligned, zero filled) and `munmap` of the same; whether a
+// block is one depends only on its layout, which `dealloc` and `realloc`
+// get unchanged. `realloc` keeps the contract of `GlobalAlloc::realloc`
+// (the new block has the old alignment and the first `min(old, new)`
+// bytes; on failure the old block is untouched).
 unsafe impl std::alloc::GlobalAlloc for Confined {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if own_mapping(layout) {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                layout.size(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            return if ptr == libc::MAP_FAILED {
+                std::ptr::null_mut()
+            } else {
+                ptr.cast()
+            };
+        }
         std::alloc::System.alloc(layout)
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if own_mapping(layout) {
+            // A new anonymous mapping is zero.
+            return self.alloc(layout);
+        }
         std::alloc::System.alloc_zeroed(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        if own_mapping(layout) {
+            libc::munmap(ptr.cast(), layout.size());
+            return;
+        }
         std::alloc::System.dealloc(ptr, layout)
     }
 
@@ -132,10 +181,10 @@ unsafe impl std::alloc::GlobalAlloc for Confined {
         // SAFETY (of the layout): the caller guarantees that `new_size`,
         // rounded up to the alignment, does not overflow `isize`.
         let new_layout = std::alloc::Layout::from_size_align_unchecked(new_size, layout.align());
-        let new = std::alloc::System.alloc(new_layout);
+        let new = self.alloc(new_layout);
         if !new.is_null() {
             std::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
-            std::alloc::System.dealloc(ptr, layout);
+            self.dealloc(ptr, layout);
         }
         new
     }

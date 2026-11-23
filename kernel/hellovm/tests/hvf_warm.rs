@@ -1135,3 +1135,33 @@ fn warm_clone_timings() {
         println!("{line}");
     }
 }
+
+/// Memory a clone frees goes back to the host, also what came from the
+/// template: the clone frees the template's 8 MiB `big` (frames it never
+/// loaded), then runs what `hvf_cli` runs (see
+/// `hvf_support::memory_goes_back`).
+#[test]
+fn a_clone_gives_freed_memory_back() {
+    let _serial = hvf_support::serial();
+    let Some((exe, root)) = setup() else {
+        return;
+    };
+    let template = python(exe, &root);
+    template.ready_ok();
+    progress("hvf_warm: memory goes back in a clone");
+    let code = format!("del big\n{}", hvf_support::FREE_AND_REUSE);
+    let mut clone = template.spawn(None, code.as_bytes()).unwrap();
+    let pid = clone.started.pid;
+    let clone_cell = std::cell::RefCell::new(&mut clone);
+    let mib = hvf_support::memory_goes_back(
+        pid,
+        || clone_cell.borrow_mut().line(),
+        || clone_cell.borrow_mut().send(b"\n"),
+    );
+    progress(&format!(
+        "hvf_warm: clone footprint {:.1} MiB at start, {:.1} touched, {:.1} freed, {:.1} after the forks",
+        mib[0], mib[1], mib[2], mib[3]
+    ));
+    let run = clone.finish();
+    assert_eq!(run.status, Status::Exited(0), "{run:?}");
+}

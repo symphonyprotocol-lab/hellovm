@@ -26,6 +26,8 @@ libc.workspace = true
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 hellovm-platform-hvf.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]

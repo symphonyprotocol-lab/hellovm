@@ -240,3 +240,54 @@ fn vcpus_through_the_command_line() {
         assert!(out.stdout.is_empty());
     }
 }
+
+/// Memory a guest frees goes back to the host: CPython touches 256 MiB,
+/// frees it, reads 256 MiB of new memory (zero), and runs 50 processes
+/// that touch and free 8 MiB each; the kernel process's footprint, read
+/// from outside, follows. Confined, on one vCPU and on four.
+#[test]
+fn freed_memory_goes_back_to_the_host() {
+    let _serial = hvf_support::serial();
+    let Some(exe) = hellovm() else {
+        return;
+    };
+    let Some(root) = guest_image() else {
+        return;
+    };
+    for vcpus in ["1", "4"] {
+        progress(&format!("hvf_cli: memory goes back, {vcpus} vCPUs"));
+        let mut child = Command::new(exe)
+            .args([
+                "--sandbox",
+                "require",
+                "--no-tty",
+                "--vcpus",
+                vcpus,
+                "--root",
+            ])
+            .arg(&root)
+            .args(["/usr/bin/python3", "-c", hvf_support::FREE_AND_REUSE])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mib = hvf_support::memory_goes_back(
+            pid,
+            || {
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut stdout, &mut line).unwrap();
+                line
+            },
+            || std::io::Write::write_all(&mut stdin, b"\n").unwrap(),
+        );
+        progress(&format!(
+            "hvf_cli: {vcpus} vCPUs: footprint {:.1} MiB at start, {:.1} touched, {:.1} freed, {:.1} after the forks",
+            mib[0], mib[1], mib[2], mib[3]
+        ));
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+    }
+}
