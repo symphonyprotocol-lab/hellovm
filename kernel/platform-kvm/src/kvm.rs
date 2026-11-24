@@ -102,6 +102,7 @@ pub struct KvmKicker {
 }
 
 impl Kicker for KvmKicker {
+    #[inline]
     fn kick(&self) {
         if !self.raised.swap(true, SeqCst) {
             if let Err(err) = sys::irq_line(self.vm.as_raw_fd(), self.irq, true) {
@@ -138,6 +139,7 @@ impl Clock {
     }
 
     /// The clock thread: kicks each vCPU whose deadline passed.
+    #[inline]
     fn run(&self) {
         let mut state = self.lock();
         while !state.quit {
@@ -567,6 +569,7 @@ impl Vcpu for KvmVcpu {
         Ok(())
     }
 
+    #[inline]
     fn reg(&self, reg: Reg) -> io::Result<u64> {
         Ok(match reg {
             Reg::X(i) => self.get(frame::X + 8 * usize::from(i.min(30))),
@@ -578,16 +581,19 @@ impl Vcpu for KvmVcpu {
         })
     }
 
+    #[inline]
     fn set_x0(&mut self, value: u64) -> io::Result<()> {
         self.put(frame::X, value);
         Ok(())
     }
 
+    #[inline]
     fn set_ttbr0(&mut self, value: u64) -> io::Result<()> {
         self.put(frame::TTBR0, value);
         Ok(())
     }
 
+    #[inline]
     fn arm_timer(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         // A deadline that passed goes to the clock again: the kick it
         // made may have been spent on a run that ended for another reason
@@ -599,6 +605,7 @@ impl Vcpu for KvmVcpu {
         Ok(())
     }
 
+    #[inline]
     fn enter(&mut self, pc: u64, pstate: u64, flush: Flush) -> io::Result<()> {
         self.put(frame::ELR, pc);
         self.put(frame::SPSR, pstate);
@@ -612,6 +619,7 @@ impl Vcpu for KvmVcpu {
         Ok(())
     }
 
+    #[inline]
     fn run(&mut self) -> io::Result<Exit> {
         if let Some(why) = &self.broken {
             return Err(io::Error::other(format!(

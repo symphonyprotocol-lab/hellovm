@@ -74,6 +74,7 @@ impl Backing for HostMem {
 }
 
 impl Kicker for VcpuKicker {
+    #[inline]
     fn kick(&self) {
         VcpuKicker::kick(self)
     }
@@ -286,6 +287,7 @@ impl Vcpu for HvfVcpu {
         Ok(())
     }
 
+    #[inline]
     fn reg(&self, reg: Reg) -> io::Result<u64> {
         let v = &self.vcpu;
         Ok(match reg {
@@ -300,14 +302,17 @@ impl Vcpu for HvfVcpu {
         })
     }
 
+    #[inline]
     fn set_x0(&mut self, value: u64) -> io::Result<()> {
         Ok(self.vcpu.set_reg(0, value)?)
     }
 
+    #[inline]
     fn set_ttbr0(&mut self, value: u64) -> io::Result<()> {
         Ok(self.vcpu.set_sys_reg(sysreg::TTBR0_EL1, value)?)
     }
 
+    #[inline]
     fn arm_timer(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         match deadline {
             None => {
@@ -335,6 +340,7 @@ impl Vcpu for HvfVcpu {
         Ok(())
     }
 
+    #[inline]
     fn enter(&mut self, pc: u64, pstate: u64, flush: Flush) -> io::Result<()> {
         let v = &self.vcpu;
         match flush {
@@ -363,6 +369,7 @@ impl Vcpu for HvfVcpu {
         Ok(())
     }
 
+    #[inline]
     fn run(&mut self) -> io::Result<Exit> {
         let exit = self.vcpu.run()?;
         Ok(match exit.reason {

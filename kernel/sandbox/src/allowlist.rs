@@ -479,6 +479,78 @@ mod tests {
         assert!(seals(true) && !seals(false));
     }
 
+    /// With `HELLOVM_SECCOMP_LEARNED_KVM=FILE`, a recording made by
+    /// running the KVM suites with `HELLOVM_SECCOMP_LEARN=FILE` (see
+    /// README, "The KVM platform"): the KVM filter must let every recorded
+    /// syscall through. The fds of the recorded `KVM_RUN`s are taken as
+    /// the vCPUs' and those of `KVM_IRQ_LINE` as the VM's (each run has
+    /// its own), so for those two it checks the requests, not the fds.
+    #[test]
+    fn every_measured_kvm_syscall_is_allowed() {
+        use crate::filter::{self, tests::data, Judge};
+        let Some(path) = std::env::var_os("HELLOVM_SECCOMP_LEARNED_KVM") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&path).expect("reading the recording");
+        let mut calls = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let fields: Vec<u64> = line
+                .split_whitespace()
+                .map(|f| u64::from_str_radix(f, 16).expect("a hex field"))
+                .collect();
+            assert_eq!(fields.len(), 7, "bad line {line:?}");
+            calls.insert(fields);
+        }
+        assert!(
+            calls.len() >= 30,
+            "only {} distinct calls recorded: the measuring run did not work",
+            calls.len()
+        );
+        let ioctl = libc::SYS_ioctl as u64;
+        let fds = |request: u32| -> Vec<i32> {
+            let mut fds: Vec<i32> = calls
+                .iter()
+                .filter(|c| c[0] == ioctl && c[2] as u32 == request)
+                .map(|c| c[1] as i32)
+                .collect();
+            fds.sort_unstable();
+            fds.dedup();
+            fds
+        };
+        let (vms, vcpus) = (fds(super::KVM_IRQ_LINE), fds(super::KVM_RUN));
+        assert!(!vcpus.is_empty(), "no KVM_RUN recorded");
+        let arch = crate::harden::audit_arch();
+        let mut refused = Vec::new();
+        for vm in vms.iter().copied().chain(vms.is_empty().then_some(-1)) {
+            let entries = super::kvm_entries(vm, &vcpus, true);
+            let prog = filter::build(
+                arch,
+                std::slice::from_ref(&filter::EVERY_ADDRESS),
+                Judge::Allowlist(&entries),
+            )
+            .unwrap();
+            for call in &calls {
+                if call[0] == ioctl && call[2] as u32 == super::KVM_IRQ_LINE && call[1] as i32 != vm
+                {
+                    continue;
+                }
+                let args: [u64; 6] = call[1..].try_into().unwrap();
+                let action = crate::bpf::run(&prog, &data(arch, call[0] as u32, 0x1000, args));
+                let errno = action & 0xffff_0000 == filter::SECCOMP_RET_ERRNO;
+                if action != filter::SECCOMP_RET_ALLOW && !errno {
+                    refused.push(format!("syscall {} {args:x?}", call[0]));
+                }
+            }
+        }
+        refused.sort();
+        refused.dedup();
+        assert!(
+            refused.is_empty(),
+            "the kernel process on the KVM platform made syscalls its allowlist refuses:\n{}",
+            refused.join("\n")
+        );
+    }
+
     /// With `HELLOVM_SECCOMP_LEARNED=FILE`, a recording made by running
     /// the tests with `HELLOVM_SECCOMP_LEARN=FILE` (see `learn`): the real
     /// filter must let every recorded syscall through. Without the

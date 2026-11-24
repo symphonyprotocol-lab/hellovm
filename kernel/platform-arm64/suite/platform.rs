@@ -374,6 +374,40 @@ fn el1_state_and_the_shim_are_out_of_reach() {
         assert_eq!(ev.trap, want, "{name}");
         p.kill(t).unwrap();
     }
+    // The pages after the shim: on KVM the vCPUs' register frames (at
+    // +0x1000, one page each) and the exit page (+0x10_0000), mapped for
+    // EL1 only; on HVF nothing. Either way EL0 gets SIGSEGV at the address
+    // (SEGV_ACCERR where they are mapped, SEGV_MAPERR where not).
+    for (name, offset, store) in [
+        ("load from vCPU 0's frame", 0x1000u64, false),
+        ("store to vCPU 0's frame", 0x1000, true),
+        ("store to vCPU 1's frame", 0x2000, true),
+        ("load from the exit page", 0x10_0000, false),
+        ("store to the exit page", 0x10_0000, true),
+    ] {
+        let code = vec![
+            shim_hi,
+            add_x1_pages(offset),
+            if store { STR_X0_X1 } else { LDR_X0_X1 },
+            SVC,
+        ];
+        let t = spawn_code(&mut p, &code);
+        match next(&mut p).trap {
+            Trap::Fault(f) => {
+                assert_eq!((f.signal, f.addr), (11, Some(SHIM_VA + offset)), "{name}");
+                assert!(matches!(f.code, 1 | 2), "{name}: {f:?}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        p.kill(t).unwrap();
+    }
+}
+
+/// `add x1, x1, #(offset >> 12), lsl #12`: adds `offset` (a multiple of
+/// 4 KiB below 16 MiB) to `x1`.
+fn add_x1_pages(offset: u64) -> u32 {
+    // add x1, x1, #(offset >> 12), lsl #12
+    0x9140_0021 | (((offset >> 12) as u32) & 0xfff) << 10
 }
 
 fn patterned(seed: u64) -> Box<hellovm_core::platform::Aarch64Context> {
