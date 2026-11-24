@@ -1,4 +1,5 @@
-//! [`HvfPlatform`]: the [`Platform`] implementation.
+//! [`VmPlatform`]: the [`Platform`] implementation, for any
+//! [`Hypervisor`].
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
@@ -15,14 +16,10 @@ use hellovm_core::platform::{
 };
 use hellovm_core::snap::{Reader, Snap, Writer};
 
+use crate::backend::{Exit, Flush, Hypervisor, Kicker, Reg, Stopped, Vcpu};
 use crate::exit::{self, AppException, SEGV_ACCERR, SEGV_MAPERR};
-use crate::layout::{self, FLUSH_OFFSET, FLUSH_PAGE_OFFSET, MAX_ADDR, MIN_ADDR, PAGE, SHIM_VA};
+use crate::layout::{self, MAX_ADDR, MIN_ADDR, PAGE};
 use crate::mmu::{Access, Backing, Demand, MmuError, Origin, Phys, SaveStats, Stale, Trimmed};
-use crate::sys::{
-    self, sysreg, HostMem, HvVcpuExit, Vcpu, VcpuKicker, Vm, HV_EXIT_REASON_CANCELED,
-    HV_EXIT_REASON_EXCEPTION, HV_EXIT_REASON_VTIMER_ACTIVATED, HV_MEMORY_EXEC, HV_MEMORY_READ,
-    HV_MEMORY_WRITE, HV_REG_CPSR, HV_REG_FPCR, HV_REG_FPSR, HV_REG_PC,
-};
 
 const SIGKILL: u32 = 9;
 const SI_KERNEL: i32 = 0x80;
@@ -65,32 +62,32 @@ fn spin_until(limit: Duration, deadline: Option<Instant>, done: impl Fn() -> boo
 }
 
 /// How long what vCPU 0 would run next may wait while the event loop is
-/// busy before another vCPU runs it ([`HvfPlatform::let_go`]).
+/// busy before another vCPU runs it ([`VmPlatform::let_go`]).
 const HOLD: Duration = SPIN;
 
 /// Most vCPUs a platform makes, whatever the framework allows.
 pub const MAX_VCPUS: usize = 64;
 
-/// vCPUs when [`HvfConfig::vcpus`] is 0: one per host CPU, at most this.
+/// vCPUs when [`VmConfig::vcpus`] is 0: one per host CPU, at most this.
 const DEFAULT_VCPUS: usize = 8;
 
 /// How much memory a platform reserves for its apps, and how many vCPUs
 /// run them.
 #[derive(Clone, Copy, Debug)]
-pub struct HvfConfig {
+pub struct VmConfig {
     /// App memory (every page any app of the sandbox touches), in bytes.
     pub memory: u64,
     /// Page-table memory, in bytes.
     pub table_memory: u64,
     /// vCPUs, each on its own host thread: threads of the apps run in
     /// parallel on them. 0 is the default: one per host CPU, at most 8.
-    /// At most [`MAX_VCPUS`] and what the framework allows.
+    /// At most [`MAX_VCPUS`] and what the hypervisor allows.
     pub vcpus: usize,
 }
 
-impl Default for HvfConfig {
+impl Default for VmConfig {
     fn default() -> Self {
-        HvfConfig {
+        VmConfig {
             memory: 2 << 30,
             table_memory: 64 << 20,
             vcpus: 0,
@@ -98,67 +95,13 @@ impl Default for HvfConfig {
     }
 }
 
-impl Backing for HostMem {
-    fn bytes(&self) -> &[u8] {
-        self.slice(0, self.len())
-    }
-
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        self.slice_mut(0, self.len())
-    }
-
-    fn sync_icache(&mut self, offset: usize, len: usize) {
-        self.check_range(offset, len);
-        // SAFETY: in bounds (checked); the call only maintains caches.
-        sys::icache_invalidate(unsafe { self.ptr().add(offset) }, len);
-    }
-
-    fn read_at(&self, offset: usize, buf: &mut [u8]) {
-        HostMem::read_at(self, offset, buf)
-    }
-
-    fn write_at(&mut self, offset: usize, data: &[u8]) {
-        HostMem::write_at(self, offset, data)
-    }
-
-    fn copy_at(&mut self, from: usize, to: usize, len: usize) {
-        HostMem::copy_at(self, from, to, len)
-    }
-
-    fn zero_at(&mut self, offset: usize, len: usize) {
-        HostMem::zero_at(self, offset, len)
-    }
-
-    fn store_u64(&mut self, offset: usize, value: u64) {
-        HostMem::store_u64(self, offset, value)
-    }
-
-    fn give_back(&mut self, offset: usize, len: usize) {
-        HostMem::give_back(self, offset, len)
-    }
-
-    fn take_back(&mut self, offset: usize, len: usize) {
-        HostMem::take_back(self, offset, len)
-    }
-}
-
-/// How often the platform invalidated TLB entries ([`HvfPlatform::flushes`]).
+/// How often the platform invalidated TLB entries ([`VmPlatform::flushes`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flushes {
     /// The whole TLB (and the instruction cache).
     pub all: u64,
     /// One page of one address space.
     pub page: u64,
-}
-
-/// Where an asynchronous exit found the vCPU.
-enum Interrupted {
-    /// The app's position is saved: resume it later.
-    Settled,
-    /// In an exception vector: run on to its `hvc`.
-    InVector,
-    /// Somewhere it can never be (a bug of the VM setup).
-    Lost(String),
 }
 
 /// Why a task is stopped.
@@ -337,8 +280,8 @@ fn page_operand(asid: u16, va: u64) -> u64 {
 }
 
 /// What the threads know of one vCPU without a lock.
-struct Slot {
-    kicker: OnceLock<VcpuKicker>,
+struct Slot<K> {
+    kicker: OnceLock<K>,
     /// Counts the wake-ups of its thread (with the scheduler locked), which
     /// polls it before it sleeps.
     wakes: AtomicU64,
@@ -355,7 +298,7 @@ struct Slot {
     pending: AtomicU64,
 }
 
-impl Slot {
+impl<K: Kicker> Slot<K> {
     fn kick(&self) {
         if let Some(kicker) = self.kicker.get() {
             kicker.kick();
@@ -379,7 +322,7 @@ impl Slot {
 }
 
 /// What the event loop and the vCPU threads share.
-struct Smp {
+struct Smp<H: Hypervisor> {
     sched: Mutex<Sched>,
     /// The event loop waits here: for events, wakers, tasks let go.
     loop_cv: Condvar,
@@ -391,10 +334,8 @@ struct Smp {
     vcpu_cvs: Vec<Condvar>,
     /// The pools and the page tables. Held from a change to the tables
     /// until no vCPU can use what it made stale (see [`Smp::change`]).
-    phys: Mutex<Phys<HostMem>>,
-    slots: Vec<Slot>,
-    /// `mach_absolute_time` ticks per second.
-    ticks_per_sec: u64,
+    phys: Mutex<Phys<H::Mem>>,
+    slots: Vec<Slot<H::Kicker>>,
     flushes_all: AtomicU64,
     flushes_page: AtomicU64,
     /// The pools' clock ([`Phys::set_clock`]) counts nanoseconds from this.
@@ -405,12 +346,12 @@ struct Smp {
     trim_due: AtomicU64,
 }
 
-impl Smp {
+impl<H: Hypervisor> Smp<H> {
     fn lock(&self) -> MutexGuard<'_, Sched> {
         self.sched.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn phys(&self) -> MutexGuard<'_, Phys<HostMem>> {
+    fn phys(&self) -> MutexGuard<'_, Phys<H::Mem>> {
         self.phys.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -491,7 +432,7 @@ impl Smp {
     /// back to the host ([`Smp::trim_aged`]): by now no vCPU can reach a
     /// free frame (each one freed was reachable only through the entries
     /// this or an earlier change made stale).
-    fn change<R>(&self, root: u64, asid: u16, f: impl FnOnce(&mut Phys<HostMem>) -> R) -> R {
+    fn change<R>(&self, root: u64, asid: u16, f: impl FnOnce(&mut Phys<H::Mem>) -> R) -> R {
         let mut phys = self.phys();
         phys.set_clock(self.clock());
         let result = f(&mut phys);
@@ -510,7 +451,7 @@ impl Smp {
     /// Gives back the free memory that has been free long enough, and
     /// records when the next will be. Called with the tables locked,
     /// when no vCPU can reach a free frame.
-    fn trim_aged(&self, phys: &mut Phys<HostMem>) {
+    fn trim_aged(&self, phys: &mut Phys<H::Mem>) {
         let age = GIVE_BACK_AGE.as_nanos() as u64;
         let (_, due) = phys.trim_aged(self.clock(), age);
         self.trim_due.store(due.unwrap_or(u64::MAX), SeqCst);
@@ -606,14 +547,21 @@ impl Smp {
     }
 }
 
-/// Ends every app of an [`HvfPlatform`] from any thread (for timeouts):
+/// Ends every app of a [`VmPlatform`] from any thread (for timeouts):
 /// the platform reports each task as [`Trap::Gone`].
-#[derive(Clone)]
-pub struct AppKiller {
-    smp: Arc<Smp>,
+pub struct AppKiller<H: Hypervisor> {
+    smp: Arc<Smp<H>>,
 }
 
-impl AppKiller {
+impl<H: Hypervisor> Clone for AppKiller<H> {
+    fn clone(&self) -> Self {
+        AppKiller {
+            smp: Arc::clone(&self.smp),
+        }
+    }
+}
+
+impl<H: Hypervisor> AppKiller<H> {
     pub fn kill(&self) {
         let mut sched = self.smp.lock();
         sched.killed = true;
@@ -647,9 +595,9 @@ enum Stop {
 }
 
 /// One vCPU, on the thread that made it.
-struct Runner {
+struct Runner<H: Hypervisor> {
     index: usize,
-    vcpu: Vcpu,
+    vcpu: H::Vcpu,
     /// The task whose registers are in the vCPU.
     loaded: Option<TaskKey>,
     /// `TTBR0_EL1` as last set.
@@ -660,9 +608,6 @@ struct Runner {
     /// Only one page: the `tlbi vae1is` operand for the shim's page flush
     /// routine.
     flush_page: Option<u64>,
-    timer_armed: bool,
-    /// The deadline the armed timer has.
-    armed_for: Option<Instant>,
     /// The task this vCPU gave a slice and when it ends: a task keeps its
     /// slice across the traps the core answers in between.
     slice: Option<(TaskKey, Instant)>,
@@ -671,8 +616,8 @@ struct Runner {
     asid0_root: Option<u64>,
 }
 
-fn host_err(err: sys::HvError) -> PlatformError {
-    PlatformError::Host(err.into())
+fn host_err(err: io::Error) -> PlatformError {
+    PlatformError::Host(err)
 }
 
 fn mmu_err(err: MmuError, addr: u64, len: u64) -> PlatformError {
@@ -685,28 +630,8 @@ fn mmu_err(err: MmuError, addr: u64, len: u64) -> PlatformError {
     }
 }
 
-/// The system registers every vCPU starts with.
-fn set_up(vcpu: &Vcpu, tcr: u64, shim_root: u64) -> Result<(), sys::HvError> {
-    for (reg, value) in [
-        (sysreg::MAIR_EL1, layout::MAIR_EL1),
-        (sysreg::TCR_EL1, tcr),
-        (sysreg::TTBR1_EL1, shim_root),
-        (sysreg::TTBR0_EL1, 0),
-        (sysreg::VBAR_EL1, SHIM_VA),
-        (sysreg::CPACR_EL1, layout::CPACR_EL1),
-        (sysreg::CNTKCTL_EL1, layout::CNTKCTL_EL1),
-        (sysreg::CNTV_CTL_EL0, 0),
-        (sysreg::SP_EL1, 0),
-        (sysreg::TPIDRRO_EL0, 0),
-        (sysreg::SCTLR_EL1, layout::SCTLR_EL1),
-    ] {
-        vcpu.set_sys_reg(reg, value)?;
-    }
-    Ok(())
-}
-
-impl Runner {
-    fn new(index: usize, vcpu: Vcpu) -> Runner {
+impl<H: Hypervisor> Runner<H> {
+    fn new(index: usize, vcpu: H::Vcpu) -> Runner<H> {
         Runner {
             index,
             vcpu,
@@ -714,8 +639,6 @@ impl Runner {
             ttbr0: 0,
             flush: true,
             flush_page: None,
-            timer_armed: false,
-            armed_for: None,
             slice: None,
             asid0_root: None,
         }
@@ -735,40 +658,12 @@ impl Runner {
         }
     }
 
-    fn read_vcpu(&self) -> Result<Box<Aarch64Context>, sys::HvError> {
-        let v = &self.vcpu;
-        let mut c = Box::new(Aarch64Context {
-            x: [0; 31],
-            sp: v.sys_reg(sysreg::SP_EL0)?,
-            pc: 0,
-            pstate: 0,
-            v: [0; 32],
-            fpsr: v.reg(HV_REG_FPSR)? as u32,
-            fpcr: v.reg(HV_REG_FPCR)? as u32,
-            tpidr: v.sys_reg(sysreg::TPIDR_EL0)?,
-        });
-        for (i, x) in c.x.iter_mut().enumerate() {
-            *x = v.reg(i as u32)?;
-        }
-        for (i, q) in c.v.iter_mut().enumerate() {
-            *q = v.simd(i as u32)?;
-        }
-        Ok(c)
+    fn read_vcpu(&self) -> io::Result<Box<Aarch64Context>> {
+        self.vcpu.read_context()
     }
 
-    fn write_vcpu(&self, c: &Aarch64Context) -> Result<(), sys::HvError> {
-        let v = &self.vcpu;
-        for (i, &x) in c.x.iter().enumerate() {
-            v.set_reg(i as u32, x)?;
-        }
-        for (i, &q) in c.v.iter().enumerate() {
-            v.set_simd(i as u32, q)?;
-        }
-        v.set_sys_reg(sysreg::SP_EL0, c.sp)?;
-        v.set_sys_reg(sysreg::TPIDR_EL0, c.tpidr)?;
-        v.set_reg(HV_REG_FPSR, u64::from(c.fpsr))?;
-        v.set_reg(HV_REG_FPCR, u64::from(c.fpcr))?;
-        Ok(())
+    fn write_vcpu(&mut self, c: &Aarch64Context) -> io::Result<()> {
+        self.vcpu.write_context(c)
     }
 
     /// Claims `key` for this vCPU (`sched` locked): what [`Runner::load`]
@@ -807,7 +702,7 @@ impl Runner {
     /// registers of the task loaded before it go back to that task first.
     fn load(
         &mut self,
-        smp: &Smp,
+        smp: &Smp<H>,
         current: &Current,
         claimed: Claimed,
     ) -> Result<(), PlatformError> {
@@ -818,7 +713,7 @@ impl Runner {
             self.write_vcpu(&context).map_err(host_err)?;
         }
         if let Some(x0) = claimed.x0 {
-            self.vcpu.set_reg(0, x0).map_err(host_err)?;
+            self.vcpu.set_x0(x0).map_err(host_err)?;
         }
         self.loaded = Some(current.key);
         self.set_space(current.root, current.asid)
@@ -832,7 +727,7 @@ impl Runner {
     /// If the vCPU cannot be read, the task has no registers any more and
     /// ends ([`Trap::Gone`]); it must not stay loaded in a vCPU that
     /// nothing will ask again.
-    fn unload(&mut self, smp: &Smp, key: TaskKey) -> Result<(), PlatformError> {
+    fn unload(&mut self, smp: &Smp<H>, key: TaskKey) -> Result<(), PlatformError> {
         let mut context = match self.read_vcpu() {
             Ok(context) => context,
             Err(err) => {
@@ -846,7 +741,8 @@ impl Runner {
                     .is_some_and(|task| task.loaded == Some(self.index))
                 {
                     log::error!(
-                        "HVF platform: vCPU {}: {err}; task {key}, loaded in it, ends",
+                        "{} platform: vCPU {}: {err}; task {key}, loaded in it, ends",
+                        H::NAME,
                         self.index
                     );
                     smp.lose(sched, key);
@@ -873,7 +769,7 @@ impl Runner {
         if self.loaded == Some(key) {
             self.loaded = None;
         }
-        // The event loop may wait for it (`HvfPlatform::unload_from`).
+        // The event loop may wait for it (`VmPlatform::unload_from`).
         smp.wake_loop();
         drop(sched);
         Ok(())
@@ -894,9 +790,7 @@ impl Runner {
     fn set_space(&mut self, root: u64, asid: u16) -> Result<(), PlatformError> {
         let ttbr0 = root | u64::from(asid) << 48;
         if self.ttbr0 != ttbr0 {
-            self.vcpu
-                .set_sys_reg(sysreg::TTBR0_EL1, ttbr0)
-                .map_err(host_err)?;
+            self.vcpu.set_ttbr0(ttbr0).map_err(host_err)?;
             self.ttbr0 = ttbr0;
         }
         if asid == 0 {
@@ -908,37 +802,9 @@ impl Runner {
         Ok(())
     }
 
-    /// Sets the timer that ends the next run at `deadline`.
-    fn arm_timer(&mut self, smp: &Smp, deadline: Option<Instant>) -> Result<(), sys::HvError> {
-        match deadline {
-            None => {
-                if self.timer_armed {
-                    self.vcpu.set_sys_reg(sysreg::CNTV_CTL_EL0, 0)?;
-                    self.timer_armed = false;
-                }
-            }
-            // Armed for it already (a trap since does not disarm it).
-            Some(deadline) if self.timer_armed && self.armed_for == Some(deadline) => {}
-            Some(deadline) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let ticks = (left.as_nanos() * u128::from(smp.ticks_per_sec) / 1_000_000_000)
-                    .min(u128::from(u64::MAX / 2)) as u64;
-                let cval = self.vcpu.guest_counter()?.saturating_add(ticks);
-                self.vcpu.set_sys_reg(sysreg::CNTV_CVAL_EL0, cval)?;
-                // ENABLE, interrupt not masked: the framework exits with
-                // HV_EXIT_REASON_VTIMER_ACTIVATED when it fires.
-                self.vcpu.set_sys_reg(sysreg::CNTV_CTL_EL0, 1)?;
-                self.vcpu.set_vtimer_mask(false)?;
-                self.timer_armed = true;
-                self.armed_for = Some(deadline);
-            }
-        }
-        Ok(())
-    }
-
     /// Starts a run of the space at `root`: the epoch goes odd, and the
     /// invalidations other threads left for this vCPU are taken.
-    fn begin_run(&mut self, smp: &Smp, root: u64) {
+    fn begin_run(&mut self, smp: &Smp<H>, root: u64) {
         let slot = &smp.slots[self.index];
         slot.root.store(root, SeqCst);
         slot.epoch.fetch_add(1, SeqCst);
@@ -955,46 +821,34 @@ impl Runner {
 
     /// Points the vCPU at the app: straight to EL0, or through one of the
     /// shim's flush routines if page tables changed.
-    fn enter(&mut self, smp: &Smp, current: &Current) -> Result<(), sys::HvError> {
+    fn enter(&mut self, smp: &Smp<H>, current: &Current) -> io::Result<()> {
         let (pc, pstate) = (current.pc, current.pstate & layout::PSTATE_APP_MASK);
-        if self.flush {
+        let flush = if self.flush {
             if current.asid != 0 {
                 self.asid0_root = None;
             }
-            self.vcpu.set_sys_reg(sysreg::ELR_EL1, pc)?;
-            self.vcpu.set_sys_reg(sysreg::SPSR_EL1, pstate)?;
-            self.vcpu.set_reg(HV_REG_PC, SHIM_VA + FLUSH_OFFSET)?;
-            self.vcpu.set_reg(HV_REG_CPSR, layout::PSTATE_EL1H_MASKED)?;
             self.flush = false;
             self.flush_page = None;
             smp.flushes_all.fetch_add(1, SeqCst);
+            Flush::All
         } else if let Some(operand) = self.flush_page.take() {
-            // The routine takes its operand in x0 and gives the app its
-            // own back from TPIDR_EL1.
-            let x0 = self.vcpu.reg(0)?;
-            self.vcpu.set_sys_reg(sysreg::TPIDR_EL1, x0)?;
-            self.vcpu.set_reg(0, operand)?;
-            self.vcpu.set_sys_reg(sysreg::ELR_EL1, pc)?;
-            self.vcpu.set_sys_reg(sysreg::SPSR_EL1, pstate)?;
-            self.vcpu.set_reg(HV_REG_PC, SHIM_VA + FLUSH_PAGE_OFFSET)?;
-            self.vcpu.set_reg(HV_REG_CPSR, layout::PSTATE_EL1H_MASKED)?;
             smp.flushes_page.fetch_add(1, SeqCst);
+            Flush::Page(operand)
         } else {
-            self.vcpu.set_reg(HV_REG_PC, pc)?;
-            self.vcpu.set_reg(HV_REG_CPSR, pstate)?;
-        }
-        Ok(())
+            Flush::None
+        };
+        self.vcpu.enter(pc, pstate, flush)
     }
 
     /// Runs the loaded task until it traps, the deadline passes or the
     /// vCPU is kicked. Takes no lock but the tables' (for a page fault).
     fn run(
         &mut self,
-        smp: &Smp,
+        smp: &Smp<H>,
         current: &mut Current,
         deadline: Option<Instant>,
     ) -> Result<Stop, PlatformError> {
-        self.arm_timer(smp, deadline).map_err(host_err)?;
+        self.vcpu.arm_timer(deadline).map_err(host_err)?;
         // Faults on a page that is ready, in a row: (page, count).
         let mut retries = (u64::MAX, 0u32);
         let mut reenter = true;
@@ -1012,29 +866,31 @@ impl Runner {
             smp.slots[self.index].epoch.fetch_add(1, SeqCst);
             let exit = exit.map_err(host_err)?;
             reenter = true;
-            let stop = match exit.reason {
-                HV_EXIT_REASON_CANCELED | HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                    if exit.reason == HV_EXIT_REASON_VTIMER_ACTIVATED {
-                        self.vcpu
-                            .set_sys_reg(sysreg::CNTV_CTL_EL0, 0)
-                            .map_err(host_err)?;
-                        self.timer_armed = false;
+            let stop = match exit {
+                Exit::Stopped(at) => match at {
+                    Stopped::At { pc, pstate } => {
+                        current.pc = pc;
+                        current.pstate = pstate & layout::PSTATE_APP_MASK;
+                        Some(Stop::Settled)
                     }
-                    match self.interrupted_at(current)? {
-                        Interrupted::Settled => Some(Stop::Settled),
-                        // In a vector, about to leave the VM with an
-                        // exception of the app: let it, with the vCPU's
-                        // state as it is.
-                        Interrupted::InVector => {
-                            reenter = false;
-                            stopped = true;
-                            None
-                        }
-                        Interrupted::Lost(why) => Some(Stop::Gone(why)),
+                    // In a flush routine, before the app ran: it starts
+                    // over from `pc`, flushing again.
+                    Stopped::Flushing => {
+                        self.flush = true;
+                        Some(Stop::Settled)
                     }
-                }
-                HV_EXIT_REASON_EXCEPTION => self.on_exception(smp, current, &exit, &mut retries)?,
-                other => Some(Stop::Gone(format!("unexpected exit reason {other}"))),
+                    // In a vector, about to leave the VM with an
+                    // exception of the app: let it, with the vCPU's
+                    // state as it is.
+                    Stopped::InVector => {
+                        reenter = false;
+                        stopped = true;
+                        None
+                    }
+                    Stopped::Lost(why) => Some(Stop::Gone(why)),
+                },
+                Exit::Unexpected(why) => Some(Stop::Gone(why)),
+                exit => self.on_exception(smp, current, &exit, &mut retries)?,
             };
             if let Some(stop) = stop {
                 return Ok(stop);
@@ -1049,57 +905,23 @@ impl Runner {
         }
     }
 
-    /// Saves where the app was when the vCPU was stopped from outside (by
-    /// `hv_vcpus_exit` or the timer), which can be anywhere.
-    fn interrupted_at(&mut self, current: &mut Current) -> Result<Interrupted, PlatformError> {
-        let cpsr = self.vcpu.reg(HV_REG_CPSR).map_err(host_err)?;
-        let pc = self.vcpu.reg(HV_REG_PC).map_err(host_err)?;
-        if cpsr & 0xf == 0 {
-            // In the app (EL0t).
-            current.pc = pc;
-            current.pstate = cpsr & layout::PSTATE_APP_MASK;
-            return Ok(Interrupted::Settled);
-        }
-        if (SHIM_VA..SHIM_VA + FLUSH_OFFSET).contains(&pc) {
-            return Ok(Interrupted::InVector);
-        }
-        if (SHIM_VA + FLUSH_PAGE_OFFSET..SHIM_VA + PAGE).contains(&pc) {
-            // In the page flush routine: x0 may still be its operand. The
-            // app's own is in TPIDR_EL1; it starts over from `pc`, with a
-            // whole flush.
-            let x0 = self.vcpu.sys_reg(sysreg::TPIDR_EL1).map_err(host_err)?;
-            self.vcpu.set_reg(0, x0).map_err(host_err)?;
-            self.flush = true;
-            return Ok(Interrupted::Settled);
-        }
-        if (SHIM_VA + FLUSH_OFFSET..SHIM_VA + PAGE).contains(&pc) {
-            // In the flush routine, before the app ran: it starts over
-            // from `pc`, flushing again.
-            self.flush = true;
-            return Ok(Interrupted::Settled);
-        }
-        Ok(Interrupted::Lost(format!(
-            "stopped at EL1 outside the shim, pc {pc:#x} cpsr {cpsr:#x}"
-        )))
-    }
-
     /// Decodes an exception exit. `None` means: resume the app.
     /// `retries` counts faults in a row on a page that was ready.
     fn on_exception(
         &mut self,
-        smp: &Smp,
+        smp: &Smp<H>,
         current: &mut Current,
-        exit: &HvVcpuExit,
+        exit: &Exit,
         retries: &mut (u64, u32),
     ) -> Result<Option<Stop>, PlatformError> {
         let v = &self.vcpu;
-        let (esr, far, pc) = match exit::hvc_immediate(exit.syndrome) {
-            // `hvc` is undefined at EL0, so this came from a vector of the
-            // shim: the registers are the app's, ELR/SPSR/ESR/FAR say what
+        let (esr, far, pc) = match *exit {
+            // From a vector of the shim (only EL0 exceptions get there and
+            // out): the registers are the app's, ELR/SPSR/ESR/FAR say what
             // happened.
-            Some(slot) => {
-                let pc = v.sys_reg(sysreg::ELR_EL1).map_err(host_err)?;
-                let pstate = v.sys_reg(sysreg::SPSR_EL1).map_err(host_err)?;
+            Exit::Vector(slot) => {
+                let pc = v.reg(Reg::ElrEl1).map_err(host_err)?;
+                let pstate = v.reg(Reg::SpsrEl1).map_err(host_err)?;
                 current.pc = pc;
                 current.pstate = pstate & layout::PSTATE_APP_MASK;
                 match slot {
@@ -1115,40 +937,47 @@ impl Runner {
                         ))));
                     }
                 }
-                let esr = v.sys_reg(sysreg::ESR_EL1).map_err(host_err)?;
+                let esr = v.reg(Reg::EsrEl1).map_err(host_err)?;
                 let far = match exit::exception_class(esr) {
-                    0x20 | 0x22 | 0x24 => v.sys_reg(sysreg::FAR_EL1).map_err(host_err)?,
-                    0x26 => v.sys_reg(sysreg::SP_EL0).map_err(host_err)?,
+                    0x20 | 0x22 | 0x24 => v.reg(Reg::FarEl1).map_err(host_err)?,
+                    0x26 => v.reg(Reg::SpEl0).map_err(host_err)?,
                     _ => 0,
                 };
                 (esr, far, pc)
             }
-            None => {
+            Exit::Direct {
+                syndrome,
+                virtual_address,
+                physical_address,
+            } => {
                 // Taken straight to EL2. From the app (EL0t) it is one the
                 // framework traps (`wfi`, `wfe`); anything else, or a fault
                 // in stage 2, means the VM is not as this platform built it.
-                let cpsr = v.reg(HV_REG_CPSR).map_err(host_err)?;
-                let pc = v.reg(HV_REG_PC).map_err(host_err)?;
-                let class = exit::exception_class(exit.syndrome);
+                let cpsr = v.reg(Reg::Cpsr).map_err(host_err)?;
+                let pc = v.reg(Reg::Pc).map_err(host_err)?;
+                let class = exit::exception_class(syndrome);
                 if cpsr & 0xf != 0 || matches!(class, 0x20 | 0x24) {
                     return Ok(Some(Stop::Gone(format!(
-                        "exit to the host with syndrome {:#x} at pc {pc:#x}, cpsr {cpsr:#x}, \
-                         address {:#x} (guest-physical {:#x})",
-                        exit.syndrome, exit.virtual_address, exit.physical_address
+                        "exit to the host with syndrome {syndrome:#x} at pc {pc:#x}, \
+                         cpsr {cpsr:#x}, address {virtual_address:#x} \
+                         (guest-physical {physical_address:#x})",
                     ))));
                 }
                 current.pc = pc;
                 current.pstate = cpsr & layout::PSTATE_APP_MASK;
-                (exit.syndrome, exit.virtual_address, pc)
+                (syndrome, virtual_address, pc)
+            }
+            Exit::Stopped(_) | Exit::Unexpected(_) => {
+                return Ok(Some(Stop::Gone("not an exception".into())));
             }
         };
         match exit::decode(esr, far, pc) {
             AppException::Syscall => {
                 let mut regs = [0u64; 7];
                 for (i, reg) in regs.iter_mut().enumerate().take(6) {
-                    *reg = v.reg(i as u32).map_err(host_err)?;
+                    *reg = v.reg(Reg::X(i as u8)).map_err(host_err)?;
                 }
-                regs[6] = v.reg(8).map_err(host_err)?;
+                regs[6] = v.reg(Reg::X(8)).map_err(host_err)?;
                 let trap = SyscallTrap {
                     nr: regs[6],
                     args: [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]],
@@ -1174,7 +1003,7 @@ impl Runner {
     /// page is not mapped, or allows the access after all).
     fn page_fault(
         &mut self,
-        smp: &Smp,
+        smp: &Smp<H>,
         current: &Current,
         addr: u64,
         access: Access,
@@ -1215,7 +1044,8 @@ impl Runner {
             // OOM killer would end it on Linux, and the others go on.
             Demand::NoMemory => {
                 log::warn!(
-                    "HVF platform: task {}: out of memory at {addr:#x}; killing it",
+                    "{} platform: task {}: out of memory at {addr:#x}; killing it",
+                    H::NAME,
                     current.key
                 );
                 Some(Stop::Trap(Trap::Fault(Fault {
@@ -1251,7 +1081,7 @@ fn settle(sched: &mut Sched, current: &Current, started: Instant) {
 
 /// The thread of vCPU `index` (not 0): runs the tasks the scheduler gives
 /// it until the platform goes.
-fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
+fn vcpu_thread<H: Hypervisor>(smp: Arc<Smp<H>>, mut runner: Runner<H>) {
     let index = runner.index;
     // Polled for work since it last ran a task.
     let mut spun = false;
@@ -1266,7 +1096,7 @@ fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
             if runner.loaded == Some(key) {
                 drop(sched);
                 if let Err(err) = runner.unload(&smp, key) {
-                    log::error!("HVF platform: vCPU {index}: {err}");
+                    log::error!("{} platform: vCPU {index}: {err}", H::NAME);
                     broken = true;
                 }
                 sched = smp.lock();
@@ -1334,7 +1164,7 @@ fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
                 None
             }
             Ok(Stop::Gone(why)) => {
-                log::error!("HVF platform: task {key}: {why}; ending it");
+                log::error!("{} platform: task {key}: {why}; ending it", H::NAME);
                 runner.loaded = None;
                 smp.lose(sched, key);
                 sched = smp.lock();
@@ -1344,7 +1174,7 @@ fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
                 // The vCPU failed: the task goes, and this vCPU runs
                 // nothing any more. Its thread stays until the platform
                 // goes, as the others do.
-                log::error!("HVF platform: vCPU {index}: {err}; task {key} ends");
+                log::error!("{} platform: vCPU {index}: {err}; task {key} ends", H::NAME);
                 runner.loaded = None;
                 broken = true;
                 smp.lose(sched, key);
@@ -1362,29 +1192,27 @@ fn vcpu_thread(smp: Arc<Smp>, mut runner: Runner) {
     drop(runner);
 }
 
-/// The Hypervisor.framework platform. See the crate documentation.
+/// The platform on a VM of hypervisor `H`. See the crate documentation.
 ///
-/// One per process (the framework allows one VM per process), used from
-/// the thread that made it: vCPU 0 belongs to that thread and runs in
-/// [`Platform::wait`]; the others have threads of their own.
-pub struct HvfPlatform {
+/// Used from the thread that made it: vCPU 0 belongs to that thread and
+/// runs in [`Platform::wait`]; the others have threads of their own.
+pub struct VmPlatform<H: Hypervisor> {
     // Field order is drop order: vCPU 0, then the VM (which removes the
     // stage-2 mappings), then the memory behind them. `Drop` ends the
     // other vCPUs' threads first.
-    runner: Runner,
+    runner: Runner<H>,
     threads: Vec<JoinHandle<()>>,
-    vm: Vm,
-    smp: Arc<Smp>,
-    _shim: HostMem,
+    vm: H,
+    smp: Arc<Smp<H>>,
     info: AddressSpaceInfo,
     cpu: CpuInfo,
     vcpus: usize,
     /// Since when what vCPU 0 would run next has waited ([`Self::let_go`]).
     held_since: Option<Instant>,
     /// A frozen template's tasks ([`Platform::freeze`]), or a clone's
-    /// before [`Platform::thaw`] ([`HvfPlatform::load_frozen`]).
+    /// before [`Platform::thaw`] ([`VmPlatform::load_frozen`]).
     frozen: Option<Vec<FrozenTasks>>,
-    config: HvfConfig,
+    config: VmConfig,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -1398,11 +1226,12 @@ struct FrozenTasks {
 
 hellovm_core::snap_struct!(FrozenTasks { root, contexts });
 
-/// The first bytes of [`HvfPlatform::save_frozen`]'s output: a fingerprint
-/// of this crate's sources (`build.rs`); the core's follows it
+/// After [`Hypervisor::SNAPSHOT_PREFIX`], the first bytes of
+/// [`VmPlatform::save_frozen`]'s output: a fingerprint of this crate's
+/// sources (`build.rs`); the core's follows it
 /// ([`hellovm_core::snap::BUILD`]: the registers and the pools' state are
 /// written with its encoding).
-const SNAPSHOT_MAGIC: &[u8] = concat!("hellovm-hvf-", env!("HELLOVM_BUILD"), "\0").as_bytes();
+const SNAPSHOT_MAGIC: &[u8] = concat!(env!("HELLOVM_BUILD"), "\0").as_bytes();
 
 /// `AT_HWCAP` from the ID registers the vCPU reports, limited to features
 /// that need nothing from the kernel. Not reported: `CPUID` (EL0 reads of
@@ -1445,7 +1274,7 @@ fn hwcap(pfr0: u64, isar0: u64, isar1: u64) -> u64 {
 }
 
 /// How many vCPUs to make: as asked, or the default, within the bounds.
-fn vcpu_count(asked: usize, framework_max: u32) -> usize {
+fn vcpu_count(asked: usize, hypervisor_max: u32) -> usize {
     let wanted = match asked {
         0 => std::thread::available_parallelism()
             .map_or(1, |n| n.get())
@@ -1454,83 +1283,64 @@ fn vcpu_count(asked: usize, framework_max: u32) -> usize {
     };
     wanted
         .min(MAX_VCPUS)
-        .min(framework_max.max(1) as usize)
+        .min(hypervisor_max.max(1) as usize)
         .max(1)
 }
 
-impl HvfPlatform {
-    /// A platform for one sandbox, with its VM and vCPUs. Fails with
-    /// `PermissionDenied` when the executable lacks the hypervisor
-    /// entitlement, and with `ResourceBusy` while another platform of this
-    /// process exists.
-    pub fn new(config: HvfConfig) -> io::Result<HvfPlatform> {
-        let round = |n: u64| {
-            n.max(sys::HOST_PAGE as u64)
-                .next_multiple_of(sys::HOST_PAGE as u64)
-        };
+/// The host page the pools take memory in (`mmu`): regions are
+/// multiples of it.
+const REGION_GRANULE: u64 = 16 * 1024;
+
+impl<H: Hypervisor> VmPlatform<H> {
+    /// A platform for one sandbox, with its VM and vCPUs. The errors are
+    /// the hypervisor's (on macOS `PermissionDenied` when the executable
+    /// lacks the hypervisor entitlement, and `ResourceBusy` while another
+    /// platform of this process exists).
+    pub fn new(config: VmConfig) -> io::Result<VmPlatform<H>> {
+        let round = |n: u64| n.max(REGION_GRANULE).next_multiple_of(REGION_GRANULE);
         let memory = round(config.memory);
         let table_memory = round(config.table_memory);
         if layout::TABLES_IPA + table_memory > layout::RAM_IPA || memory > 32 << 30 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "HVF platform: at most 32 GiB of memory and 3 GiB of page tables",
+                format!(
+                    "{} platform: at most 32 GiB of memory and 3 GiB of page tables",
+                    H::NAME
+                ),
             ));
         }
         if config.vcpus > MAX_VCPUS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("HVF platform: at most {MAX_VCPUS} vCPUs"),
+                format!("{} platform: at most {MAX_VCPUS} vCPUs", H::NAME),
             ));
         }
-        let vm = Vm::create()?;
-        let shim = HostMem::new(layout::SHIM_REGION as usize)?;
-        let tables = HostMem::new(table_memory as usize)?;
-        let ram = HostMem::new(memory as usize)?;
-        let mut shim = shim;
-        let code = layout::shim_code();
-        shim.slice_mut(0, code.len()).copy_from_slice(&code);
-        shim.sync_icache(0, code.len());
-        // SAFETY: each region lives in `HvfPlatform` until after the VM is
-        // destroyed (field order), and holds only what the guest may see:
-        // the shim, the guest's page tables (read only) and app memory.
-        unsafe {
-            vm.map(
-                shim.ptr(),
-                layout::SHIM_IPA,
-                shim.len(),
-                HV_MEMORY_READ | HV_MEMORY_EXEC,
-            )?;
-            vm.map(
-                tables.ptr(),
-                layout::TABLES_IPA,
-                tables.len(),
-                HV_MEMORY_READ,
-            )?;
-            vm.map(
-                ram.ptr(),
-                layout::RAM_IPA,
-                ram.len(),
-                HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC,
-            )?;
-        }
+        let (vm, tables, ram) = H::create(memory as usize, table_memory as usize)?;
         let mut phys = Phys::new(tables, ram);
-        let shim_root = phys
-            .shim_space()
+        let shim_root = vm
+            .shim_space(&mut phys)
             .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "page tables"))?;
-        let vcpus = vcpu_count(config.vcpus, vm.max_vcpus().unwrap_or(1));
+        let vcpus = vcpu_count(config.vcpus, vm.max_vcpus());
         if config.vcpus > vcpus {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("HVF platform: this host allows at most {vcpus} vCPUs"),
+                format!(
+                    "{} platform: this host allows at most {vcpus} vCPUs",
+                    H::NAME
+                ),
             ));
         }
-        let vcpu = Vcpu::create(vm.token())?;
+        let mut vcpu = H::vcpu(vm.token(), 0)?;
 
-        let mmfr0 = vcpu.sys_reg(sysreg::ID_AA64MMFR0_EL1)?;
+        let id = vcpu.id_regs()?;
+        let mmfr0 = id.mmfr0;
         if (mmfr0 >> 28) & 0xf == 0xf {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "HVF platform: the vCPU does not support 4 KiB translation granules",
+                format!(
+                    "{} platform: the vCPU does not support 4 KiB translation granules",
+                    H::NAME
+                ),
             ));
         }
         // The guest-physical layout fits in 36 bits; use what the vCPU has
@@ -1538,22 +1348,11 @@ impl HvfPlatform {
         let ips = (mmfr0 & 0xf).min(5);
         let asid16 = (mmfr0 >> 4) & 0xf == 2;
         let cpu = CpuInfo {
-            hwcap: hwcap(
-                vcpu.sys_reg(sysreg::ID_AA64PFR0_EL1)?,
-                vcpu.sys_reg(sysreg::ID_AA64ISAR0_EL1)?,
-                vcpu.sys_reg(sysreg::ID_AA64ISAR1_EL1)?,
-            ),
+            hwcap: hwcap(id.pfr0, id.isar0, id.isar1),
             hwcap2: 0,
         };
         let tcr = layout::tcr_el1(ips, asid16);
-        set_up(&vcpu, tcr, shim_root)?;
-        let mut timebase = sys::MachTimebaseInfo::default();
-        sys::timebase(&mut timebase);
-        let ticks_per_sec = if timebase.numer == 0 {
-            24_000_000
-        } else {
-            1_000_000_000 * u64::from(timebase.denom) / u64::from(timebase.numer)
-        };
+        vcpu.set_up(tcr, shim_root)?;
         let slots = (0..vcpus)
             .map(|_| Slot {
                 kicker: OnceLock::new(),
@@ -1588,18 +1387,16 @@ impl HvfPlatform {
             vcpu_cvs: (0..vcpus).map(|_| Condvar::new()).collect(),
             phys: Mutex::new(phys),
             slots,
-            ticks_per_sec,
             flushes_all: AtomicU64::new(0),
             flushes_page: AtomicU64::new(0),
             epoch: Instant::now(),
             trim_due: AtomicU64::new(u64::MAX),
         });
-        let mut platform = HvfPlatform {
+        let mut platform = VmPlatform {
             runner: Runner::new(0, vcpu),
             threads: Vec::new(),
             vm,
             smp,
-            _shim: shim,
             info: AddressSpaceInfo {
                 page_size: PAGE,
                 min_addr: MIN_ADDR,
@@ -1610,7 +1407,7 @@ impl HvfPlatform {
             vcpus,
             held_since: None,
             frozen: None,
-            config: HvfConfig {
+            config: VmConfig {
                 memory,
                 table_memory,
                 vcpus: config.vcpus,
@@ -1628,8 +1425,8 @@ impl HvfPlatform {
             let thread = std::thread::Builder::new()
                 .name(format!("hellovm-vcpu{index}"))
                 .spawn(move || {
-                    let made = Vcpu::create(token).and_then(|vcpu| {
-                        set_up(&vcpu, tcr, shim_root)?;
+                    let made = H::vcpu(token, index).and_then(|mut vcpu| {
+                        vcpu.set_up(tcr, shim_root)?;
                         Ok(vcpu)
                     });
                     match made {
@@ -1646,9 +1443,12 @@ impl HvfPlatform {
             platform.threads.push(thread);
             match ready_rx.recv() {
                 Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(err.into()),
+                Ok(Err(err)) => return Err(err),
                 Err(_) => {
-                    return Err(io::Error::other("HVF platform: a vCPU thread ended"));
+                    return Err(io::Error::other(format!(
+                        "{} platform: a vCPU thread ended",
+                        H::NAME
+                    )));
                 }
             }
         }
@@ -1656,7 +1456,7 @@ impl HvfPlatform {
     }
 
     /// A handle that ends every app from any thread.
-    pub fn killer(&self) -> AppKiller {
+    pub fn killer(&self) -> AppKiller<H> {
         AppKiller {
             smp: Arc::clone(&self.smp),
         }
@@ -1713,8 +1513,8 @@ impl HvfPlatform {
     /// Saves a template that [`Platform::freeze`] froze, for its clones
     /// (see the `mmu` module for how): the used page tables into `tables`,
     /// the app frames that are not all zero into `ram` (each at its own
-    /// offset), both as large as [`HvfPlatform::pool_sizes`] says and
-    /// zero. Returns the rest, for [`HvfPlatform::load_frozen`].
+    /// offset), both as large as [`VmPlatform::pool_sizes`] says and
+    /// zero. Returns the rest, for [`VmPlatform::load_frozen`].
     pub fn save_frozen(
         &mut self,
         tables: &mut [u8],
@@ -1730,6 +1530,7 @@ impl HvfPlatform {
                 "snapshot regions of the wrong size".into(),
             ));
         }
+        w.bytes(H::SNAPSHOT_PREFIX.as_bytes());
         w.bytes(SNAPSHOT_MAGIC);
         w.bytes(hellovm_core::snap::BUILD.as_bytes());
         memory.put(w);
@@ -1740,9 +1541,9 @@ impl HvfPlatform {
     }
 
     /// Makes this new platform (nothing spawned yet, made with the
-    /// template's [`HvfPlatform::pool_sizes`]) a clone of a saved
+    /// template's [`VmPlatform::pool_sizes`]) a clone of a saved
     /// template, ready for [`Platform::thaw`]: `meta` from
-    /// [`HvfPlatform::save_frozen`], `tables` the saved page tables (the
+    /// [`VmPlatform::save_frozen`], `tables` the saved page tables (the
     /// used part), `origin` the saved app memory, copied page by page as
     /// the clone touches it.
     pub fn load_frozen(
@@ -1754,10 +1555,15 @@ impl HvfPlatform {
         let bad = |e: hellovm_core::snap::Bad| e.to_string();
         let mut r = Reader::new(meta);
         let core = hellovm_core::snap::BUILD.as_bytes();
-        if r.take(SNAPSHOT_MAGIC.len()).map_err(bad)? != SNAPSHOT_MAGIC
+        let prefix = H::SNAPSHOT_PREFIX.as_bytes();
+        if r.take(prefix.len()).map_err(bad)? != prefix
+            || r.take(SNAPSHOT_MAGIC.len()).map_err(bad)? != SNAPSHOT_MAGIC
             || r.take(core.len()).map_err(bad)? != core
         {
-            return Err("not a snapshot of this build's HVF platform".into());
+            return Err(format!(
+                "not a snapshot of this build's {} platform",
+                H::NAME
+            ));
         }
         let memory = u64::get(&mut r).map_err(bad)?;
         let table_memory = u64::get(&mut r).map_err(bad)?;
@@ -1851,7 +1657,7 @@ impl HvfPlatform {
 
     /// Ends a task the platform cannot run any more, as [`Trap::Gone`].
     fn gone(&mut self, key: TaskKey, why: &str) -> Event {
-        log::error!("HVF platform: task {key}: {why}; ending it");
+        log::error!("{} platform: task {key}: {why}; ending it", H::NAME);
         if self.runner.loaded == Some(key) {
             self.runner.loaded = None;
         }
@@ -1871,8 +1677,9 @@ impl HvfPlatform {
         if log::log_enabled!(log::Level::Debug) && !std::mem::replace(&mut sched.dumped, true) {
             for (key, task) in &sched.tasks {
                 log::debug!(
-                    "HVF platform: killed: task {key}: space {} {:?} pc {:#x} runtime {} ns, \
+                    "{} platform: killed: task {key}: space {} {:?} pc {:#x} runtime {} ns, \
                      on vCPU {:?}, loaded in {:?}, interrupt {}",
+                    H::NAME,
                     task.space,
                     task.state,
                     task.pc,
@@ -1884,7 +1691,8 @@ impl HvfPlatform {
             }
             for (index, slot) in smp.slots.iter().enumerate() {
                 log::debug!(
-                    "HVF platform: killed: vCPU {index}: epoch {}, root {:#x}, pending {:#x}",
+                    "{} platform: killed: vCPU {index}: epoch {}, root {:#x}, pending {:#x}",
+                    H::NAME,
                     slot.epoch.load(SeqCst),
                     slot.root.load(SeqCst),
                     slot.pending.load(SeqCst)
@@ -1972,10 +1780,15 @@ impl HvfPlatform {
     }
 
     fn set_x0(&mut self, key: TaskKey, value: u64) -> Result<(), PlatformError> {
-        let mut sched = self.lock();
+        let smp = Arc::clone(&self.smp);
+        let mut sched = smp.lock();
         let task = sched.task(key)?;
         match task.loaded {
-            Some(0) => self.runner.vcpu.set_reg(0, value).map_err(host_err),
+            // vCPU 0 is this thread's: nothing else reaches it.
+            Some(0) => {
+                drop(sched);
+                self.runner.vcpu.set_x0(value).map_err(host_err)
+            }
             Some(_) => {
                 task.x0 = Some(value);
                 Ok(())
@@ -2002,7 +1815,7 @@ impl HvfPlatform {
     }
 }
 
-impl Platform for HvfPlatform {
+impl<H: Hypervisor> Platform for VmPlatform<H> {
     fn arch(&self) -> Arch {
         Arch::Aarch64
     }
@@ -2157,6 +1970,7 @@ impl Platform for HvfPlatform {
         task.pc = context.pc;
         task.pstate = context.pstate & layout::PSTATE_APP_MASK;
         if task.loaded == Some(0) {
+            drop(sched);
             return self.runner.write_vcpu(context).map_err(host_err);
         }
         task.saved = Some(context.clone());
@@ -2312,8 +2126,8 @@ impl Platform for HvfPlatform {
 
     /// Keeps the registers and the address space of every task: nothing
     /// is ended, since the tasks' memory is what
-    /// [`HvfPlatform::save_frozen`] saves next. The kernel process then
-    /// exits; the clones are new processes ([`HvfPlatform::load_frozen`]).
+    /// [`VmPlatform::save_frozen`] saves next. The kernel process then
+    /// exits; the clones are new processes ([`VmPlatform::load_frozen`]).
     fn freeze(&mut self, spaces: &[FrozenSpace]) -> Result<(), PlatformError> {
         let mut frozen = Vec::new();
         for space in spaces {
@@ -2346,7 +2160,7 @@ impl Platform for HvfPlatform {
         Ok(())
     }
 
-    /// A clone's tasks, from [`HvfPlatform::load_frozen`]: one address
+    /// A clone's tasks, from [`VmPlatform::load_frozen`]: one address
     /// space per frozen one, with the template's tables, and a stopped
     /// task per frozen task with its registers.
     fn thaw(&mut self) -> Result<Vec<Vec<TaskKey>>, PlatformError> {
@@ -2441,7 +2255,7 @@ impl Platform for HvfPlatform {
     }
 }
 
-impl Drop for HvfPlatform {
+impl<H: Hypervisor> Drop for VmPlatform<H> {
     fn drop(&mut self) {
         // The other vCPUs first, each destroyed by its own thread.
         self.stop_threads();
@@ -2451,721 +2265,10 @@ impl Drop for HvfPlatform {
             let phys = self.smp.phys();
             (phys.tables_backing().len(), phys.ram_backing().len())
         };
-        for (ipa, len) in [
-            (layout::SHIM_IPA, layout::SHIM_REGION as usize),
-            (layout::TABLES_IPA, tables),
-            (layout::RAM_IPA, ram),
-        ] {
-            if let Err(err) = self.vm.unmap(ipa, len) {
-                log::warn!("{err}");
-            }
-        }
-    }
-}
-#[cfg(test)]
-#[path = "madvise_probe.rs"]
-mod madvise_probe;
-
-#[cfg(test)]
-mod breakdown {
-    use super::*;
-
-    #[test]
-    #[ignore = "benchmark"]
-    fn exit_cost_breakdown() {
-        let _guard = super::vm_tests::VM
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut p = match HvfPlatform::new(HvfConfig {
-            vcpus: 1,
-            ..HvfConfig::default()
-        }) {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("SKIPPING: {err}");
-                return;
-            }
-        };
-        let t = p.spawn().unwrap();
-        p.map(t, 0x10000, PAGE, Prot::ALL, Sharing::Private)
-            .unwrap();
-        let code: Vec<u8> = [0xd400_0001u32, 0x17ff_ffff]
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        p.write(t, 0x10000, &code).unwrap();
-        p.resume(
-            t,
-            Resume::Start {
-                entry: 0x10000,
-                stack: 0,
-            },
-        )
-        .unwrap();
-        p.wait(None).unwrap().unwrap();
-        const N: u32 = 1_000_000;
-        // Bare: set PC, run, nothing read.
-        let start = Instant::now();
-        for _ in 0..N {
-            p.runner.vcpu.set_reg(HV_REG_PC, 0x10000).unwrap();
-            p.runner.vcpu.set_reg(HV_REG_CPSR, 0).unwrap();
-            p.runner.vcpu.run().unwrap();
-        }
-        let bare = start.elapsed() / N;
-        let start = Instant::now();
-        let mut sum = 0u64;
-        for _ in 0..N {
-            sum = sum.wrapping_add(p.runner.vcpu.reg(3).unwrap());
-        }
-        let get = start.elapsed() / N;
-        let start = Instant::now();
-        for _ in 0..N {
-            sum = sum.wrapping_add(p.runner.vcpu.sys_reg(sysreg::ELR_EL1).unwrap());
-        }
-        let sys = start.elapsed() / N;
-        let start = Instant::now();
-        for _ in 0..N {
-            p.runner.vcpu.set_reg(0, sum).unwrap();
-        }
-        let set = start.elapsed() / N;
-        eprintln!("bare exit {bare:?}, get_reg {get:?}, get_sys_reg {sys:?}, set_reg {set:?}");
+        self.vm.release(tables, ram);
     }
 }
 
-/// Memory given back to the host, with the VM running (P1g).
-#[cfg(test)]
-mod give_back_tests {
-    use super::*;
-
-    const CODE: u64 = 0x10_000;
-    const REGION: u64 = 0x1000_0000;
-    const LEN: u64 = 64 << 20;
-    /// Each spinner's page.
-    const SPIN_DATA: u64 = 0x20_000;
-
-    fn footprint() -> u64 {
-        // SAFETY: zeroed plain-old-data; the call fills it.
-        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-        // SAFETY: our own pid and a buffer of the flavor's type.
-        let rc = unsafe {
-            libc::proc_pid_rusage(
-                libc::getpid(),
-                libc::RUSAGE_INFO_V2,
-                (&mut info as *mut libc::rusage_info_v2).cast(),
-            )
-        };
-        assert_eq!(rc, 0);
-        info.ri_phys_footprint
-    }
-
-    fn word(trap: Trap) -> u64 {
-        match trap {
-            Trap::Syscall(SyscallTrap { args, .. }) => args[0],
-            other => panic!("not a syscall: {other:?}"),
-        }
-    }
-
-    fn resident_kib() -> String {
-        // SAFETY: as in `footprint`.
-        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-        // SAFETY: as in `footprint`.
-        unsafe {
-            libc::proc_pid_rusage(
-                libc::getpid(),
-                libc::RUSAGE_INFO_V4,
-                (&mut info as *mut libc::rusage_info_v4).cast(),
-            )
-        };
-        format!(
-            "{} KiB, wired {} KiB",
-            info.ri_resident_size >> 10,
-            info.ri_wired_size >> 10
-        )
-    }
-
-    /// Lets the platform run (`t` is stopped) until what the pools keep
-    /// went back, for 300 ms at most: what they keep then, and how long
-    /// it took.
-    fn given_back(p: &mut HvfPlatform, t: TaskKey) -> (u64, Duration) {
-        let timer = Instant::now();
-        loop {
-            let (kept, _) = p.memory_kept();
-            if kept <= 512 << 10 || timer.elapsed() > Duration::from_millis(300) {
-                return (kept, timer.elapsed());
-            }
-            if let Some(ev) = p.wait(Some(Duration::from_millis(30))).unwrap() {
-                assert_ne!(ev.task, t, "the program is stopped");
-                p.resume(ev.task, Resume::Continue).unwrap();
-            }
-        }
-    }
-
-    /// A program touches 64 MiB; the host unmaps it, and it goes back
-    /// within `GIVE_BACK_AGE` (here, the program being stopped, once the
-    /// event loop is idle); the footprint falls back. Mapped again, all of
-    /// it reads zero although the host pages it gets were the ones given
-    /// back (their old bytes may still be there). Five rounds; with more
-    /// than one vCPU, three threads of the same process write their own
-    /// pages without a system call meanwhile, on the other vCPUs.
-    fn run(vcpus: usize) {
-        let _guard = super::vm_tests::VM
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut p = match HvfPlatform::new(HvfConfig {
-            vcpus,
-            ..HvfConfig::default()
-        }) {
-            Ok(p) => p,
-            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
-                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
-            }
-            Err(err) => {
-                eprintln!("SKIPPING: {err}");
-                return;
-            }
-        };
-        let t = p.spawn().unwrap();
-        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
-        // touch: [x1] = x3 every page up to x2; svc; then x0 = OR of the
-        // first and last word of every page from x5 up to x2; svc.
-        // spin: [x6] = x3++ for ever.
-        let code: Vec<u8> = [
-            0xf900_0023u32,
-            0x9140_0421,
-            0xeb02_003f,
-            0x54ff_ffa3,
-            0xd400_0001,
-            0xd280_0000,
-            0xf940_00a4,
-            0xaa04_0000,
-            0xf947_fca4,
-            0xaa04_0000,
-            0x9140_04a5,
-            0xeb02_00bf,
-            0x54ff_ff43,
-            0xd400_0001,
-            0x1400_0000,
-            0xf900_00c3,
-            0x9100_0463,
-            0x17ff_fffe,
-        ]
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
-        p.write(t, CODE, &code).unwrap();
-        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
-            .unwrap();
-        p.map(t, SPIN_DATA, 4 * PAGE, Prot::RW, Sharing::Private)
-            .unwrap();
-        let mut spinners = Vec::new();
-        for i in 1..vcpus.min(4) as u64 {
-            let s = p.clone_task(t, true).unwrap();
-            let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
-                unreachable!()
-            };
-            ctx.pc = CODE + 0x3c;
-            ctx.x[6] = SPIN_DATA + i * PAGE;
-            p.set_context(s, &Context::Aarch64(ctx)).unwrap();
-            p.resume(s, Resume::Continue).unwrap();
-            spinners.push(s);
-        }
-        let start = footprint();
-        let next = |p: &mut HvfPlatform| loop {
-            let ev = p.wait(None).unwrap().unwrap();
-            if ev.task == t {
-                return word(ev.trap);
-            }
-            // A spinner's slice: on with it.
-            p.resume(ev.task, Resume::Continue).unwrap();
-        };
-        for round in 0..5u64 {
-            p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
-            let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
-                unreachable!()
-            };
-            ctx.pc = CODE;
-            ctx.x[1] = REGION;
-            ctx.x[2] = REGION + LEN;
-            ctx.x[3] = 0xa5a5_0000 + round + 1;
-            ctx.x[5] = REGION;
-            p.set_context(t, &Context::Aarch64(ctx)).unwrap();
-            let untouched = footprint();
-            p.resume(t, Resume::Continue).unwrap();
-            next(&mut p);
-            let touched = footprint();
-            // The footprints are this test process's, in which other
-            // tests allocate meanwhile: they are reported, and what is
-            // checked is what the platform counts (the command-line tests
-            // check the footprint, from outside the process).
-            assert!(
-                p.memory_in_use().0 >= LEN,
-                "round {round}: {} in use after the touch",
-                p.memory_in_use().0
-            );
-            // Freed, then mapped again with nothing in it.
-            let (_, before) = p.memory_kept();
-            let timer = Instant::now();
-            p.unmap(t, REGION, LEN).unwrap();
-            let unmap = timer.elapsed();
-            // Nothing goes back at once; it does within
-            // `GIVE_BACK_AGE` (here, with the program stopped, once the
-            // event loop is idle).
-            let (kept, back_after) = given_back(&mut p, t);
-            let (_, after) = p.memory_kept();
-            assert!(kept <= 512 << 10, "round {round}: {kept} kept");
-            let freed = footprint();
-            assert!(
-                after.ram - before.ram >= LEN / 16384 - 64,
-                "round {round}: trimmed {before:?} -> {after:?}"
-            );
-            p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
-            let timer = Instant::now();
-            p.resume(t, Resume::Continue).unwrap();
-            assert_eq!(next(&mut p), 0, "round {round}: old bytes in new memory");
-            let reread = timer.elapsed();
-            p.unmap(t, REGION, LEN).unwrap();
-            given_back(&mut p, t);
-            eprintln!(
-                "{vcpus} vCPUs, round {round}: footprint {} MiB at the start, {} before the \
-                 touch, {} touched, {} freed (resident {}); unmap of 64 MiB {unmap:?}, back after {back_after:?} \
-                 ({} host pages in {} calls, {} µs), \
-                 64 MiB read again {reread:?}",
-                start >> 20,
-                untouched >> 20,
-                touched >> 20,
-                freed >> 20,
-                resident_kib(),
-                after.ram - before.ram,
-                after.calls - before.calls,
-                (after.nanos - before.nanos) / 1000
-            );
-        }
-        for s in spinners {
-            p.kill(s).unwrap();
-        }
-        p.kill(t).unwrap();
-        // What the pools kept goes back once the loop is idle.
-        for _ in 0..100 {
-            if p.wait(Some(Duration::from_millis(100))).unwrap().is_none() {
-                break;
-            }
-        }
-        assert_eq!(p.memory_kept().0, 0);
-        assert_eq!(p.memory_in_use().0, 0);
-    }
-
-    /// On the only vCPU a program spins without a system call, so the
-    /// event loop is never idle: what was freed goes back once it has been
-    /// free for `GIVE_BACK_AGE` (but the reserve), the run being ended for
-    /// it.
-    #[test]
-    fn freed_memory_goes_back_while_a_program_spins() {
-        let _guard = super::vm_tests::VM
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut p = match HvfPlatform::new(HvfConfig {
-            vcpus: 1,
-            ..HvfConfig::default()
-        }) {
-            Ok(p) => p,
-            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
-                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
-            }
-            Err(err) => {
-                eprintln!("SKIPPING: {err}");
-                return;
-            }
-        };
-        let t = p.spawn().unwrap();
-        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
-        // spin: [x6] = x3++ for ever.
-        let code: Vec<u8> = [0xf900_00c3u32, 0x9100_0463, 0x17ff_fffe]
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        p.write(t, CODE, &code).unwrap();
-        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
-            .unwrap();
-        p.map(t, SPIN_DATA, PAGE, Prot::RW, Sharing::Private)
-            .unwrap();
-        p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
-        for i in 0..LEN / PAGE {
-            p.write(t, REGION + i * PAGE, &[1]).unwrap();
-        }
-        // From before the memory is freed: it cannot go back sooner than
-        // `GIVE_BACK_AGE` after this.
-        let timer = Instant::now();
-        p.unmap(t, REGION, LEN).unwrap();
-        assert!(p.memory_kept().0 >= LEN - (1 << 20));
-        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
-            unreachable!()
-        };
-        ctx.pc = CODE;
-        ctx.x[6] = SPIN_DATA;
-        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
-        p.resume(t, Resume::Continue).unwrap();
-        let mut kept = p.memory_kept().0;
-        while kept > (crate::mmu::RAM_KEEP + crate::mmu::TABLES_KEEP) * 16384
-            && timer.elapsed() < Duration::from_secs(2)
-        {
-            // The program never stops: each wait ends with its deadline.
-            assert!(p.wait(Some(Duration::from_millis(20))).unwrap().is_none());
-            kept = p.memory_kept().0;
-        }
-        let took = timer.elapsed();
-        eprintln!("spinning: {kept} bytes kept after {took:?}");
-        assert!(
-            kept <= (crate::mmu::RAM_KEEP + crate::mmu::TABLES_KEEP) * 16384,
-            "{kept} kept after {took:?}"
-        );
-        assert!(took >= GIVE_BACK_AGE, "{took:?}");
-        p.kill(t).unwrap();
-    }
-
-    #[test]
-    fn freed_memory_goes_back_on_one_vcpu() {
-        run(1);
-    }
-
-    #[test]
-    fn freed_memory_goes_back_with_other_vcpus_running() {
-        run(4);
-    }
-}
-
-/// What needs the platform's insides: spaces beyond the ASIDs there are.
-#[cfg(test)]
-mod vm_tests {
-    use super::*;
-
-    /// One VM per process: the tests of this crate that make one take
-    /// turns.
-    pub(super) static VM: Mutex<()> = Mutex::new(());
-
-    const CODE: u64 = 0x10_000;
-    const DATA: u64 = 0x20_000;
-
-    fn word(trap: Trap) -> u64 {
-        match trap {
-            Trap::Syscall(SyscallTrap { args, .. }) => args[0],
-            other => panic!("not a syscall: {other:?}"),
-        }
-    }
-
-    /// The timer (or a waker) may stop the vCPU inside the page flush
-    /// routine, while `x0` holds the routine's operand and the app's own
-    /// `x0` waits in `TPIDR_EL1`: the app gets its own back, and the whole
-    /// TLB is flushed instead.
-    #[test]
-    fn an_interrupted_page_flush_gives_the_app_its_x0_back() {
-        let _guard = VM.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = match HvfPlatform::new(HvfConfig {
-            vcpus: 1,
-            ..HvfConfig::default()
-        }) {
-            Ok(p) => p,
-            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
-                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
-            }
-            Err(err) => {
-                eprintln!("SKIPPING: {err}");
-                return;
-            }
-        };
-        let t = p.spawn().unwrap();
-        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
-        // Loop: svc.
-        let code: Vec<u8> = [0xd400_0001u32, 0x17ff_ffff]
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        p.write(t, CODE, &code).unwrap();
-        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
-            .unwrap();
-        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
-            unreachable!()
-        };
-        ctx.pc = CODE;
-        ctx.x[0] = 0x1111;
-        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
-        p.resume(t, Resume::Continue).unwrap();
-        assert_eq!(word(p.wait(None).unwrap().unwrap().trap), 0x1111);
-        // The vCPU as an exit inside the routine leaves it, at each of
-        // its instructions: before and after `x0` is the app's again.
-        for (at, x0) in [
-            (0u64, 0xdead_0000_0000_0123u64),
-            (12, 0xdead_0000_0000_0123),
-            (16, 0x2222),
-        ] {
-            p.runner.flush = false;
-            p.runner
-                .vcpu
-                .set_sys_reg(sysreg::TPIDR_EL1, 0x2222)
-                .unwrap();
-            p.runner.vcpu.set_reg(0, x0).unwrap();
-            p.runner
-                .vcpu
-                .set_reg(HV_REG_PC, SHIM_VA + FLUSH_PAGE_OFFSET + at)
-                .unwrap();
-            p.runner
-                .vcpu
-                .set_reg(HV_REG_CPSR, layout::PSTATE_EL1H_MASKED)
-                .unwrap();
-            let mut current = Current {
-                key: t,
-                root: 0,
-                asid: 0,
-                pc: 0,
-                pstate: 0,
-            };
-            assert!(matches!(
-                p.runner.interrupted_at(&mut current).unwrap(),
-                Interrupted::Settled
-            ));
-            assert!(p.runner.flush, "the whole TLB is flushed instead");
-            assert_eq!(p.runner.vcpu.reg(0).unwrap(), 0x2222);
-            // And the app runs on with it.
-            p.resume(t, Resume::Continue).unwrap();
-            assert_eq!(
-                word(p.wait(None).unwrap().unwrap().trap),
-                0x2222,
-                "at +{at}"
-            );
-        }
-    }
-
-    /// The core answers a system call of a task whose registers are in
-    /// another vCPU, and reads the registers before that vCPU has run the
-    /// task again (as it does to deliver a signal that came in between):
-    /// they have the result, and so does the app when it runs.
-    #[test]
-    fn registers_read_before_the_task_runs_again_have_the_result() {
-        let _guard = VM.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = match HvfPlatform::new(HvfConfig {
-            vcpus: 2,
-            ..HvfConfig::default()
-        }) {
-            Ok(p) => p,
-            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
-                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
-            }
-            Err(err) => {
-                eprintln!("SKIPPING: {err}");
-                return;
-            }
-        };
-        let t = p.spawn().unwrap();
-        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
-        // Loop: svc.
-        let code: Vec<u8> = [0xd400_0001u32, 0x17ff_ffff]
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        p.write(t, CODE, &code).unwrap();
-        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
-            .unwrap();
-        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
-            unreachable!()
-        };
-        ctx.pc = CODE;
-        ctx.x[0] = 0x1111;
-        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
-        // Runnable without a call of `wait`, so that vCPU 1 runs it, not
-        // the event loop's.
-        {
-            let mut sched = p.lock();
-            sched.tasks.get_mut(&t).unwrap().state = State::Runnable;
-            p.smp.wake(1);
-        }
-        let start = Instant::now();
-        while p.lock().events.is_empty() {
-            assert!(
-                start.elapsed() < Duration::from_secs(10),
-                "vCPU 1 ran nothing"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(word(p.wait(None).unwrap().unwrap().trap), 0x1111);
-        assert_eq!(p.lock().tasks[&t].loaded, Some(1));
-        p.set_x0(t, 0x7777).unwrap();
-        let Context::Aarch64(ctx) = p.context(t).unwrap() else {
-            unreachable!()
-        };
-        assert_eq!(ctx.x[0], 0x7777, "the result is in the registers read");
-        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
-        p.resume(t, Resume::Continue).unwrap();
-        assert_eq!(word(p.wait(None).unwrap().unwrap().trap), 0x7777);
-        p.kill(t).unwrap();
-    }
-
-    /// With ASIDs used up, new spaces share ASID 0, and switching between
-    /// two of them flushes: each process still reads its own page.
-    #[test]
-    fn spaces_beyond_the_asids_share_one_and_flush() {
-        let _guard = VM.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = match HvfPlatform::new(HvfConfig {
-            vcpus: 1,
-            ..HvfConfig::default()
-        }) {
-            Ok(p) => p,
-            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
-                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
-            }
-            Err(err) => {
-                eprintln!("SKIPPING: {err}");
-                return;
-            }
-        };
-        // ASID 1 only; every other space gets 0.
-        p.lock().asid_limit = 2;
-        let t = p.spawn().unwrap();
-        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
-        // Loop: x0 = [x1]; svc; [x1] = x2; svc.
-        let code: Vec<u8> = [
-            0xf940_0020u32,
-            0xd400_0001,
-            0xf900_0022,
-            0xd400_0001,
-            0x17ff_fffc,
-        ]
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
-        p.write(t, CODE, &code).unwrap();
-        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
-            .unwrap();
-        p.map(t, DATA, PAGE, Prot::RW, Sharing::Private).unwrap();
-        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
-            unreachable!()
-        };
-        ctx.pc = CODE;
-        ctx.x[1] = DATA;
-        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
-        p.resume(t, Resume::Continue).unwrap();
-        let ev = p.wait(None).unwrap().unwrap();
-        assert_eq!(word(ev.trap), 0);
-        let mut tasks = vec![t];
-        for _ in 0..3 {
-            tasks.push(p.clone_task(t, false).unwrap());
-        }
-        let asids: Vec<u16> = tasks
-            .iter()
-            .map(|t| {
-                let sched = p.lock();
-                sched.spaces[&sched.tasks[t].space].asid
-            })
-            .collect();
-        assert_eq!(asids, [1, 0, 0, 0]);
-        // Each stores its own value, then all read theirs, in turn, many
-        // times.
-        for (i, &t) in tasks.iter().enumerate() {
-            let mut ctx = match p.context(t).unwrap() {
-                Context::Aarch64(c) => c,
-                Context::X86_64(_) => unreachable!(),
-            };
-            ctx.x[2] = 0x100 + i as u64;
-            p.set_context(t, &Context::Aarch64(ctx)).unwrap();
-        }
-        let step = |p: &mut HvfPlatform, t: TaskKey| {
-            p.resume(t, Resume::Continue).unwrap();
-            let ev = p.wait(None).unwrap().unwrap();
-            assert_eq!(ev.task, t);
-            ev.trap
-        };
-        for &t in &tasks {
-            step(&mut p, t);
-        }
-        for round in 0..50 {
-            for (i, &t) in tasks.iter().enumerate() {
-                assert_eq!(word(step(&mut p, t)), 0x100 + i as u64, "round {round}");
-                step(&mut p, t);
-            }
-        }
-        for t in tasks {
-            p.kill(t).unwrap();
-        }
-    }
-
-    /// The timer can end a slice while the vCPU is in an exception vector,
-    /// on its way out with an exception of the app. When that exception
-    /// needs nothing from the core (here a page that gets its memory on
-    /// first touch), the run still ends there; before, the app went on
-    /// with no timer and kept the vCPU until something else stopped it.
-    #[test]
-    fn a_slice_that_ends_in_a_vector_still_ends() {
-        let _guard = VM.lock().unwrap_or_else(|e| e.into_inner());
-        let mut p = match HvfPlatform::new(HvfConfig {
-            vcpus: 1,
-            ..HvfConfig::default()
-        }) {
-            Ok(p) => p,
-            Err(err) if std::env::var("HELLOVM_REQUIRE_E2E").as_deref() == Ok("1") => {
-                panic!("HELLOVM_REQUIRE_E2E=1 but the HVF platform is unavailable: {err}")
-            }
-            Err(err) => {
-                eprintln!("SKIPPING: {err}");
-                return;
-            }
-        };
-        const BASE: u64 = 0x1000_0000;
-        const LEN: u64 = 64 << 20;
-        let t = p.spawn().unwrap();
-        p.map(t, CODE, PAGE, Prot::RW, Sharing::Private).unwrap();
-        // Touch every page: str x2, [x1]; add x1, x1, #4096; cmp x1, x3;
-        // b.ne back; then spin: b .
-        let code: Vec<u8> = [
-            0xf900_0022u32,
-            0x9140_0421,
-            0xeb03_003f,
-            0x54ff_ffa1,
-            0x1400_0000,
-        ]
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
-        p.write(t, CODE, &code).unwrap();
-        p.protect(t, CODE, PAGE, Prot(Prot::READ.0 | Prot::EXEC.0))
-            .unwrap();
-        p.map(t, BASE, LEN, Prot::RW, Sharing::Private).unwrap();
-        let Context::Aarch64(mut ctx) = Context::zeroed(Arch::Aarch64) else {
-            unreachable!()
-        };
-        ctx.pc = CODE;
-        ctx.x[1] = BASE;
-        ctx.x[3] = BASE + LEN;
-        p.set_context(t, &Context::Aarch64(ctx)).unwrap();
-        p.resume(t, Resume::Continue).unwrap();
-        // A waker, should a run not end by itself.
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watchdog = {
-            let (waker, done) = (p.waker(), Arc::clone(&done));
-            std::thread::spawn(move || {
-                let lock = Mutex::new(());
-                let cv = Condvar::new();
-                let mut guard = lock.lock().unwrap();
-                while !done.load(SeqCst) {
-                    guard = cv
-                        .wait_timeout(guard, Duration::from_millis(500))
-                        .unwrap()
-                        .0;
-                    waker.wake();
-                }
-            })
-        };
-        let start = Instant::now();
-        let mut slowest = Duration::ZERO;
-        while start.elapsed() < Duration::from_secs(1) {
-            let before = Instant::now();
-            assert!(p.wait(Some(Duration::from_micros(20))).unwrap().is_none());
-            slowest = slowest.max(before.elapsed());
-        }
-        done.store(true, SeqCst);
-        watchdog.join().unwrap();
-        assert!(p.memory_in_use().0 >= LEN, "the app touched every page");
-        assert!(
-            slowest < Duration::from_millis(100),
-            "a wait of 20 us took {slowest:?}"
-        );
-        p.kill(t).unwrap();
-    }
-}
+#[cfg(feature = "testing")]
+#[path = "testing.rs"]
+pub mod testing;

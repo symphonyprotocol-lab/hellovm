@@ -4,6 +4,7 @@ members = [
     "core",
     "host",
     "platform-seccomp",
+    "platform-arm64",
     "platform-hvf",
     "sandbox",
     "test-guest",
@@ -36,6 +37,7 @@ hellovm-egress-wire = { path = "egress-wire" }
 hellovm-control = { path = "control" }
 hellovm-noded = { path = "noded" }
 hellovm-platform-seccomp = { path = "platform-seccomp" }
+hellovm-platform-arm64 = { path = "platform-arm64" }
 hellovm-platform-hvf = { path = "platform-hvf" }
 hellovm-sandbox = { path = "sandbox" }
 hellovm-test-guest = { path = "test-guest" }

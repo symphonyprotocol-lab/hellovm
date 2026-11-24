@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 hellovm-core.workspace = true
+hellovm-platform-arm64.workspace = true
 log.workspace = true
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -16,4 +17,5 @@ libc.workspace = true
 
 [dev-dependencies]
 hellovm-host.workspace = true
+hellovm-platform-arm64 = { workspace = true, features = ["testing"] }
 hellovm-test-guest.workspace = true

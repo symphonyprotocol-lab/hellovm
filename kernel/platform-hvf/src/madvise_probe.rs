@@ -8,8 +8,8 @@
 use std::io::Write as _;
 
 use super::*;
-use crate::layout::pte;
 use crate::sys::HOST_PAGE;
+use hellovm_platform_arm64::layout::pte;
 
 const CODE: u64 = 0x10_000;
 const DATA: u64 = 0x20_000;
@@ -82,7 +82,7 @@ fn madvise_of_mapped_app_memory() {
     };
     let mut log = Log::open();
     log.step(&format!("start, advice {advice}"));
-    let _guard = super::vm_tests::VM
+    let _guard = crate::tests::vm_tests::VM
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut p = HvfPlatform::new(HvfConfig {
@@ -112,12 +112,9 @@ fn madvise_of_mapped_app_memory() {
         p.write(t, DATA + i * PAGE, &[1]).unwrap();
     }
     // A host page all of whose four frames are data pages.
-    let root = {
-        let sched = p.lock();
-        sched.spaces[&sched.tasks[&t].space].root
-    };
+    let root = p.root_of(t);
     let (host_off, va) = {
-        let phys = p.smp.phys();
+        let phys = p.phys_for_tests();
         let frames: Vec<(u64, u64)> = (0..DATA_PAGES)
             .map(|i| {
                 let va = DATA + i * PAGE;
@@ -134,26 +131,25 @@ fn madvise_of_mapped_app_memory() {
             .expect("a host page of data frames");
         ((frame - layout::RAM_IPA) as usize, va)
     };
-    let host = unsafe { p.smp.phys().ram_backing().ptr().add(host_off) };
+    let host = unsafe { p.phys_for_tests().ram_backing().ptr().add(host_off) };
     log.step(&format!(
         "host page at offset {host_off:#x}, guest va {va:#x}"
     ));
 
     let pattern = |b: u8| vec![b; HOST_PAGE];
     let fill = |p: &mut HvfPlatform, b: u8| {
-        p.smp
-            .phys()
+        p.phys_for_tests()
             .ram_backing_mut_for_probe()
             .write_at(host_off, &pattern(b));
     };
     let host_word = |p: &HvfPlatform| {
         let mut buf = [0u8; 8];
-        p.smp.phys().ram_backing().read_at(host_off, &mut buf);
+        p.phys_for_tests().ram_backing().read_at(host_off, &mut buf);
         u64::from_le_bytes(buf)
     };
     let host_all = |p: &HvfPlatform| {
         let mut buf = vec![0u8; HOST_PAGE];
-        p.smp.phys().ram_backing().read_at(host_off, &mut buf);
+        p.phys_for_tests().ram_backing().read_at(host_off, &mut buf);
         buf
     };
 
@@ -304,7 +300,7 @@ fn reclaimed_pages_behind_stage_2() {
     const STEP: usize = 64 << 20;
     let mut log = Log::open();
     log.step("pressure: start");
-    let _guard = super::vm_tests::VM
+    let _guard = crate::tests::vm_tests::VM
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut p = HvfPlatform::new(HvfConfig {
@@ -356,12 +352,9 @@ fn reclaimed_pages_behind_stage_2() {
     p.map(t, REGION, LEN, Prot::RW, Sharing::Private).unwrap();
     log.step("pressure: the program writes 64 MiB");
     start(&mut p, CODE);
-    let root = {
-        let sched = p.lock();
-        sched.spaces[&sched.tasks[&t].space].root
-    };
+    let root = p.root_of(t);
     let mut offsets: Vec<usize> = {
-        let phys = p.smp.phys();
+        let phys = p.phys_for_tests();
         (0..LEN / PAGE)
             .map(|i| {
                 let frame = phys.lookup(root, REGION + i * PAGE) & pte::ADDR_MASK;
@@ -371,11 +364,11 @@ fn reclaimed_pages_behind_stage_2() {
     };
     offsets.sort_unstable();
     offsets.dedup();
-    let base = p.smp.phys().ram_backing().ptr() as *const u8;
+    let base = p.phys_for_tests().ram_backing().ptr() as *const u8;
     // Freed and given back, all of it.
     p.unmap(t, REGION, LEN).unwrap();
     log.step("pressure: freed; giving it all back");
-    p.trim_all();
+    p.trim_all_for_tests();
     let given = p.memory_kept().1;
     log.step(&format!(
         "pressure: given back {given:?}; {} of {} host pages resident; free pages {}",
@@ -468,7 +461,7 @@ fn reclaimed_pages_behind_stage_2() {
         "pressure: the program read OR {or:#x} (must be 0)"
     ));
     let reused = {
-        let phys = p.smp.phys();
+        let phys = p.phys_for_tests();
         (0..LEN / PAGE)
             .filter(|i| {
                 let frame = phys.lookup(root, REGION + i * PAGE) & pte::ADDR_MASK;

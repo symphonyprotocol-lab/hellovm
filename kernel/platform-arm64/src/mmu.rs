@@ -96,9 +96,29 @@ use hellovm_core::platform::Prot;
 
 use crate::layout::{pte, MAX_ADDR, PAGE, RAM_IPA, SHIM_IPA, SHIM_VA, TABLES_IPA};
 
+/// A page of the `TTBR1_EL1` tree besides the shim
+/// ([`Phys::shim_space_with`]): EL1 only, never executable.
+#[derive(Clone, Copy, Debug)]
+pub struct El1Page {
+    pub va: u64,
+    /// Its guest-physical address.
+    pub ipa: u64,
+    pub writable: bool,
+    /// Its `MAIR_EL1` attribute.
+    pub attr_index: u64,
+}
+
 /// Memory the pools live in.
 pub trait Backing {
     fn bytes(&self) -> &[u8];
+    /// The size in bytes.
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn bytes_mut(&mut self) -> &mut [u8];
     /// Makes code written to `offset..offset + len` visible to the guest's
     /// instruction fetch.
@@ -804,7 +824,7 @@ impl<B: Backing> Phys<B> {
         &self.ram
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn ram_backing_mut_for_probe(&mut self) -> &mut B {
         &mut self.ram
     }
@@ -1110,6 +1130,22 @@ impl<B: Backing> Phys<B> {
     /// The `TTBR1_EL1` tree: the shim page at [`SHIM_VA`], EL1 read and
     /// execute only. EL0 can neither read nor execute it.
     pub fn shim_space(&mut self) -> Result<u64, MmuError> {
+        self.shim_space_with(&[])
+    }
+
+    /// [`Phys::shim_space`] with more pages for EL1 only, none of them
+    /// executable (the KVM platform's register frames and its exit page),
+    /// each in the 2 MiB after the shim page. A page outside it, or on the
+    /// shim page, is `BadAddress`.
+    pub fn shim_space_with(&mut self, extra: &[El1Page]) -> Result<u64, MmuError> {
+        let span = SHIM_VA + PAGE..SHIM_VA + (1 << 21);
+        if extra.iter().any(|page| {
+            !span.contains(&page.va)
+                || !page.va.is_multiple_of(PAGE)
+                || page.ipa & !pte::ADDR_MASK != 0
+        }) {
+            return Err(MmuError::BadAddress);
+        }
         let root = self.new_table()?;
         let mut table = root;
         for level in 0..3 {
@@ -1129,6 +1165,18 @@ impl<B: Backing> Phys<B> {
             | pte::AP_RO
             | pte::UXN;
         self.set_entry(table, index(SHIM_VA, 3), desc);
+        for page in extra {
+            let desc = page.ipa
+                | pte::VALID
+                | pte::TABLE_OR_PAGE
+                | pte::AF
+                | pte::SH_INNER
+                | (page.attr_index & 7) << 2
+                | if page.writable { 0 } else { pte::AP_RO }
+                | pte::UXN
+                | pte::PXN;
+            self.set_entry(table, index(page.va, 3), desc);
+        }
         Ok(root)
     }
 

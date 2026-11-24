@@ -616,7 +616,7 @@ unsafe impl Sync for HostMem {}
 impl Drop for HostMem {
     fn drop(&mut self) {
         // SAFETY: unmaps exactly what `new` mapped. The VM's stage-2
-        // mapping of it is removed first (see `HvfPlatform::drop`).
+        // mapping of it is removed first (see `Hvf::release`).
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
     }
 }
@@ -709,9 +709,9 @@ impl Drop for SharedMap {
     }
 }
 
-impl crate::mmu::Origin for SharedMap {
+impl hellovm_platform_arm64::Origin for SharedMap {
     fn read_frame(&self, index: usize, out: &mut [u8]) {
-        let page = crate::layout::PAGE as usize;
+        let page = hellovm_platform_arm64::layout::PAGE as usize;
         let at = index.checked_mul(page).filter(|&at| at + page <= self.len);
         match at {
             Some(at) => {
