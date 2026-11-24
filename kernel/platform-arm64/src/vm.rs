@@ -1058,6 +1058,24 @@ impl<H: Hypervisor> Runner<H> {
     }
 }
 
+/// A vCPU made on one thread, to be run on another
+/// ([`Hypervisor::DEFER_THREADS`]).
+struct Unbound<T>(T);
+
+// SAFETY: only made for a backend with `DEFER_THREADS`, whose vCPUs may
+// move to another thread before they first run (the trait's contract);
+// the vCPU is used on one thread at a time, first the one that made it
+// (set-up only), then its own.
+unsafe impl<T> Send for Unbound<T> {}
+
+impl<T> Unbound<T> {
+    /// Takes the whole value (a closure that named the field would
+    /// capture the field alone, which is not `Send`).
+    fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 /// What claiming a task found ([`Runner::claim`]).
 struct Claimed {
     /// Its registers, unless they are in this vCPU already.
@@ -1213,6 +1231,9 @@ pub struct VmPlatform<H: Hypervisor> {
     /// before [`Platform::thaw`] ([`VmPlatform::load_frozen`]).
     frozen: Option<Vec<FrozenTasks>>,
     config: VmConfig,
+    /// vCPUs made but whose threads have not started yet
+    /// ([`Hypervisor::DEFER_THREADS`]).
+    deferred: Vec<Unbound<Runner<H>>>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -1412,16 +1433,29 @@ impl<H: Hypervisor> VmPlatform<H> {
                 table_memory,
                 vcpus: config.vcpus,
             },
+            deferred: Vec::new(),
             _not_send: PhantomData,
         };
+        let token = platform.vm.token();
+        if H::DEFER_THREADS {
+            // Every vCPU made here, on this thread; their threads start
+            // at the first `wait` (`start_threads`).
+            for index in 1..vcpus {
+                let mut vcpu = H::vcpu(token.clone(), index)?;
+                vcpu.set_up(tcr, shim_root)?;
+                let _ = platform.smp.slots[index].kicker.set(vcpu.kicker());
+                platform.deferred.push(Unbound(Runner::new(index, vcpu)));
+            }
+            return Ok(platform);
+        }
         // The other vCPUs, each made by its own thread (a vCPU belongs to
         // the thread that made it). Made now, before the kernel process
         // hardens itself, so that it never needs to make a thread or a
         // vCPU afterwards.
-        let token = platform.vm.token();
         for index in 1..vcpus {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let smp = Arc::clone(&platform.smp);
+            let token = token.clone();
             let thread = std::thread::Builder::new()
                 .name(format!("hellovm-vcpu{index}"))
                 .spawn(move || {
@@ -1453,6 +1487,27 @@ impl<H: Hypervisor> VmPlatform<H> {
             }
         }
         Ok(platform)
+    }
+
+    /// The VM.
+    pub fn hypervisor(&self) -> &H {
+        &self.vm
+    }
+
+    /// Starts the threads of the vCPUs made in [`VmPlatform::new`] when
+    /// the backend defers them ([`Hypervisor::DEFER_THREADS`]): called by
+    /// the first `wait`, once the kernel process has confined itself.
+    fn start_threads(&mut self) -> io::Result<()> {
+        while let Some(Unbound(runner)) = self.deferred.pop() {
+            let smp = Arc::clone(&self.smp);
+            let index = runner.index;
+            let runner = Unbound(runner);
+            let thread = std::thread::Builder::new()
+                .name(format!("hellovm-vcpu{index}"))
+                .spawn(move || vcpu_thread(smp, runner.into_inner()))?;
+            self.threads.push(thread);
+        }
+        Ok(())
     }
 
     /// A handle that ends every app from any thread.
@@ -2027,6 +2082,9 @@ impl<H: Hypervisor> Platform for VmPlatform<H> {
     }
 
     fn wait(&mut self, timeout: Option<Duration>) -> Result<Option<Event>, PlatformError> {
+        if !self.deferred.is_empty() {
+            self.start_threads().map_err(host_err)?;
+        }
         let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         let smp = Arc::clone(&self.smp);
         loop {

@@ -3,7 +3,8 @@
 //! ```text
 //! hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty]
 //!         [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES]
-//!         [--vcpus N] [--sandbox require|best-effort|off] --root DIR
+//!         [--platform seccomp|kvm] [--vcpus N]
+//!         [--sandbox require|best-effort|off] --root DIR
 //!         [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
 //! ```
 //!
@@ -20,9 +21,13 @@
 //! and makes hellovm exit with 124, like `timeout(1)`. `--trace` prints
 //! every syscall the kernel handled to stderr. `--fs-limit` caps the
 //! in-memory writable layer (file contents plus a small cost per file;
-//! default 2 GiB): writes past it fail with `ENOSPC`. `--vcpus` (macOS
-//! only) sets how many vCPUs run the program's threads in parallel (1 to
-//! 64; default one per host CPU, at most 8).
+//! default 2 GiB): writes past it fail with `ENOSPC`. `--platform` (Linux
+//! only) chooses what runs the program: `seccomp` (the default: app
+//! processes under seccomp and ptrace) or `kvm` (a KVM virtual machine,
+//! on arm64 Linux with `/dev/kvm`; aarch64 programs; no warm clones).
+//! `--vcpus` (macOS, and `--platform kvm`) sets how many vCPUs run the
+//! program's threads in parallel (1 to 64; default one per host CPU, at
+//! most 8).
 //!
 //! `--egress SOCKET` sends the sandbox's outbound TCP flows to the
 //! `hellovm-egress` proxy listening on that Unix socket; without it nothing
@@ -209,7 +214,7 @@ mod template;
 mod template_macos;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
-     [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES] [--vcpus N] [--sandbox require|best-effort|off] --root DIR \
+     [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES] [--platform seccomp|kvm] [--vcpus N] [--sandbox require|best-effort|off] --root DIR \
      [--env NAME=VALUE]... [--] PROGRAM [ARGS...]
        hellovm --template SOCKET [options] --root DIR PROGRAM [ARGS...]
        hellovm --clone SOCKET [--sandbox-id ID] [--input DATA] [--timeout SECONDS] [--ready]";
@@ -270,9 +275,12 @@ struct Options {
     sandbox_id: Option<u64>,
     /// `--fs-limit BYTES`: the writable layer's limit.
     fs_limit: Option<u64>,
-    /// `--vcpus N`: vCPUs of the HVF platform (macOS).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// `--vcpus N`: vCPUs of the HVF platform (macOS) or the KVM platform
+    /// (Linux).
     vcpus: Option<usize>,
+    /// `--platform`: what runs the program on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    platform: PlatformKind,
     /// Test hook: splice outbound TCP to this loopback address.
     #[cfg(feature = "insecure-test-hooks")]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -305,8 +313,19 @@ struct Options {
     warm_role: Option<String>,
 }
 
+/// `--platform seccomp|kvm` (Linux).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PlatformKind {
+    /// App processes under seccomp and ptrace (`hellovm-platform-seccomp`).
+    #[default]
+    Seccomp,
+    /// A KVM virtual machine (`hellovm-platform-kvm`, arm64 only).
+    Kvm,
+}
+
 fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let mut trace = false;
+    let mut platform = PlatformKind::default();
     let mut tty = None;
     let mut timeout = None;
     let mut root = None;
@@ -434,12 +453,20 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                         .filter(|n| (1..=64).contains(n))
                         .ok_or_else(|| format!("--vcpus {text}: expected 1 to 64"))?,
                 );
-                if !cfg!(target_os = "macos") {
-                    return Err(
-                        "--vcpus is for the HVF platform (macOS): on Linux every thread of \
-                         the program is a host thread of its own"
-                            .into(),
-                    );
+                continue;
+            }
+            Some("--platform") => {
+                args.next();
+                let value = args.next().ok_or("--platform needs seccomp or kvm")?;
+                platform = match value.to_string_lossy().as_ref() {
+                    "seccomp" => PlatformKind::Seccomp,
+                    "kvm" => PlatformKind::Kvm,
+                    other => return Err(format!("--platform {other}: expected seccomp or kvm")),
+                };
+                if !cfg!(target_os = "linux") {
+                    return Err("--platform is for Linux (on macOS the HVF platform runs \
+                                every program)"
+                        .into());
                 }
                 continue;
             }
@@ -515,6 +542,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
             return Err(format!("--clone takes no program\n{USAGE}"));
         }
         return Ok(Options {
+            platform,
             trace,
             tty,
             timeout,
@@ -557,8 +585,23 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
     if argv.is_empty() && needs_program {
         return Err(USAGE.to_string());
     }
+    if vcpus.is_some() && cfg!(target_os = "linux") && platform != PlatformKind::Kvm {
+        return Err(
+            "--vcpus is for the HVF platform (macOS) and the KVM platform (--platform kvm): \
+             on the seccomp platform every thread of the program is a host thread of its own"
+                .into(),
+        );
+    }
+    if platform == PlatformKind::Kvm && template.is_some() {
+        return Err("--template: warm clones run on the seccomp platform, not on KVM".into());
+    }
+    #[cfg(feature = "insecure-test-hooks")]
+    if platform == PlatformKind::Kvm && (session || splice_to.is_some()) {
+        return Err("--insecure-test-session and --splice-to run on the seccomp platform".into());
+    }
     let root = root.ok_or_else(|| format!("--root is required\n{USAGE}"))?;
     Ok(Options {
+        platform,
         trace,
         tty,
         timeout,
@@ -657,6 +700,7 @@ fn harden(
     egress: Option<PathBuf>,
     fds: Result<usize, String>,
     warm: bool,
+    platform: hellovm_sandbox::Platform,
 ) -> Result<(Option<PathBuf>, bool), Box<dyn std::error::Error>> {
     #[cfg(feature = "insecure-test-hooks")]
     let (tcp_port, learn, skip_landlock) = (
@@ -670,7 +714,9 @@ fn harden(
     );
     #[cfg(not(feature = "insecure-test-hooks"))]
     let (tcp_port, learn, skip_landlock) = (None, None, false);
-    hellovm_platform_seccomp::check_clean_spawn()?;
+    if matches!(platform, hellovm_sandbox::Platform::Seccomp) {
+        hellovm_platform_seccomp::check_clean_spawn()?;
+    }
     let hardened = hellovm_sandbox::apply(hellovm_sandbox::Config {
         mode: options.sandbox,
         image: image.dir_fd(),
@@ -681,6 +727,7 @@ fn harden(
         skip_landlock,
         warm,
         fds,
+        platform,
     })?;
     if let Some(dir) = hardened.image {
         image.rebind(dir);
@@ -713,6 +760,9 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
         drop(image);
         return template::run(options, socket, fds);
     }
+    if options.platform == PlatformKind::Kvm {
+        return run_kvm(options, image, egress, fds);
+    }
     // Takes the host profile the sandbox and the platform share.
     let mut app = SeccompPlatform::new()?;
     // Before the hardening: the host opens what it needs from the host's
@@ -724,7 +774,14 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
         host.set_splice_endpoint(addr)?;
     }
     let image = host.image_mut().expect("the host has the image");
-    if let (Some(path), _) = harden(options, image, egress, fds, false)? {
+    if let (Some(path), _) = harden(
+        options,
+        image,
+        egress,
+        fds,
+        false,
+        hellovm_sandbox::Platform::Seccomp,
+    )? {
         host.set_egress(path)?;
     }
     #[cfg(feature = "insecure-test-hooks")]
@@ -790,6 +847,107 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     }
 }
 
+/// `--platform kvm`: the KVM platform (arm64 Linux), hardened as on the
+/// seccomp platform but with the KVM allowlist. The VM and its vCPUs are
+/// made first, with no thread of their own yet (namespaces and Landlock
+/// apply to the calling thread only); the vCPU threads start with the
+/// program.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn run_kvm(
+    options: &Options,
+    image: hellovm_host::ImageDir,
+    egress: Option<PathBuf>,
+    fds: Result<usize, String>,
+) -> Result<Ended, Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use hellovm_core::Kernel;
+    use hellovm_host::StdioHost;
+    use hellovm_platform_kvm::{KvmConfig, KvmPlatform};
+
+    let mut app = KvmPlatform::new(KvmConfig {
+        vcpus: options.vcpus.unwrap_or(0),
+        ..KvmConfig::default()
+    })
+    .map_err(|err| format!("the KVM platform: {err}"))?;
+    let (vm, vcpus) = app.hypervisor().fds();
+    // Before the hardening: the host opens what it needs from the host's
+    // filesystem (`/dev/urandom`) now.
+    let mut host = StdioHost::new(Some(image));
+    let image = host.image_mut().expect("the host has the image");
+    if let (Some(path), _) = harden(
+        options,
+        image,
+        egress,
+        fds,
+        false,
+        hellovm_sandbox::Platform::Kvm { vm, vcpus },
+    )? {
+        host.set_egress(path)?;
+    }
+    let sandbox_id = sandbox_id(options, &mut host)?;
+    let mut kernel = Kernel::new(host).with_sandbox_id(sandbox_id);
+    if let Some(bytes) = options.fs_limit {
+        kernel = kernel.with_fs_limit(bytes);
+    }
+    if options.trace {
+        kernel = kernel.with_trace();
+    }
+    let terminal = options
+        .tty
+        .unwrap_or_else(|| host_tty::is_terminal(0) && host_tty::is_terminal(1));
+    // Restores the host terminal when dropped.
+    let _raw = if terminal {
+        kernel = kernel.with_console(hellovm_core::ConsoleMode::Terminal);
+        host_tty::RawMode::enter(0)
+    } else {
+        None
+    };
+    kernel.exec(&mut app, &options.argv[0], &options.argv, &options.env)?;
+    if terminal {
+        if let Some((rows, cols)) = host_tty::window_size(1) {
+            kernel.set_window_size(rows, cols);
+        }
+    }
+    let timed_out = Arc::new(AtomicBool::new(false));
+    if let Some(timeout) = options.timeout {
+        let killer = app.killer();
+        let timed_out = Arc::clone(&timed_out);
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            timed_out.store(true, Ordering::SeqCst);
+            killer.kill();
+        });
+    }
+    let status = kernel.run(&mut app);
+    for record in kernel.trace() {
+        eprintln!("hellovm: trace: {record}");
+    }
+    if !kernel.host_mut().drain_streams(EXIT_DRAIN) {
+        log::warn!("outbound streams still had undelivered bytes after {EXIT_DRAIN:?}");
+    }
+    let status = status?;
+    match (status, options.timeout) {
+        (hellovm_core::ExitStatus::Signaled(9), Some(timeout))
+            if timed_out.load(Ordering::SeqCst) =>
+        {
+            Ok(Ended::TimedOut(timeout))
+        }
+        _ => Ok(Ended::Status(status)),
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+fn run_kvm(
+    _options: &Options,
+    _image: hellovm_host::ImageDir,
+    _egress: Option<PathBuf>,
+    _fds: Result<usize, String>,
+) -> Result<Ended, Box<dyn std::error::Error>> {
+    Err("--platform kvm: the KVM platform runs aarch64 programs on arm64 Linux only".into())
+}
+
 /// `--sandbox-id`, or a random one: what names the sandbox to the egress
 /// proxy.
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
@@ -817,7 +975,14 @@ fn run_session(
     let mut host = hellovm_host::CaptureHost::new(Some(image));
     hellovm_platform_seccomp::host_profile()?;
     let image = host.image_mut().expect("the host has the image");
-    let (egress, _) = harden(options, image, egress, fds, false)?;
+    let (egress, _) = harden(
+        options,
+        image,
+        egress,
+        fds,
+        false,
+        hellovm_sandbox::Platform::Seccomp,
+    )?;
     if let Some(addr) = options.splice_to {
         host.set_splice_endpoint(addr)?;
     }

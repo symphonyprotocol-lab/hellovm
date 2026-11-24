@@ -23,10 +23,19 @@ pub trait Hypervisor: Sized + 'static {
     const NAME: &'static str;
     /// The start of a warm-clone snapshot's magic.
     const SNAPSHOT_PREFIX: &'static str;
+    /// Whether the platform makes every vCPU when it is made, on the
+    /// calling thread, and starts the other vCPUs' threads only at its
+    /// first `wait`: so that a kernel process that confines itself in
+    /// between has no thread of its own before then (on Linux, namespaces
+    /// and Landlock apply to the calling thread only). A backend may say
+    /// so only if its vCPUs may move to another thread before they first
+    /// run (KVM's may). Hypervisor.framework binds a vCPU to the thread
+    /// that made it: there each vCPU's thread makes it, with the platform.
+    const DEFER_THREADS: bool = false;
     /// Host memory the pools live in.
     type Mem: Backing + Send + 'static;
     /// Lets another thread make a vCPU of this VM.
-    type Token: Copy + Send + 'static;
+    type Token: Clone + Send + 'static;
     type Vcpu: Vcpu<Kicker = Self::Kicker>;
     type Kicker: Kicker;
 
@@ -45,7 +54,7 @@ pub trait Hypervisor: Sized + 'static {
     fn token(&self) -> Self::Token;
 
     /// Makes vCPU `index` for the calling thread, which runs it from then
-    /// on.
+    /// on (with [`Hypervisor::DEFER_THREADS`], until it moves to its own).
     fn vcpu(token: Self::Token, index: usize) -> io::Result<Self::Vcpu>;
 
     /// The platform is going (every vCPU but the event loop's is gone):

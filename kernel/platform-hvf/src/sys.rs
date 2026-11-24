@@ -50,32 +50,9 @@ pub const HV_REG_FPCR: u32 = 32;
 pub const HV_REG_FPSR: u32 = 33;
 pub const HV_REG_CPSR: u32 = 34;
 
-/// `hv_sys_reg_t`: the system register encodings, `op0:op1:CRn:CRm:op2`.
-pub mod sysreg {
-    pub const ID_AA64PFR0_EL1: u16 = 0xc020;
-    pub const ID_AA64ISAR0_EL1: u16 = 0xc030;
-    pub const ID_AA64ISAR1_EL1: u16 = 0xc031;
-    pub const ID_AA64MMFR0_EL1: u16 = 0xc038;
-    pub const SCTLR_EL1: u16 = 0xc080;
-    pub const CPACR_EL1: u16 = 0xc082;
-    pub const TTBR0_EL1: u16 = 0xc100;
-    pub const TTBR1_EL1: u16 = 0xc101;
-    pub const TCR_EL1: u16 = 0xc102;
-    pub const SPSR_EL1: u16 = 0xc200;
-    pub const ELR_EL1: u16 = 0xc201;
-    pub const SP_EL0: u16 = 0xc208;
-    pub const ESR_EL1: u16 = 0xc290;
-    pub const FAR_EL1: u16 = 0xc300;
-    pub const MAIR_EL1: u16 = 0xc510;
-    pub const VBAR_EL1: u16 = 0xc600;
-    pub const CNTKCTL_EL1: u16 = 0xc708;
-    pub const TPIDR_EL1: u16 = 0xc684;
-    pub const TPIDR_EL0: u16 = 0xde82;
-    pub const TPIDRRO_EL0: u16 = 0xde83;
-    pub const CNTV_CTL_EL0: u16 = 0xdf19;
-    pub const CNTV_CVAL_EL0: u16 = 0xdf1a;
-    pub const SP_EL1: u16 = 0xe208;
-}
+/// `hv_sys_reg_t`: the system register encodings, `op0:op1:CRn:CRm:op2`
+/// (shared with KVM's `ONE_REG` ids).
+pub use hellovm_platform_arm64::layout::sysreg;
 
 #[link(name = "Hypervisor", kind = "framework")]
 extern "C" {

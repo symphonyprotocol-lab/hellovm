@@ -14,7 +14,8 @@
 //! and `HVF_GUESTS` are built as aarch64 Linux executables with the
 //! system's clang (`--target=aarch64-linux-gnu`) and the `rust-lld` of the
 //! Rust toolchain as the linker; there is no Linux libc there, so no C
-//! guests. Other targets build no guests and the crate is empty.
+//! guests. On aarch64 Linux `HVF_GUESTS` are built too, for the KVM
+//! platform's tests. Other targets build no guests and the crate is empty.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,8 @@ const ASM_GUESTS: &[&str] = &["hello", "enosys"];
 const C_GUESTS: &[&str] = &["pie", "signals", "threads", "forks", "smp"];
 /// C guests linked dynamically against the build host's libc.
 const DYNAMIC_GUESTS: &[&str] = &["dynamic", "netcheck"];
-/// aarch64-only assembly guests for the HVF platform's tests (`asm/hvf`).
+/// aarch64-only assembly guests for the HVF and KVM platforms' tests
+/// (`asm/hvf`), built on macOS and on aarch64 Linux.
 const HVF_GUESTS: &[&str] = &[
     "getpid_loop",
     "segv",
@@ -88,6 +90,19 @@ fn main() {
             guest.to_uppercase(),
             out.display()
         );
+    }
+    if arch == "aarch64" {
+        // For the KVM platform's tests, as on macOS for the HVF one's.
+        for guest in HVF_GUESTS {
+            let src = manifest_dir.join("asm/hvf").join(format!("{guest}.S"));
+            let out = out_dir.join(guest);
+            build(&cc, guest, &src, &out, &["-nostdlib", "-static", "-no-pie"]);
+            println!(
+                "cargo:rustc-env=HELLOVM_GUEST_{}={}",
+                guest.to_uppercase(),
+                out.display()
+            );
+        }
     }
     for guest in C_GUESTS {
         let var = format!("HELLOVM_GUEST_{}", guest.to_uppercase());

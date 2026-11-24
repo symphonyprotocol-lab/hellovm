@@ -131,6 +131,13 @@ pub const SCTLR_EL1: u64 = {
         | LSMAOE
 };
 
+/// [`SCTLR_EL1`] with `wfi` and `wfe` trapped to EL1 (`nTWI` and `nTWE`
+/// clear), for a hypervisor that does not trap them itself to the host:
+/// KVM would block the vCPU in a `wfi` until an interrupt. The shim takes
+/// them instead, and the platform skips them, as Hypervisor.framework's
+/// traps of them are skipped.
+pub const SCTLR_EL1_TRAP_WFX: u64 = SCTLR_EL1 & !(1 << 16 | 1 << 18);
+
 /// `TCR_EL1` for both halves, with `ips` (`TCR_EL1.IPS`, the
 /// intermediate physical address size) from `ID_AA64MMFR0_EL1.PARange`,
 /// and 16-bit ASIDs if `asid16` (else 8-bit). The ASID is taken from
@@ -187,6 +194,36 @@ pub const PSTATE_EL1H_MASKED: u64 = 0x3c5;
 pub const PSTATE_APP_MASK: u64 = 0xf000_0000 | PSTATE_DIT;
 /// `PSTATE.DIT`, as in `SPSR_ELx`.
 pub const PSTATE_DIT: u64 = 1 << 24;
+
+/// System register encodings, `op0:op1:CRn:CRm:op2` in 16 bits
+/// (`op0` in bits 15:14, `op1` 13:11, `CRn` 10:7, `CRm` 6:3, `op2` 2:0):
+/// Hypervisor.framework's `hv_sys_reg_t` and the low bits of KVM's
+/// `KVM_REG_ARM64_SYSREG` register ids.
+pub mod sysreg {
+    pub const ID_AA64PFR0_EL1: u16 = 0xc020;
+    pub const ID_AA64ISAR0_EL1: u16 = 0xc030;
+    pub const ID_AA64ISAR1_EL1: u16 = 0xc031;
+    pub const ID_AA64MMFR0_EL1: u16 = 0xc038;
+    pub const SCTLR_EL1: u16 = 0xc080;
+    pub const CPACR_EL1: u16 = 0xc082;
+    pub const TTBR0_EL1: u16 = 0xc100;
+    pub const TTBR1_EL1: u16 = 0xc101;
+    pub const TCR_EL1: u16 = 0xc102;
+    pub const SPSR_EL1: u16 = 0xc200;
+    pub const ELR_EL1: u16 = 0xc201;
+    pub const SP_EL0: u16 = 0xc208;
+    pub const ESR_EL1: u16 = 0xc290;
+    pub const FAR_EL1: u16 = 0xc300;
+    pub const MAIR_EL1: u16 = 0xc510;
+    pub const VBAR_EL1: u16 = 0xc600;
+    pub const CNTKCTL_EL1: u16 = 0xc708;
+    pub const TPIDR_EL1: u16 = 0xc684;
+    pub const TPIDR_EL0: u16 = 0xde82;
+    pub const TPIDRRO_EL0: u16 = 0xde83;
+    pub const CNTV_CTL_EL0: u16 = 0xdf19;
+    pub const CNTV_CVAL_EL0: u16 = 0xdf1a;
+    pub const SP_EL1: u16 = 0xe208;
+}
 
 /// Stage-1 descriptor bits (4 KiB granule).
 pub mod pte {
