@@ -7,7 +7,9 @@
 #   limactl start hellovm-kvm
 #
 # from the repository root: the repository is mounted read-only at /src.
-minimumLimaVersion: "1.0.0"
+# Lima 1.0.4 did not start a VM on a Mac with Docker Desktop (its network
+# helper fails on the /var/run/docker.sock link); 2.3.0 did.
+minimumLimaVersion: "2.0.0"
 vmType: vz
 nestedVirtualization: true
 cpus: 4

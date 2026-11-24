@@ -548,10 +548,18 @@ pub fn install_kick_handler() -> io::Result<()> {
     Ok(())
 }
 
-/// The calling thread's id.
+/// The calling thread's id (asked of the host once per thread).
 pub fn gettid() -> i32 {
-    // SAFETY: plain syscall.
-    unsafe { libc::gettid() }
+    thread_local! {
+        static TID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    }
+    TID.with(|tid| {
+        if tid.get() == 0 {
+            // SAFETY: plain syscall.
+            tid.set(unsafe { libc::gettid() });
+        }
+        tid.get()
+    })
 }
 
 /// Sends [`KICK_SIGNAL`] to thread `tid` of this process.
