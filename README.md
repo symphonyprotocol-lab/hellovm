@@ -11,7 +11,9 @@ The kernel lives in `kernel/`, a Rust workspace:
 | `hellovm-core` | `kernel/core` | Syscall emulation: processes, threads, signals, pipes, ELF loading, memory map, filesystem, terminal, `/proc`, IPv4 sockets; independent of the host OS |
 | `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks, outbound streams to the egress proxy |
 | `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
+| `hellovm-platform-arm64` | `kernel/platform-arm64` | What the two VM platforms share: stage-1 tables and pools, the VM layout, exception decoding and the scheduler, over a small hypervisor interface; their shared test suites |
 | `hellovm-platform-hvf` | `kernel/platform-hvf` | macOS platform on Apple silicon: a Hypervisor.framework VM with no guest kernel (see **The HVF platform (macOS)**) |
+| `hellovm-platform-kvm` | `kernel/platform-kvm` | arm64 Linux platform: the same VM on KVM (`--platform kvm`, see **The KVM platform (arm64 Linux)**) |
 | `hellovm-sandbox` | `kernel/sandbox` | Least privilege for the kernel process itself (see **Hardening**) |
 | `hellovm` | `kernel/hellovm` | Command-line launcher; warm-clone templates and clones, and the control protocol's client (`hellovm::warm`) |
 | `hellovm-egress` | `kernel/egress` | The egress proxy (`hellovm-egress` binary): default-deny domain allowlist, one per host |
@@ -718,7 +720,8 @@ footprint read from outside with `proc_pid_rusage`):
 | CPython: a million strings freed, 100,000 byte strings, a dict of 300,000 | 188.0 / 190.3 ms | 194.6 / 198.2 ms |
 
 Giving back 64 MiB (4,096 chunks, in two calls) takes 2.6 to 6.2 ms,
-about 1 µs a chunk; the platform test (`give_back_tests` in `app.rs`)
+about 1 µs a chunk; the platform test (`give_back_tests` in
+`platform-hvf/src/tests.rs`)
 reports it each round: footprint 2 MiB, 130 touched, 2 to 3 after the
 memory went back (30 to 35 ms after the `munmap`, the program being
 stopped), on one vCPU and on four with three threads spinning on the
@@ -727,7 +730,7 @@ made the allocation-heavy script 14% slower (216 ms); without any give
 back, or giving back only when idle, it took 193 ms: the remaining 3%
 is the host's zeroing of new frames and what goes back after 100 ms.
 
-*Tests.* `mmu.rs`'s randomized test against its model gives memory back
+*Tests.* `mmu.rs`'s (`kernel/platform-arm64/src`) randomized test against its model gives memory back
 between steps (to random reserves; given-back memory is filled with
 garbage, which the comparisons would see) and checks every list and
 count of the pools after every step; `mmu_trim_tests.rs` checks runs of
@@ -867,8 +870,11 @@ HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_
 target/debug/hellovm --sandbox require --root target/hvf-guests/root /bin/sh -c 'seq 100 | grep 7 | wc -l'
 ```
 
-The tests (`kernel/platform-hvf/tests/hvf.rs` and `guests.rs`, the unit
-tests in `kernel/platform-hvf/src`, and `kernel/hellovm/tests/hvf_cli.rs`)
+The tests (`kernel/platform-hvf/tests/hvf.rs` and `guests.rs`, which
+are the shared suites `kernel/platform-arm64/suite/platform.rs` and
+`guests.rs` that the KVM platform runs too, the unit tests in
+`kernel/platform-arm64/src` and `kernel/platform-hvf/src`, and
+`kernel/hellovm/tests/hvf_cli.rs`)
 cover the hello world end to end (through the core and through the
 command line), `SIGSEGV` delivery, fault events from unmapped and
 protected memory (and that `mprotect` and `munmap` reach a program whose
@@ -957,7 +963,7 @@ core (`getpid` in a loop, `kernel/test-guest/asm/hvf/getpid_loop.S`), it
 is **904 ns** per call, VM creation and loading included. Of the 834 ns,
 736 ns is the VM exit and entry alone (`hv_vcpu_run` with nothing read);
 reading a general register costs about 5 ns and a system register 11 ns
-(`exit_cost_breakdown` in `platform-hvf/src/app.rs`). Measured the same way as on Linux, through the command line
+(`exit_cost_breakdown` in `platform-hvf/src/tests.rs`). Measured the same way as on Linux, through the command line
 (release build, `--sandbox off`, wall clock of a run of 1,000,000 calls
 minus a run of 0, best of 5), HVF takes 906 ns per `getpid`, and starting
 `hellovm` (VM creation included) about 5 ms. For comparison only, in a
@@ -1837,7 +1843,7 @@ Each kernel process is started from the executable's path, so it is
 another build than its template's if `hellovm` was replaced meanwhile.
 The kernel state and the platform's state each start with a fingerprint
 of the sources that define them (`build.rs` of `hellovm-core` and of
-`hellovm-platform-hvf`); a clone of another build refuses the snapshot
+`hellovm-platform-arm64`); a clone of another build refuses the snapshot
 and its requester gets `E`: the template has to be started again.
 
 **The snapshot** is one POSIX shared memory object (`shm_open`, its name
@@ -1877,7 +1883,7 @@ template's page tables into its own table pool and marks every frame
 that the template had as *pending*: each page descriptor that points at
 one is made not valid, so the first access to it faults, and the fault
 copies the frame (4 KiB) from the snapshot into the clone's own memory
-and makes the page valid again (`kernel/platform-hvf/src/mmu.rs`, "Warm
+and makes the page valid again (`kernel/platform-arm64/src/mmu.rs`, "Warm
 clones"). Copy-on-write between the clone's own processes works as
 before; the kernel's own reads of a pending frame read the snapshot,
 its writes copy the frame first. Nothing of this asks anything unusual

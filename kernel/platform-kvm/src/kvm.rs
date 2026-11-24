@@ -19,7 +19,7 @@
 //! threads under Landlock.
 
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -95,7 +95,7 @@ impl Backing for HostMem {
 /// next run).
 #[derive(Clone)]
 pub struct KvmKicker {
-    vm: RawFd,
+    vm: Arc<OwnedFd>,
     irq: u32,
     /// The line is (about to be) raised; the vCPU lowers it after a run.
     raised: Arc<AtomicBool>,
@@ -104,7 +104,7 @@ pub struct KvmKicker {
 impl Kicker for KvmKicker {
     fn kick(&self) {
         if !self.raised.swap(true, SeqCst) {
-            if let Err(err) = sys::irq_line(self.vm, self.irq, true) {
+            if let Err(err) = sys::irq_line(self.vm.as_raw_fd(), self.irq, true) {
                 warn_once(&err);
             }
         }
@@ -197,7 +197,7 @@ impl Clock {
 /// What a vCPU thread needs to make its vCPU.
 #[derive(Clone)]
 pub struct KvmToken {
-    vm: RawFd,
+    vm: Arc<OwnedFd>,
     run_len: usize,
     init: sys::VcpuInit,
     /// The frames region (its pages are the vCPUs'), alive as long as the
@@ -367,7 +367,7 @@ impl Hypervisor for Kvm {
 
     fn token(&self) -> KvmToken {
         KvmToken {
-            vm: self.vm.raw(),
+            vm: self.vm.shared(),
             run_len: self.run_len,
             init: self.init,
             frames: self.frames.ptr() as usize,
@@ -382,7 +382,7 @@ impl Hypervisor for Kvm {
         }
         // SAFETY: `vm` is the VM's fd, open as long as the `Kvm`, which
         // outlives every vCPU.
-        let fd = unsafe { sys::create_vcpu(token.vm, index as u64)? };
+        let fd = unsafe { sys::create_vcpu(token.vm.as_raw_fd(), index as u64)? };
         let fd = VcpuFd::new(fd, token.run_len)?;
         fd.init(&token.init)?;
         token
@@ -391,7 +391,7 @@ impl Hypervisor for Kvm {
             .unwrap_or_else(|e| e.into_inner())
             .push(fd.raw());
         let kicker = KvmKicker {
-            vm: token.vm,
+            vm: Arc::clone(&token.vm),
             irq: sys::cpu_irq_line(index),
             raised: Arc::new(AtomicBool::new(false)),
         };
@@ -455,7 +455,7 @@ impl KvmVcpu {
     }
 
     fn lower(&self) {
-        if let Err(err) = sys::irq_line(self.kicker.vm, self.kicker.irq, false) {
+        if let Err(err) = sys::irq_line(self.kicker.vm.as_raw_fd(), self.kicker.irq, false) {
             warn_once(&err);
         }
     }
@@ -589,7 +589,10 @@ impl Vcpu for KvmVcpu {
     }
 
     fn arm_timer(&mut self, deadline: Option<Instant>) -> io::Result<()> {
-        if self.armed != deadline {
+        // A deadline that passed goes to the clock again: the kick it
+        // made may have been spent on a run that ended for another reason
+        // (the vCPU lowers its line after every run).
+        if self.armed != deadline || deadline.is_some_and(|at| at <= Instant::now()) {
             self.clock.set(self.index, deadline)?;
             self.armed = deadline;
         }

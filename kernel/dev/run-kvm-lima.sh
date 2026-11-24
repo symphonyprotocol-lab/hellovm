@@ -48,7 +48,7 @@ for line in sys.stdin:
 cargo build -p hellovm
 {
   cargo test --no-run --message-format=json -p hellovm-platform-arm64 -p hellovm-platform-kvm | list
-  cargo test --no-run --message-format=json -p hellovm --test kvm_cli | list
+  cargo test --no-run --message-format=json -p hellovm --features kvm-tests --test kvm_cli | list
 } > target/linux/kvm-tests.txt
 '
 # The repository at /src in the VM (an instance mounted elsewhere gets a

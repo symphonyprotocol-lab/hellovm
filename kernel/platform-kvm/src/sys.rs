@@ -9,6 +9,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const KVMIO: u64 = 0xae;
 
@@ -222,19 +223,25 @@ impl Kvm {
         let fd = unsafe { ioctl(self.fd.as_raw_fd(), KVM_CREATE_VM, 0, "KVM_CREATE_VM")? };
         // SAFETY: a new fd this process owns.
         Ok(VmFd {
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            fd: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
         })
     }
 }
 
-/// A VM.
+/// A VM. Its fd stays open while a [`VmFd::shared`] of it lives (the
+/// kickers of its vCPUs), so that a kick never reaches another fd that
+/// took its number.
 pub struct VmFd {
-    fd: OwnedFd,
+    fd: Arc<OwnedFd>,
 }
 
 impl VmFd {
     pub fn raw(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+
+    pub fn shared(&self) -> Arc<OwnedFd> {
+        Arc::clone(&self.fd)
     }
 
     /// `KVM_CHECK_EXTENSION` on the VM.

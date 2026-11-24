@@ -7,7 +7,9 @@
 //! host. Without `/dev/kvm` the tests print `SKIPPING` and pass, unless
 //! `HELLOVM_REQUIRE_E2E=1`; the tests that need busybox and CPython take
 //! the image of `kernel/platform-hvf/build-guests.sh` from
-//! `HELLOVM_KVM_GUESTS`.
+//! `HELLOVM_KVM_GUESTS`. Built only with the `kvm-tests` feature
+//! (`kernel/dev/run-kvm-lima.sh`), since `run-e2e.sh` runs where there is
+//! no `/dev/kvm`.
 
 #![cfg(all(target_os = "linux", target_arch = "aarch64"))]
 
