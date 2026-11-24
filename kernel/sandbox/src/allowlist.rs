@@ -405,7 +405,12 @@ mod tests {
         use crate::filter::{self, tests::data, Judge};
         let arch = crate::harden::audit_arch();
         let entries = super::kvm_entries(4, &[5, 6], false);
-        let prog = filter::build(arch, &[0..u64::MAX], Judge::Allowlist(&entries)).unwrap();
+        let prog = filter::build(
+            arch,
+            std::slice::from_ref(&filter::EVERY_ADDRESS),
+            Judge::Allowlist(&entries),
+        )
+        .unwrap();
         let ioctl = |fd: u64, req: u64| {
             crate::bpf::run(
                 &prog,
@@ -423,7 +428,7 @@ mod tests {
                 assert_eq!(ioctl(fd, req), kill, "ioctl {req:#x} on fd {fd}");
             }
         }
-        assert_eq!(ioctl(0, libc::TCGETS as u64), allow);
+        assert_eq!(ioctl(0, u64::from(libc::TCGETS as u32)), allow);
         // No syscall is left to a tracer: there are no app processes.
         let other = crate::bpf::run(
             &prog,

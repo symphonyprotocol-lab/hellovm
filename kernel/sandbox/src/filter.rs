@@ -58,6 +58,11 @@ pub const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 pub const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
 pub const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
+/// Every address, as a code range: on the KVM platform the kernel process
+/// has no app processes, so every syscall is judged by the allowlist,
+/// whatever code made it.
+pub const EVERY_ADDRESS: Range<u64> = 0..u64::MAX;
+
 /// A condition on the low 32 bits of a syscall argument.
 #[derive(Clone, Debug)]
 pub enum Check {
@@ -334,7 +339,12 @@ pub(crate) mod tests {
                 vec![Check::OneOf(1, vec![0x5401])],
             ]),
         }];
-        let prog = build(ARCH, &[0..u64::MAX], Judge::Allowlist(&entries)).unwrap();
+        let prog = build(
+            ARCH,
+            std::slice::from_ref(&EVERY_ADDRESS),
+            Judge::Allowlist(&entries),
+        )
+        .unwrap();
         let run = |args: [u64; 6]| bpf::run(&prog, &data(ARCH, 29, 0x1000, args));
         assert_eq!(run([5, 0xae80, 0, 0, 0, 0]), SECCOMP_RET_ALLOW);
         assert_eq!(run([6, 0xae80, 0, 0, 0, 0]), SECCOMP_RET_ALLOW);

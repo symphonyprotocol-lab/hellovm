@@ -74,7 +74,7 @@ pub fn sysreg_id(encoding: u16) -> u64 {
 /// The `ONE_REG` id of a core register at `offset` bytes into `struct
 /// kvm_regs`.
 const fn core_id(offset: u64) -> u64 {
-    REG_ARM64_U64 | KVM_REG_ARM_CORE | offset / 4
+    REG_ARM64_U64 | KVM_REG_ARM_CORE | (offset / 4)
 }
 
 /// `regs.pc`: after `regs.regs[31]` and `regs.sp`.

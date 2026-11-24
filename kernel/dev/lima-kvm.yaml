@@ -1,0 +1,36 @@
+# A Linux VM with /dev/kvm for the KVM platform's tests on an Apple
+# silicon Mac (M3 or later, macOS 15 or later: nested virtualization).
+# See kernel/dev/run-kvm-lima.sh and README, "The KVM platform".
+#
+#   limactl create --name hellovm-kvm \
+#     --set ".mounts[0].location = \"$PWD\"" kernel/dev/lima-kvm.yaml
+#   limactl start hellovm-kvm
+#
+# from the repository root: the repository is mounted read-only at /src.
+minimumLimaVersion: "1.0.0"
+vmType: vz
+nestedVirtualization: true
+cpus: 4
+memory: 8GiB
+disk: 20GiB
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release-20250115/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+  digest: "sha256:f11282a728ad42f8bfe0b646a6807674d79a019bfc229d80032345dd3228a2db"
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+mounts:
+- location: "/path/to/the/repository"
+  mountPoint: "/src"
+  writable: false
+mountType: virtiofs
+containerd:
+  system: false
+  user: false
+provision:
+# The tests run as the Lima user, which is not in the kvm group.
+- mode: system
+  script: |
+    #!/bin/sh
+    echo 'KERNEL=="kvm", MODE="0666"' > /etc/udev/rules.d/99-hellovm-kvm.rules
+    chmod 0666 /dev/kvm 2>/dev/null || true

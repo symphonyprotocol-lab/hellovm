@@ -340,11 +340,6 @@ pub(crate) fn audit_arch() -> u32 {
     }
 }
 
-/// Every address: on the KVM platform the kernel process has no app
-/// processes, so every syscall is judged by the allowlist, whatever code
-/// made it.
-const EVERYWHERE: [std::ops::Range<u64>; 1] = [0..u64::MAX];
-
 fn install_seccomp(
     profile: Option<&hellovm_platform_seccomp::HostProfile>,
     config: &Config<'_>,
@@ -352,7 +347,7 @@ fn install_seccomp(
 ) -> Result<String, String> {
     let code = match profile {
         Some(profile) => profile.code_ranges(),
-        None => &EVERYWHERE[..],
+        None => std::slice::from_ref(&filter::EVERY_ADDRESS),
     };
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(out) = learn {

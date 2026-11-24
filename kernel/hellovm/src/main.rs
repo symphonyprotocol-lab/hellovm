@@ -276,7 +276,11 @@ struct Options {
     /// `--fs-limit BYTES`: the writable layer's limit.
     fs_limit: Option<u64>,
     /// `--vcpus N`: vCPUs of the HVF platform (macOS) or the KVM platform
-    /// (Linux).
+    /// (arm64 Linux).
+    #[cfg_attr(
+        not(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     vcpus: Option<usize>,
     /// `--platform`: what runs the program on Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
