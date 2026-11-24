@@ -20,7 +20,10 @@
 //!   `TTBR0_EL1` from the frame, invalidates the TLB if the frame asks
 //!   (all of it and the instruction cache, or one page of one address
 //!   space), loads every register from the frame and `eret`s to the app
-//!   at the frame's `ELR_EL1` with its `SPSR_EL1`.
+//!   at the frame's `ELR_EL1` with its `SPSR_EL1`. Just before the
+//!   `eret` it checks the frame's stop flag (a kick): if it is set, it
+//!   leaves again the same way instead (the frame still holds every
+//!   register of the app), and starts over when run again.
 //!
 //! A system call round trip is then one `KVM_RUN`, and nothing else. The
 //! code is assembled into this crate (`global_asm!`, in a data section:
@@ -65,6 +68,9 @@ pub mod frame {
     pub const FLUSH: usize = 0x148;
     /// The `tlbi vae1is` operand for `FLUSH` 2.
     pub const OPERAND: usize = 0x150;
+    /// Not 0: the vCPU is to leave before it returns to the app (written
+    /// by a kicker at any time, with an atomic store).
+    pub const STOP: usize = 0x158;
     /// `v0` to `v31`, 16 bytes each.
     pub const V: usize = 0x160;
     pub const SIZE: usize = V + 32 * 16;
@@ -73,6 +79,11 @@ pub mod frame {
 pub const FLUSH_NONE: u64 = 0;
 pub const FLUSH_ALL: u64 = 1;
 pub const FLUSH_PAGE: u64 = 2;
+
+/// The `SLOT` of an exit the restore routine made because `STOP` was set
+/// (not a vector: the frame holds the app's registers as the host left
+/// them).
+pub const SLOT_STOPPED: u64 = 16;
 
 std::arch::global_asm!(
     r#"
@@ -202,8 +213,23 @@ hellovm_kvm_shim_restore:
     ldp x24, x25, [sp, #192]
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
+    .global hellovm_kvm_shim_check
+hellovm_kvm_shim_check:
+    ldr x0, [sp, #{stop}]
+    cbnz x0, 5f
     ldp x0, x1, [sp]
     eret
+5:
+    mov x0, #{slot_stopped}
+    str x0, [sp, #{slot}]
+    movz x0, #{exit_3}, lsl #48
+    movk x0, #{exit_2}, lsl #32
+    movk x0, #{exit_1}, lsl #16
+    movk x0, #{exit_0}
+    .global hellovm_kvm_shim_stop_exit
+hellovm_kvm_shim_stop_exit:
+    str xzr, [x0]
+    b hellovm_kvm_shim_restore
     .global hellovm_kvm_shim_end
 hellovm_kvm_shim_end:
     .popsection
@@ -217,6 +243,8 @@ hellovm_kvm_shim_end:
     ttbr0 = const frame::TTBR0,
     flush = const frame::FLUSH,
     operand = const frame::OPERAND,
+    stop = const frame::STOP,
+    slot_stopped = const SLOT_STOPPED,
     flush_all = const FLUSH_ALL,
     exit_3 = const (EXIT_VA >> 48) & 0xffff,
     exit_2 = const (EXIT_VA >> 32) & 0xffff,
@@ -225,10 +253,19 @@ hellovm_kvm_shim_end:
 );
 
 extern "C" {
+    static hellovm_kvm_shim_check: u8;
     static hellovm_kvm_shim_start: u8;
     static hellovm_kvm_shim_exit: u8;
     static hellovm_kvm_shim_restore: u8;
     static hellovm_kvm_shim_end: u8;
+}
+
+/// Where in the shim the stop check is (`ldr`, `cbnz`, `ldp`, `eret`):
+/// a vCPU stopped between the check and the `eret` would return to the
+/// app with the stop flag set, so the host moves it back to the check.
+pub fn check_offset() -> u64 {
+    // Only the symbols' addresses are taken.
+    (&raw const hellovm_kvm_shim_check as usize - &raw const hellovm_kvm_shim_start as usize) as u64
 }
 
 /// The shim's machine code (at most a page) and the offsets of the exit
@@ -268,7 +305,8 @@ mod tests {
             assert_eq!(word(slot * 0x80 + 8) >> 26, 0b000101, "b at slot {slot}");
         }
         assert_eq!(word(exit as usize), 0xf900_001f, "str xzr, [x0]");
-        assert_eq!(word(code.len() - 4), 0xd69f_03e0, "eret");
+        assert_eq!(word(code.len() - 4) >> 26, 0b000101, "b restore");
+        assert_eq!(word(code.len() - 8), 0xf900_001f, "str xzr, [x0]");
         assert!(frame::SIZE <= PAGE as usize);
     }
 }

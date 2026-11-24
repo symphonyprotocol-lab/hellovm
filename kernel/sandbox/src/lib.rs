@@ -31,8 +31,9 @@
 //! the kernel process has made its VM and vCPUs before, with no second
 //! thread yet (namespaces and Landlock apply to the calling thread), and
 //! its seccomp allowlist (`allowlist::kvm_entries`) judges every syscall
-//! the same way, since there are no app processes: `KVM_RUN` and
-//! `KVM_IRQ_LINE` are the only `ioctl`s on KVM fds.
+//! the same way, since there are no app processes: `KVM_RUN` and the
+//! three `ioctl`s that stop a running vCPU, on the vCPUs' fds, are the
+//! only `ioctl`s on KVM fds.
 //!
 //! Required for `--sandbox=require`: 1, 3, 4, 6, 7, and filesystem
 //! confinement by 2 or 5 (at least one). The network namespace, Landlock's

@@ -1,16 +1,27 @@
 //! [`Kvm`]: KVM as the hypervisor of the shared arm64 platform
 //! (`hellovm-platform-arm64`).
 //!
-//! The VM has no in-kernel interrupt controller: the only interrupt is
-//! each vCPU's IRQ input, which the host raises (`KVM_IRQ_LINE`) to make
-//! the vCPU leave the VM. The app at EL0 runs with interrupts unmasked,
-//! so the vCPU takes the IRQ at once (in the shim, where they are masked,
-//! as soon as it returns to the app), and its vector leaves the VM like
-//! any exception, with the app's registers saved (see `shim`). A kick
-//! from another thread ([`KvmKicker`]) and the end of a deadline (a clock
-//! thread, made with the VM, raises the line when a vCPU's deadline has
-//! passed) are both that. The vCPU lowers its line after each run in
-//! which it was raised.
+//! Nothing interrupts the app: the VM has no interrupt controller and no
+//! timer interrupts (virtual interrupt lines did not reach the guest
+//! under the nested virtualization of the Mac this was built on, and are
+//! not needed). A kick ([`KvmKicker`], from any thread: a waker, an event
+//! for the event loop, a TLB shootdown, the killer; and the clock thread
+//! when a vCPU's deadline has passed) sets the stop flag in the vCPU's
+//! frame and `immediate_exit` in its `kvm_run`, and sends the vCPU's
+//! thread a signal, so that `KVM_RUN` returns `EINTR` (at once, if the
+//! vCPU was not in it). The vCPU then leaves through the shim:
+//!
+//! * at EL0 (the app was running; `PSTATE` read with
+//!   `KVM_GET_ONE_REG`): the host has KVM inject a synchronous external
+//!   data abort (`KVM_SET_VCPU_EVENTS`), which KVM enters itself, in
+//!   software, at the shim's vector for EL0; the vector saves the app's
+//!   registers and exits as for any exception;
+//! * at EL1 (in the shim): it runs on and leaves by itself, through the
+//!   exit of the save routine or the stop check before the restore
+//!   routine's `eret`; if it was stopped between that check and the
+//!   `eret`, the host moves its `PC` back to the check first.
+//!
+//! The stop flag is cleared by the exit it causes.
 //!
 //! Every vCPU is made with the VM, on the calling thread, and the clock
 //! and vCPU threads start later (`Hypervisor::DEFER_THREADS`), once the
@@ -20,7 +31,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -91,31 +102,44 @@ impl Backing for HostMem {
     fn take_back(&mut self, _offset: usize, _len: usize) {}
 }
 
-/// Raises a vCPU's IRQ input: it leaves the VM (now, or at once in its
-/// next run).
+/// Makes a vCPU leave the VM (now, or at once in its next run): see the
+/// module documentation.
 #[derive(Clone)]
 pub struct KvmKicker {
-    vm: Arc<OwnedFd>,
-    irq: u32,
-    /// The line is (about to be) raised; the vCPU lowers it after a run.
-    raised: Arc<AtomicBool>,
+    /// The frames, kept mapped as long as a kicker lives.
+    frames: Arc<HostMem>,
+    /// This vCPU's frame in them.
+    frame: usize,
+    run: Arc<sys::RunMap>,
+    /// The thread that runs the vCPU (0 before it first ran).
+    tid: Arc<AtomicI32>,
+}
+
+impl KvmKicker {
+    fn stop_flag(&self) -> &AtomicU64 {
+        // SAFETY: the stop word of this vCPU's frame, in bounds and
+        // aligned (frames are pages of `frames`, which `self` keeps
+        // mapped); shared with the shim and the vCPU's thread, which use
+        // it only through atomic accesses and the shim's loads.
+        unsafe { AtomicU64::from_ptr(self.frames.ptr().add(self.frame + frame::STOP).cast()) }
+    }
 }
 
 impl Kicker for KvmKicker {
     #[inline]
     fn kick(&self) {
-        if !self.raised.swap(true, SeqCst) {
-            if let Err(err) = sys::irq_line(self.vm.as_raw_fd(), self.irq, true) {
-                warn_once(&err);
-            }
+        // A stop asked for already and not yet made covers this one (its
+        // signal is on its way, or `immediate_exit` waits for the next
+        // run): a TLB shootdown that kicks again and again while it waits
+        // for the vCPU costs no more signals.
+        if self.stop_flag().swap(1, SeqCst) != 0 {
+            return;
         }
-    }
-}
-
-fn warn_once(err: &io::Error) {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, SeqCst) {
-        log::error!("KVM platform: {err}");
+        self.run.set_immediate_exit(true);
+        let tid = self.tid.load(SeqCst);
+        if tid != 0 {
+            sys::kick_thread(tid);
+        }
     }
 }
 
@@ -202,9 +226,8 @@ pub struct KvmToken {
     vm: Arc<OwnedFd>,
     run_len: usize,
     init: sys::VcpuInit,
-    /// The frames region (its pages are the vCPUs'), alive as long as the
-    /// VM.
-    frames: usize,
+    /// The frames region (its pages are the vCPUs').
+    frames: Arc<HostMem>,
     clock: Arc<Clock>,
     vcpu_fds: Arc<Mutex<Vec<RawFd>>>,
 }
@@ -214,7 +237,7 @@ pub struct Kvm {
     // Field order is drop order: the clock thread is stopped in `release`.
     vm: VmFd,
     _shim: HostMem,
-    frames: HostMem,
+    frames: Arc<HostMem>,
     run_len: usize,
     init: sys::VcpuInit,
     max_vcpus: u32,
@@ -223,15 +246,14 @@ pub struct Kvm {
 }
 
 impl Kvm {
-    /// The fds a confined kernel process keeps using: the VM's (for
-    /// `KVM_IRQ_LINE`) and each vCPU's (for `KVM_RUN`).
-    pub fn fds(&self) -> (RawFd, Vec<RawFd>) {
-        let vcpus = self
-            .vcpu_fds
+    /// The fds a confined kernel process keeps using: each vCPU's (for
+    /// `KVM_RUN`, and to stop it: `KVM_GET_ONE_REG`, `KVM_SET_ONE_REG`,
+    /// `KVM_SET_VCPU_EVENTS`).
+    pub fn vcpu_fds(&self) -> Vec<RawFd> {
+        self.vcpu_fds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        (self.vm.raw(), vcpus)
+            .clone()
     }
 
     fn stop_clock(&mut self) {
@@ -278,11 +300,7 @@ impl Hypervisor for Kvm {
             ));
         }
         let kvm = sys::Kvm::open()?;
-        for (cap, name) in [
-            (sys::KVM_CAP_USER_MEMORY, "KVM_CAP_USER_MEMORY"),
-            (sys::KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG"),
-            (sys::KVM_CAP_READONLY_MEM, "KVM_CAP_READONLY_MEM"),
-        ] {
+        for (cap, name) in sys::CAPS {
             if kvm.extension(cap) <= 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -299,8 +317,11 @@ impl Hypervisor for Kvm {
             _ => vm.extension(sys::KVM_CAP_NR_VCPUS).max(1),
         } as u32;
         let init = vm.preferred_target()?;
+        sys::install_kick_handler()?;
         let mut shim = HostMem::new(layout::SHIM_REGION as usize)?;
-        let frames = HostMem::new((MAX_VCPUS * PAGE as usize).next_multiple_of(sys::HOST_PAGE))?;
+        let frames = Arc::new(HostMem::new(
+            (MAX_VCPUS * PAGE as usize).next_multiple_of(sys::HOST_PAGE),
+        )?);
         let tables = HostMem::new(table_memory)?;
         let ram = HostMem::new(memory)?;
         let (code, _, _) = shim::code();
@@ -372,7 +393,7 @@ impl Hypervisor for Kvm {
             vm: self.vm.shared(),
             run_len: self.run_len,
             init: self.init,
-            frames: self.frames.ptr() as usize,
+            frames: Arc::clone(&self.frames),
             clock: Arc::clone(&self.clock),
             vcpu_fds: Arc::clone(&self.vcpu_fds),
         }
@@ -393,30 +414,33 @@ impl Hypervisor for Kvm {
             .unwrap_or_else(|e| e.into_inner())
             .push(fd.raw());
         let kicker = KvmKicker {
-            vm: Arc::clone(&token.vm),
-            irq: sys::cpu_irq_line(index),
-            raised: Arc::new(AtomicBool::new(false)),
+            frames: Arc::clone(&token.frames),
+            frame: index * PAGE as usize,
+            run: fd.run_map(),
+            tid: Arc::new(AtomicI32::new(0)),
         };
         token.clock.lock().kickers[index] = Some(kicker.clone());
         Ok(KvmVcpu {
             fd,
-            // In bounds: `index` < MAX_VCPUS frames.
-            frame: (token.frames + index * PAGE as usize) as *mut u8,
+            // SAFETY: page `index` of the frames (`index` < MAX_VCPUS),
+            // which the kicker keeps mapped.
+            frame: unsafe { token.frames.ptr().add(index * PAGE as usize) },
             index,
             kicker,
             clock: token.clock,
             armed: None,
             broken: None,
+            injected: false,
         })
     }
 
+    /// Stops the clock thread. The memory slots stay: closing the VM's
+    /// and vCPUs' fds ends the VM, and the confined process may not
+    /// change its memory slots (`allowlist::kvm_entries`); memory unmapped
+    /// before the last fd is closed is taken out of the VM by KVM itself
+    /// (its MMU notifier), and no vCPU runs again by then.
     fn release(&mut self, _table_memory: usize, _memory: usize) {
         self.stop_clock();
-        for slot in [SLOT_SHIM, SLOT_TABLES, SLOT_RAM, SLOT_FRAMES] {
-            if let Err(err) = self.vm.unmap(slot) {
-                log::warn!("KVM platform: {err}");
-            }
-        }
     }
 }
 
@@ -440,6 +464,9 @@ pub struct KvmVcpu {
     /// Why the vCPU cannot run any more, after an exit that left it
     /// somewhere it cannot go on from.
     broken: Option<String>,
+    /// An external abort was injected to stop it, and its exit has not
+    /// come yet.
+    injected: bool,
 }
 
 impl KvmVcpu {
@@ -456,10 +483,25 @@ impl KvmVcpu {
         unsafe { std::ptr::write_volatile(self.frame.add(offset).cast::<u64>(), value) }
     }
 
-    fn lower(&self) {
-        if let Err(err) = sys::irq_line(self.kicker.vm.as_raw_fd(), self.kicker.irq, false) {
-            warn_once(&err);
+    /// After `KVM_RUN` returned `EINTR` with the stop flag set: makes the
+    /// vCPU leave through the shim when it runs again (see the module
+    /// documentation).
+    fn steer_out(&mut self) -> io::Result<()> {
+        let pstate = self.fd.get_reg(sys::REG_PSTATE)?;
+        if pstate & 0xf == 0 {
+            // In the app.
+            self.fd.inject_external_abort()?;
+            self.injected = true;
+            return Ok(());
         }
+        let check = SHIM_VA + shim::check_offset();
+        let pc = self.fd.get_reg(sys::REG_PC)?;
+        // `ldr` and `cbnz` of the check, then `ldp` and `eret`: past the
+        // `cbnz` the flag is not looked at again.
+        if (check + 8..=check + 12).contains(&pc) {
+            self.fd.set_reg(sys::REG_PC, check)?;
+        }
+        Ok(())
     }
 
     /// The exit details, for a message.
@@ -627,25 +669,19 @@ impl Vcpu for KvmVcpu {
                 self.index
             )));
         }
+        self.kicker.tid.store(sys::gettid(), SeqCst);
         loop {
-            let exited = self.fd.run()?;
-            // A kick (or the clock) raised the line during or before this
-            // run: it has done its work, the run is over.
-            let was_raised = self.kicker.raised.swap(false, SeqCst);
-            if !exited {
-                // A signal interrupted `KVM_RUN` (the guest is wherever it
-                // was): run on.
-                if was_raised {
-                    self.lower();
+            if !self.fd.run()? {
+                // A kick (or another signal): `immediate_exit` is spent.
+                self.kicker.run.set_immediate_exit(false);
+                if self.kicker.stop_flag().load(SeqCst) != 0 {
+                    self.steer_out()?;
                 }
                 continue;
             }
             let reason = self.fd.exit_reason();
             let (addr, len, write) = self.fd.mmio();
             if reason != sys::KVM_EXIT_MMIO || addr != EXIT_IPA || len != 8 || !write {
-                if was_raised {
-                    self.lower();
-                }
                 // The vCPU did not leave through the shim's exit: there is
                 // no saved state to go on from.
                 let why = self.describe(reason);
@@ -653,10 +689,11 @@ impl Vcpu for KvmVcpu {
                 return Ok(Exit::Unexpected(why));
             }
             let slot = self.get(frame::SLOT);
-            if was_raised || slot == u64::from(layout::VECTOR_LOWER_IRQ) {
-                self.lower();
-            }
-            if slot == u64::from(layout::VECTOR_LOWER_IRQ) {
+            let injected = std::mem::take(&mut self.injected);
+            if slot == shim::SLOT_STOPPED
+                || (injected && slot == u64::from(layout::VECTOR_LOWER_SYNC))
+            {
+                self.kicker.stop_flag().store(0, SeqCst);
                 if self.armed.is_some_and(|at| at <= Instant::now()) {
                     self.armed = None;
                 }

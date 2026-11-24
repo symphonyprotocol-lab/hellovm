@@ -6,8 +6,8 @@
 //! exceptions) is `hellovm-platform-arm64`'s, shared with the HVF
 //! platform; this crate is its KVM backend ([`Kvm`]): the VM and its
 //! memory slots, a shim that saves the app's registers to memory and
-//! leaves the VM with one MMIO store (`shim`), the vCPUs, the IRQ line
-//! that kicks a vCPU out, the clock thread for deadlines, and host memory
+//! leaves the VM with one MMIO store (`shim`), the vCPUs, the kick (a stop
+//! flag and a signal), the clock thread for deadlines, and host memory
 //! given back with `madvise(MADV_DONTNEED)` (`sys`).
 //!
 //! # What the app can reach
@@ -47,15 +47,11 @@ pub type AppKiller = hellovm_platform_arm64::AppKiller<Kvm>;
 /// `/dev/kvm`, `PermissionDenied` without access to it).
 pub fn check_access() -> std::io::Result<()> {
     let kvm = sys::Kvm::open()?;
-    for cap in [
-        sys::KVM_CAP_USER_MEMORY,
-        sys::KVM_CAP_ONE_REG,
-        sys::KVM_CAP_READONLY_MEM,
-    ] {
+    for (cap, name) in sys::CAPS {
         if kvm.extension(cap) <= 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                format!("the host's KVM lacks capability {cap}"),
+                format!("the host's KVM lacks {name}"),
             ));
         }
     }

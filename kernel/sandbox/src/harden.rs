@@ -43,10 +43,10 @@ pub enum Platform {
     /// process and driven with `ptrace` (see `filter`).
     #[default]
     Seccomp,
-    /// `hellovm-platform-kvm`: a KVM VM, made before the hardening, with
-    /// its fds (see `allowlist::kvm_entries`). The process has no other
-    /// thread yet.
-    Kvm { vm: i32, vcpus: Vec<i32> },
+    /// `hellovm-platform-kvm`: a KVM VM, made before the hardening, and
+    /// its vCPUs' fds (see `allowlist::kvm_entries`). The process has no
+    /// other thread yet.
+    Kvm { vcpus: Vec<i32> },
 }
 
 /// A hardening layer.
@@ -366,9 +366,7 @@ fn install_seccomp(
         return Err("HELLOVM_SECCOMP_LEARN needs the insecure-test-hooks feature".into());
     }
     let entries = match (&config.platform, profile) {
-        (Platform::Kvm { vm, vcpus }, _) => {
-            allowlist::kvm_entries(*vm, vcpus, config.tcp_port.is_some())
-        }
+        (Platform::Kvm { vcpus }, _) => allowlist::kvm_entries(vcpus, config.tcp_port.is_some()),
         (Platform::Seccomp, Some(profile)) => {
             allowlist::entries(profile.stub_fd(), config.tcp_port.is_some(), config.warm)
         }

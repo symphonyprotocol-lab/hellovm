@@ -88,6 +88,9 @@ pub fn registers_read_before_the_task_runs_again_have_the_result<H: Hypervisor>(
     p.set_context(t, &Context::Aarch64(ctx)).unwrap();
     // Runnable without a call of `wait`, so that vCPU 1 runs it, not
     // the event loop's.
+    // (A first `wait` starts the vCPU threads of a backend that defers
+    // them.)
+    assert!(p.wait(Some(Duration::ZERO)).unwrap().is_none());
     {
         let mut sched = p.lock();
         sched.tasks.get_mut(&t).unwrap().state = State::Runnable;
@@ -256,7 +259,11 @@ pub fn a_slice_that_ends_in_a_vector_still_ends<H: Hypervisor>(
     };
     let start = Instant::now();
     let mut slowest = Duration::ZERO;
-    while start.elapsed() < Duration::from_secs(1) {
+    // For a second, and until the app touched every page (which takes
+    // longer under nested virtualization), at most 30 s.
+    while start.elapsed() < Duration::from_secs(1)
+        || (p.memory_in_use().0 < LEN && start.elapsed() < Duration::from_secs(30))
+    {
         let before = Instant::now();
         assert!(p.wait(Some(Duration::from_micros(20))).unwrap().is_none());
         slowest = slowest.max(before.elapsed());

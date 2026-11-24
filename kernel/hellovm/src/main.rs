@@ -875,7 +875,7 @@ fn run_kvm(
         ..KvmConfig::default()
     })
     .map_err(|err| format!("the KVM platform: {err}"))?;
-    let (vm, vcpus) = app.hypervisor().fds();
+    let vcpus = app.hypervisor().vcpu_fds();
     // Before the hardening: the host opens what it needs from the host's
     // filesystem (`/dev/urandom`) now.
     let mut host = StdioHost::new(Some(image));
@@ -886,7 +886,7 @@ fn run_kvm(
         egress,
         fds,
         false,
-        hellovm_sandbox::Platform::Kvm { vm, vcpus },
+        hellovm_sandbox::Platform::Kvm { vcpus },
     )? {
         host.set_egress(path)?;
     }

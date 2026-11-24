@@ -31,8 +31,8 @@ pub const KVM_CHECK_EXTENSION: u64 = io(0x03);
 pub const KVM_GET_VCPU_MMAP_SIZE: u64 = io(0x04);
 pub const KVM_CREATE_VCPU: u64 = io(0x41);
 pub const KVM_SET_USER_MEMORY_REGION: u64 = iow(0x46, 32);
-pub const KVM_IRQ_LINE: u64 = iow(0x61, 8);
 pub const KVM_RUN: u64 = io(0x80);
+pub const KVM_SET_VCPU_EVENTS: u64 = iow(0xa0, 64);
 pub const KVM_GET_ONE_REG: u64 = iow(0xab, 16);
 pub const KVM_SET_ONE_REG: u64 = iow(0xac, 16);
 pub const KVM_ARM_VCPU_INIT: u64 = iow(0xae, 32);
@@ -45,22 +45,24 @@ pub const KVM_CAP_NR_VCPUS: u64 = 9;
 pub const KVM_CAP_MAX_VCPUS: u64 = 66;
 pub const KVM_CAP_ONE_REG: u64 = 70;
 pub const KVM_CAP_READONLY_MEM: u64 = 81;
+pub const KVM_CAP_IMMEDIATE_EXIT: u64 = 136;
+pub const KVM_CAP_ARM_INJECT_EXT_DABT: u64 = 178;
 
 pub const KVM_MEM_READONLY: u32 = 1 << 1;
+
+/// The capabilities the platform needs.
+pub const CAPS: [(u64, &str); 5] = [
+    (KVM_CAP_USER_MEMORY, "KVM_CAP_USER_MEMORY"),
+    (KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG"),
+    (KVM_CAP_READONLY_MEM, "KVM_CAP_READONLY_MEM"),
+    (KVM_CAP_IMMEDIATE_EXIT, "KVM_CAP_IMMEDIATE_EXIT"),
+    (KVM_CAP_ARM_INJECT_EXT_DABT, "KVM_CAP_ARM_INJECT_EXT_DABT"),
+];
 
 pub const KVM_EXIT_MMIO: u32 = 6;
 pub const KVM_EXIT_FAIL_ENTRY: u32 = 9;
 pub const KVM_EXIT_INTERNAL_ERROR: u32 = 17;
 pub const KVM_EXIT_SYSTEM_EVENT: u32 = 24;
-
-/// `KVM_IRQ_LINE` on a VM without an in-kernel interrupt controller: the
-/// IRQ input of a vCPU (`KVM_ARM_IRQ_TYPE_CPU`, `KVM_ARM_IRQ_CPU_IRQ`).
-pub fn cpu_irq_line(vcpu: usize) -> u32 {
-    // `vcpu_index` in bits 23:16, `vcpu2_index` (the index's next bits)
-    // in 31:28; type CPU (0) in 27:24, IRQ (0) in 15:0.
-    let vcpu = vcpu as u32;
-    (vcpu & 0xff) << 16 | ((vcpu >> 8) & 0xf) << 28
-}
 
 /// `KVM_REG_ARM64 | KVM_REG_SIZE_U64`.
 const REG_ARM64_U64: u64 = 0x6000_0000_0000_0000 | 0x0030_0000_0000_0000;
@@ -110,16 +112,22 @@ struct OneReg {
     addr: u64,
 }
 
-/// `struct kvm_irq_level`.
+/// `struct kvm_vcpu_events` (arm64).
 #[repr(C)]
-struct IrqLevel {
-    irq: u32,
-    level: u32,
+#[derive(Default)]
+struct VcpuEvents {
+    serror_pending: u8,
+    serror_has_esr: u8,
+    ext_dabt_pending: u8,
+    pad: [u8; 5],
+    serror_esr: u64,
+    reserved: [u32; 12],
 }
 
 /// Offsets in `struct kvm_run` (the same on every architecture up to the
 /// union).
 pub mod run {
+    pub const IMMEDIATE_EXIT: usize = 1;
     pub const EXIT_REASON: usize = 8;
     /// The union of exit details starts here.
     pub const UNION: usize = 32;
@@ -286,27 +294,6 @@ impl VmFd {
         Ok(())
     }
 
-    /// Removes memory slot `slot` (a size of 0).
-    pub fn unmap(&self, slot: u32) -> io::Result<()> {
-        let region = MemoryRegion {
-            slot,
-            flags: 0,
-            guest_phys_addr: 0,
-            memory_size: 0,
-            userspace_addr: 0,
-        };
-        // SAFETY: a valid region; removing a slot only changes the VM.
-        unsafe {
-            ioctl(
-                self.raw(),
-                KVM_SET_USER_MEMORY_REGION,
-                &region as *const MemoryRegion as u64,
-                "KVM_SET_USER_MEMORY_REGION",
-            )?
-        };
-        Ok(())
-    }
-
     /// The vCPU target this host prefers, for [`VcpuFd::init`].
     pub fn preferred_target(&self) -> io::Result<VcpuInit> {
         let mut init = VcpuInit::default();
@@ -335,30 +322,44 @@ pub unsafe fn create_vcpu(vm: RawFd, id: u64) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Sets the IRQ input of a vCPU (see [`cpu_irq_line`]) on the VM `vm`
-/// (from any thread).
-pub fn irq_line(vm: RawFd, irq: u32, level: bool) -> io::Result<()> {
-    let line = IrqLevel {
-        irq,
-        level: u32::from(level),
-    };
-    // SAFETY: a valid `struct kvm_irq_level`.
-    unsafe {
-        ioctl(
-            vm,
-            KVM_IRQ_LINE,
-            &line as *const IrqLevel as u64,
-            "KVM_IRQ_LINE",
-        )?
-    };
-    Ok(())
+/// A vCPU's `struct kvm_run` mapping, shared with its kickers (which set
+/// `immediate_exit`), unmapped when the last of them goes.
+pub struct RunMap {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the mapping is plain shared memory; the vCPU's thread reads it
+// between runs, and other threads only store `immediate_exit`, with an
+// atomic store.
+unsafe impl Send for RunMap {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for RunMap {}
+
+impl RunMap {
+    /// Makes the vCPU's next `KVM_RUN` (or the one it is in, once a
+    /// signal interrupts it) return `EINTR` (`immediate_exit`), or stops
+    /// asking for that.
+    pub fn set_immediate_exit(&self, on: bool) {
+        // SAFETY: byte 1 of the mapping (at least a page), which KVM reads
+        // at the start of `KVM_RUN` and never writes.
+        let byte =
+            unsafe { std::sync::atomic::AtomicU8::from_ptr(self.ptr.add(run::IMMEDIATE_EXIT)) };
+        byte.store(u8::from(on), Ordering::SeqCst);
+    }
+}
+
+impl Drop for RunMap {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly what `VcpuFd::new` mapped.
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
 }
 
 /// A vCPU's fd and its `struct kvm_run` mapping.
 pub struct VcpuFd {
     fd: OwnedFd,
-    run: *mut u8,
-    run_len: usize,
+    run: Arc<RunMap>,
 }
 
 impl VcpuFd {
@@ -385,13 +386,19 @@ impl VcpuFd {
         }
         Ok(VcpuFd {
             fd,
-            run: run.cast(),
-            run_len,
+            run: Arc::new(RunMap {
+                ptr: run.cast(),
+                len: run_len,
+            }),
         })
     }
 
     pub fn raw(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+
+    pub fn run_map(&self) -> Arc<RunMap> {
+        Arc::clone(&self.run)
     }
 
     pub fn init(&self, init: &VcpuInit) -> io::Result<()> {
@@ -443,34 +450,59 @@ impl VcpuFd {
         Ok(())
     }
 
+    /// Makes the vCPU take a synchronous external data abort before its
+    /// next instruction (`KVM_SET_VCPU_EVENTS`, `ext_dabt_pending`): KVM
+    /// enters the exception itself, at the vector for the vCPU's current
+    /// exception level.
+    pub fn inject_external_abort(&self) -> io::Result<()> {
+        let events = VcpuEvents {
+            ext_dabt_pending: 1,
+            ..VcpuEvents::default()
+        };
+        // SAFETY: a valid `struct kvm_vcpu_events`, which the call reads.
+        unsafe {
+            ioctl(
+                self.raw(),
+                KVM_SET_VCPU_EVENTS,
+                &events as *const VcpuEvents as u64,
+                "KVM_SET_VCPU_EVENTS",
+            )?
+        };
+        Ok(())
+    }
+
     /// `KVM_RUN`: `Ok(true)` when the vCPU exited (see [`VcpuFd::exit_reason`]),
-    /// `Ok(false)` when a signal interrupted the call.
+    /// `Ok(false)` when a signal or `immediate_exit` ended the call.
     pub fn run(&self) -> io::Result<bool> {
         // SAFETY: no argument; the run structure is mapped (`new`).
-        match unsafe { ioctl(self.raw(), KVM_RUN, 0, "KVM_RUN") } {
-            Ok(_) => Ok(true),
-            Err(err) if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) => Ok(false),
-            Err(err) => Err(err),
+        let ret = unsafe { libc::ioctl(self.raw(), KVM_RUN as _, 0) };
+        if ret >= 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR | libc::EAGAIN) => Ok(false),
+            _ => Err(io::Error::new(err.kind(), format!("KVM_RUN: {err}"))),
         }
     }
 
     fn run_u64(&self, offset: usize) -> u64 {
-        assert!(offset + 8 <= self.run_len && offset.is_multiple_of(8));
+        assert!(offset + 8 <= self.run.len && offset.is_multiple_of(8));
         // SAFETY: in bounds and aligned (checked); KVM writes the run
         // structure only during `KVM_RUN` on this thread.
-        unsafe { std::ptr::read_volatile(self.run.add(offset).cast::<u64>()) }
+        unsafe { std::ptr::read_volatile(self.run.ptr.add(offset).cast::<u64>()) }
     }
 
     fn run_u32(&self, offset: usize) -> u32 {
-        assert!(offset + 4 <= self.run_len && offset.is_multiple_of(4));
+        assert!(offset + 4 <= self.run.len && offset.is_multiple_of(4));
         // SAFETY: as in `run_u64`.
-        unsafe { std::ptr::read_volatile(self.run.add(offset).cast::<u32>()) }
+        unsafe { std::ptr::read_volatile(self.run.ptr.add(offset).cast::<u32>()) }
     }
 
     fn run_u8(&self, offset: usize) -> u8 {
-        assert!(offset < self.run_len);
+        assert!(offset < self.run.len);
         // SAFETY: as in `run_u64`.
-        unsafe { std::ptr::read_volatile(self.run.add(offset)) }
+        unsafe { std::ptr::read_volatile(self.run.ptr.add(offset)) }
     }
 
     pub fn exit_reason(&self) -> u32 {
@@ -492,10 +524,45 @@ impl VcpuFd {
     }
 }
 
-impl Drop for VcpuFd {
-    fn drop(&mut self) {
-        // SAFETY: unmaps exactly what `new` mapped.
-        unsafe { libc::munmap(self.run.cast(), self.run_len) };
+/// The signal that interrupts a vCPU's `KVM_RUN` ([`kick_thread`]):
+/// `SIGURG`, which nothing else in the kernel process uses (it is sent
+/// only for out-of-band data on sockets that asked for it with
+/// `F_SETOWN`) and which is ignored by default.
+pub const KICK_SIGNAL: libc::c_int = libc::SIGURG;
+
+extern "C" fn on_kick(_: libc::c_int) {}
+
+/// Installs a handler for [`KICK_SIGNAL`] that does nothing (so that a
+/// thread it reaches in a system call other than `KVM_RUN` restarts it).
+pub fn install_kick_handler() -> io::Result<()> {
+    // SAFETY: zeroed is a valid `sigaction`; the fields are set below.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = on_kick as extern "C" fn(libc::c_int) as usize;
+    action.sa_flags = libc::SA_RESTART;
+    // SAFETY: an empty mask, written by the call.
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    // SAFETY: a valid action for a signal the process handles itself.
+    if unsafe { libc::sigaction(KICK_SIGNAL, &action, std::ptr::null_mut()) } != 0 {
+        return Err(last_error("sigaction"));
+    }
+    Ok(())
+}
+
+/// The calling thread's id.
+pub fn gettid() -> i32 {
+    // SAFETY: plain syscall.
+    unsafe { libc::gettid() }
+}
+
+/// Sends [`KICK_SIGNAL`] to thread `tid` of this process.
+pub fn kick_thread(tid: i32) {
+    static PID: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    // SAFETY: plain syscall.
+    let pid = *PID.get_or_init(|| unsafe { libc::getpid() });
+    // SAFETY: plain syscall; a thread that is gone makes it fail
+    // (`ESRCH`), and any thread of this process handles the signal.
+    unsafe {
+        libc::syscall(libc::SYS_tgkill, pid, tid, KICK_SIGNAL);
     }
 }
 
