@@ -98,6 +98,10 @@ pub use seatbelt::Kind as ProfileKind;
 #[cfg(target_os = "linux")]
 pub use landlock::nest as nest_landlock_domain;
 
+/// See `limits::seal_supervisor`.
+#[cfg(target_os = "linux")]
+pub use limits::seal_supervisor;
+
 #[cfg(target_os = "linux")]
 pub use harden::{
     apply, close_inherited_fds, Config, Hardened, Layer, LayerReport, Platform, Refused, Report,

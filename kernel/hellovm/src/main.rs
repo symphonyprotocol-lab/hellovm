@@ -886,7 +886,10 @@ fn run_kvm(
         egress,
         fds,
         false,
-        hellovm_sandbox::Platform::Kvm { vcpus },
+        hellovm_sandbox::Platform::Kvm {
+            vcpus,
+            ingress: false,
+        },
     )? {
         host.set_egress(path)?;
     }
