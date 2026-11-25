@@ -281,6 +281,11 @@ impl Drop for Kvm {
 impl Hypervisor for Kvm {
     const NAME: &'static str = "KVM";
     const SNAPSHOT_PREFIX: &'static str = "hellovm-kvm-";
+    // Clones map the snapshot's written pages, a run at a time
+    // (`snapshot::map_frozen_memory`): 128 KiB of zero frames between two
+    // runs are written too, which bounds the runs of a 2 GiB pool to
+    // 16,384.
+    const SNAPSHOT_GAP: u64 = 32;
     // The kernel process confines itself after the platform is made,
     // and on Linux that must happen before it has a second thread.
     const DEFER_THREADS: bool = true;
@@ -446,9 +451,7 @@ impl Hypervisor for Kvm {
 }
 
 fn page_size() -> usize {
-    // SAFETY: plain libc call.
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(size).unwrap_or(4096)
+    sys::host_page_size()
 }
 
 /// A vCPU of the VM, with its frame.

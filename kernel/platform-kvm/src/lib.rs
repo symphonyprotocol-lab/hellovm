@@ -27,6 +27,7 @@
 
 mod kvm;
 mod shim;
+pub mod snapshot;
 mod sys;
 
 #[cfg(test)]
