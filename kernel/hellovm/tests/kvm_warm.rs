@@ -2,7 +2,7 @@
 //! `/dev/kvm`), end to end: the tests of `hvf_warm.rs` (`vm_warm/tests.rs`)
 //! with CPython and busybox from the guest image (`HELLOVM_KVM_GUESTS`),
 //! under `--sandbox require`, and what only KVM clones have: an ingress
-//! channel, and memory mapped from the snapshot file without growing it.
+//! channel, and a snapshot file that clones never grow.
 //! Without `/dev/kvm` the tests print `SKIPPING` and pass, unless
 //! `HELLOVM_REQUIRE_E2E=1`. Built only with the `kvm-tests` feature
 //! (`kernel/dev/run-kvm-lima.sh`), as `kvm_cli.rs`.
@@ -84,8 +84,8 @@ mod support {
     }
 
     /// What of the resident size is the process's own (`RssAnon`) and
-    /// what it shares with the snapshot (`RssShmem`: the template's pages
-    /// it read, mapped from the file).
+    /// what it shares with the snapshot (`RssShmem`: the pages of the
+    /// kernel state and page tables it read through its mappings).
     pub fn memory_detail(pid: u32) -> String {
         let mib = |b: u64| b as f64 / (1 << 20) as f64;
         format!(
@@ -129,9 +129,10 @@ mod support {
 include!("vm_warm/tests.rs");
 
 /// Clones share the snapshot file read only. Memory that was zero in the
-/// template (here a 32 MiB buffer nobody touched) must not come from the
-/// file: the host would allocate each page of it in the file at a clone's
-/// first touch, for all clones and for as long as the template lives. The
+/// template (here a 32 MiB buffer nobody touched) is not stored, and a
+/// clone must not make the host allocate it in the file: a read of a hole
+/// through a mapping would, for all clones and for as long as the
+/// template lives (clones read frames with `pread`, which does not). The
 /// supervisor logs what the file holds once frozen and after each clone.
 #[test]
 fn clones_do_not_grow_the_snapshot() {
@@ -173,7 +174,8 @@ exec(compile(code, "<clone>", "exec"))
         })
         .collect();
     assert_eq!(holds.len(), 4, "{output}");
-    // Padded runs hold some zero pages too, but far less than the buffer.
+    // The stored frames, the kernel state and the page tables: far less
+    // than the buffer.
     assert!(holds[0] < stored + (8 << 20), "{holds:?}, {stored} stored");
     assert!(
         holds.iter().all(|&h| h == holds[0]),

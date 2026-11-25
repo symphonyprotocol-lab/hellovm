@@ -27,13 +27,13 @@
 
 mod kvm;
 mod shim;
-pub mod snapshot;
 mod sys;
 
 #[cfg(test)]
 mod tests;
 
-pub use hellovm_platform_arm64::{Flushes, Trimmed, MAX_VCPUS};
+pub use hellovm_platform_arm64::layout::PAGE;
+pub use hellovm_platform_arm64::{Flushes, Origin, Trimmed, MAX_VCPUS};
 pub use kvm::{Kvm, KvmKicker, KvmVcpu};
 
 /// The KVM platform: the shared arm64 platform on a KVM VM.

@@ -829,12 +829,6 @@ impl<B: Backing> Phys<B> {
         &mut self.ram
     }
 
-    /// The app memory's host memory, while no frame of it is in use (see
-    /// `VmPlatform::with_app_memory`).
-    pub fn ram_mut(&mut self) -> Option<&mut B> {
-        (self.ram_pool.taken() == 0).then_some(&mut self.ram)
-    }
-
     /// App memory in use, in bytes.
     pub fn ram_in_use(&self) -> u64 {
         self.ram_pool.in_use() * PAGE
@@ -1768,9 +1762,6 @@ pub struct SaveStats {
     pub stored: u64,
     /// Bytes of page tables saved.
     pub tables: u64,
-    /// Frames written as zeros between two saved ones (see `gap` in
-    /// [`Phys::save`]).
-    pub padded: u64,
 }
 
 impl<B: Backing> Phys<B> {
@@ -1780,17 +1771,10 @@ impl<B: Backing> Phys<B> {
     /// offset (the rest of `ram` is left alone: zero), and returns the
     /// rest of the state as bytes for [`Phys::load`]. `tables` and `ram`
     /// are as large as the pools. Nothing may run meanwhile.
-    ///
-    /// With `gap` > 0, fewer than `gap` frames between two saved ones are
-    /// written too, as zeros: a snapshot that clones map from its file in
-    /// runs of written pages (the KVM platform's, see
-    /// [`Hypervisor::SNAPSHOT_GAP`](crate::Hypervisor::SNAPSHOT_GAP)) then
-    /// has fewer, longer runs.
     pub fn save(
         &self,
         tables: &mut [u8],
         ram: &mut [u8],
-        gap: u64,
         w: &mut hellovm_core::snap::Writer<'_>,
     ) -> SaveStats {
         use hellovm_core::snap::Snap;
@@ -1802,7 +1786,6 @@ impl<B: Backing> Phys<B> {
         tables[..tables_len].copy_from_slice(&self.tables.bytes()[..tables_len]);
         let mut stored = vec![0u64; self.refs.len().div_ceil(64)];
         let mut page = [0u8; PAGE as usize];
-        let mut last: Option<usize> = None;
         for (i, &refs) in self
             .refs
             .iter()
@@ -1821,12 +1804,6 @@ impl<B: Backing> Phys<B> {
             ram[off..off + PAGE as usize].copy_from_slice(&page);
             stored[i / 64] |= 1 << (i % 64);
             stats.stored += 1;
-            if let Some(last) = last.filter(|&last| i - last > 1 && ((i - last - 1) as u64) < gap) {
-                // Written, not left alone: a file allocates what is written.
-                ram[(last + 1) * PAGE as usize..off].fill(0);
-                stats.padded += (i - last - 1) as u64;
-            }
-            last = Some(i);
         }
         // The fields of `Saved`, in its order, without copying the pools'
         // state first.
@@ -1848,15 +1825,11 @@ impl<B: Backing> Phys<B> {
     /// will use. Checks that the tables of those spaces stay inside the
     /// pools, and leaves each page whose frame is pending not valid (see
     /// the module documentation).
-    ///
-    /// Without an `origin`, nothing is pending: the app memory already
-    /// holds the template's (the KVM platform maps the snapshot's frames
-    /// into it, privately, before it loads: see `hellovm-platform-kvm`).
     pub fn load(
         &mut self,
         saved: Saved,
         tables: &[u8],
-        origin: Option<Box<dyn Origin>>,
+        origin: Box<dyn Origin>,
         roots: &[u64],
     ) -> Result<(), String> {
         let same = |a: &SavedPool, b: &Pool| a.base == b.base && a.frames == b.frames;
@@ -1918,15 +1891,15 @@ impl<B: Backing> Phys<B> {
         self.refs = saved.refs;
         self.objects = saved.objects;
         self.next_object = saved.next_object;
-        // Only frames in use are pending, and only with an origin.
+        // Only frames in use are pending.
         let mut pending = saved.stored;
         for (i, &refs) in self.refs.iter().enumerate() {
-            if refs == 0 || origin.is_none() {
+            if refs == 0 {
                 pending[i / 64] &= !(1 << (i % 64));
             }
         }
         self.pending = pending;
-        self.origin = origin;
+        self.origin = Some(origin);
         for &root in roots {
             self.adopt(root, 0)?;
         }
@@ -1999,7 +1972,7 @@ mod tests {
         let mut saved_tables = vec![0u8; tables * PAGE as usize];
         let mut saved_ram = vec![0u8; ram * PAGE as usize];
         let mut w = hellovm_core::snap::Writer::new();
-        let stats = t.save(&mut saved_tables, &mut saved_ram, 0, &mut w);
+        let stats = t.save(&mut saved_tables, &mut saved_ram, &mut w);
         let meta = w.into_inner();
         let saved = |meta: &[u8]| {
             let mut r = hellovm_core::snap::Reader::new(meta);
@@ -2014,7 +1987,7 @@ mod tests {
         c.load(
             saved(&meta).unwrap(),
             &saved_tables,
-            Some(Box::new(VecOrigin(saved_ram.clone()))),
+            Box::new(VecOrigin(saved_ram.clone())),
             &[a, b],
         )
         .unwrap();
@@ -2073,7 +2046,7 @@ mod tests {
             .load(
                 saved(&meta).unwrap(),
                 &saved_tables,
-                Some(Box::new(VecOrigin(saved_ram.clone()))),
+                Box::new(VecOrigin(saved_ram.clone())),
                 &[a]
             )
             .is_err());
@@ -2083,73 +2056,11 @@ mod tests {
             .load(
                 saved(&meta).unwrap(),
                 &saved_tables,
-                Some(Box::new(VecOrigin(saved_ram))),
+                Box::new(VecOrigin(saved_ram)),
                 &[0x1234_5000]
             )
             .is_err());
         assert!(saved(&meta[..meta.len() / 2]).is_err());
-    }
-
-    /// The KVM way: the clone's app memory already holds the snapshot's
-    /// frames (mapped from its file), so nothing is pending; gaps shorter
-    /// than `gap` between saved frames are written as zeros.
-    #[test]
-    fn a_clone_with_its_memory_mapped_has_nothing_pending() {
-        let (tables, ram) = (64, 64);
-        let mut t = phys(tables, ram);
-        t.shim_space().unwrap();
-        let a = t.new_space().unwrap();
-        t.map(a, 0x40_0000, 8 * PAGE, Prot::RW, false).unwrap();
-        t.write(a, 0x40_0000, b"first").unwrap();
-        // In use and all zero: frames 1 and 2 of the pool.
-        t.write(a, 0x40_1000, &[0; 8]).unwrap();
-        t.write(a, 0x40_2000, &[0; 8]).unwrap();
-        t.write(a, 0x40_3000, b"second").unwrap();
-        let b = t.fork(a).unwrap();
-        let mut saved_tables = vec![0u8; tables * PAGE as usize];
-        // Garbage where nothing is written: padding must write its zeros.
-        let mut saved_ram = vec![0xeeu8; ram * PAGE as usize];
-        let mut w = hellovm_core::snap::Writer::new();
-        let stats = t.save(&mut saved_tables, &mut saved_ram, 32, &mut w);
-        assert_eq!((stats.frames, stats.stored, stats.padded), (4, 2, 2));
-        let first = t.lookup(a, 0x40_0000) & pte::ADDR_MASK;
-        let off = (first - RAM_IPA) as usize;
-        assert!(saved_ram[off + PAGE as usize..off + 3 * PAGE as usize]
-            .iter()
-            .all(|&b| b == 0));
-        // Past the last saved frame nothing is written.
-        assert_eq!(saved_ram[off + 4 * PAGE as usize], 0xee);
-        // No padding without a gap to fill.
-        let mut again = vec![0xeeu8; ram * PAGE as usize];
-        let mut w0 = hellovm_core::snap::Writer::new();
-        let unpadded = t.save(&mut saved_tables.clone(), &mut again, 2, &mut w0);
-        assert_eq!(unpadded.padded, 0);
-        let meta = w.into_inner();
-        saved_tables.truncate(stats.tables as usize);
-        for page in saved_ram.chunks_mut(PAGE as usize) {
-            if page.iter().all(|&b| b == 0xee) {
-                page.fill(0);
-            }
-        }
-
-        // The clone's memory is the snapshot's, as a private mapping makes it.
-        let mut c = Phys::new(vec![0; tables * PAGE as usize], saved_ram.clone());
-        c.shim_space().unwrap();
-        let mut r = hellovm_core::snap::Reader::new(&meta);
-        let saved = <Saved as hellovm_core::snap::Snap>::get(&mut r).unwrap();
-        c.load(saved, &saved_tables, None, &[a, b]).unwrap();
-        // Valid at once, copy-on-write between the clone's spaces.
-        let desc = c.lookup(a, 0x40_0000);
-        assert_ne!(desc & pte::VALID, 0);
-        assert_ne!(desc & pte::AP_RO, 0);
-        let mut buf = [0u8; 6];
-        c.read(b, 0x40_3000, &mut buf).unwrap();
-        assert_eq!(&buf, b"second");
-        assert_eq!(c.demand(a, 0x40_0000, Access::Write), Demand::Filled);
-        c.write(a, 0x40_0000, b"FIRST").unwrap();
-        c.read(b, 0x40_0000, &mut buf[..5]).unwrap();
-        assert_eq!(&buf[..5], b"first");
-        assert_eq!(c.loaded(), 0, "nothing is copied from an origin");
     }
 
     #[test]

@@ -612,13 +612,6 @@ pub fn icache_invalidate(ptr: *mut u8, len: usize) {
 /// The granule of the pools' give-back (4 frames), and of every region.
 pub const HOST_PAGE: usize = 16 * 1024;
 
-/// The host's page size.
-pub fn host_page_size() -> usize {
-    // SAFETY: plain libc call.
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(size).unwrap_or(4096)
-}
-
 /// Anonymous, zero-filled host memory, released on drop.
 pub struct HostMem {
     ptr: *mut u8,
@@ -725,58 +718,11 @@ impl HostMem {
         }
     }
 
-    /// Maps `len` bytes of the file `fd` at `file_offset` over
-    /// `offset..offset + len` (all multiples of the host's page size),
-    /// privately (`MAP_PRIVATE | MAP_FIXED`): reads see the file's pages,
-    /// which every other mapping of them shares, and the first write to a
-    /// page copies it for this mapping alone; nothing written here reaches
-    /// the file. A memory slot over this mapping follows it (KVM's MMU
-    /// notifier drops what stage 2 held of the pages it replaced).
-    pub fn map_file_private(
-        &mut self,
-        offset: usize,
-        len: usize,
-        fd: RawFd,
-        file_offset: u64,
-    ) -> io::Result<()> {
-        self.check_range(offset, len);
-        let page = host_page_size() as u64;
-        if len == 0
-            || !(offset as u64).is_multiple_of(page)
-            || !(len as u64).is_multiple_of(page)
-            || !file_offset.is_multiple_of(page)
-        {
-            return Err(io::ErrorKind::InvalidInput.into());
-        }
-        let file_offset =
-            libc::off_t::try_from(file_offset).map_err(|_| io::ErrorKind::InvalidInput)?;
-        // SAFETY: replaces pages inside this mapping (checked) with a
-        // private mapping of the file; nothing outside it is affected,
-        // and the pools reach these bytes only through `self`.
-        let ptr = unsafe {
-            libc::mmap(
-                self.ptr.add(offset).cast(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
-                fd,
-                file_offset,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(last_error("mmap of the snapshot"));
-        }
-        Ok(())
-    }
-
     /// Gives `offset..offset + len` (whole host pages) back to the host
     /// (`MADV_DONTNEED`): the pages are freed at once and no longer count
     /// in the process's resident memory, and KVM removes them from the
     /// VM's stage-2 tables (its MMU notifier); the next access, by the
-    /// host or the VM, gets a new zero page, or in a range a warm clone
-    /// mapped from its snapshot ([`HostMem::map_file_private`]) the
-    /// snapshot's page again: undefined either way for the pools, which
-    /// zero every frame they hand out.
+    /// host or the VM, gets a new zero page.
     pub fn give_back(&mut self, offset: usize, len: usize) {
         self.check_range(offset, len);
         assert!(offset.is_multiple_of(HOST_PAGE) && len.is_multiple_of(HOST_PAGE));

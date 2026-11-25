@@ -26,10 +26,9 @@
 //!   the requester's fds and the snapshot (read only) from the
 //!   supervisor, makes its VM, loads the page tables and the kernel state,
 //!   hardens itself like any sandbox, and runs the clone. App memory
-//!   comes from the snapshot: on HVF page by page as the clone touches it
-//!   (copied), on KVM mapped from the snapshot privately before the
-//!   hardening (shared with the template's file until written). It sends
-//!   `S` and `X` (or `E`) on the requester's connection itself.
+//!   comes from the snapshot page by page as the clone touches it,
+//!   copied (see `SnapshotFrames`). It sends `S` and `X` (or `E`) on the
+//!   requester's connection itself.
 //!
 //! Each kernel process talks to the supervisor over a socket pair that is
 //! its stdin. When the supervisor dies (the socket closes) or stops a
@@ -50,9 +49,9 @@ use hellovm::warm::{self, Frame, Kind, Request, Status};
 use hellovm_core::{Kernel, KernelError, TemplateEnd};
 use hellovm_host::{ImageDir, StdioHost};
 #[cfg(target_os = "macos")]
-use hellovm_platform_hvf::{AppKiller, HvfConfig as VmConfig, HvfPlatform as VmApp};
+use hellovm_platform_hvf::{AppKiller, HvfConfig as VmConfig, HvfPlatform as VmApp, Origin, PAGE};
 #[cfg(target_os = "linux")]
-use hellovm_platform_kvm::{AppKiller, KvmConfig as VmConfig, KvmPlatform as VmApp};
+use hellovm_platform_kvm::{AppKiller, KvmConfig as VmConfig, KvmPlatform as VmApp, Origin, PAGE};
 
 use crate::{Ended, Options, EXIT_DRAIN};
 
@@ -484,20 +483,86 @@ impl Drop for SharedMap {
     }
 }
 
-/// On HVF a clone copies each frame of the template from the snapshot at
-/// its first touch.
-#[cfg(target_os = "macos")]
-impl hellovm_platform_hvf::Origin for SharedMap {
+/// The template's app memory in the snapshot, from which a clone copies
+/// each frame at its first touch: the platform's `Origin`, on both VM
+/// platforms.
+///
+/// Which frames a clone reads is up to the template's metadata (the
+/// stored bits in the platform's state), and the template's kernel
+/// process ran guest code: hostile metadata may name frames the template
+/// never wrote, holes of the snapshot's file. On Linux the frames are
+/// read with `pread` from the clones' read-only descriptor: reading a
+/// hole of a memfd that way gives zeros and allocates nothing, where a
+/// read through a mapping would allocate the page in the file that every
+/// clone shares. So whatever the metadata says, no clone grows the
+/// snapshot (the `kvm_warm` test `clones_do_not_grow_the_snapshot`). On
+/// macOS they are read through a read-only shared mapping, since the
+/// host cannot `pread` POSIX shared memory. A frame outside the app
+/// memory region reads as zeros on both.
+pub struct SnapshotFrames {
+    #[cfg(target_os = "macos")]
+    map: SharedMap,
+    #[cfg(target_os = "linux")]
+    fd: OwnedFd,
+    /// Where the region starts in the file.
+    #[cfg(target_os = "linux")]
+    at: u64,
+    len: usize,
+}
+
+impl SnapshotFrames {
+    /// The `len` bytes at `at` of the snapshot `fd` (read only).
+    fn new(fd: OwnedFd, at: u64, len: usize) -> io::Result<SnapshotFrames> {
+        #[cfg(target_os = "macos")]
+        return Ok(SnapshotFrames {
+            map: SharedMap::map(fd.as_fd(), at, len, false)?,
+            len,
+        });
+        #[cfg(target_os = "linux")]
+        Ok(SnapshotFrames { fd, at, len })
+    }
+}
+
+impl Origin for SnapshotFrames {
     fn read_frame(&self, index: usize, out: &mut [u8]) {
-        let page = hellovm_platform_hvf::PAGE as usize;
-        let at = index.checked_mul(page).filter(|&at| at + page <= self.len);
-        match at {
-            Some(at) => {
-                // SAFETY: in bounds (checked); a copy without a reference,
-                // like guest memory (nothing writes it any more).
-                unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(at), out.as_mut_ptr(), page) }
+        let page = PAGE as usize;
+        let at = index
+            .checked_mul(page)
+            .filter(|&at| at + page <= self.len && out.len() == page);
+        let Some(at) = at else {
+            return out.fill(0);
+        };
+        #[cfg(target_os = "macos")]
+        out.copy_from_slice(&self.map.bytes()[at..at + page]);
+        #[cfg(target_os = "linux")]
+        {
+            let mut done = 0;
+            while done < page {
+                let offset = self.at + (at + done) as u64;
+                // SAFETY: reads into the rest of `out`, `page - done`
+                // bytes long.
+                let n = unsafe {
+                    libc::pread(
+                        self.fd.as_raw_fd(),
+                        out[done..].as_mut_ptr().cast(),
+                        page - done,
+                        offset as libc::off_t,
+                    )
+                };
+                if n > 0 {
+                    done += n as usize;
+                } else if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                } else {
+                    // Past the end of the file or an error of the host's;
+                    // neither is expected (the file is as long as the
+                    // layout and sealed). Zeros, as for a frame never
+                    // written.
+                    log::warn!("clone: frame {index} of the snapshot could not be read");
+                    out[done..].fill(0);
+                    break;
+                }
             }
-            None => out.fill(0),
         }
     }
 }
@@ -1284,14 +1349,13 @@ fn template_kernel(
     head[..Header::LEN].copy_from_slice(&header.encode());
     log::info!(
         "template saved in {:?}: kernel state {} bytes, platform {} bytes, page tables {} bytes, \
-         {} of {} app frames stored, {} zero frames between them",
+         {} of {} app frames stored",
         saving.elapsed(),
         header.kernel_len,
         header.platform_len,
         stats.tables,
         stats.stored,
-        stats.frames,
-        stats.padded
+        stats.frames
     );
     let mut message = vec![MSG_FROZEN];
     message.extend_from_slice(&header.stored.to_le_bytes());
@@ -1389,13 +1453,12 @@ fn clone_kernel(options: &Options, fds: Result<usize, String>, control: &UnixStr
         send(Frame::Error(why));
         CLONE_FAILED
     };
-    let mut app = match prepare_clone(options, fds, control, &snapshot, stdio, ingress.is_some()) {
+    // The snapshot's descriptor goes to the clone's origin (on Linux,
+    // which reads from it; on macOS it keeps a mapping instead).
+    let mut app = match prepare_clone(options, fds, control, snapshot, stdio, ingress.is_some()) {
         Ok(prepared) => prepared,
         Err(why) => return fail(format!("rebuilding the clone: {why}")),
     };
-    // Nothing of the snapshot is left but the mappings made from it (on
-    // KVM, private ones).
-    drop(snapshot);
     let (app, kernel): (&mut VmApp, _) = (&mut app.0, &mut app.1);
     let sandbox_id = match request.sandbox_id {
         Some(id) => id,
@@ -1465,7 +1528,7 @@ fn prepare_clone(
     options: &Options,
     fds: Result<usize, String>,
     control: &UnixStream,
-    snapshot: &OwnedFd,
+    snapshot: OwnedFd,
     stdio: [File; 3],
     ingress: bool,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
@@ -1481,14 +1544,12 @@ fn prepare_clone(
         layout.tables as usize,
         false,
     )?;
-    // HVF: a frame at a time, copied at its first touch.
-    #[cfg(target_os = "macos")]
-    let origin: Option<Box<dyn hellovm_platform_hvf::Origin>> = Some(Box::new(SharedMap::map(
-        snapshot.as_fd(),
+    // A frame at a time, copied at its first touch.
+    let origin: Box<dyn Origin> = Box::new(SnapshotFrames::new(
+        snapshot,
         layout.ram_at(),
         layout.ram as usize,
-        false,
-    )?));
+    )?);
     let egress = egress_path(options)?;
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
@@ -1497,24 +1558,6 @@ fn prepare_clone(
     let t1 = Instant::now();
     // Never dropped: see `run`.
     let mut app = std::mem::ManuallyDrop::new(Box::new(new_platform(options)?));
-    // KVM: the snapshot's written runs mapped over the clone's app
-    // memory, privately; which runs, the host says (nothing the template
-    // wrote is read for it).
-    #[cfg(target_os = "linux")]
-    let origin = {
-        let mapped = hellovm_platform_kvm::snapshot::map_frozen_memory(
-            &mut app,
-            snapshot.as_fd(),
-            layout.ram_at(),
-        )
-        .map_err(|err| format!("mapping the snapshot's app memory: {err}"))?;
-        log::debug!(
-            "clone: snapshot's app memory mapped: {} bytes in {} runs",
-            mapped.bytes,
-            mapped.runs
-        );
-        None
-    };
     let t2 = Instant::now();
     let mut host = StdioHost::new(Some(image));
     let [stdin, stdout, stderr] = stdio;
@@ -1538,8 +1581,8 @@ fn prepare_clone(
     let kernel = Kernel::load_frozen(host, &state.bytes()[..kernel_len])?;
     drop(state);
     log::debug!(
-        "clone: snapshot mapped in {:?}, VM made (and on KVM its memory mapped) in {:?}, \
-         hardened in {:?}, page tables loaded in {:?}, kernel state read in {:?}",
+        "clone: snapshot mapped in {:?}, VM made in {:?}, hardened in {:?}, \
+         page tables loaded in {:?}, kernel state read in {:?}",
         t1 - t0,
         t2 - t1,
         t3 - t2,

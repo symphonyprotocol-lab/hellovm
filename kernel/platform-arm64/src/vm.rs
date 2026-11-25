@@ -1590,7 +1590,7 @@ impl<H: Hypervisor> VmPlatform<H> {
         w.bytes(hellovm_core::snap::BUILD.as_bytes());
         memory.put(w);
         table_memory.put(w);
-        let stats = self.smp.phys().save(tables, ram, H::SNAPSHOT_GAP, w);
+        let stats = self.smp.phys().save(tables, ram, w);
         frozen.put(w);
         Ok(stats)
     }
@@ -1600,13 +1600,12 @@ impl<H: Hypervisor> VmPlatform<H> {
     /// template, ready for [`Platform::thaw`]: `meta` from
     /// [`VmPlatform::save_frozen`], `tables` the saved page tables (the
     /// used part), `origin` the saved app memory, copied page by page as
-    /// the clone touches it; `None` when the app memory holds the saved
-    /// one already (see [`VmPlatform::with_app_memory`]).
+    /// the clone touches it.
     pub fn load_frozen(
         &mut self,
         meta: &[u8],
         tables: &[u8],
-        origin: Option<Box<dyn Origin>>,
+        origin: Box<dyn Origin>,
     ) -> Result<(), String> {
         let bad = |e: hellovm_core::snap::Bad| e.to_string();
         let mut r = Reader::new(meta);
@@ -1649,19 +1648,6 @@ impl<H: Hypervisor> VmPlatform<H> {
         self.smp.phys().load(pools, tables, origin, &roots)?;
         self.frozen = Some(frozen);
         Ok(())
-    }
-
-    /// Lends the app memory's host memory to `f`, for a clone's backend
-    /// to put the template's app memory in it before
-    /// [`VmPlatform::load_frozen`] (the KVM platform maps the snapshot's
-    /// frames there). Only while nothing has run: `None` once a task
-    /// exists or something is frozen or loaded.
-    pub fn with_app_memory<R>(&mut self, f: impl FnOnce(&mut H::Mem) -> R) -> Option<R> {
-        if !self.lock().tasks.is_empty() || self.frozen.is_some() {
-            return None;
-        }
-        let mut phys = self.smp.phys();
-        phys.ram_mut().map(f)
     }
 
     /// App frames a clone copied from its template so far.
