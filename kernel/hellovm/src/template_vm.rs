@@ -1,13 +1,17 @@
-//! `hellovm --template SOCKET` on macOS (the HVF platform): a warm-clone
-//! template and its clones, with the protocol of `hellovm::warm`.
+//! `hellovm --template SOCKET` on the VM platforms: the HVF platform
+//! (macOS) and the KVM platform (`--platform kvm`, arm64 Linux). A
+//! warm-clone template and its clones, with the protocol of
+//! `hellovm::warm`.
 //!
-//! A Hypervisor.framework VM does not survive `fork`, and a process has
-//! one, so a clone cannot be a fork of the template's kernel process as on
-//! Linux. Three kinds of process instead, each a `hellovm` started from
-//! its own executable (see README, "Warm clones on macOS"):
+//! Neither a Hypervisor.framework VM nor a KVM VM survives `fork` (KVM
+//! refuses a VM fd in another process), so a clone cannot be a fork of
+//! the template's kernel process as on the seccomp platform. Three kinds
+//! of process instead, each a `hellovm` started from its own executable
+//! (see README, "Warm clones on macOS" and "Warm clones on KVM"):
 //!
 //! * The *supervisor* (`hellovm --template`) binds the socket, makes the
-//!   snapshot (a POSIX shared memory object) and starts the template's
+//!   snapshot (a POSIX shared memory object on macOS, a memfd on Linux,
+//!   sealed once written) and starts the template's
 //!   kernel process. Once the template is frozen it serves the socket:
 //!   for each clone request it starts a clone's kernel process. It runs no
 //!   guest code, makes no VM and reads no byte any kernel process wrote:
@@ -21,30 +25,36 @@
 //! * A *clone's kernel process* (`--warm-role clone`) gets the request,
 //!   the requester's fds and the snapshot (read only) from the
 //!   supervisor, makes its VM, loads the page tables and the kernel state,
-//!   hardens itself like any sandbox, and runs the clone: app memory comes
-//!   from the snapshot page by page as the clone touches it. It sends `S`
-//!   and `X` (or `E`) on the requester's connection itself.
+//!   hardens itself like any sandbox, and runs the clone. App memory
+//!   comes from the snapshot: on HVF page by page as the clone touches it
+//!   (copied), on KVM mapped from the snapshot privately before the
+//!   hardening (shared with the template's file until written). It sends
+//!   `S` and `X` (or `E`) on the requester's connection itself.
 //!
 //! Each kernel process talks to the supervisor over a socket pair that is
 //! its stdin. When the supervisor dies (the socket closes) or stops a
 //! clone because its requester went away (it sends a byte), the kernel
 //! process ends its apps with the platform's killer, as `--timeout` does,
-//! and exits; only one that has not exited 10 s later is killed.
+//! and exits; only one that has not exited 10 s later is killed. On Linux
+//! a kernel process also dies with the supervisor (`PR_SET_PDEATHSIG`).
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hellovm::warm::{self, Frame, Kind, Request, Status};
 use hellovm_core::{Kernel, KernelError, TemplateEnd};
 use hellovm_host::{ImageDir, StdioHost};
-use hellovm_platform_hvf::{HvfConfig, HvfPlatform, SharedMap};
+#[cfg(target_os = "macos")]
+use hellovm_platform_hvf::{AppKiller, HvfConfig as VmConfig, HvfPlatform as VmApp};
+#[cfg(target_os = "linux")]
+use hellovm_platform_kvm::{AppKiller, KvmConfig as VmConfig, KvmPlatform as VmApp};
 
-use crate::{egress_socket, harden, Ended, Options, EXIT_DRAIN};
+use crate::{Ended, Options, EXIT_DRAIN};
 
 /// Most connections served at once (clones and requests being read). Each
 /// clone is a process with a VM of its own.
@@ -102,7 +112,7 @@ impl Layout {
     /// made with the same one), and the state region the writable layer's
     /// limit needs.
     fn of(options: &Options) -> Layout {
-        let config = HvfConfig::default();
+        let config = VmConfig::default();
         let fs = options
             .fs_limit
             .unwrap_or(hellovm_core::vfs::DEFAULT_UPPER_LIMIT)
@@ -137,7 +147,8 @@ struct Header {
     stored: u64,
     areas: u32,
     /// The template's monotonic clock, and the host's uptime clock
-    /// (`CLOCK_UPTIME_RAW`, the one `Instant` uses), at the freeze.
+    /// (the one `Instant` uses: `CLOCK_UPTIME_RAW` on macOS,
+    /// `CLOCK_MONOTONIC` on Linux), at the freeze.
     monotonic_ns: u64,
     uptime_ns: u64,
 }
@@ -186,12 +197,26 @@ impl Header {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn uptime_ns() -> u64 {
     extern "C" {
         fn clock_gettime_nsec_np(clock: libc::clockid_t) -> u64;
     }
     // SAFETY: plain clock read (from the commpage: no system call).
     unsafe { clock_gettime_nsec_np(libc::CLOCK_UPTIME_RAW) }
+}
+
+#[cfg(target_os = "linux")]
+fn uptime_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: plain clock read into a valid struct (from the vDSO).
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
 }
 
 /// The messages of the template's kernel process to the supervisor.
@@ -204,13 +229,12 @@ const MAX_MESSAGE: usize = 1 + 4096;
 // ---------------------------------------------------------------------
 // The supervisor.
 
-/// `hellovm --template SOCKET` on macOS.
+/// `hellovm --template SOCKET` on macOS, or on Linux with `--platform
+/// kvm`.
 pub fn run(options: &Options, socket: &Path) -> Result<Ended, Box<dyn std::error::Error>> {
     // The kernel processes check these themselves; checked here too so
     // that a bad option fails before the socket exists.
-    if let Some(path) = &options.egress {
-        egress_socket(path)?;
-    }
+    egress_path(options)?;
     let exe = std::env::current_exe()?;
     let listener = UnixListener::bind(socket)
         .map_err(|err| format!("control socket {}: {err}", socket.display()))?;
@@ -226,7 +250,6 @@ pub fn run(options: &Options, socket: &Path) -> Result<Ended, Box<dyn std::error
         .map_err(|err| format!("starting the template's kernel process: {err}"))?;
     let started = Instant::now();
     warm::send_with_fds(&control, b"HVMK", &[rw.as_raw_fd()])?;
-    drop(rw);
     let message = read_message(&control);
     // It exits after its message; no snapshot is used before it has.
     let status = wait_exit(&mut kernel, EXIT_PATIENCE);
@@ -265,9 +288,18 @@ pub fn run(options: &Options, socket: &Path) -> Result<Ended, Box<dyn std::error
             return Err(why.into());
         }
     };
+    // Its only writer has exited: from now on nobody can change it.
+    if let Err(err) = seal(&rw) {
+        let why = format!("sealing the snapshot: {err}");
+        refuse(&listener, &why);
+        return Err(why.into());
+    }
+    drop(rw);
     log::info!(
-        "template frozen after {:?}: {stored} bytes of memory in {areas} areas",
-        started.elapsed()
+        "template frozen after {:?}: {stored} bytes of memory in {areas} areas; \
+         the snapshot holds {} bytes",
+        started.elapsed(),
+        allocated(&ro)
     );
     drop(control);
     serve(&listener, &exe, options, &ro, (stored, areas))?;
@@ -278,6 +310,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<Ended, Box<dyn std::error
 /// write it (for the template's kernel process) and one that may only
 /// read it (for the clones: a read-only descriptor cannot be mapped
 /// writable).
+#[cfg(target_os = "macos")]
 fn shared_memory(len: u64) -> io::Result<(OwnedFd, OwnedFd)> {
     let mut id = [0u8; 4];
     File::open("/dev/urandom")?.read_exact(&mut id)?;
@@ -313,6 +346,174 @@ fn shared_memory(len: u64) -> io::Result<(OwnedFd, OwnedFd)> {
     }
 }
 
+/// On macOS nothing to do: the template's kernel process, which had the
+/// only writable descriptor, has exited, and the read-only ones cannot
+/// write.
+#[cfg(target_os = "macos")]
+fn seal(_rw: &OwnedFd) -> io::Result<()> {
+    Ok(())
+}
+
+/// The snapshot: a memfd, sized, and a second descriptor of it opened
+/// read only (through `/proc/self/fd`: a memfd has no other name) for the
+/// clones, which may not write it, grow it or fill its holes
+/// (`fallocate` needs a writable descriptor) even before it is sealed.
+#[cfg(target_os = "linux")]
+fn shared_memory(len: u64) -> io::Result<(OwnedFd, OwnedFd)> {
+    // SAFETY: plain calls; the fds are owned at once.
+    unsafe {
+        let rw = libc::memfd_create(
+            c"hellovm-snapshot".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        );
+        if rw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let rw = OwnedFd::from_raw_fd(rw);
+        let len = libc::off_t::try_from(len).map_err(|_| io::ErrorKind::InvalidInput)?;
+        if libc::ftruncate(rw.as_raw_fd(), len) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let path =
+            std::ffi::CString::new(format!("/proc/self/fd/{}", rw.as_raw_fd())).expect("no NUL");
+        let ro = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if ro < 0 {
+            return Err(io::Error::other(format!(
+                "a read-only descriptor of the snapshot (needs /proc): {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok((rw, OwnedFd::from_raw_fd(ro)))
+    }
+}
+
+/// Seals the snapshot once the template's kernel process, its only
+/// writer, has exited: no write, no growing or shrinking, no new seals.
+/// The host refuses `F_SEAL_WRITE` while a writable shared mapping
+/// exists, so this also checks that none is left.
+#[cfg(target_os = "linux")]
+fn seal(rw: &OwnedFd) -> io::Result<()> {
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: plain fcntl on an fd this process owns.
+    if unsafe { libc::fcntl(rw.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A shared mapping of the snapshot: writable for the template's kernel
+/// process that saves into it, read only for its clones. Unmapped on
+/// drop.
+pub struct SharedMap {
+    ptr: *mut u8,
+    len: usize,
+    writable: bool,
+}
+
+impl SharedMap {
+    /// Maps `len` bytes of `fd` at `offset` (multiples of the host's page
+    /// size). A read-only mapping cannot be made writable later: the
+    /// clones' descriptor is read only, so the host refuses that.
+    pub fn map(
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        len: usize,
+        writable: bool,
+    ) -> io::Result<SharedMap> {
+        // SAFETY: plain libc call.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        if len == 0 || !(len as u64).is_multiple_of(page) || !offset.is_multiple_of(page) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let prot = if writable {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+        let offset = libc::off_t::try_from(offset)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: a new shared mapping of the file; nothing else in the
+        // process is affected.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                prot,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                offset,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(SharedMap {
+            ptr: ptr.cast(),
+            len,
+            writable,
+        })
+    }
+
+    /// The bytes. Only the template's kernel process writes them, before
+    /// any clone exists: for a clone they never change. On Linux a clone
+    /// reads only what its header says the template wrote: reading a
+    /// hole of a memfd through a mapping fills it.
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: the mapping lives as long as `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// The bytes, writable (a mapping made writable).
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        assert!(self.writable, "a read-only snapshot mapping");
+        // SAFETY: as in `bytes`; `&mut self` makes this the only view in
+        // this process.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+// SAFETY: a plain shared mapping; access goes through `&self`/`&mut self`.
+unsafe impl Send for SharedMap {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for SharedMap {}
+
+impl Drop for SharedMap {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly what `map` mapped.
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+/// On HVF a clone copies each frame of the template from the snapshot at
+/// its first touch.
+#[cfg(target_os = "macos")]
+impl hellovm_platform_hvf::Origin for SharedMap {
+    fn read_frame(&self, index: usize, out: &mut [u8]) {
+        let page = hellovm_platform_hvf::PAGE as usize;
+        let at = index.checked_mul(page).filter(|&at| at + page <= self.len);
+        match at {
+            Some(at) => {
+                // SAFETY: in bounds (checked); a copy without a reference,
+                // like guest memory (nothing writes it any more).
+                unsafe { std::ptr::copy_nonoverlapping(self.ptr.add(at), out.as_mut_ptr(), page) }
+            }
+            None => out.fill(0),
+        }
+    }
+}
+
+/// The bytes the host has allocated for the snapshot: what the template
+/// wrote, which clones never grow (logged; the supervisor is not
+/// dumpable, so nobody else may look at its fds).
+fn allocated(fd: &OwnedFd) -> u64 {
+    // SAFETY: a valid fd and a zeroed stat buffer the call fills.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return 0;
+    }
+    st.st_blocks as u64 * 512
+}
+
 /// The command line of a kernel process: the template's options (the
 /// program too, which a clone ignores), and its role.
 fn kernel_args(options: &Options, role: &str) -> Vec<std::ffi::OsString> {
@@ -335,6 +536,8 @@ fn kernel_args(options: &Options, role: &str) -> Vec<std::ffi::OsString> {
     if let Some(n) = options.vcpus {
         flag("--vcpus", n.to_string().into());
     }
+    #[cfg(target_os = "linux")]
+    flag("--platform", "kvm".into());
     flag(
         "--sandbox",
         match options.sandbox {
@@ -520,6 +723,12 @@ fn serve(
             }
             if child != 0 || clients[i].exiting {
                 reap(&mut clients[i]);
+                if clients[i].done {
+                    log::debug!(
+                        "template: a clone ended; the snapshot holds {} bytes",
+                        allocated(snapshot)
+                    );
+                }
             }
         }
         let now = Instant::now();
@@ -642,6 +851,7 @@ fn read_request(
                 client.done = true;
                 return;
             }
+            #[cfg(target_os = "macos")]
             if request.ingress {
                 client.send(&Frame::Error(
                     "an ingress channel needs Linux: on macOS a sandbox has no inbound \
@@ -812,14 +1022,12 @@ fn control_socket() -> UnixStream {
 static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Stops the sandbox as soon as the supervisor closes `control` (it died)
-/// or sends anything on it (stop): a thread, made before the hardening,
-/// blocked in `read` until then, ends every app with `killer` (the run
-/// then ends and the process exits as after `--timeout`), and exits the
-/// process itself if that has not happened after [`EXIT_PATIENCE`].
-fn stop_with_supervisor(
-    control: &UnixStream,
-    killer: hellovm_platform_hvf::AppKiller,
-) -> io::Result<()> {
+/// or sends anything on it (stop): a thread, blocked in `read` until
+/// then, ends every app with `killer` (the run then ends and the process
+/// exits as after `--timeout`), and exits the process itself if that has
+/// not happened after [`EXIT_PATIENCE`]. Made before the hardening on
+/// macOS, after it on Linux (see [`confine`]).
+fn stop_with_supervisor(control: &UnixStream, killer: AppKiller) -> io::Result<()> {
     let control = control.try_clone()?;
     STOPPED.store(false, std::sync::atomic::Ordering::SeqCst);
     std::thread::Builder::new()
@@ -830,7 +1038,10 @@ fn stop_with_supervisor(
             let _ = read_some(&control, &mut byte);
             STOPPED.store(true, std::sync::atomic::Ordering::SeqCst);
             killer.kill();
+            #[cfg(target_os = "macos")]
             hellovm_host::sleep_confined(EXIT_PATIENCE);
+            #[cfg(target_os = "linux")]
+            std::thread::sleep(EXIT_PATIENCE);
             // SAFETY: ends the process at once.
             unsafe { libc::_exit(CLONE_FAILED) };
         })?;
@@ -839,7 +1050,7 @@ fn stop_with_supervisor(
 
 /// Writes all of `data` to the socket `fd` with `write`, which the
 /// confined process may make (`std`'s socket writes are `sendto`, and its
-/// reads `recvfrom`: not in the profile).
+/// reads `recvfrom`: not in the macOS profile).
 fn write_all(fd: &impl AsRawFd, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
         // SAFETY: a valid buffer of that length.
@@ -878,6 +1089,97 @@ fn tell(control: &UnixStream, message: &[u8]) {
     let _ = write_all(control, &message);
 }
 
+/// The egress proxy's socket as the confined kernel process reaches it.
+fn egress_path(options: &Options) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    return options
+        .egress
+        .as_deref()
+        .map(crate::egress_socket)
+        .transpose();
+    #[cfg(target_os = "linux")]
+    return Ok(options
+        .egress
+        .as_deref()
+        .map(std::path::absolute)
+        .transpose()?);
+}
+
+/// This process's VM, made before the hardening.
+fn new_platform(options: &Options) -> Result<VmApp, Box<dyn std::error::Error>> {
+    VmApp::new(VmConfig {
+        vcpus: options.vcpus.unwrap_or(0),
+        ..VmConfig::default()
+    })
+    .map_err(|err| format!("the {} platform: {err}", PLATFORM).into())
+}
+
+#[cfg(target_os = "macos")]
+const PLATFORM: &str = "HVF";
+#[cfg(target_os = "linux")]
+const PLATFORM: &str = "KVM";
+
+/// On Linux a kernel process dies with the supervisor even before its
+/// thread that watches the control socket exists (that one starts after
+/// the hardening): `PR_SET_PDEATHSIG`, and a check that the supervisor
+/// is still its parent.
+#[cfg(target_os = "linux")]
+fn die_with_supervisor() -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: plain prctl and getppid.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() == 1 {
+            return Err("the supervisor is gone".into());
+        }
+    }
+    Ok(())
+}
+
+/// Hardens the kernel process (the layers of any run, `hellovm-sandbox`)
+/// and starts the thread that stops it with the supervisor. On macOS the
+/// thread and the egress I/O thread exist before the Seatbelt profile;
+/// on Linux no thread may exist before the namespaces and Landlock (they
+/// apply to the calling thread only), so both start after. `ingress`: a
+/// clone that receives inbound connections (KVM's allowlist then takes
+/// `recvmsg`).
+fn confine(
+    options: &Options,
+    app: &VmApp,
+    host: &mut StdioHost,
+    egress: Option<PathBuf>,
+    fds: Result<usize, String>,
+    ingress: bool,
+    control: &UnixStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = ingress;
+        let image_path = host.image_mut().ok_or("no image")?.root().to_path_buf();
+        stop_with_supervisor(control, app.killer())?;
+        if let Some(path) = &egress {
+            host.set_egress(path)?;
+        }
+        crate::harden(options, &image_path, egress.as_deref(), fds)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let vcpus = app.hypervisor().vcpu_fds();
+        let image = host.image_mut().ok_or("no image")?;
+        let (egress, _) = crate::harden(
+            options,
+            image,
+            egress,
+            fds,
+            false,
+            hellovm_sandbox::Platform::Kvm { vcpus, ingress },
+        )?;
+        if let Some(path) = egress {
+            host.set_egress(path)?;
+        }
+        stop_with_supervisor(control, app.killer())?;
+    }
+    Ok(())
+}
+
 /// `--warm-role template`: the template's kernel process.
 pub fn run_template_kernel(options: &Options, fds: Result<usize, String>) -> ! {
     let control = control_socket();
@@ -909,25 +1211,19 @@ fn template_kernel(
     let layout = Layout::of(options);
     let mut snapshot = SharedMap::map(shm.as_fd(), 0, layout.total() as usize, true)?;
     drop(shm);
-    let egress = options.egress.as_deref().map(egress_socket).transpose()?;
+    let egress = egress_path(options)?;
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
-    let image_path = image.root().to_path_buf();
-    let mut app = std::mem::ManuallyDrop::new(HvfPlatform::new(HvfConfig {
-        vcpus: options.vcpus.unwrap_or(0),
-        ..HvfConfig::default()
-    })?);
-    let app: &mut HvfPlatform = &mut app;
+    #[cfg(target_os = "linux")]
+    die_with_supervisor()?;
+    let mut app = std::mem::ManuallyDrop::new(new_platform(options)?);
+    let app: &mut VmApp = &mut app;
     if app.pool_sizes() != (layout.ram, layout.tables) {
         return Err("the VM's size differs from the snapshot's".into());
     }
-    stop_with_supervisor(control, app.killer())?;
     let mut host = StdioHost::new(Some(image));
     host.close_input();
-    if let Some(path) = &egress {
-        host.set_egress(path)?;
-    }
-    harden(options, &image_path, egress.as_deref(), fds)?;
+    confine(options, app, &mut host, egress, fds, false, control)?;
     let sandbox_id = crate::sandbox_id(options, &mut host)?;
     let mut kernel = Kernel::new(host).with_sandbox_id(sandbox_id).template();
     if let Some(bytes) = options.fs_limit {
@@ -988,13 +1284,14 @@ fn template_kernel(
     head[..Header::LEN].copy_from_slice(&header.encode());
     log::info!(
         "template saved in {:?}: kernel state {} bytes, platform {} bytes, page tables {} bytes, \
-         {} of {} app frames stored",
+         {} of {} app frames stored, {} zero frames between them",
         saving.elapsed(),
         header.kernel_len,
         header.platform_len,
         stats.tables,
         stats.stored,
-        stats.frames
+        stats.frames,
+        stats.padded
     );
     let mut message = vec![MSG_FROZEN];
     message.extend_from_slice(&header.stored.to_le_bytes());
@@ -1016,6 +1313,8 @@ struct Setup {
     snapshot: OwnedFd,
     conn: UnixStream,
     stdio: [File; 3],
+    /// The ingress channel, when the request has one (Linux).
+    ingress: Option<OwnedFd>,
 }
 
 fn receive_setup(control: &UnixStream) -> Result<Setup, String> {
@@ -1023,7 +1322,7 @@ fn receive_setup(control: &UnixStream) -> Result<Setup, String> {
     let mut have = 0;
     let mut fds = Vec::new();
     let request = loop {
-        let n = warm::recv_with_fds(control.as_fd(), &mut buf[have..], &mut fds, 6)
+        let n = warm::recv_with_fds(control.as_fd(), &mut buf[have..], &mut fds, 7)
             .map_err(|err| format!("the request: {err}"))?;
         if n == 0 {
             return Err("the supervisor sent no request".into());
@@ -1043,15 +1342,14 @@ fn receive_setup(control: &UnixStream) -> Result<Setup, String> {
         }
     };
     warm::wipe(&mut buf);
+    let want = if request.ingress { 6 } else { 5 };
+    if fds.len() != want {
+        return Err("the request came without its fds".into());
+    }
     let mut fds = fds.into_iter();
-    let (Some(snapshot), Some(conn), Some(i), Some(o), Some(e), None) = (
-        fds.next(),
-        fds.next(),
-        fds.next(),
-        fds.next(),
-        fds.next(),
-        fds.next(),
-    ) else {
+    let (Some(snapshot), Some(conn), Some(i), Some(o), Some(e)) =
+        (fds.next(), fds.next(), fds.next(), fds.next(), fds.next())
+    else {
         return Err("the request came without its fds".into());
     };
     Ok(Setup {
@@ -1059,6 +1357,7 @@ fn receive_setup(control: &UnixStream) -> Result<Setup, String> {
         snapshot,
         conn: UnixStream::from(conn),
         stdio: [File::from(i), File::from(o), File::from(e)],
+        ingress: fds.next(),
     })
 }
 
@@ -1077,6 +1376,7 @@ fn clone_kernel(options: &Options, fds: Result<usize, String>, control: &UnixStr
         snapshot,
         conn,
         stdio,
+        ingress,
     } = setup;
     let send = |frame: Frame| {
         let mut bytes = frame.encode();
@@ -1089,12 +1389,14 @@ fn clone_kernel(options: &Options, fds: Result<usize, String>, control: &UnixStr
         send(Frame::Error(why));
         CLONE_FAILED
     };
-    let mut app = match prepare_clone(options, fds, control, &snapshot, stdio) {
+    let mut app = match prepare_clone(options, fds, control, &snapshot, stdio, ingress.is_some()) {
         Ok(prepared) => prepared,
         Err(why) => return fail(format!("rebuilding the clone: {why}")),
     };
+    // Nothing of the snapshot is left but the mappings made from it (on
+    // KVM, private ones).
     drop(snapshot);
-    let (app, kernel): (&mut HvfPlatform, _) = (&mut app.0, &mut app.1);
+    let (app, kernel): (&mut VmApp, _) = (&mut app.0, &mut app.1);
     let sandbox_id = match request.sandbox_id {
         Some(id) => id,
         None => {
@@ -1110,6 +1412,18 @@ fn clone_kernel(options: &Options, fds: Result<usize, String>, control: &UnixStr
     if let Err(err) = kernel.thaw(app, std::mem::take(&mut request.input)) {
         return fail(format!("rebuilding the clone: {err}"));
     }
+    #[cfg(target_os = "linux")]
+    if let Some(channel) = ingress {
+        let queue = kernel.host_mut().inbound_queue();
+        let spawned = std::thread::Builder::new()
+            .name("hellovm-ingress".into())
+            .spawn(move || crate::template::ingress_channel(channel, queue));
+        if let Err(err) = spawned {
+            return fail(format!("the ingress channel: {err}"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    drop(ingress);
     log::info!("clone sandbox id {sandbox_id:016x}");
     log::debug!(
         "clone: set up in {:?}, tasks rebuilt in {:?}",
@@ -1145,7 +1459,7 @@ fn clone_kernel(options: &Options, fds: Result<usize, String>, control: &UnixStr
 
 /// A clone's VM, with the template's tables, and its kernel, with the
 /// template's state, hardened: everything but the thaw.
-type Prepared = (std::mem::ManuallyDrop<Box<HvfPlatform>>, Kernel<StdioHost>);
+type Prepared = (std::mem::ManuallyDrop<Box<VmApp>>, Kernel<StdioHost>);
 
 fn prepare_clone(
     options: &Options,
@@ -1153,6 +1467,7 @@ fn prepare_clone(
     control: &UnixStream,
     snapshot: &OwnedFd,
     stdio: [File; 3],
+    ingress: bool,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
     let layout = Layout::of(options);
     let t0 = Instant::now();
@@ -1166,23 +1481,40 @@ fn prepare_clone(
         layout.tables as usize,
         false,
     )?;
-    let ram = SharedMap::map(
+    // HVF: a frame at a time, copied at its first touch.
+    #[cfg(target_os = "macos")]
+    let origin: Option<Box<dyn hellovm_platform_hvf::Origin>> = Some(Box::new(SharedMap::map(
         snapshot.as_fd(),
         layout.ram_at(),
         layout.ram as usize,
         false,
-    )?;
-    let egress = options.egress.as_deref().map(egress_socket).transpose()?;
+    )?));
+    let egress = egress_path(options)?;
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
-    let image_path = image.root().to_path_buf();
+    #[cfg(target_os = "linux")]
+    die_with_supervisor()?;
     let t1 = Instant::now();
     // Never dropped: see `run`.
-    let mut app = std::mem::ManuallyDrop::new(Box::new(HvfPlatform::new(HvfConfig {
-        vcpus: options.vcpus.unwrap_or(0),
-        ..HvfConfig::default()
-    })?));
-    stop_with_supervisor(control, app.killer())?;
+    let mut app = std::mem::ManuallyDrop::new(Box::new(new_platform(options)?));
+    // KVM: the snapshot's written runs mapped over the clone's app
+    // memory, privately; which runs, the host says (nothing the template
+    // wrote is read for it).
+    #[cfg(target_os = "linux")]
+    let origin = {
+        let mapped = hellovm_platform_kvm::snapshot::map_frozen_memory(
+            &mut app,
+            snapshot.as_fd(),
+            layout.ram_at(),
+        )
+        .map_err(|err| format!("mapping the snapshot's app memory: {err}"))?;
+        log::debug!(
+            "clone: snapshot's app memory mapped: {} bytes in {} runs",
+            mapped.bytes,
+            mapped.runs
+        );
+        None
+    };
     let t2 = Instant::now();
     let mut host = StdioHost::new(Some(image));
     let [stdin, stdout, stderr] = stdio;
@@ -1190,27 +1522,24 @@ fn prepare_clone(
     // The template's clock goes on: deadlines in the state count in it.
     let waited = Duration::from_nanos(uptime_ns().saturating_sub(header.uptime_ns));
     host.set_monotonic_clock(Duration::from_nanos(header.monotonic_ns) + waited);
-    if let Some(path) = &egress {
-        host.set_egress(path)?;
-    }
     // Confined before anything but the header is read: the snapshot was
     // written by the template's kernel process, which ran guest code.
-    harden(options, &image_path, egress.as_deref(), fds)?;
+    confine(options, &app, &mut host, egress, fds, ingress, control)?;
     let t3 = Instant::now();
     let kernel_len = header.kernel_len as usize;
     let platform = &state.bytes()[kernel_len..kernel_len + header.platform_len as usize];
     app.load_frozen(
         platform,
         &tables.bytes()[..header.tables_len as usize],
-        Some(Box::new(ram)),
+        origin,
     )?;
     drop(tables);
     let t4 = Instant::now();
     let kernel = Kernel::load_frozen(host, &state.bytes()[..kernel_len])?;
     drop(state);
     log::debug!(
-        "clone: snapshot mapped in {:?}, VM made in {:?}, hardened in {:?}, \
-         page tables loaded in {:?}, kernel state read in {:?}",
+        "clone: snapshot mapped in {:?}, VM made (and on KVM its memory mapped) in {:?}, \
+         hardened in {:?}, page tables loaded in {:?}, kernel state read in {:?}",
         t1 - t0,
         t2 - t1,
         t3 - t2,
