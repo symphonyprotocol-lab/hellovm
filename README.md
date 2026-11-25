@@ -1335,7 +1335,9 @@ the 1.0.4 attempt). On 2026-11-25 a VM made from `lima-kvm.yaml` as
 committed, with the commands above, ran the same suites once more, all
 passing; and again with warm clones (P1i): `hellovm-platform-arm64` 27
 tests, `hellovm-platform-kvm` 5, `kvm.rs` 19, `guests.rs` 11, `kvm_cli`
-7, `kvm_warm` 16, all passing.
+7, `kvm_warm` 16, all passing; and again with clones that copy their
+frames at first touch: `hellovm-platform-arm64` 26, `hellovm-platform-kvm`
+4, `kvm.rs` 19, `guests.rs` 11, `kvm_cli` 7, `kvm_warm` 16, all passing.
 
 **Performance.** Measured in that Lima VM, release builds, through the
 command line with `--sandbox require` (wall clock, best of 3 or 10) and
@@ -2380,53 +2382,62 @@ second descriptor, opened read only through `/proc/self/fd` (a memfd
 has no other name): with it nothing can write the file, map it shared
 and writable, grow it or fill its holes (`fallocate` needs a writable
 descriptor), sealed or not. Apart from that the snapshot is the macOS
-one, with one change in what the template writes: the frames between
-two saved ones are written as zeros when there are fewer than 32 of
-them (128 KiB), so that the saved frames lie in few runs
-(`Hypervisor::SNAPSHOT_GAP`; 0 on HVF).
+one.
 
-**A clone's memory** is the snapshot's, mapped. Before it confines
-itself, the clone's kernel process asks the host which runs of the
-file's app memory region hold data (`lseek` with `SEEK_DATA` and
-`SEEK_HOLE`: the host's answer, not anything the template wrote) and
-maps each run over the same offsets of its VM's app memory,
-`MAP_PRIVATE | MAP_FIXED`, from the read-only descriptor
-(`hellovm-platform-kvm`'s `snapshot.rs`). The memory slot follows the
-new mapping. The page tables and pools are then loaded as on macOS,
-but with nothing pending: every page is valid at once, a read of a
-page the template had is the host's page of the file, shared with the
-template's file and every other clone, and a first write makes the
-host copy it for this clone alone. That happens in the host's page
-fault, inside `KVM_RUN`: no exit reaches the kernel process for it, and
-the kernel process copies nothing. Everything else of the app memory
-stays the clone's own anonymous memory, zero, as the template's was.
-Holes of the file are never mapped: the host fills a hole of a memfd at
-the first touch through any mapping, so a clone that touched one
-would grow the file all clones share, for as long as the template
-lives (`clones_do_not_grow_the_snapshot` writes 32 MiB of memory that
-was zero in the template, three times, and the supervisor's log of
-what the file holds stays the same). The clone reads the kernel state
-and the page tables only up to the lengths in the header, for the same
-reason. At most 16,384 runs (each is a mapping of its own, and Linux
-allows 65,530 a process by default); a template padded as above has at
-most that many in 2 GiB, and the CPython template below is one run.
-The pools' rules hold unchanged: every frame handed out is zeroed by
-the host first, and memory given back (`MADV_DONTNEED`) gets, at its
-next touch, the file's page again where it was mapped from the file:
-undefined for the pools either way.
+**A clone's memory** is copied from the snapshot as on macOS: the page
+tables and pools are loaded with every frame the template had pending,
+and a frame is copied into the clone's own app memory at its first
+touch (an exit to the kernel process, which reads the frame and makes
+the page valid). The difference is how the frame is read: with `pread`
+from the read-only descriptor, not through a mapping
+(`SnapshotFrames` in `template_vm.rs`, the one `Origin` of both
+platforms; macOS reads through a mapping, since its host cannot `pread`
+POSIX shared memory). Which frames a clone reads is up to the
+template's metadata (the stored bits in the platform's state), and the
+template's kernel process ran guest code, so hostile metadata may name
+frames the template never wrote: holes of the file. A read of a hole of
+a memfd through a mapping makes the host allocate that page in the
+file, the one every clone shares, for as long as the template lives;
+`pread` of a hole gives zeros and allocates nothing. So whatever the
+metadata says, no clone's app memory grows the snapshot
+(`clones_do_not_grow_the_snapshot` writes 32 MiB of memory that was
+zero in the template, three times, and the supervisor's log of what the
+file holds stays the same). `pread` was on the KVM allowlist already
+(the image's files are read with it), so nothing is added for it. The
+kernel state and the page tables are still read through mappings, and
+only up to the lengths in the header; the header's lengths are checked
+against the layout, so hostile lengths can make clones fill holes of
+those two regions at most, never more than the layout gives them (the
+state region: the writable layer's limit and 256 MiB; the page-table
+pool), each hole once for all clones, as an honest template could have
+written them itself. The pools' rules hold unchanged: every frame handed
+out is zeroed by the host first.
+
+Mapping the snapshot's app memory into each clone, privately, was
+tried too (each run of the file's written pages mapped over the VM's
+app memory before the hardening, so that pages a clone only reads stay
+one copy for all clones and the first write is copied by the host's
+page fault, inside `KVM_RUN`). Under nested virtualization it was
+slower: about the same to the first line, but a CPython clone's exit,
+where finalization writes most of its objects, took 1443 ms (against
+559 ms copied, below), each first write to a mapped page being a
+stage-2 fault and an invalidation that go through Apple's hypervisor.
+It saved about 0.9 MiB of a waiting clone's own memory. It was never
+run on a native arm64 host, and is not in the code.
 
 **Hardening.** Each kernel process is confined exactly like a
 `--platform kvm` run (see **The KVM platform**), in the same order: the
-VM and every vCPU are made (and in a clone the snapshot's memory
-mapped), and then the process confines itself while it has no other
-thread. The thread that watches the control socket and the egress I/O
+VM and every vCPU are made, and then the process confines itself while
+it has no other thread. The thread that watches the control socket and the egress I/O
 thread start after the hardening, unlike on macOS, since on Linux the
 namespaces and Landlock apply only to the calling thread; the kernel
 processes also die with the supervisor (`PR_SET_PDEATHSIG`). The
 template's allowlist is any KVM run's; a clone with an ingress channel
 also has `recvmsg` (with `MSG_CMSG_CLOEXEC` only), to receive each
-inbound connection; nothing else is added. The descriptor of the
-snapshot is closed before the clone's guest runs. Clones are not forks
+inbound connection; nothing else is added. A clone keeps its read-only
+descriptor of the snapshot open while it runs, to copy frames from it:
+it can read with it only its own template, and write, map writable,
+grow or fill nothing (see above). Clones are not forks
 of each other or of the template: each has a Landlock domain of its
 own, not nested in another, and none has `ptrace`, `process_vm_*` or
 `kill` on its list, so the nested domain the seccomp platform's clones
@@ -2469,50 +2480,39 @@ platform** (nested virtualization, Ubuntu 24.04, 4 vCPUs) on an M3 Max,
 `--sandbox require`, one clone at a time, medians of 30 (5 cold
 starts):
 
-| | KVM, mapped (as built) | KVM, copied on first touch (as HVF) | HVF (macOS, above) |
-|---|---|---|---|
-| Cold `hellovm`, start to first line | 1550 ms | 1610 ms | 219.6 ms |
-| Template, start to frozen (once) | 1877 ms | 1882 ms | 304.9 ms |
-| Snapshot (stored pages, areas) | 33.0 MiB, 149 | 33.0 MiB, 149 | 33.0 MiB, 149 |
-| Snapshot file (with the kernel state and 193 padding frames) | 41.5 MiB, 1 run | 41.5 MiB | |
-| **Clone, request to first guest instruction** (`S`) | **6.4 ms** (5.3–9.8) | 5.5 ms (4.8–6.5) | 11.8 ms |
-| **Clone, request to first line** | **36.9 ms** (34.8–44.9) | 35.2 ms (34.1–37.1) | 13.0 ms |
-| Clone, request to exit status | 1443 ms | 517 ms | 29.0 ms |
-| A waiting clone's kernel process: its own memory (`RssAnon`), and the snapshot's pages it maps (`RssShmem`) | 6.6 MiB, 6.0 MiB | 7.5 MiB, 6.6 MiB | 21 MiB (footprint) |
-| The supervisor (resident) | 2.3 MiB | 2.2 MiB | |
+| | KVM | HVF (macOS, above) |
+|---|---|---|
+| Cold `hellovm`, start to first line | 1483 ms | 219.6 ms |
+| Template, start to frozen (once) | 1640 ms | 304.9 ms |
+| Snapshot (stored pages, areas) | 33.0 MiB, 149 | 33.0 MiB, 149 |
+| Snapshot file, with the kernel state and page tables | 38.8 MiB | |
+| **Clone, request to first guest instruction** (`S`) | **5.7 ms** (5.1–8.1) | 11.8 ms |
+| **Clone, request to first line** | **37.4 ms** (35.3–42.9) | 13.0 ms |
+| Clone, request to exit status | 559 ms | 29.0 ms |
+| App memory a clone copies from the snapshot | 16.5 MiB | 16.5 MiB |
+| A waiting clone's kernel process (resident; its own memory, `RssAnon`) | 10.2 MiB (7.4 MiB) | 21 MiB (footprint) |
+| The supervisor (resident) | 2.2 MiB | |
 
-The copied column is a measurement of the alternative, not something
-that is built: the HVF way (frames pending, copied from the snapshot at
-their first touch) run on KVM by a local change for this table only.
-Under nested virtualization the mapping is not faster: to the first
-line both are the same, and a clone's exit, where CPython's
-finalization writes most of its objects, takes nearly three times as
-long. Each first write to a page mapped from the file is a stage-2
-fault, a copy in the host's page fault and an invalidation of the
-read-only translation, and under Apple's hypervisor each of those is a
-round trip through it; a copied frame costs one exit to the kernel
-process and one fault. What the mapping saves is memory: pages a clone
-only reads stay one copy for all clones (0.9 MiB less per waiting clone
-here, more for clones that read more than they write), and the kernel
-process copies nothing. On a native arm64 host, where a fault costs a
-microsecond or so and an exit a few, the balance is likely the other
-way, but that was not measured; if it is not, copying on first touch is
-a change of a few lines (`load_frozen` with an origin).
+A waiting clone shares no page with the snapshot: it has read the
+kernel state and the page tables through mappings and unmapped them,
+and reads frames with `pread`. The snapshot file never grows after the
+template is frozen (the supervisor logged 40,706,048 bytes after every
+clone).
 
-Where a clone's 6.4 ms go (`HELLOVM_LOG=debug` on the template): the
-snapshot's header and regions mapped 0.2–0.3 ms; the VM, its vCPUs
-and the app memory mapped 0.6–0.8 ms; the hardening 0.7 ms (no profile
-to compile, unlike Seatbelt); the page tables and pools 0.9–1.2 ms;
-the kernel state (3.7 MB) 0.9–2.1 ms; the thaw 12 µs; the rest is
-starting the process and the request. The first line comes 30 ms later
-because CPython's first steps after the clone point touch many pages
-for the first time, each a fault under nested virtualization, and the cold
-start is slow for the same reason (see **The KVM platform**,
-Performance). A clone that frees the template's 8 MiB and runs what
-`kvm_cli` runs (`a_clone_gives_freed_memory_back`) is resident 13.9 MiB
-at start, 270.5 MiB with 256 MiB touched, 14.6 MiB freed and 15.8 MiB
-after its 50 processes. 30 clones one after another, each started,
-run to the end and gone, take 12.0 s in a debug build.
+Where a clone's 5.7 ms go (`HELLOVM_LOG=debug` on the template): the
+snapshot's header and regions mapped 0.2–0.3 ms; the VM and its vCPUs
+0.7–0.9 ms; the hardening 0.7–0.9 ms (no profile to compile, unlike
+Seatbelt); the page tables and pools 0.9 ms; the kernel state (3.7 MB)
+1.0 ms; the thaw a few µs; the rest is starting the process and the
+request. The first line comes 30 ms later because CPython's first steps
+after the clone point touch many pages for the first time, each an
+exit to the kernel process and a copy, and each fault slow under nested
+virtualization; the cold start is slow for the same reason (see **The
+KVM platform**, Performance). A clone that frees the template's 8 MiB
+and runs what `kvm_cli` runs (`a_clone_gives_freed_memory_back`) is
+resident 10.4 MiB at start, 266.9 MiB with 256 MiB touched, 10.8 MiB
+freed and 11.6 MiB after its 50 processes. 30 clones one after another,
+each started, run to the end and gone, take 7.0 s in a debug build.
 
 What is not done or not verified on KVM: a native arm64 host (every
 number above is nested); more than four clones alive at once
