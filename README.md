@@ -68,7 +68,7 @@ Debian system.
 - **Warm clones**: a template sandbox loads its environment once (CPython
   with its modules imported, say) and new sandboxes are made from it in
   a few milliseconds: forks on Linux, new processes loaded from its
-  snapshot on macOS (see **Warm clones**).
+  snapshot on macOS and on KVM (see **Warm clones**).
 - **Control plane**: `hellovm-api` and `hellovm-noded` create sandboxes
   with CPython already loaded over HTTP in 7 to 8 ms, run commands and
   Python in them, read, write and edit their files, and keep tenants
@@ -1074,10 +1074,11 @@ kvm` runs aarch64 Linux programs in a KVM virtual machine
 Hypervisor.framework VM on macOS: no guest kernel, the program at EL0, a
 shim at EL1, page tables written by hellovm, processes with
 copy-on-write `fork`, `execve`, threads in parallel on several vCPUs
-(`--vcpus`), and memory given back to the host. The seccomp platform stays
+(`--vcpus`), memory given back to the host, and warm clones (see **Warm
+clones on KVM**). The seccomp platform stays
 the default on Linux (`--platform seccomp`): it is the one that runs
-everywhere (any architecture, inside containers without `/dev/kvm`, and
-it has warm clones). The same kernel core handles every system call.
+everywhere (any architecture, inside containers without `/dev/kvm`).
+The same kernel core handles every system call.
 
 **What is shared with HVF.** Everything that does not depend on the
 hypervisor moved from `kernel/platform-hvf` into `kernel/platform-arm64`
@@ -1233,7 +1234,12 @@ already. A filter cannot look into the `ioctl`'s argument, so which
 register `KVM_SET_ONE_REG` sets is not checked. `clone` is allowed for
 threads only (the vCPU and clock threads start after the filter, under
 it), `tgkill` only with `SIGURG` (the kick) and `SIGABRT`, and `madvise`
-for the give-back. The memory slots are never removed: at the end the
+for the give-back. `tgkill` may name only the process's own pid: the
+kernel processes of a host's sandboxes (a KVM template's clones among
+them) run as one user, Ubuntu 24.04's Linux 6.8 has no Landlock signal
+scope, and a filter cannot tell thread ids apart, but it can tell the
+process id, which a confined kernel process never changes (it does not
+fork). The memory slots are never removed: at the end the
 fds are closed, which ends the VM.
 
 The list (47 entries) was measured with `HELLOVM_SECCOMP_LEARN=FILE`
@@ -1278,14 +1284,18 @@ a VM (`platform-kvm/src/tests.rs`), the shim's layout, and
 `kernel/hellovm/tests/kvm_cli.rs` (the command line, confined: hello
 world, every layer active, `--timeout` with programs that never make a
 system call, refused options, busybox and CPython, `--vcpus` 1 and 4,
-memory given back, read from `/proc/PID/status`). The shared EL1 test
+memory given back, read from `/proc/PID/status`), and
+`kernel/hellovm/tests/kvm_warm.rs` (warm clones, see **Warm clones on
+KVM**). The shared EL1 test
 also checks that EL0 cannot load from or store to the frames and the
 exit page. Without `/dev/kvm` they print `SKIPPING`
-and pass, unless `HELLOVM_REQUIRE_E2E=1`; `kvm_cli` is built only with
+and pass, unless `HELLOVM_REQUIRE_E2E=1`; `kvm_cli` and `kvm_warm` are built only with
 the `kvm-tests` feature and `run-e2e.sh` leaves the KVM suites out (it
 runs where there is no `/dev/kvm`). The sandbox's unit tests check the
 KVM allowlist (no process control, the four vCPU `ioctl`s only on a
-vCPU fd, every other KVM `ioctl` killed on every fd), and with
+vCPU fd, every other KVM `ioctl` killed on every fd, `tgkill` only to
+the process's own pid, `recvmsg` only for a clone with an ingress
+channel), and with
 `HELLOVM_SECCOMP_LEARNED_KVM=FILE` a measurement against it.
 
 On a Mac (M3 or later, macOS 15 or later), the suites run in a Lima VM
@@ -1305,8 +1315,8 @@ missing, builds the tests in the dev container into `kernel/target/linux`
 and runs each test binary in the VM with `HELLOVM_REQUIRE_E2E=1`. On a
 native arm64 Linux host with `/dev/kvm`, the same tests run with `cargo
 test -p hellovm-platform-kvm` and `cargo test -p hellovm --features
-kvm-tests --test kvm_cli`, with `HELLOVM_KVM_GUESTS` set to an image made
-by `build-guests.sh`.
+kvm-tests --test kvm_cli --test kvm_warm`, with `HELLOVM_KVM_GUESTS` set
+to an image made by `build-guests.sh`.
 
 Run on 2026-11-24 in a Lima VM (Lima 2.3.0, vz, nested virtualization,
 Ubuntu 24.04 with Linux 6.8, 4 vCPUs, 8 GiB) on an M3 Max with macOS
@@ -1323,7 +1333,9 @@ from the same settings with the repository mounted at its own path (and
 linked to `/src`) and Lima's host resolver turned off (a leftover of
 the 1.0.4 attempt). On 2026-11-25 a VM made from `lima-kvm.yaml` as
 committed, with the commands above, ran the same suites once more, all
-passing.
+passing; and again with warm clones (P1i): `hellovm-platform-arm64` 27
+tests, `hellovm-platform-kvm` 5, `kvm.rs` 19, `guests.rs` 11, `kvm_cli`
+7, `kvm_warm` 16, all passing.
 
 **Performance.** Measured in that Lima VM, release builds, through the
 command line with `--sandbox require` (wall clock, best of 3 or 10) and
@@ -1362,11 +1374,11 @@ branch measured in turn, five runs of 1,000,000 each, best of them;
 `#[inline]` on the backend made no difference).
 
 **What works, and what does not yet.** Everything of the HVF
-platform's list but warm clones: static and dynamically linked aarch64
+platform's list: static and dynamically linked aarch64
 programs, processes with `fork` and `execve`, `vfork`, `posix_spawn`,
 pipes, signals, shared memory, busybox and CPython with `subprocess`,
-threads in parallel on up to 64 vCPUs, confinement, memory given back.
-Limits:
+threads in parallel on up to 64 vCPUs, confinement, memory given back,
+and warm clones (with an ingress channel, which macOS lacks). Limits:
 
 * Tested only under nested virtualization (above); not on a native host,
   not on other KVM versions than Linux 6.8, not with 16 KiB or 64 KiB
@@ -1375,18 +1387,7 @@ Limits:
 * arm64 only: there is no x86_64 KVM backend (the shim, the tables and
   the decoding are arm64's), and on x86_64 `--platform kvm` refuses to
   start.
-* No warm clones on KVM (`--template` refuses `--platform kvm`). What
-  they would need: the shared code already saves a frozen template's
-  tables and frames and loads them into a new VM with frames copied on
-  first touch (`VmPlatform::save_frozen`, `load_frozen`); a KVM VM does
-  not survive a `fork` (KVM refuses a VM fd from another process), so the
-  seccomp platform's way, forking the frozen kernel process, does not
-  work, and the macOS way would: a supervisor that keeps the snapshot in
-  a sealed memfd and starts a new kernel process per clone, which makes
-  its VM, loads the snapshot and confines itself. On Linux the snapshot
-  of app memory could be mapped `MAP_PRIVATE` straight into the clone's
-  memory slot, so that pages are shared copy-on-write by the host
-  without the platform copying them.
+* Warm clones have their own limits (see **Warm clones on KVM**).
 * Every first touch of a page and every copy-on-write fault is an exit
   (as on HVF); under nested virtualization that dominates memory-heavy
   programs. Mapping several pages per fault, or larger pages, is not
@@ -2342,6 +2343,183 @@ that live for long next to each other, were not run.
 What is not done or not verified on macOS: a clone started ahead of its
 request; sharing read-only pages between clones; ingress; confining the
 supervisor; `hellovm-noded` and the API on macOS.
+
+### Warm clones on KVM
+
+On arm64 Linux, `hellovm --template SOCKET --platform kvm` makes a
+template on the KVM platform, and its clones are KVM sandboxes. The
+options, the protocol, and what a clone sees are as everywhere else;
+the node daemon or any other requester needs to know nothing of how the
+clone is made.
+
+```sh
+hellovm --template /tmp/t/py.sock --platform kvm --sandbox require --root kernel/target/hvf-guests/root \
+  /usr/bin/python3 -c 'import json; exec(open("/dev/hellovm-clone", "rb").read())' &
+hellovm --clone /tmp/t/py.sock --ready
+echo '{"a": 41}' | hellovm --clone /tmp/t/py.sock --input 'import sys; print(json.load(sys.stdin)["a"] + 1)'
+```
+
+A KVM VM does not survive a `fork` either (KVM refuses a VM's fd in
+another process than the one that made it), so the seccomp platform's
+way, forking the frozen kernel process, does not work here. The macOS
+way does, and it is the same code (`kernel/hellovm/src/template_vm.rs`,
+which was `template_macos.rs`): a supervisor that keeps the snapshot,
+the template's kernel process that writes it and exits, and one new
+kernel process per clone that makes its own VM, confines itself, loads
+the snapshot and runs. Everything **Warm clones on macOS** says of the
+three processes, the control sockets, stopping a clone, a template
+that dies, a build that changed and the snapshot's layout and kernel
+state holds here too. What differs:
+
+**The snapshot** is a memfd. The supervisor gives the template's kernel
+process a writable descriptor of it, and once that process has exited
+seals it (`F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`;
+the host refuses `F_SEAL_WRITE` while any writable shared mapping of it
+exists, so the seal also checks that none is left). The clones get a
+second descriptor, opened read only through `/proc/self/fd` (a memfd
+has no other name): with it nothing can write the file, map it shared
+and writable, grow it or fill its holes (`fallocate` needs a writable
+descriptor), sealed or not. Apart from that the snapshot is the macOS
+one, with one change in what the template writes: the frames between
+two saved ones are written as zeros when there are fewer than 32 of
+them (128 KiB), so that the saved frames lie in few runs
+(`Hypervisor::SNAPSHOT_GAP`; 0 on HVF).
+
+**A clone's memory** is the snapshot's, mapped. Before it confines
+itself, the clone's kernel process asks the host which runs of the
+file's app memory region hold data (`lseek` with `SEEK_DATA` and
+`SEEK_HOLE`: the host's answer, not anything the template wrote) and
+maps each run over the same offsets of its VM's app memory,
+`MAP_PRIVATE | MAP_FIXED`, from the read-only descriptor
+(`hellovm-platform-kvm`'s `snapshot.rs`). The memory slot follows the
+new mapping. The page tables and pools are then loaded as on macOS,
+but with nothing pending: every page is valid at once, a read of a
+page the template had is the host's page of the file, shared with the
+template's file and every other clone, and a first write makes the
+host copy it for this clone alone. That happens in the host's page
+fault, inside `KVM_RUN`: no exit reaches the kernel process for it, and
+the kernel process copies nothing. Everything else of the app memory
+stays the clone's own anonymous memory, zero, as the template's was.
+Holes of the file are never mapped: the host fills a hole of a memfd at
+the first touch through any mapping, so a clone that touched one
+would grow the file all clones share, for as long as the template
+lives (`clones_do_not_grow_the_snapshot` writes 32 MiB of memory that
+was zero in the template, three times, and the supervisor's log of
+what the file holds stays the same). The clone reads the kernel state
+and the page tables only up to the lengths in the header, for the same
+reason. At most 16,384 runs (each is a mapping of its own, and Linux
+allows 65,530 a process by default); a template padded as above has at
+most that many in 2 GiB, and the CPython template below is one run.
+The pools' rules hold unchanged: every frame handed out is zeroed by
+the host first, and memory given back (`MADV_DONTNEED`) gets, at its
+next touch, the file's page again where it was mapped from the file:
+undefined for the pools either way.
+
+**Hardening.** Each kernel process is confined exactly like a
+`--platform kvm` run (see **The KVM platform**), in the same order: the
+VM and every vCPU are made (and in a clone the snapshot's memory
+mapped), and then the process confines itself while it has no other
+thread. The thread that watches the control socket and the egress I/O
+thread start after the hardening, unlike on macOS, since on Linux the
+namespaces and Landlock apply only to the calling thread; the kernel
+processes also die with the supervisor (`PR_SET_PDEATHSIG`). The
+template's allowlist is any KVM run's; a clone with an ingress channel
+also has `recvmsg` (with `MSG_CMSG_CLOEXEC` only), to receive each
+inbound connection; nothing else is added. The descriptor of the
+snapshot is closed before the clone's guest runs. Clones are not forks
+of each other or of the template: each has a Landlock domain of its
+own, not nested in another, and none has `ptrace`, `process_vm_*` or
+`kill` on its list, so the nested domain the seccomp platform's clones
+need is not needed here. `tgkill`, which every KVM run needs for its
+kicks, may name only the process's own pid (see **The KVM platform**):
+without that, a compromised clone could abort a sibling clone on a host
+without Landlock's signal scope (Linux 6.8 has none). `template_and_clones_are_confined`
+checks that the template's and a clone's kernel process each report
+every layer.
+
+The supervisor is `hellovm --template` itself, unconfined but for
+`RLIMIT_CORE` 0, not dumpable, `no_new_privs` and its soft
+`RLIMIT_NOFILE` raised to 1024: it starts the kernel processes, which
+would inherit a seccomp filter, Landlock or namespaces before they open
+`/dev/kvm` and make their VMs. It needs `/proc` once, for the read-only
+descriptor. As on macOS it reads no byte a kernel process wrote but the
+template's fixed-size message and exit statuses.
+
+**Egress and ingress.** A clone's kernel process connects to the egress
+proxy itself, with the clone's sandbox id: `each_clone_has_its_own_egress_flows`
+has two clones fetch through the proxy and finds each flow audited
+with its clone's id and its clone's kernel process as the peer. Unlike
+on macOS, a clone may have an ingress channel, handled as on the
+seccomp platform (`inbound_connections_through_the_ingress_channel` is
+that suite's test).
+
+**Limits.** At most 128 connections at once (each clone a process with
+a VM of its own, as on macOS; the seccomp platform allows 512); 64 KiB
+of input and a complete request within 10 s; clones have the VM of the
+default size and the template's `--vcpus`; the kernel state must fit
+the snapshot's state region. Refused with the reason, as on the seccomp
+platform: open outbound connections, `MAP_SHARED` memory with more than
+one address space, a terminal, a program that ends before its clone
+point.
+
+**Measured** with `tests/kvm_warm.rs` (`warm_clone_timings`, the CPython
+program of the other two benchmarks, from the guest image: Debian
+bookworm, CPython 3.11), release build, in the Lima VM of **The KVM
+platform** (nested virtualization, Ubuntu 24.04, 4 vCPUs) on an M3 Max,
+`--sandbox require`, one clone at a time, medians of 30 (5 cold
+starts):
+
+| | KVM, mapped (as built) | KVM, copied on first touch (as HVF) | HVF (macOS, above) |
+|---|---|---|---|
+| Cold `hellovm`, start to first line | 1550 ms | 1610 ms | 219.6 ms |
+| Template, start to frozen (once) | 1877 ms | 1882 ms | 304.9 ms |
+| Snapshot (stored pages, areas) | 33.0 MiB, 149 | 33.0 MiB, 149 | 33.0 MiB, 149 |
+| Snapshot file (with the kernel state and 193 padding frames) | 41.5 MiB, 1 run | 41.5 MiB | |
+| **Clone, request to first guest instruction** (`S`) | **6.4 ms** (5.3–9.8) | 5.5 ms (4.8–6.5) | 11.8 ms |
+| **Clone, request to first line** | **36.9 ms** (34.8–44.9) | 35.2 ms (34.1–37.1) | 13.0 ms |
+| Clone, request to exit status | 1443 ms | 517 ms | 29.0 ms |
+| A waiting clone's kernel process: its own memory (`RssAnon`), and the snapshot's pages it maps (`RssShmem`) | 6.6 MiB, 6.0 MiB | 7.5 MiB, 6.6 MiB | 21 MiB (footprint) |
+| The supervisor (resident) | 2.3 MiB | 2.2 MiB | |
+
+The copied column is a measurement of the alternative, not something
+that is built: the HVF way (frames pending, copied from the snapshot at
+their first touch) run on KVM by a local change for this table only.
+Under nested virtualization the mapping is not faster: to the first
+line both are the same, and a clone's exit, where CPython's
+finalization writes most of its objects, takes nearly three times as
+long. Each first write to a page mapped from the file is a stage-2
+fault, a copy in the host's page fault and an invalidation of the
+read-only translation, and under Apple's hypervisor each of those is a
+round trip through it; a copied frame costs one exit to the kernel
+process and one fault. What the mapping saves is memory: pages a clone
+only reads stay one copy for all clones (0.9 MiB less per waiting clone
+here, more for clones that read more than they write), and the kernel
+process copies nothing. On a native arm64 host, where a fault costs a
+microsecond or so and an exit a few, the balance is likely the other
+way, but that was not measured; if it is not, copying on first touch is
+a change of a few lines (`load_frozen` with an origin).
+
+Where a clone's 6.4 ms go (`HELLOVM_LOG=debug` on the template): the
+snapshot's header and regions mapped 0.2–0.3 ms; the VM, its vCPUs
+and the app memory mapped 0.6–0.8 ms; the hardening 0.7 ms (no profile
+to compile, unlike Seatbelt); the page tables and pools 0.9–1.2 ms;
+the kernel state (3.7 MB) 0.9–2.1 ms; the thaw 12 µs; the rest is
+starting the process and the request. The first line comes 30 ms later
+because CPython's first steps after the clone point touch many pages
+for the first time, each a fault under nested virtualization, and the cold
+start is slow for the same reason (see **The KVM platform**,
+Performance). A clone that frees the template's 8 MiB and runs what
+`kvm_cli` runs (`a_clone_gives_freed_memory_back`) is resident 13.9 MiB
+at start, 270.5 MiB with 256 MiB touched, 14.6 MiB freed and 15.8 MiB
+after its 50 processes. 30 clones one after another, each started,
+run to the end and gone, take 12.0 s in a debug build.
+
+What is not done or not verified on KVM: a native arm64 host (every
+number above is nested); more than four clones alive at once
+(`clones_at_once_are_isolated_and_one_can_be_killed` keeps four); a
+clone started ahead of its request; confining the supervisor;
+`hellovm-noded` and the API with KVM templates (they speak the same
+protocol, but were not run against one).
 
 ## Control plane
 
