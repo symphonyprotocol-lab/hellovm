@@ -1202,7 +1202,7 @@ fn prepare_clone(
     app.load_frozen(
         platform,
         &tables.bytes()[..header.tables_len as usize],
-        Box::new(ram),
+        Some(Box::new(ram)),
     )?;
     drop(tables);
     let t4 = Instant::now();

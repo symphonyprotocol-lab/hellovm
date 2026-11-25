@@ -23,6 +23,12 @@ pub trait Hypervisor: Sized + 'static {
     const NAME: &'static str;
     /// The start of a warm-clone snapshot's magic.
     const SNAPSHOT_PREFIX: &'static str;
+    /// A warm-clone template writes the frames between two saved ones as
+    /// zeros when there are fewer than this many (see `Phys::save`): for
+    /// a backend whose clones map the snapshot's written pages from its
+    /// file, a run at a time (KVM), so that a fragmented template does not
+    /// become thousands of mappings. 0: never (HVF copies frame by frame).
+    const SNAPSHOT_GAP: u64 = 0;
     /// Whether the platform makes every vCPU when it is made, on the
     /// calling thread, and starts the other vCPUs' threads only at its
     /// first `wait`: so that a kernel process that confines itself in

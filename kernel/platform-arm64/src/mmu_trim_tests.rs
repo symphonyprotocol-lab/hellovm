@@ -228,7 +228,7 @@ fn a_template_after_trim_saves_only_what_is_used() {
     let mut saved_tables = vec![0u8; tables * PAGE as usize];
     let mut saved_ram = vec![0u8; ram * PAGE as usize];
     let mut w = hellovm_core::snap::Writer::new();
-    let stats = t.save(&mut saved_tables, &mut saved_ram, &mut w);
+    let stats = t.save(&mut saved_tables, &mut saved_ram, 0, &mut w);
     assert_eq!((stats.frames, stats.stored), (16, 16));
     assert!(
         saved_ram[16 * PAGE as usize..].iter().all(|&b| b == 0),
@@ -254,7 +254,7 @@ fn a_template_after_trim_saves_only_what_is_used() {
     c.load(
         saved,
         &saved_tables,
-        Box::new(VecOrigin(saved_ram)),
+        Some(Box::new(VecOrigin(saved_ram))),
         &[root],
     )
     .unwrap();
