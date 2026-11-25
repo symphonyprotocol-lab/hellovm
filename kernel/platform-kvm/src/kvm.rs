@@ -18,8 +18,9 @@
 //!   registers and exits as for any exception;
 //! * at EL1 (in the shim): it runs on and leaves by itself, through the
 //!   exit of the save routine or the stop check before the restore
-//!   routine's `eret`; if it was stopped between that check and the
-//!   `eret`, the host moves its `PC` back to the check first.
+//!   routine's `eret`; if it was stopped after that check had loaded
+//!   the flag and before the `eret`, the host moves its `PC` back to the
+//!   check first.
 //!
 //! The stop flag is cleared by the exit it causes.
 //!
@@ -497,8 +498,9 @@ impl KvmVcpu {
         let check = SHIM_VA + shim::check_offset();
         let pc = self.fd.get_reg(sys::REG_PC)?;
         // `ldr` and `cbnz` of the check, then `ldp` and `eret`: past the
-        // `cbnz` the flag is not looked at again.
-        if (check + 8..=check + 12).contains(&pc) {
+        // `ldr` the flag is not looked at again (at the `cbnz`, `x0` may
+        // hold the flag as it was before this kick set it).
+        if (check + 4..=check + 12).contains(&pc) {
             self.fd.set_reg(sys::REG_PC, check)?;
         }
         Ok(())

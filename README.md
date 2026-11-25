@@ -1318,11 +1318,12 @@ with `HELLOVM_KVM_VCPUS=1`). The KVM in that VM is a nested one, at
 virtual EL2 under Apple's hypervisor; the platform was not run on a
 native arm64 Linux host. Lima 1.0.4 did not start the VM on this Mac
 (its network helper fails on Docker Desktop's `/var/run/docker.sock`
-link); `lima-kvm.yaml` needs Lima 2. The VM tested was made from the
-same settings with the repository mounted at its own path (and linked
-to `/src`) and Lima's host resolver turned off (a leftover of the
-1.0.4 attempt); `lima-kvm.yaml` as committed (mounted at `/src`) was not
-started.
+link); `lima-kvm.yaml` needs Lima 2. Those two runs were in a VM made
+from the same settings with the repository mounted at its own path (and
+linked to `/src`) and Lima's host resolver turned off (a leftover of
+the 1.0.4 attempt). On 2026-11-25 a VM made from `lima-kvm.yaml` as
+committed, with the commands above, ran the same suites once more, all
+passing.
 
 **Performance.** Measured in that Lima VM, release builds, through the
 command line with `--sandbox require` (wall clock, best of 3 or 10) and

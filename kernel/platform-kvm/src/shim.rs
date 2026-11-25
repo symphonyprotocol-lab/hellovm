@@ -261,8 +261,8 @@ extern "C" {
 }
 
 /// Where in the shim the stop check is (`ldr`, `cbnz`, `ldp`, `eret`):
-/// a vCPU stopped between the check and the `eret` would return to the
-/// app with the stop flag set, so the host moves it back to the check.
+/// a vCPU stopped after the `ldr` and before the `eret` would return to
+/// the app with the stop flag set, so the host moves it back to the check.
 pub fn check_offset() -> u64 {
     // Only the symbols' addresses are taken.
     (&raw const hellovm_kvm_shim_check as usize - &raw const hellovm_kvm_shim_start as usize) as u64

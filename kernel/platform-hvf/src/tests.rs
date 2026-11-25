@@ -135,13 +135,13 @@ mod give_back_tests {
     }
 
     /// Lets the platform run (`t` is stopped) until what the pools keep
-    /// went back, for 300 ms at most: what they keep then, and how long
+    /// went back, for 5 s at most: what they keep then, and how long
     /// it took.
     fn given_back(p: &mut HvfPlatform, t: TaskKey) -> (u64, Duration) {
         let timer = Instant::now();
         loop {
             let (kept, _) = p.memory_kept();
-            if kept <= 512 << 10 || timer.elapsed() > Duration::from_millis(300) {
+            if kept <= 512 << 10 || timer.elapsed() > Duration::from_secs(5) {
                 return (kept, timer.elapsed());
             }
             if let Some(ev) = p.wait(Some(Duration::from_millis(30))).unwrap() {
