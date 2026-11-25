@@ -1,0 +1,16 @@
+[package]
+name = "hellovm-platform-arm64"
+description = "What the hellovm platforms on arm64 VMs share: stage-1 tables, the EL1 shim's layout, exception decoding and the scheduler, over a small hypervisor interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[features]
+# Hooks for the backends' tests (`testing`): never in a normal build.
+testing = []
+
+[dependencies]
+hellovm-core.workspace = true
+log.workspace = true

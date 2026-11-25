@@ -27,6 +27,14 @@
 //!    the process. `filter` explains how that coexists with the app
 //!    processes' own filter.
 //!
+//! On the KVM platform (`hellovm --platform kvm`) the layers are the same;
+//! the kernel process has made its VM and vCPUs before, with no second
+//! thread yet (namespaces and Landlock apply to the calling thread), and
+//! its seccomp allowlist (`allowlist::kvm_entries`) judges every syscall
+//! the same way, since there are no app processes: `KVM_RUN` and the
+//! three `ioctl`s that stop a running vCPU, on the vCPUs' fds, are the
+//! only `ioctl`s on KVM fds.
+//!
 //! Required for `--sandbox=require`: 1, 3, 4, 6, 7, and filesystem
 //! confinement by 2 or 5 (at least one). The network namespace, Landlock's
 //! TCP and scope rights, and the IPC namespace are used when available.
@@ -92,7 +100,7 @@ pub use landlock::nest as nest_landlock_domain;
 
 #[cfg(target_os = "linux")]
 pub use harden::{
-    apply, close_inherited_fds, Config, Hardened, Layer, LayerReport, Refused, Report,
+    apply, close_inherited_fds, Config, Hardened, Layer, LayerReport, Platform, Refused, Report,
 };
 
 /// `--sandbox=require|best-effort|off`.

@@ -119,7 +119,14 @@ pub fn run(
         host.set_splice_endpoint(addr)?;
     }
     let image = host.image_mut().expect("the host has the image");
-    let (egress, landlock) = harden(options, image, egress, fds, true)?;
+    let (egress, landlock) = harden(
+        options,
+        image,
+        egress,
+        fds,
+        true,
+        hellovm_sandbox::Platform::Seccomp,
+    )?;
     if !landlock {
         // Clones are forks of this process: they share its user namespace
         // and its Landlock domain (none), so nothing but a domain of their

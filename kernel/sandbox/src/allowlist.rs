@@ -106,21 +106,7 @@ pub fn entries(stub_fd: i32, tcp: bool, warm: bool) -> Vec<Entry> {
         allow(SYS_close_range),
         allow(SYS_ppoll),
         checked(SYS_fcntl, vec![one_of(1, &fcntls)]),
-        checked(
-            SYS_ioctl,
-            vec![Check::OneOf(
-                1,
-                vec![
-                    TCGETS as u32,
-                    TCSETS as u32,
-                    // glibc 2.42+ (Ubuntu 26.04) tcgetattr/tcsetattr.
-                    TCGETS2 as u32,
-                    TCSETS2 as u32,
-                    TIOCGWINSZ as u32,
-                    FIONBIO as u32,
-                ],
-            )],
-        ),
+        checked(SYS_ioctl, vec![Check::OneOf(1, TERMINAL_IOCTLS.to_vec())]),
         // The image directory, walked from its fd (`ImageDir`): read-only
         // opens, never creating or writing anything.
         checked(
@@ -236,8 +222,246 @@ pub fn entries(stub_fd: i32, tcp: bool, warm: bool) -> Vec<Entry> {
     list
 }
 
+/// The `ioctl`s on a vCPU's fd the KVM platform makes once confined
+/// (`linux/kvm.h`): `KVM_RUN` (`_IO(0xae, 0x80)`), and to stop a running
+/// vCPU (see `hellovm-platform-kvm`) `KVM_GET_ONE_REG` and
+/// `KVM_SET_ONE_REG` (`_IOW(0xae, 0xab/0xac, struct kvm_one_reg)`) and
+/// `KVM_SET_VCPU_EVENTS` (`_IOW(0xae, 0xa0, struct kvm_vcpu_events)`).
+pub const KVM_RUN: u32 = 0xae80;
+pub const KVM_GET_ONE_REG: u32 = 0x4010_aeab;
+pub const KVM_SET_ONE_REG: u32 = 0x4010_aeac;
+pub const KVM_SET_VCPU_EVENTS: u32 = 0x4040_aea0;
+pub const KVM_VCPU_IOCTLS: [u32; 4] = [
+    KVM_RUN,
+    KVM_GET_ONE_REG,
+    KVM_SET_ONE_REG,
+    KVM_SET_VCPU_EVENTS,
+];
+
+/// The signal the KVM platform stops a vCPU's thread with.
+const KVM_KICK_SIGNAL: c_int = SIGURG;
+
+/// The terminal `ioctl`s both lists allow on any fd.
+const TERMINAL_IOCTLS: [u32; 6] = [
+    TCGETS as u32,
+    TCSETS as u32,
+    // glibc 2.42+ (Ubuntu 26.04) tcgetattr/tcsetattr.
+    TCGETS2 as u32,
+    TCSETS2 as u32,
+    TIOCGWINSZ as u32,
+    FIONBIO as u32,
+];
+
+/// The allowlist of a kernel process that runs its guest on the KVM
+/// platform (`hellovm-platform-kvm`): `vcpus` are the vCPUs' fds. There
+/// are no app processes, so nothing of `ptrace`, `process_vm_*`,
+/// `wait4`, `fork`, `execveat`, `kill`, pidfds, `setsid` or `seccomp`
+/// (the seccomp platform's list has them). The only `ioctl`s on KVM fds
+/// are [`KVM_VCPU_IOCTLS`], on a vCPU's fd: the VM, its memory slots and
+/// its vCPUs are all set up before the process confines itself, the VM's
+/// own fd takes no `ioctl` any more, and `/dev/kvm` is closed by then.
+/// Nothing can make another VM or vCPU, or map other memory into this
+/// one.
+///
+/// Measured with `HELLOVM_SECCOMP_LEARN` over the KVM suites (see
+/// README, "The KVM platform"); the rest is as in [`entries`].
+pub fn kvm_entries(vcpus: &[i32], tcp: bool) -> Vec<Entry> {
+    let mut domains = vec![AF_UNIX];
+    if tcp {
+        domains.push(AF_INET);
+    }
+    let vcpus: Vec<u32> = vcpus.iter().map(|&fd| fd as u32).collect();
+    vec![
+        // Most frequent first: the filter checks the entries in order.
+        checked_any(
+            SYS_ioctl,
+            vec![
+                vec![
+                    Check::OneOf(0, vcpus),
+                    Check::OneOf(1, KVM_VCPU_IOCTLS.to_vec()),
+                ],
+                vec![Check::OneOf(1, TERMINAL_IOCTLS.to_vec())],
+            ],
+        ),
+        allow(SYS_futex),
+        allow(SYS_rt_sigreturn),
+        // I/O on fds the kernel holds: the console, image files, sockets
+        // to the egress proxy, pipes of std.
+        allow(SYS_read),
+        allow(SYS_write),
+        allow(SYS_pread64),
+        allow(SYS_close),
+        allow(SYS_ppoll),
+        checked(
+            SYS_fcntl,
+            vec![one_of(1, &[F_GETFD, F_SETFD, F_GETFL, F_DUPFD_CLOEXEC])],
+        ),
+        // The image directory, walked from its fd (`ImageDir`): read-only
+        // opens, never creating or writing anything.
+        checked(
+            SYS_openat,
+            vec![Check::Subset(
+                2,
+                (O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_DIRECTORY | O_LARGEFILE) as u32,
+            )],
+        ),
+        allow(SYS_newfstatat),
+        allow(SYS_fstat),
+        allow(SYS_statx),
+        allow(SYS_readlinkat),
+        allow(SYS_getdents64),
+        // Memory, never executable; `madvise` gives guest memory back.
+        allow(SYS_brk),
+        checked(
+            SYS_mmap,
+            vec![Check::Subset(2, (PROT_READ | PROT_WRITE) as u32)],
+        ),
+        checked(
+            SYS_mprotect,
+            vec![Check::Subset(2, (PROT_READ | PROT_WRITE) as u32)],
+        ),
+        allow(SYS_munmap),
+        allow(SYS_mremap),
+        allow(SYS_madvise),
+        // Threads (the vCPUs' and the clock's start after the hardening)
+        // and synchronisation.
+        checked(SYS_clone, vec![one_of(0, &[THREAD])]),
+        Entry {
+            // glibc tries clone3 first and falls back to clone.
+            nr: SYS_clone3 as u32,
+            rule: Rule::Errno(ENOSYS as u32),
+        },
+        allow(SYS_set_robust_list),
+        allow(SYS_rseq),
+        allow(SYS_sched_getaffinity),
+        allow(SYS_sched_yield),
+        allow(SYS_exit),
+        allow(SYS_exit_group),
+        allow(SYS_gettid),
+        allow(SYS_getpid),
+        checked(SYS_prctl, vec![one_of(0, &[PR_SET_NAME])]),
+        // Signals: std's guard pages.
+        allow(SYS_rt_sigaction),
+        allow(SYS_rt_sigprocmask),
+        allow(SYS_restart_syscall),
+        allow(SYS_sigaltstack),
+        // Time.
+        allow(SYS_clock_nanosleep),
+        allow(SYS_clock_gettime),
+        allow(SYS_gettimeofday),
+        allow(SYS_getrandom),
+        // The kick that stops a vCPU's thread; SIGABRT is abort() after a
+        // panic. A filter cannot tell whose thread it is (the process's
+        // own, Landlock's scope keeps it there where the host has ABI 6).
+        checked(SYS_tgkill, vec![one_of(2, &[KVM_KICK_SIGNAL, SIGABRT])]),
+        // Outbound streams to the egress proxy: Unix stream sockets only.
+        checked(
+            SYS_socket,
+            vec![
+                one_of(0, &domains),
+                one_of(
+                    1,
+                    &[
+                        SOCK_STREAM | SOCK_CLOEXEC,
+                        SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                    ],
+                ),
+            ],
+        ),
+        allow(SYS_connect),
+        allow(SYS_sendto),
+        allow(SYS_recvfrom),
+        allow(SYS_setsockopt),
+        allow(SYS_shutdown),
+    ]
+}
+
+fn checked_any(nr: c_long, groups: Vec<Vec<Check>>) -> Entry {
+    Entry {
+        nr: nr as u32,
+        rule: Rule::AnyOf(groups),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The KVM list: one rule per syscall, and none of what only app
+    /// processes need.
+    #[test]
+    fn kvm_list_has_no_process_control() {
+        use libc::*;
+        let entries = super::kvm_entries(&[5, 6], true);
+        let mut nrs: Vec<u32> = entries.iter().map(|e| e.nr).collect();
+        nrs.sort_unstable();
+        nrs.dedup();
+        assert_eq!(nrs.len(), entries.len(), "a syscall is listed twice");
+        for nr in [
+            SYS_ptrace,
+            SYS_process_vm_readv,
+            SYS_process_vm_writev,
+            SYS_wait4,
+            SYS_execveat,
+            SYS_execve,
+            SYS_kill,
+            SYS_pidfd_open,
+            SYS_pidfd_send_signal,
+            SYS_setsid,
+            SYS_seccomp,
+            SYS_accept4,
+            SYS_landlock_restrict_self,
+        ] {
+            assert!(!nrs.contains(&(nr as u32)), "syscall {nr}");
+        }
+    }
+
+    /// The vCPU `ioctl`s only on a vCPU's fd, and no other KVM `ioctl`
+    /// (`KVM_CREATE_VM`, `KVM_CREATE_VCPU`, `KVM_SET_USER_MEMORY_REGION`,
+    /// `KVM_ARM_VCPU_INIT`, `KVM_IRQ_LINE`) on any fd.
+    #[test]
+    fn kvm_ioctls_are_only_the_vcpus() {
+        use crate::filter::{self, tests::data, Judge};
+        let arch = crate::harden::audit_arch();
+        let entries = super::kvm_entries(&[5, 6], false);
+        let prog = filter::build(
+            arch,
+            std::slice::from_ref(&filter::EVERY_ADDRESS),
+            Judge::Allowlist(&entries),
+        )
+        .unwrap();
+        let ioctl = |fd: u64, req: u64| {
+            crate::bpf::run(
+                &prog,
+                &data(arch, libc::SYS_ioctl as u32, 0x1000, [fd, req, 0, 0, 0, 0]),
+            )
+        };
+        let (allow, kill) = (filter::SECCOMP_RET_ALLOW, filter::SECCOMP_RET_KILL_PROCESS);
+        for req in super::KVM_VCPU_IOCTLS {
+            assert_eq!(ioctl(5, req.into()), allow);
+            assert_eq!(ioctl(6, req.into()), allow);
+            assert_eq!(ioctl(4, req.into()), kill, "{req:#x} on another fd");
+        }
+        for req in [0xae01u64, 0xae41, 0x4020_ae46, 0x4020_aeae, 0x4008_ae61] {
+            for fd in [3, 4, 5, 6] {
+                assert_eq!(ioctl(fd, req), kill, "ioctl {req:#x} on fd {fd}");
+            }
+        }
+        assert_eq!(ioctl(0, u64::from(libc::TCGETS as u32)), allow);
+        // No syscall is left to a tracer: there are no app processes.
+        let other = crate::bpf::run(
+            &prog,
+            &data(arch, libc::SYS_ptrace as u32, u64::MAX, [0; 6]),
+        );
+        assert_eq!(other, kill);
+        let tgkill = |sig: u64| {
+            crate::bpf::run(
+                &prog,
+                &data(arch, libc::SYS_tgkill as u32, 0x1000, [1, 2, sig, 0, 0, 0]),
+            )
+        };
+        assert_eq!(tgkill(libc::SIGURG as u64), allow);
+        assert_eq!(tgkill(libc::SIGKILL as u64), kill);
+    }
+
     #[test]
     fn every_syscall_has_one_rule() {
         for (tcp, warm) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -278,6 +502,68 @@ mod tests {
             })
         };
         assert!(seals(true) && !seals(false));
+    }
+
+    /// With `HELLOVM_SECCOMP_LEARNED_KVM=FILE`, a recording made by
+    /// running the KVM suites with `HELLOVM_SECCOMP_LEARN=FILE` (see
+    /// README, "The KVM platform"): the KVM filter must let every recorded
+    /// syscall through. The fds of the recorded `KVM_RUN`s are taken as
+    /// the vCPUs' (each run has its own), so for the vCPU `ioctl`s it
+    /// checks the requests, not the fds.
+    #[test]
+    fn every_measured_kvm_syscall_is_allowed() {
+        use crate::filter::{self, tests::data, Judge};
+        let Some(path) = std::env::var_os("HELLOVM_SECCOMP_LEARNED_KVM") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&path).expect("reading the recording");
+        let mut calls = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let fields: Vec<u64> = line
+                .split_whitespace()
+                .map(|f| u64::from_str_radix(f, 16).expect("a hex field"))
+                .collect();
+            assert_eq!(fields.len(), 7, "bad line {line:?}");
+            calls.insert(fields);
+        }
+        assert!(
+            calls.len() >= 30,
+            "only {} distinct calls recorded: the measuring run did not work",
+            calls.len()
+        );
+        let ioctl = libc::SYS_ioctl as u64;
+        let mut vcpus: Vec<i32> = calls
+            .iter()
+            .filter(|c| c[0] == ioctl && c[2] as u32 == super::KVM_RUN)
+            .map(|c| c[1] as i32)
+            .collect();
+        vcpus.sort_unstable();
+        vcpus.dedup();
+        assert!(!vcpus.is_empty(), "no KVM_RUN recorded");
+        let arch = crate::harden::audit_arch();
+        let entries = super::kvm_entries(&vcpus, true);
+        let prog = filter::build(
+            arch,
+            std::slice::from_ref(&filter::EVERY_ADDRESS),
+            Judge::Allowlist(&entries),
+        )
+        .unwrap();
+        let mut refused = Vec::new();
+        for call in &calls {
+            let args: [u64; 6] = call[1..].try_into().unwrap();
+            let action = crate::bpf::run(&prog, &data(arch, call[0] as u32, 0x1000, args));
+            let errno = action & 0xffff_0000 == filter::SECCOMP_RET_ERRNO;
+            if action != filter::SECCOMP_RET_ALLOW && !errno {
+                refused.push(format!("syscall {} {args:x?}", call[0]));
+            }
+        }
+        refused.sort();
+        refused.dedup();
+        assert!(
+            refused.is_empty(),
+            "the kernel process on the KVM platform made syscalls its allowlist refuses:\n{}",
+            refused.join("\n")
+        );
     }
 
     /// With `HELLOVM_SECCOMP_LEARNED=FILE`, a recording made by running

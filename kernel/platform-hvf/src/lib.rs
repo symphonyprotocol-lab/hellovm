@@ -3,6 +3,12 @@
 //! `fork` (copy-on-write), `execve` and dynamic linking, with threads in
 //! parallel on several vCPUs (see README, "The HVF platform").
 //!
+//! The platform itself (the scheduler, the page tables, the decoding of
+//! exceptions) is `hellovm-platform-arm64`'s, which the KVM platform on
+//! Linux shares; this crate is its Hypervisor.framework backend
+//! ([`Hvf`]): the VM, the shim of `hvc` vectors, the vCPUs' registers and
+//! timer, and the host memory (`sys`).
+//!
 //! # How app code runs
 //!
 //! The app runs at EL0 of a VM that has no guest kernel. At EL1 there is
@@ -62,15 +68,23 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-mod app;
-mod exit;
-mod layout;
-mod mmu;
+mod hvf;
 mod sys;
 
-pub use app::{AppKiller, Flushes, HvfConfig, HvfPlatform, MAX_VCPUS};
-pub use mmu::{Origin, SaveStats, Trimmed};
+#[cfg(test)]
+mod tests;
+
+pub use hellovm_platform_arm64::{Flushes, Origin, SaveStats, Trimmed, MAX_VCPUS};
+pub use hvf::{Hvf, HvfVcpu};
 pub use sys::SharedMap;
+
+/// The HVF platform: the shared arm64 platform on Hypervisor.framework.
+/// One per process (the framework allows one VM per process).
+pub type HvfPlatform = hellovm_platform_arm64::VmPlatform<Hvf>;
+/// How much memory an [`HvfPlatform`] reserves and how many vCPUs it runs.
+pub type HvfConfig = hellovm_platform_arm64::VmConfig;
+/// Ends every app of an [`HvfPlatform`] from any thread.
+pub type AppKiller = hellovm_platform_arm64::AppKiller<Hvf>;
 
 /// Whether this process may use Hypervisor.framework: `Ok` if a VM could
 /// be created (and was destroyed again), otherwise why not. A process

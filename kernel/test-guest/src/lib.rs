@@ -3,7 +3,8 @@
 //! The assembly guests are static, libc-free Linux executables for the
 //! target architecture; the C guests use the build host's glibc. Linux
 //! targets, and macOS on Apple silicon (aarch64 Linux executables for the
-//! HVF platform: the assembly guests and the `asm/hvf` ones only).
+//! HVF platform: the assembly guests and the `asm/hvf` ones only). The
+//! `asm/hvf` guests are built on aarch64 Linux too (for the KVM platform).
 
 #![forbid(unsafe_code)]
 
@@ -75,41 +76,41 @@ pub const SMP: &str = env!("HELLOVM_GUEST_SMP");
 #[cfg(target_os = "linux")]
 pub const NETCHECK: &str = env!("HELLOVM_GUEST_NETCHECK");
 
-/// aarch64 Linux, built on macOS for the HVF platform: calls `getpid` N
+/// aarch64 Linux (for the HVF and KVM platforms): calls `getpid` N
 /// times (N is the decimal `argv[1]`, default 1), checking each result is
 /// 1, then exits with 0 (1 on a wrong result).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 pub const GETPID_LOOP: &str = env!("HELLOVM_GUEST_GETPID_LOOP");
 
-/// aarch64 Linux, built on macOS: loads from address 0x10 (unmapped); the
+/// aarch64 Linux: loads from address 0x10 (unmapped); the
 /// kernel kills it with `SIGSEGV`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 pub const SEGV: &str = env!("HELLOVM_GUEST_SEGV");
 
-/// aarch64 Linux, built on macOS: system calls with odd register values
+/// aarch64 Linux: system calls with odd register values
 /// (number -1, huge lengths, addresses at the top of the address space),
 /// then prints `survived` and calls `rt_sigreturn` with an unmapped stack
 /// (killed with `SIGSEGV`).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 pub const ODD_REGS: &str = env!("HELLOVM_GUEST_ODD_REGS");
 
-/// aarch64 Linux, built on macOS: sets `PSTATE.DIT`, makes a system call,
+/// aarch64 Linux: sets `PSTATE.DIT`, makes a system call,
 /// and exits with 0 if it is still set (1 if not).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 pub const DIT: &str = env!("HELLOVM_GUEST_DIT");
 
-/// aarch64 Linux, built on macOS: reserves 64 GiB with `PROT_NONE`, uses
+/// aarch64 Linux: reserves 64 GiB with `PROT_NONE`, uses
 /// a few pages in the middle, unmaps it; then maps, touches and unmaps a
 /// page at 2000 places a gigabyte apart. Exits with 0, or the number of
 /// the step that failed.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 pub const RESERVE: &str = env!("HELLOVM_GUEST_RESERVE");
 
-/// aarch64 Linux, built on macOS: cache maintenance (`ic ivau`, `dc cvau`)
+/// aarch64 Linux: cache maintenance (`ic ivau`, `dc cvau`)
 /// over read-only executable pages that were never touched. Exits with 0.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 pub const ICACHE: &str = env!("HELLOVM_GUEST_ICACHE");
 
-/// aarch64 Linux, built on macOS: spins forever, making no system call.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// aarch64 Linux: spins forever, making no system call.
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 pub const SPIN: &str = env!("HELLOVM_GUEST_SPIN");

@@ -58,6 +58,11 @@ pub const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 pub const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
 pub const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
+/// Every address, as a code range: on the KVM platform the kernel process
+/// has no app processes, so every syscall is judged by the allowlist,
+/// whatever code made it.
+pub const EVERY_ADDRESS: Range<u64> = 0..u64::MAX;
+
 /// A condition on the low 32 bits of a syscall argument.
 #[derive(Clone, Debug)]
 pub enum Check {
@@ -79,6 +84,9 @@ pub enum Rule {
     Errno(u32),
     /// Allowed when every check passes; otherwise the process is killed.
     Checked(Vec<Check>),
+    /// Allowed when every check of one of the groups passes; otherwise
+    /// the process is killed.
+    AnyOf(Vec<Vec<Check>>),
 }
 
 /// One allowlist entry.
@@ -198,10 +206,21 @@ pub fn build(
                         asm.here(fail);
                         asm.ret(SECCOMP_RET_KILL_PROCESS);
                     }
+                    Rule::AnyOf(groups) => {
+                        for checks in groups {
+                            let next = asm.label();
+                            for check in checks {
+                                emit_check(&mut asm, check, next);
+                            }
+                            asm.ret(SECCOMP_RET_ALLOW);
+                            asm.here(next);
+                        }
+                        asm.ret(SECCOMP_RET_KILL_PROCESS);
+                    }
                 }
                 asm.here(skip);
                 // Bodies end in a return, so A must be reloaded.
-                if matches!(entry.rule, Rule::Checked(_)) {
+                if matches!(entry.rule, Rule::Checked(_) | Rule::AnyOf(_)) {
                     asm.load(bpf::NR);
                 }
             }
@@ -307,6 +326,43 @@ pub(crate) mod tests {
         assert_eq!(
             run(ARCH, 3, k, [1, 0, 1 << 32, 0, 0, 0]),
             SECCOMP_RET_KILL_PROCESS
+        );
+    }
+
+    #[test]
+    fn any_of_allows_when_one_group_passes() {
+        let entries = vec![Entry {
+            nr: 29,
+            rule: Rule::AnyOf(vec![
+                vec![Check::OneOf(0, vec![5, 6]), Check::OneOf(1, vec![0xae80])],
+                vec![Check::OneOf(0, vec![4]), Check::OneOf(1, vec![0x4008_ae61])],
+                vec![Check::OneOf(1, vec![0x5401])],
+            ]),
+        }];
+        let prog = build(
+            ARCH,
+            std::slice::from_ref(&EVERY_ADDRESS),
+            Judge::Allowlist(&entries),
+        )
+        .unwrap();
+        let run = |args: [u64; 6]| bpf::run(&prog, &data(ARCH, 29, 0x1000, args));
+        assert_eq!(run([5, 0xae80, 0, 0, 0, 0]), SECCOMP_RET_ALLOW);
+        assert_eq!(run([6, 0xae80, 0, 0, 0, 0]), SECCOMP_RET_ALLOW);
+        assert_eq!(run([4, 0x4008_ae61, 0, 0, 0, 0]), SECCOMP_RET_ALLOW);
+        assert_eq!(run([9, 0x5401, 0, 0, 0, 0]), SECCOMP_RET_ALLOW);
+        // The right request on the wrong fd, and the other way round.
+        assert_eq!(run([4, 0xae80, 0, 0, 0, 0]), SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(run([5, 0x4008_ae61, 0, 0, 0, 0]), SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(run([7, 0xae80, 0, 0, 0, 0]), SECCOMP_RET_KILL_PROCESS);
+        // Another syscall: not on the list.
+        assert_eq!(
+            bpf::run(&prog, &data(ARCH, 30, 0x1000, [0; 6])),
+            SECCOMP_RET_KILL_PROCESS
+        );
+        // With every address inside, nothing is left to a tracer.
+        assert_eq!(
+            bpf::run(&prog, &data(ARCH, 29, u64::MAX, [5, 0xae80, 0, 0, 0, 0])),
+            SECCOMP_RET_ALLOW
         );
     }
 

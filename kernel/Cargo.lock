@@ -11,6 +11,7 @@ dependencies = [
  "hellovm-egress",
  "hellovm-host",
  "hellovm-platform-hvf",
+ "hellovm-platform-kvm",
  "hellovm-platform-seccomp",
  "hellovm-sandbox",
  "hellovm-test-guest",
@@ -87,11 +88,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellovm-platform-arm64"
+version = "0.0.1"
+dependencies = [
+ "hellovm-core",
+ "log",
+]
+
+[[package]]
 name = "hellovm-platform-hvf"
 version = "0.0.1"
 dependencies = [
  "hellovm-core",
  "hellovm-host",
+ "hellovm-platform-arm64",
+ "hellovm-test-guest",
+ "libc",
+ "log",
+]
+
+[[package]]
+name = "hellovm-platform-kvm"
+version = "0.0.1"
+dependencies = [
+ "hellovm-core",
+ "hellovm-host",
+ "hellovm-platform-arm64",
  "hellovm-test-guest",
  "libc",
  "log",

@@ -95,9 +95,15 @@ unset HELLOVM_NET_E2E
 
 cargo check --workspace --all-targets
 
+# The KVM platform's suites need /dev/kvm and the guest image of
+# kernel/platform-hvf/build-guests.sh: kernel/dev/run-kvm-lima.sh runs
+# them (in a Lima VM on a Mac). Here only the KVM crate's tests that need
+# no VM run (the shim's layout).
+echo "run-e2e: the KVM platform's suites are left out (see kernel/dev/run-kvm-lima.sh)"
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
-if ! cargo test --workspace -- --nocapture >"$log" 2>&1; then
+if ! { cargo test --workspace --exclude hellovm-platform-kvm -- --nocapture &&
+  cargo test -p hellovm-platform-kvm --lib shim:: -- --nocapture; } >"$log" 2>&1; then
   cat "$log" >&2
   echo "run-e2e: cargo test failed" >&2
   exit 1

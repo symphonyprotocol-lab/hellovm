@@ -31,6 +31,22 @@ pub struct Config<'a> {
     pub warm: bool,
     /// The outcome of [`close_inherited_fds`].
     pub fds: Result<usize, String>,
+    /// What runs the guest.
+    pub platform: Platform,
+}
+
+/// The platform the kernel process runs its guest on, which decides its
+/// seccomp filter.
+#[derive(Clone, Debug, Default)]
+pub enum Platform {
+    /// `hellovm-platform-seccomp`: app processes forked from the kernel
+    /// process and driven with `ptrace` (see `filter`).
+    #[default]
+    Seccomp,
+    /// `hellovm-platform-kvm`: a KVM VM, made before the hardening, and
+    /// its vCPUs' fds (see `allowlist::kvm_entries`). The process has no
+    /// other thread yet.
+    Kvm { vcpus: Vec<i32> },
 }
 
 /// A hardening layer.
@@ -215,8 +231,14 @@ pub fn apply(config: Config<'_>) -> Result<Hardened, Refused> {
         config.fds.clone().map(|n| format!("{n} closed")),
     );
 
-    // Taken before the namespaces and Landlock hide /proc.
-    let profile = hellovm_platform_seccomp::host_profile().map_err(|err| err.to_string());
+    // Taken before the namespaces and Landlock hide /proc (the seccomp
+    // platform's only).
+    let profile = match config.platform {
+        Platform::Seccomp => hellovm_platform_seccomp::host_profile()
+            .map(Some)
+            .map_err(|err| err.to_string()),
+        Platform::Kvm { .. } => Ok(None),
+    };
     // The measurement file, if any, must be opened before Landlock.
     let learn = config.learn.as_ref().map(|path| {
         std::fs::OpenOptions::new()
@@ -319,11 +341,14 @@ pub(crate) fn audit_arch() -> u32 {
 }
 
 fn install_seccomp(
-    profile: &hellovm_platform_seccomp::HostProfile,
+    profile: Option<&hellovm_platform_seccomp::HostProfile>,
     config: &Config<'_>,
     learn: Option<Result<std::fs::File, String>>,
 ) -> Result<String, String> {
-    let code = profile.code_ranges();
+    let code = match profile {
+        Some(profile) => profile.code_ranges(),
+        None => std::slice::from_ref(&filter::EVERY_ADDRESS),
+    };
     #[cfg(feature = "insecure-test-hooks")]
     if let Some(out) = learn {
         let mut prog = filter::build(
@@ -340,7 +365,13 @@ fn install_seccomp(
     if learn.is_some() {
         return Err("HELLOVM_SECCOMP_LEARN needs the insecure-test-hooks feature".into());
     }
-    let entries = allowlist::entries(profile.stub_fd(), config.tcp_port.is_some(), config.warm);
+    let entries = match (&config.platform, profile) {
+        (Platform::Kvm { vcpus }, _) => allowlist::kvm_entries(vcpus, config.tcp_port.is_some()),
+        (Platform::Seccomp, Some(profile)) => {
+            allowlist::entries(profile.stub_fd(), config.tcp_port.is_some(), config.warm)
+        }
+        (Platform::Seccomp, None) => return Err("no host profile".into()),
+    };
     let mut prog = filter::build(audit_arch(), code, filter::Judge::Allowlist(&entries))?;
     let fprog = libc::sock_fprog {
         len: prog.len() as libc::c_ushort,

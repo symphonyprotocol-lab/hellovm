@@ -11,7 +11,9 @@ The kernel lives in `kernel/`, a Rust workspace:
 | `hellovm-core` | `kernel/core` | Syscall emulation: processes, threads, signals, pipes, ELF loading, memory map, filesystem, terminal, `/proc`, IPv4 sockets; independent of the host OS |
 | `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks, outbound streams to the egress proxy |
 | `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
+| `hellovm-platform-arm64` | `kernel/platform-arm64` | What the two VM platforms share: stage-1 tables and pools, the VM layout, exception decoding and the scheduler, over a small hypervisor interface; their shared test suites |
 | `hellovm-platform-hvf` | `kernel/platform-hvf` | macOS platform on Apple silicon: a Hypervisor.framework VM with no guest kernel (see **The HVF platform (macOS)**) |
+| `hellovm-platform-kvm` | `kernel/platform-kvm` | arm64 Linux platform: the same VM on KVM (`--platform kvm`, see **The KVM platform (arm64 Linux)**) |
 | `hellovm-sandbox` | `kernel/sandbox` | Least privilege for the kernel process itself (see **Hardening**) |
 | `hellovm` | `kernel/hellovm` | Command-line launcher; warm-clone templates and clones, and the control protocol's client (`hellovm::warm`) |
 | `hellovm-egress` | `kernel/egress` | The egress proxy (`hellovm-egress` binary): default-deny domain allowlist, one per host |
@@ -718,7 +720,8 @@ footprint read from outside with `proc_pid_rusage`):
 | CPython: a million strings freed, 100,000 byte strings, a dict of 300,000 | 188.0 / 190.3 ms | 194.6 / 198.2 ms |
 
 Giving back 64 MiB (4,096 chunks, in two calls) takes 2.6 to 6.2 ms,
-about 1 µs a chunk; the platform test (`give_back_tests` in `app.rs`)
+about 1 µs a chunk; the platform test (`give_back_tests` in
+`platform-hvf/src/tests.rs`)
 reports it each round: footprint 2 MiB, 130 touched, 2 to 3 after the
 memory went back (30 to 35 ms after the `munmap`, the program being
 stopped), on one vCPU and on four with three threads spinning on the
@@ -727,7 +730,7 @@ made the allocation-heavy script 14% slower (216 ms); without any give
 back, or giving back only when idle, it took 193 ms: the remaining 3%
 is the host's zeroing of new frames and what goes back after 100 ms.
 
-*Tests.* `mmu.rs`'s randomized test against its model gives memory back
+*Tests.* `mmu.rs`'s (`kernel/platform-arm64/src`) randomized test against its model gives memory back
 between steps (to random reserves; given-back memory is filled with
 garbage, which the comparisons would see) and checks every list and
 count of the pools after every step; `mmu_trim_tests.rs` checks runs of
@@ -867,8 +870,11 @@ HELLOVM_HVF_GUESTS=$PWD/target/hvf-guests/root cargo test -p hellovm --test hvf_
 target/debug/hellovm --sandbox require --root target/hvf-guests/root /bin/sh -c 'seq 100 | grep 7 | wc -l'
 ```
 
-The tests (`kernel/platform-hvf/tests/hvf.rs` and `guests.rs`, the unit
-tests in `kernel/platform-hvf/src`, and `kernel/hellovm/tests/hvf_cli.rs`)
+The tests (`kernel/platform-hvf/tests/hvf.rs` and `guests.rs`, which
+are the shared suites `kernel/platform-arm64/suite/platform.rs` and
+`guests.rs` that the KVM platform runs too, the unit tests in
+`kernel/platform-arm64/src` and `kernel/platform-hvf/src`, and
+`kernel/hellovm/tests/hvf_cli.rs`)
 cover the hello world end to end (through the core and through the
 command line), `SIGSEGV` delivery, fault events from unmapped and
 protected memory (and that `mprotect` and `munmap` reach a program whose
@@ -957,7 +963,7 @@ core (`getpid` in a loop, `kernel/test-guest/asm/hvf/getpid_loop.S`), it
 is **904 ns** per call, VM creation and loading included. Of the 834 ns,
 736 ns is the VM exit and entry alone (`hv_vcpu_run` with nothing read);
 reading a general register costs about 5 ns and a system register 11 ns
-(`exit_cost_breakdown` in `platform-hvf/src/app.rs`). Measured the same way as on Linux, through the command line
+(`exit_cost_breakdown` in `platform-hvf/src/tests.rs`). Measured the same way as on Linux, through the command line
 (release build, `--sandbox off`, wall clock of a run of 1,000,000 calls
 minus a run of 0, best of 5), HVF takes 906 ns per `getpid`, and starting
 `hellovm` (VM creation included) about 5 ms. For comparison only, in a
@@ -1059,6 +1065,342 @@ that another vCPU writes while the core reads it (a `write` system call
 from a buffer another thread is filling) is copied as it is at that
 moment, as on Linux. `--vcpus` does not limit how many host CPUs the VM
 uses at once beyond its own count; macOS schedules the vCPU threads.
+
+## The KVM platform (arm64 Linux)
+
+Since milestone P1h, on arm64 Linux with `/dev/kvm`, `hellovm --platform
+kvm` runs aarch64 Linux programs in a KVM virtual machine
+(`kernel/platform-kvm`) the way the HVF platform runs them in a
+Hypervisor.framework VM on macOS: no guest kernel, the program at EL0, a
+shim at EL1, page tables written by hellovm, processes with
+copy-on-write `fork`, `execve`, threads in parallel on several vCPUs
+(`--vcpus`), and memory given back to the host. The seccomp platform stays
+the default on Linux (`--platform seccomp`): it is the one that runs
+everywhere (any architecture, inside containers without `/dev/kvm`, and
+it has warm clones). The same kernel core handles every system call.
+
+**What is shared with HVF.** Everything that does not depend on the
+hypervisor moved from `kernel/platform-hvf` into `kernel/platform-arm64`
+(`hellovm-platform-arm64`) and is used by both platforms unchanged:
+
+* `mmu.rs` (with its tests): the stage-1 tables, the frame and table
+  pools, reference counts and copy-on-write, shared objects, staleness
+  records, the give-back of whole free host pages, warm-clone save and
+  load;
+* `layout.rs`: the guest-physical layout, the descriptor bits, the EL1
+  system register values and their encodings (HVF's `hv_sys_reg_t` and
+  KVM's `KVM_REG_ARM64_SYSREG` ids are the same 16 bits);
+* `exit.rs`: the decoding of an exception syndrome into a system call, a
+  page fault or a signal;
+* `vm.rs`: the platform itself (`VmPlatform<H>`, which implements the
+  core's `Platform` trait): the scheduler, the per-vCPU TLB bookkeeping
+  and the shootdown on page-table changes, register contexts and where
+  they are loaded, `fork`/`clone`, the kicks, the event queue, the
+  give-back timing, freezing and thawing;
+* the end-to-end suites (`suite/platform.rs` and `suite/guests.rs`),
+  which `platform-hvf/tests` and `platform-kvm/tests` include, and the
+  tests of the shared code that need a VM (`testing.rs`).
+
+`VmPlatform` is generic over a small hypervisor interface (`backend.rs`):
+make the VM with its shim and pools mapped, the shim's `TTBR1_EL1` tree,
+make a vCPU, read the ID registers, set up its system registers, read and
+write the app's registers, enter the app (with a flush of the whole TLB,
+of one page, or none), run until the next exit (decoded into "stopped
+from outside", "an exception through vector N" or "an exit straight to
+the hypervisor"), a timer for the next run and a kicker any thread can
+call. `HvfPlatform` is `VmPlatform<Hvf>` and `KvmPlatform` is
+`VmPlatform<Kvm>`; the HVF backend is the old code (`hvc` vectors,
+registers read with `hv_vcpu_get_reg`, the guest's virtual timer,
+`hv_vcpus_exit`), with the same behaviour, messages, snapshot format and
+tests.
+
+**How it works on KVM.** On Hypervisor.framework the host reads a
+vCPU's registers for a few nanoseconds each; on KVM each would be a
+`KVM_GET_ONE_REG` system call, and an `hvc` from EL1 is KVM's own
+(PSCI), never the host's. So the KVM shim (`platform-kvm/src/shim.rs`,
+assembled into the crate with `global_asm!` and copied into the VM) does
+more:
+
+* `SP_EL1` of each vCPU points to its *frame*, a page of its own mapped
+  for EL1 only and never executable. Each of the 16 vectors stores `x0`
+  and `x1` there, puts its number in `x0` and branches to the save
+  routine, which stores the rest of the app's registers (general, `SP`,
+  `ELR_EL1`, `SPSR_EL1`, `ESR_EL1`, `FAR_EL1`, `TPIDR_EL0`, the 32 SIMD
+  registers, `FPSR`, `FPCR`) and then stores a zero to the *exit page*,
+  which no memory slot backs: `KVM_RUN` returns with `KVM_EXIT_MMIO` for
+  that address, and the host reads everything from the frame.
+* When the host runs the vCPU again, KVM completes the store and the
+  vCPU goes on with the next instruction, the restore routine: it loads
+  `TTBR0_EL1` from the frame, invalidates the whole TLB and the
+  instruction cache or one page of one ASID if the frame says so (the
+  same `tlbi` as on HVF), loads every register and `eret`s to the app at
+  the frame's `ELR_EL1` and `SPSR_EL1`.
+
+A system call round trip is one `KVM_RUN` and nothing else: no
+`KVM_GET_ONE_REG`/`KVM_SET_ONE_REG` for it (the core's reads of a
+task's registers are reads of the frame). An exit that is anything else
+(an MMIO access elsewhere, `KVM_EXIT_FAIL_ENTRY`,
+`KVM_EXIT_INTERNAL_ERROR`, `KVM_EXIT_SYSTEM_EVENT`, an unknown reason)
+ends the task that ran (`Trap::Gone`, logged with the exit) and leaves
+that vCPU unusable: its next run is an error, which ends the sandbox if
+it is the event loop's vCPU. Nothing panics.
+
+Nothing interrupts the app: the VM has no interrupt controller and no
+timer interrupt. A kick from another thread (a waker, an event for the
+event loop, `kill`, `interrupt`, a TLB shootdown, the killer), or from a
+clock thread (`hellovm-clock`) when a vCPU's deadline (the end of a
+slice, a `wait` timeout, memory due to go back) has passed, sets a stop
+flag in the vCPU's frame and `immediate_exit` in its `kvm_run`, and
+sends the vCPU's thread `SIGURG` (a handler that does nothing), so that
+`KVM_RUN` returns `EINTR`, at once if the vCPU was not in it. If the
+app was running (`PSTATE` at EL0, one `KVM_GET_ONE_REG`), the host has
+KVM inject a synchronous external data abort (`KVM_SET_VCPU_EVENTS`):
+KVM enters the shim's vector for EL0 itself, in software, the vector
+saves the app's registers and exits as for any exception, and the host
+takes that exit as the stop (with the app's `PC`, nothing executed). If
+the vCPU was in the shim, it runs on and leaves by itself: through the
+save routine's exit, or through the stop check just before the restore
+routine's `eret`, which leaves instead when the flag is set; a vCPU
+stopped in the two instructions between that check and the `eret` has
+its `PC` set back to the check (`KVM_SET_ONE_REG`). The exit the stop
+causes clears the flag, and a kick while a stop is pending sends no
+second signal. So a kick costs a signal and two or three `ioctl`s, and
+a system call nothing. The first design raised each vCPU's IRQ input
+with `KVM_IRQ_LINE` (the vector for IRQs would have saved and exited
+the same way); under the nested virtualization of the Mac it was tested
+on, neither the virtual IRQ nor the virtual FIQ ever reached the guest,
+and the vCPU ran on. `wfi` and `wfe` are trapped to EL1
+(`SCTLR_EL1.nTWI` and `nTWE` clear; KVM would otherwise block the vCPU
+in a `wfi`) and skipped, as on HVF.
+
+| Guest-physical | Size | Memory slot | What |
+|---|---|---|---|
+| `0x1_0000` | 16 KiB | read only | The shim (vectors, save and restore routines) |
+| `0x10_0000` | 256 KiB | read, write | The vCPUs' frames, one 4 KiB page each (64 at most) |
+| `0x3000_0000` | | none | The exit page: a store to it leaves `KVM_RUN` |
+| `0x4000_0000` | 64 MiB | read only | Page tables, written only by the kernel process |
+| `0x1_0000_0000` | 2 GiB | read, write | The program's memory |
+
+`TTBR1_EL1` maps the shim at `0xffff_0000_0000_0000` (EL1, read and
+execute), the frames right after it and the exit page 1 MiB above it
+(EL1, read and write, never executable; the exit page as device memory),
+all in one last-level table. KVM's memory slots cannot forbid execution,
+unlike HVF's stage 2, so stage 1 does: nothing outside the shim is
+executable at EL1 (`PXN`), and EL0 reaches only what the core mapped.
+The other system registers are HVF's.
+
+The vCPUs are made with the VM, all on the calling thread, and the vCPU
+threads and the clock thread start only at the first `wait`: the kernel
+process confines itself in between (see below), and on Linux a process
+with a second thread can neither enter a user namespace nor put its
+other threads under Landlock. A vCPU made on one thread and run on
+another is fine for KVM (`DEFER_THREADS` in the backend interface; HVF
+binds a vCPU to the thread that made it and keeps making them on their
+own threads).
+
+**What confines the kernel process.** The layers are those of **Hardening**
+in the same order: inherited fds closed, user, mount, network and IPC
+namespaces where the host allows them, resource limits, `no_new_privs`,
+Landlock (the image read only, no TCP, scoped signals), not dumpable,
+and a seccomp allowlist (`allowlist::kvm_entries`). Before them the
+kernel process opens `/dev/kvm`, makes the VM, its four memory slots,
+every vCPU (with its `kvm_run` mapping and its system registers) and
+closes `/dev/kvm` again. Then, confined, it uses only the vCPUs' fds of
+KVM, and the allowlist is the seccomp platform's without
+everything app processes need (no `ptrace`, `process_vm_*`, `wait4`,
+`fork`, `execveat`, `kill`, pidfds, `setsid` or `seccomp`), judged
+whatever code made the call (there are no app processes, so nothing is
+left to a tracer). The `ioctl`s it allows:
+
+| `ioctl` | On | Why |
+|---|---|---|
+| `KVM_RUN` | the vCPUs' fds only | runs a vCPU (every exit comes back through it) |
+| `KVM_GET_ONE_REG` | the vCPUs' fds only | a stop: where the vCPU is (`PSTATE`, `PC`) |
+| `KVM_SET_VCPU_EVENTS` | the vCPUs' fds only | a stop: the external abort that makes a running app enter the shim |
+| `KVM_SET_ONE_REG` | the vCPUs' fds only | a stop: `PC` back to the stop check (rare) |
+| `TCGETS`, `TCSETS`, `TCGETS2`, `TCSETS2`, `TIOCGWINSZ`, `FIONBIO` | any fd | the console, as on the seccomp platform |
+
+Any other `ioctl` kills the process, and the VM's fd takes none: so a
+compromised kernel process cannot make another VM or vCPU
+(`KVM_CREATE_VM`, `KVM_CREATE_VCPU`), map other memory into the VM
+(`KVM_SET_USER_MEMORY_REGION`), set up a vCPU again
+(`KVM_ARM_VCPU_INIT`), or reach any other KVM interface. What the four
+vCPU `ioctl`s allow (running its vCPUs, reading and setting their
+registers, injecting an abort or an SError into them) acts on its own
+VM, whose memory and page tables are its own memory, which it can
+already write; so through KVM it reaches nothing it could not reach
+already. A filter cannot look into the `ioctl`'s argument, so which
+register `KVM_SET_ONE_REG` sets is not checked. `clone` is allowed for
+threads only (the vCPU and clock threads start after the filter, under
+it), `tgkill` only with `SIGURG` (the kick) and `SIGABRT`, and `madvise`
+for the give-back. The memory slots are never removed: at the end the
+fds are closed, which ends the VM.
+
+The list (47 entries) was measured with `HELLOVM_SECCOMP_LEARN=FILE`
+over `kvm_cli` in the Lima VM below (Ubuntu 24.04, glibc of the dev
+image: 2.36): 26 distinct syscalls, all on the list
+(`HELLOVM_SECCOMP_LEARNED_KVM=FILE cargo test -p hellovm-sandbox
+measured_kvm` checks a recording). The first measurement found that the
+memory slots were removed at the end (`KVM_SET_USER_MEMORY_REGION`,
+which killed every run as it ended), and that kicks cost 1.7 million
+`tgkill`s in those tests (a TLB shootdown kicks again every few
+thousand spins while it waits for a vCPU): now a kick whose stop is
+still pending sends nothing, and the count was 87,000. In the Lima VM
+the layers were: inherited fds, resource limits, `no_new_privs`,
+Landlock (ABI 4: image read only, no TCP; Ubuntu 24.04's 6.8 kernel has
+no scoped signals), not dumpable, seccomp; the namespaces are skipped
+(AppArmor's `restrict_unprivileged_userns`), so `--sandbox require`
+starts on Landlock.
+
+**Memory given back to the host.** The pools are the shared code's:
+whole free 16 KiB chunks go back after 100 ms, 4 MiB (+1 MiB of tables)
+stay until the sandbox is idle for 20 ms. On Linux the give-back is
+`madvise(MADV_DONTNEED)`: the pages are freed at once and leave the
+process's resident size, and KVM's MMU notifier removes them from the
+VM's stage 2 (the next access, by the guest or the host, gets a new zero
+page). That is the defined Linux behaviour for guest memory, unlike the
+macOS case that could not be verified; `MADV_FREE` was not used, since
+it keeps the pages resident until the host needs them and so the
+resident size would not show what the sandbox uses. Taking memory back
+needs no call. The host still zeroes every frame it hands out, as on
+HVF. Measured in the Lima VM with `kvm_cli` (CPython touches 256 MiB,
+frees it, reads 256 MiB of new memory, which is zero, and runs 50
+processes that each touch and free 8 MiB; the kernel process's `VmRSS`
+read from outside), confined, on 1 and 4 vCPUs: 17.5 MiB at the start,
+274 MiB touched, 17.9 MiB freed, 18.0 MiB after the processes (17.3,
+274.0, 17.7, 17.9 on 4 vCPUs). A page used by both the host (which
+zeroed it) and the guest counts once here, unlike on macOS.
+
+**Tests.** The KVM platform runs the shared suites
+(`kernel/platform-kvm/tests/kvm.rs` and `guests.rs`, the same tests as
+the HVF platform's `hvf.rs` and `guests.rs`), the shared tests that need
+a VM (`platform-kvm/src/tests.rs`), the shim's layout, and
+`kernel/hellovm/tests/kvm_cli.rs` (the command line, confined: hello
+world, every layer active, `--timeout` with programs that never make a
+system call, refused options, busybox and CPython, `--vcpus` 1 and 4,
+memory given back, read from `/proc/PID/status`). The shared EL1 test
+also checks that EL0 cannot load from or store to the frames and the
+exit page. Without `/dev/kvm` they print `SKIPPING`
+and pass, unless `HELLOVM_REQUIRE_E2E=1`; `kvm_cli` is built only with
+the `kvm-tests` feature and `run-e2e.sh` leaves the KVM suites out (it
+runs where there is no `/dev/kvm`). The sandbox's unit tests check the
+KVM allowlist (no process control, the four vCPU `ioctl`s only on a
+vCPU fd, every other KVM `ioctl` killed on every fd), and with
+`HELLOVM_SECCOMP_LEARNED_KVM=FILE` a measurement against it.
+
+On a Mac (M3 or later, macOS 15 or later), the suites run in a Lima VM
+with nested virtualization, `kernel/dev/lima-kvm.yaml` (Ubuntu 24.04, 4
+vCPUs, 8 GiB, the repository mounted read only at `/src`):
+
+```sh
+limactl create --name hellovm-kvm --set ".mounts[0].location = \"$PWD\"" kernel/dev/lima-kvm.yaml
+limactl start hellovm-kvm
+kernel/dev/run-kvm-lima.sh hellovm-kvm hellovm-dev
+limactl stop hellovm-kvm
+limactl delete -f hellovm-kvm
+```
+
+`run-kvm-lima.sh` builds the guest image (`build-guests.sh`) if it is
+missing, builds the tests in the dev container into `kernel/target/linux`
+and runs each test binary in the VM with `HELLOVM_REQUIRE_E2E=1`. On a
+native arm64 Linux host with `/dev/kvm`, the same tests run with `cargo
+test -p hellovm-platform-kvm` and `cargo test -p hellovm --features
+kvm-tests --test kvm_cli`, with `HELLOVM_KVM_GUESTS` set to an image made
+by `build-guests.sh`.
+
+Run on 2026-11-24 in a Lima VM (Lima 2.3.0, vz, nested virtualization,
+Ubuntu 24.04 with Linux 6.8, 4 vCPUs, 8 GiB) on an M3 Max with macOS
+27.2, by `run-kvm-lima.sh`, twice: `hellovm-platform-arm64` 26 tests,
+`hellovm-platform-kvm` 4, `kvm.rs` 19, `guests.rs` 11 (busybox, CPython,
+forks, signals, threads, threads in parallel, the fork bomb, out of
+memory), `kvm_cli` 7, all passing (and `kvm.rs` and `guests.rs` again
+with `HELLOVM_KVM_VCPUS=1`). The KVM in that VM is a nested one, at
+virtual EL2 under Apple's hypervisor; the platform was not run on a
+native arm64 Linux host. Lima 1.0.4 did not start the VM on this Mac
+(its network helper fails on Docker Desktop's `/var/run/docker.sock`
+link); `lima-kvm.yaml` needs Lima 2. Those two runs were in a VM made
+from the same settings with the repository mounted at its own path (and
+linked to `/src`) and Lima's host resolver turned off (a leftover of
+the 1.0.4 attempt). On 2026-11-25 a VM made from `lima-kvm.yaml` as
+committed, with the commands above, ran the same suites once more, all
+passing.
+
+**Performance.** Measured in that Lima VM, release builds, through the
+command line with `--sandbox require` (wall clock, best of 3 or 10) and
+the platform's own benchmarks (`syscall_round_trip`, `benchmarks` in
+`guests.rs`), next to the seccomp platform in the same VM (not nested:
+its app processes are processes of the VM's Linux) and the HVF platform
+natively on the same Mac (the numbers above):
+
+| | KVM (nested, Lima VM) | seccomp (same VM) | HVF (macOS) |
+|---|---|---|---|
+| system call round trip, platform only | 52 µs | | 0.9 µs |
+| `getpid` through the command line | 47 µs | 75 µs | 0.9 µs |
+| start-up (`getpid` loop of 0) | 14 ms | 4.5 ms | 5 ms |
+| `python3 -c pass` | 151 ms | 66 ms | 22 ms |
+| `sh -c 'seq 1 20000 \| grep 7 \| sort -rn \| uniq \| head -3'` | 50 ms | 25 ms | 19 ms |
+| Python benchmark | 957 ms | 39 ms | 43 ms |
+| `fork` + `exit` + `wait` | 490 µs | 552 µs | 36 µs |
+| `fork` with 256 MiB touched | 1.1 ms | 1.3 ms | 0.3 ms |
+| ... and the child writing all of it | 9.3 s (143 µs a page) | 121 ms | 180 ms |
+| pipe round trip between two processes | 686 µs | 166 µs | 8 µs |
+| four threads of CPU work (`smp scale 4 50000000`, in-guest) | 328 ms on 1 vCPU, 98 ms on 4 | 90 ms | |
+
+Under nested virtualization every exit of the guest goes from the VM's
+KVM through Apple's hypervisor, which traps much of KVM's own world
+switch: about 50 µs a round trip, against 0.9 µs for Hypervisor.framework
+natively. Work that exits often is slow there: every first touch of a
+page and every copy-on-write fault is an exit (CPython's start-up and
+benchmark, the child writing 256 MiB), while CPU work runs at full speed
+and scales with the vCPUs (3.3 times faster on 4). These numbers say
+what the nested setup costs, not what KVM costs on a native arm64 host,
+where an exit costs on the order of a microsecond; that was not
+measured. The seccomp numbers in the same VM are slower than in Docker
+Desktop (75 µs against 23 µs a `getpid`). The shared code costs the HVF
+platform about 30 ns a round trip (936 against 903 ns, `main` and this
+branch measured in turn, five runs of 1,000,000 each, best of them;
+`#[inline]` on the backend made no difference).
+
+**What works, and what does not yet.** Everything of the HVF
+platform's list but warm clones: static and dynamically linked aarch64
+programs, processes with `fork` and `execve`, `vfork`, `posix_spawn`,
+pipes, signals, shared memory, busybox and CPython with `subprocess`,
+threads in parallel on up to 64 vCPUs, confinement, memory given back.
+Limits:
+
+* Tested only under nested virtualization (above); not on a native host,
+  not on other KVM versions than Linux 6.8, not with 16 KiB or 64 KiB
+  host pages (16 KiB should work: the pools' chunks are 16 KiB; larger
+  host pages are refused at start).
+* arm64 only: there is no x86_64 KVM backend (the shim, the tables and
+  the decoding are arm64's), and on x86_64 `--platform kvm` refuses to
+  start.
+* No warm clones on KVM (`--template` refuses `--platform kvm`). What
+  they would need: the shared code already saves a frozen template's
+  tables and frames and loads them into a new VM with frames copied on
+  first touch (`VmPlatform::save_frozen`, `load_frozen`); a KVM VM does
+  not survive a `fork` (KVM refuses a VM fd from another process), so the
+  seccomp platform's way, forking the frozen kernel process, does not
+  work, and the macOS way would: a supervisor that keeps the snapshot in
+  a sealed memfd and starts a new kernel process per clone, which makes
+  its VM, loads the snapshot and confines itself. On Linux the snapshot
+  of app memory could be mapped `MAP_PRIVATE` straight into the clone's
+  memory slot, so that pages are shared copy-on-write by the host
+  without the platform copying them.
+* Every first touch of a page and every copy-on-write fault is an exit
+  (as on HVF); under nested virtualization that dominates memory-heavy
+  programs. Mapping several pages per fault, or larger pages, is not
+  done.
+* A kick costs a signal and a few `ioctl`s; a kick that finds the app
+  running makes KVM inject an abort, so `KVM_SET_VCPU_EVENTS` and the
+  external-abort injection (`KVM_CAP_ARM_INJECT_EXT_DABT`, Linux 5.5)
+  are required.
+* An unexpected exit (anything but the shim's) ends the task and leaves
+  the vCPU unusable; on the event loop's vCPU that ends the sandbox with
+  an error. None happened in the tests.
+* `KVM_SET_ONE_REG` stays allowed after the hardening for the rare stop
+  between the stop check and the `eret`, and no filter can tell which
+  register it sets.
 
 ## Hardening
 
@@ -1213,6 +1555,14 @@ on their own where the host has them. In the dev container and in an Ubuntu 26.0
 (Docker's default seccomp profile) the namespaces are skipped and every
 other layer is active; with `--security-opt seccomp=unconfined` all
 seven are.
+
+**On the KVM platform** (`--platform kvm`) the layers and their order
+are the same; the VM and its vCPUs are made before them, with no second
+thread yet, and the seccomp allowlist is the KVM one, which judges every
+syscall whatever code made it (there are no app processes) and allows
+`KVM_RUN` and the three `ioctl`s that stop a running vCPU, on the
+vCPUs' fds, as the only `ioctl`s on KVM fds. See **The
+KVM platform (arm64 Linux)**.
 
 **On macOS (the HVF platform).** The threat model is the same: assume a
 guest has taken over the kernel process (arbitrary code in it). The VM
@@ -1837,7 +2187,7 @@ Each kernel process is started from the executable's path, so it is
 another build than its template's if `hellovm` was replaced meanwhile.
 The kernel state and the platform's state each start with a fingerprint
 of the sources that define them (`build.rs` of `hellovm-core` and of
-`hellovm-platform-hvf`); a clone of another build refuses the snapshot
+`hellovm-platform-arm64`); a clone of another build refuses the snapshot
 and its requester gets `E`: the template has to be started again.
 
 **The snapshot** is one POSIX shared memory object (`shm_open`, its name
@@ -1877,7 +2227,7 @@ template's page tables into its own table pool and marks every frame
 that the template had as *pending*: each page descriptor that points at
 one is made not valid, so the first access to it faults, and the fault
 copies the frame (4 KiB) from the snapshot into the clone's own memory
-and makes the page valid again (`kernel/platform-hvf/src/mmu.rs`, "Warm
+and makes the page valid again (`kernel/platform-arm64/src/mmu.rs`, "Warm
 clones"). Copy-on-write between the clone's own processes works as
 before; the kernel's own reads of a pending frame read the snapshot,
 its writes copy the frame first. Nothing of this asks anything unusual
@@ -3544,7 +3894,9 @@ container with the default Docker seccomp profile (ptrace of one's own
 child is allowed there). On macOS on Apple silicon `hellovm` runs
 aarch64 Linux programs on the HVF platform (see **The HVF
 platform (macOS)** for signing and its own tests); there the Linux
-end-to-end tests are compiled out. On other hosts the workspace builds,
+end-to-end tests are compiled out. On arm64 Linux with `/dev/kvm`,
+`--platform kvm` runs programs in a KVM VM instead; its tests need
+`/dev/kvm` and run apart (see **The KVM platform (arm64 Linux)**). On other hosts the workspace builds,
 but `hellovm` cannot run programs.
 
 `kernel/dev/run-e2e.sh`, run from the repository root, is the one-shot
