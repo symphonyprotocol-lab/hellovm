@@ -59,7 +59,6 @@ pub struct SeccompNotifResp {
 /// sees in the return register when a signal interrupted a syscall
 /// (`linux/errno.h`: `ERESTARTSYS`, `ERESTARTNOINTR`, `ERESTARTNOHAND`,
 /// `ERESTART_RESTARTBLOCK`).
-#[cfg(target_arch = "x86_64")]
 pub const RESTART_ERRNOS: [i64; 4] = [512, 513, 514, 516];
 
 // Syscalls added after 2019 have the same number on every architecture.

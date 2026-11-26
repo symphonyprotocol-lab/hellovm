@@ -604,8 +604,17 @@ impl SeccompPlatform {
             task.tracee.resume(Run::Syscall, 0)?;
             task.state = State::Stopped(StopKind::SyscallExit);
             self.in_place += 1;
-            return self.finish_injected(key, nr);
+            let (ret, child) = self.finish_injected(key, nr)?;
+            // A host signal pending on the task (an interrupt sent while it
+            // still ran) makes the host refuse some calls with a restart
+            // code: `clone` does not start with a signal pending
+            // (`ERESTARTNOINTR`). Through the stub, below, the task takes
+            // the signal first (it is dropped) and then makes the call.
+            if child.is_some() || !sys::RESTART_ERRNOS.contains(&ret.wrapping_neg()) {
+                return Ok((ret, child));
+            }
         }
+        let (task, kind) = self.stopped(key)?;
         if kind == StopKind::Seccomp {
             // Skip the app's own syscall to reach its exit stop. The app
             // registers stay in `task.regs`.
@@ -2059,6 +2068,49 @@ mod tests {
         let mut buf = [0u8; 6];
         p.read(t, data, &mut buf).unwrap();
         assert_eq!(&buf, b"parent");
+        p.resume(t, Resume::Return(u as i64)).unwrap();
+        p.resume(u, Resume::Return(0)).unwrap();
+        for (task, ret) in [(t, u as i64), (u, 0)] {
+            let context = stop_spinning(&mut p, task);
+            assert_eq!(ret_of(&context), ret, "task {task}");
+            assert_eq!(context.pc(), spin, "task {task}");
+        }
+    }
+
+    /// An app `clone` whose task has a host signal pending (an interrupt
+    /// sent while it still ran): the host will not start a clone then
+    /// (`ERESTARTNOINTR`), so the platform does it again through the stub,
+    /// where the task takes the signal first. The fork succeeds.
+    #[test]
+    fn a_pending_interrupt_does_not_fail_an_in_place_clone() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let addr = 0x2000_0000;
+        let spin = syscall_then_spin(&mut p, t, addr);
+        let page = p.address_space().page_size;
+        let clone = p.arch().syscall_nr(Sysno::Clone).unwrap();
+        let mut context = p.context(t).unwrap();
+        context.set_pc(addr);
+        context.set_sp(addr + 2 * page);
+        match &mut context {
+            Context::Aarch64(c) => c.x[8] = clone,
+            Context::X86_64(c) => c.rax = clone,
+        }
+        p.set_context(t, &context).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        match next_event(&mut p) {
+            Event {
+                trap: Trap::Syscall(trap),
+                ..
+            } if trap.nr == clone => {}
+            other => panic!("expected the clone, got {other:?}"),
+        }
+        // The task is at the clone's seccomp stop: the signal stays pending.
+        let pid = p.host_pid(t).unwrap();
+        // SAFETY: plain syscall to our tracee.
+        unsafe { libc::syscall(libc::SYS_tgkill, pid, pid, INTERRUPT_SIGNAL) };
+        let u = p.clone_task(t, false).unwrap();
+        assert_ne!(p.host_pid(u), p.host_pid(t));
         p.resume(t, Resume::Return(u as i64)).unwrap();
         p.resume(u, Resume::Return(0)).unwrap();
         for (task, ret) in [(t, u as i64), (u, 0)] {
