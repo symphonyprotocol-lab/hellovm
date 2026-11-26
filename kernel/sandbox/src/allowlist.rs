@@ -106,7 +106,15 @@ pub fn entries(stub_fd: i32, tcp: bool, warm: bool) -> Vec<Entry> {
         allow(SYS_close_range),
         allow(SYS_ppoll),
         checked(SYS_fcntl, vec![one_of(1, &fcntls)]),
-        checked(SYS_ioctl, vec![Check::OneOf(1, TERMINAL_IOCTLS.to_vec())]),
+        // Terminals, and the listeners of the app processes' seccomp
+        // filters (receiving and answering notifications).
+        checked(
+            SYS_ioctl,
+            vec![Check::OneOf(
+                1,
+                [TERMINAL_IOCTLS.as_slice(), SECCOMP_NOTIF_IOCTLS.as_slice()].concat(),
+            )],
+        ),
         // The image directory, walked from its fd (`ImageDir`): read-only
         // opens, never creating or writing anything.
         checked(
@@ -179,7 +187,20 @@ pub fn entries(stub_fd: i32, tcp: bool, warm: bool) -> Vec<Entry> {
             )],
         ),
         allow(SYS_setsid),
-        checked(SYS_seccomp, vec![one_of(0, &[1]), one_of(1, &[0])]),
+        // SECCOMP_SET_MODE_FILTER, with or without a listener
+        // (SECCOMP_FILTER_FLAG_NEW_LISTENER).
+        checked(SYS_seccomp, vec![one_of(0, &[1]), one_of(1, &[0, 8])]),
+        // The hand-over of a new app process's listener to K: a Unix
+        // datagram socket pair made per app process, C's `sendmsg` of the
+        // listener (an `SCM_RIGHTS` message) and K's `recvmsg` of it.
+        checked(
+            SYS_socketpair,
+            vec![
+                one_of(0, &[AF_UNIX]),
+                one_of(1, &[SOCK_DGRAM | SOCK_CLOEXEC]),
+            ],
+        ),
+        checked(SYS_sendmsg, vec![one_of(2, &[0])]),
         checked(
             SYS_execveat,
             vec![one_of(0, &[stub_fd]), one_of(4, &[AT_EMPTY_PATH])],
@@ -203,6 +224,15 @@ pub fn entries(stub_fd: i32, tcp: bool, warm: bool) -> Vec<Entry> {
         allow(SYS_recvfrom),
         allow(SYS_setsockopt),
         allow(SYS_shutdown),
+        // The listener of a new app process, and (warm clones) a clone's
+        // stdio fds with its request.
+        checked(
+            SYS_recvmsg,
+            vec![one_of(
+                2,
+                &[MSG_CMSG_CLOEXEC, MSG_CMSG_CLOEXEC | MSG_DONTWAIT],
+            )],
+        ),
     ];
     #[cfg(target_arch = "x86_64")]
     list.push(allow(SYS_poll));
@@ -214,7 +244,6 @@ pub fn entries(stub_fd: i32, tcp: bool, warm: bool) -> Vec<Entry> {
         // without rules: only reduces what it may do).
         list.extend([
             checked(SYS_accept4, vec![one_of(3, &[SOCK_CLOEXEC])]),
-            checked(SYS_recvmsg, vec![one_of(2, &[MSG_CMSG_CLOEXEC])]),
             allow(SYS_landlock_create_ruleset),
             checked(SYS_landlock_restrict_self, vec![one_of(1, &[0])]),
         ]);
@@ -240,6 +269,14 @@ pub const KVM_VCPU_IOCTLS: [u32; 4] = [
 
 /// The signal the KVM platform stops a vCPU's thread with.
 const KVM_KICK_SIGNAL: c_int = SIGURG;
+
+/// The `ioctl`s on a seccomp listener (`linux/seccomp.h`, the same
+/// numbers on every architecture): `SECCOMP_IOCTL_NOTIF_RECV`
+/// (`_IOWR('!', 0, struct seccomp_notif)`), `SECCOMP_IOCTL_NOTIF_SEND`
+/// (`_IOWR('!', 1, struct seccomp_notif_resp)`) and
+/// `SECCOMP_IOCTL_NOTIF_SET_FLAGS` (`_IOW('!', 4, __u64)`). Never
+/// `SECCOMP_IOCTL_NOTIF_ADDFD`: K puts no fd into an app process.
+pub const SECCOMP_NOTIF_IOCTLS: [u32; 3] = [0xc050_2100, 0xc018_2101, 0x4008_2104];
 
 /// The terminal `ioctl`s both lists allow on any fd.
 const TERMINAL_IOCTLS: [u32; 6] = [
@@ -531,7 +568,6 @@ mod tests {
         use libc::*;
         let only = [
             SYS_accept4,
-            SYS_recvmsg,
             SYS_landlock_create_ruleset,
             SYS_landlock_restrict_self,
         ];

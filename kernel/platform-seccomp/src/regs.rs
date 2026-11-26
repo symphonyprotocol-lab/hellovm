@@ -57,6 +57,24 @@ impl Regs {
         self.x[..6].copy_from_slice(&args);
     }
 
+    /// At the signal-delivery-stop of a task whose notified syscall a
+    /// signal interrupted: makes the registers what they were when the
+    /// syscall was reported (as at a seccomp stop), `ip` being the
+    /// address after its `svc`. The host has already prepared the
+    /// restart (`pc` back on the `svc`, `x0` the first argument again).
+    pub fn interrupted_notification(&mut self, ip: u64) {
+        self.pc = ip;
+    }
+
+    /// At a signal-delivery-stop of a running task: if a signal interrupted
+    /// a syscall that waited for a notification nobody had received yet,
+    /// makes the task re-execute it on resume. On aarch64 the host has
+    /// already done that before the stop. Returns whether it changed
+    /// anything.
+    pub fn rewind_interrupted_syscall(&mut self) -> bool {
+        false
+    }
+
     /// The register state of a freshly started program: every
     /// general-purpose register zero (x0 is the `rtld_fini` pointer for
     /// libc), `sp` and `pc` as given. `pstate` is kept from the host's
@@ -210,6 +228,37 @@ impl Regs {
         self.rip = insn;
         self.rax = nr;
         [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9] = args;
+    }
+
+    /// At the signal-delivery-stop of a task whose notified syscall a
+    /// signal interrupted: makes the registers what they were when the
+    /// syscall was reported (as at a seccomp stop: `rax` is `-ENOSYS`),
+    /// `ip` being the address after its `syscall`. The host has put
+    /// `-ERESTARTSYS` in `rax` and would rewind the task when it resumes
+    /// (`orig_rax` is still the syscall number): `orig_rax` = -1 stops
+    /// that, so the task resumes exactly with these registers.
+    pub fn interrupted_notification(&mut self, ip: u64) {
+        self.rip = ip;
+        self.rax = -(libc::ENOSYS as i64) as u64;
+        self.orig_rax = u64::MAX;
+    }
+
+    /// At a signal-delivery-stop of a running task: if a signal interrupted
+    /// a syscall that waited for a notification nobody had received yet
+    /// (`orig_rax` is its number, `rax` one of the host's restart codes),
+    /// makes the task re-execute it on resume, as the host would: `rip`
+    /// back on the `syscall`, `rax` its number. `orig_rax` = -1 keeps the
+    /// host from rewinding it a second time. Returns whether it changed
+    /// anything.
+    pub fn rewind_interrupted_syscall(&mut self) -> bool {
+        let restart = crate::sys::RESTART_ERRNOS.contains(&(self.rax as i64).wrapping_neg());
+        if self.orig_rax == u64::MAX || !restart {
+            return false;
+        }
+        self.rip = self.rip.wrapping_sub(SYSCALL_INSN_LEN);
+        self.rax = self.orig_rax;
+        self.orig_rax = u64::MAX;
+        true
     }
 
     /// The register state of a freshly started program: every

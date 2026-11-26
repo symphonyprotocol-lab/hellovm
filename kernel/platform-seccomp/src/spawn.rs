@@ -16,7 +16,11 @@
 //! The kernel process (K) traces the app process (C) with ptrace, and C's
 //! seccomp filter returns `SECCOMP_RET_TRACE` for every syscall of the
 //! native ABI (and kills on any other ABI). Every app syscall therefore
-//! stops C *before* it runs, with K as the tracer:
+//! stops C *before* it runs, with K as the tracer. (With the notification
+//! fast path, most syscalls go to K as seccomp user notifications instead
+//! and never stop C for ptrace; see `filter::notify` and `app`. What
+//! follows is unchanged by it: the syscalls that change C's address space
+//! or registers, and everything injected, still take this path.)
 //!
 //! * To emulate a syscall, K reads the registers, lets the core compute the
 //!   result, and skips the syscall (`orig_rax = -1` on x86_64,
@@ -99,15 +103,25 @@
 //!    process, see `profile`) and prepares the filter, the `execveat` arguments and a shared page for error reports,
 //!    all before forking. After `fork`, C only makes raw syscalls and memory
 //!    stores (K may be multi-threaded, so C must not allocate).
-//! 2. C sets `PR_SET_PDEATHSIG`, closes every fd except the stub memfd, calls
-//!    `PTRACE_TRACEME` and stops itself with `SIGSTOP`. K sets the ptrace
+//! 2. C sets `PR_SET_PDEATHSIG`, closes every fd except the stub memfd
+//!    (and its end of the hand-over socket, below), clears its signal mask
+//!    (K's event-loop thread blocks `SIGURG`, see `wake`, and execve keeps
+//!    the mask), calls `PTRACE_TRACEME` and stops itself with `SIGSTOP`. K sets the ptrace
 //!    options (`EXITKILL`: C dies with its tracer; `TRACESECCOMP`; exec and
 //!    syscall-stop reporting) and resumes it.
-//! 3. C sets `PR_SET_NO_NEW_PRIVS`, installs the filter and calls
+//! 3. C sets `PR_SET_NO_NEW_PRIVS` and installs the filter. With the
+//!    fast path that is the notification filter, with a listener
+//!    (`SECCOMP_FILTER_FLAG_NEW_LISTENER`; on a host without user
+//!    notifications C falls back to the trace-only filter). C hands the
+//!    listener to K over a Unix datagram socket pair made for this spawn:
+//!    its `sendmsg` of the listener (`SCM_RIGHTS`) on its end of the pair
+//!    traps; K checks the fd and the message address it prepared, lets it
+//!    run and receives the listener on its end. Then C calls
 //!    `execveat(stub_fd, "", ..., AT_EMPTY_PATH)`. That traps; K checks it
 //!    is exactly the call it prepared and lets it run. C now has a fresh
-//!    address space (stub, stack, vdso, vvar), an empty fd table (the memfd
-//!    is close-on-exec) and default signal handlers.
+//!    address space (stub, stack, vdso, vvar), an empty fd table (the
+//!    memfd, its socket and the listener are close-on-exec), no blocked
+//!    host signal and default signal handlers.
 //! 4. At the `execveat` exit stop, K unmaps everything except the stub
 //!    page by injection: one `munmap` below the stub and one from above it
 //!    to the top of the user range (U4: no `/proc/<pid>/maps`, which a
@@ -133,11 +147,15 @@
 //! stub's range ([`crate::SeccompPlatform`] checks this independently of
 //! the core). The values are chosen by the core, in response to app requests
 //! it has validated. Before the app runs, the host also executes the
-//! bootstrap `setsid` and `execveat` of the generated stub. On the host side
+//! bootstrap `setsid`, `rt_sigprocmask`, the hand-over `sendmsg` of the
+//! listener and the `execveat` of the generated stub. A notified syscall is
+//! never executed by the host: it returns the value K answers with. On the
+//! host side
 //! K uses, per app process, ptrace requests, `waitpid`,
 //! `process_vm_readv`/`writev`, `pidfd_open` (for [`crate::AppKiller`]) and
-//! `tgkill` with `SIGURG` (to interrupt a running task); see `wake` for how
-//! K waits. On x86_64 the legacy vsyscall page is
+//! `tgkill` with `SIGURG` (to interrupt a running task, or to end a
+//! notification the core needs a ptrace stop for), and the listener
+//! `ioctl`s; see `wake` for how K waits. On x86_64 the legacy vsyscall page is
 //! still present (it cannot be unmapped); its emulation goes through seccomp
 //! like a real syscall, so it is trapped and emulated as well.
 //!
@@ -164,6 +182,12 @@
 //! * **Building the image with `execve` of the real program** (U0). The
 //!   host kernel would parse an untrusted ELF file and build the stack, and
 //!   the core could not own the address space layout.
+//! * **Answering a notification with "continue"**
+//!   (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`) or injecting fds
+//!   (`SECCOMP_IOCTL_NOTIF_ADDFD`) for the fast path. Either would let the
+//!   host run something the app chose; K only ever answers a notification
+//!   with a return value, and its own filter does not allow the `ADDFD`
+//!   `ioctl`.
 //! * **`fork` by spawning a fresh stub and copying memory through K** (U2).
 //!   It needs no injected `clone`, but copies every page of the parent on
 //!   every `fork` (a CPython `subprocess` would copy tens of megabytes) and
@@ -185,7 +209,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -204,6 +228,7 @@ const STAGE_NO_NEW_PRIVS: i32 = 3;
 const STAGE_SECCOMP: i32 = 4;
 const STAGE_EXEC: i32 = 5;
 const STAGE_SETSID: i32 = 6;
+const STAGE_SIGMASK: i32 = 7;
 
 fn stage_name(stage: i32) -> &'static str {
     match stage {
@@ -213,6 +238,7 @@ fn stage_name(stage: i32) -> &'static str {
         STAGE_SECCOMP => "installing the seccomp filter",
         STAGE_EXEC => "execveat of the stub",
         STAGE_SETSID => "setsid",
+        STAGE_SIGMASK => "rt_sigprocmask",
         _ => "an unknown step",
     }
 }
@@ -292,6 +318,9 @@ pub struct Spawned {
     pub tracee: Tracee,
     /// The registers at that stop.
     pub regs: Regs,
+    /// The listener of the app's filter, when it has the notification
+    /// fast path (see `filter::notify`).
+    pub listener: Option<OwnedFd>,
 }
 
 fn context(err: io::Error, what: &str) -> io::Error {
@@ -317,21 +346,43 @@ pub fn spawn(
     arch: Arch,
     stub_fd: BorrowedFd<'_>,
     keep: Option<BorrowedFd<'_>>,
+    notify: bool,
 ) -> io::Result<Spawned> {
     let execveat_nr = arch
         .syscall_nr(Sysno::Execveat)
         .expect("execveat exists on every architecture");
+    let sendmsg_nr = arch
+        .syscall_nr(Sysno::Sendmsg)
+        .expect("sendmsg exists on every architecture");
 
     // Everything C needs is prepared before the fork.
     let empty = CString::default();
     let arg0 = CString::new("hellovm-stub").unwrap();
     let argv: [*const libc::c_char; 2] = [arg0.as_ptr(), ptr::null()];
     let envp: [*const libc::c_char; 1] = [ptr::null()];
-    let mut filter = filter::trace_all(sys::audit_arch(arch));
-    let prog = libc::sock_fprog {
-        len: filter.len() as libc::c_ushort,
-        filter: filter.as_mut_ptr(),
+    let audit = sys::audit_arch(arch);
+    let mut trace_filter = filter::trace_all(audit);
+    let trace_prog = libc::sock_fprog {
+        len: trace_filter.len() as libc::c_ushort,
+        filter: trace_filter.as_mut_ptr(),
     };
+    // The hand-over of the listener: a datagram socket pair, C's end kept
+    // open across the bootstrap and closed by its execveat.
+    let handoff = if notify { Some(Handoff::new()?) } else { None };
+    let mut notify_filter = handoff.as_ref().map(|h| {
+        filter::notify(
+            audit,
+            &filter::trace_numbers(arch),
+            sendmsg_nr as u32,
+            h.child.as_raw_fd() as u32,
+            arch == Arch::X86_64,
+        )
+    });
+    let notify_prog = notify_filter.as_mut().map(|f| libc::sock_fprog {
+        len: f.len() as libc::c_ushort,
+        filter: f.as_mut_ptr(),
+    });
+    let mut message = HandoffMessage::new();
     let page = SharedPage::new()?;
     let hs = page.handshake();
 
@@ -350,8 +401,18 @@ pub fn spawn(
             child_bootstrap(
                 hs,
                 parent,
-                [stub_fd.as_raw_fd(), keep.map_or(-1, |fd| fd.as_raw_fd())],
-                &prog,
+                [
+                    stub_fd.as_raw_fd(),
+                    keep.map_or(-1, |fd| fd.as_raw_fd()),
+                    handoff.as_ref().map_or(-1, |h| h.child.as_raw_fd()),
+                ],
+                &trace_prog,
+                notify_prog.as_ref().map(|p| {
+                    (
+                        p as *const libc::sock_fprog,
+                        &mut *message as *mut HandoffMessage,
+                    )
+                }),
                 empty.as_ptr(),
                 argv.as_ptr(),
                 envp.as_ptr(),
@@ -371,13 +432,46 @@ pub fn spawn(
         .map_err(|e| context(e, "PTRACE_SETOPTIONS"))?;
     tracee.resume(Run::Cont, 0)?;
 
-    // Step 3: the only syscall the app process makes on its own is the
-    // prepared execveat.
+    // Step 3: the only syscalls the app process makes on its own are the
+    // prepared hand-over of the listener (with the notification filter)
+    // and execveat. (Under the `HELLOVM_SECCOMP_LEARN` test hook the
+    // kernel process's own filter sends the hand-over to the learning
+    // supervisor, which outranks this tracer: it runs unseen and the first
+    // stop is the execveat.)
     match tracee.wait()? {
         Stop::Seccomp => {}
         stop => return Err(unexpected(stop, hs, "waiting for execveat")),
     }
-    let (nr, args) = tracee.regs()?.syscall();
+    let (mut nr, mut args) = tracee.regs()?.syscall();
+    if let Some(handoff) = &handoff {
+        if nr == sendmsg_nr {
+            if args[0] != handoff.child.as_raw_fd() as u64
+                || args[1] != message.header_addr()
+                || args[2] != 0
+            {
+                return Err(io::Error::other(format!(
+                    "unexpected hand-over {args:#x?} from the app process"
+                )));
+            }
+            tracee.resume(Run::Syscall, 0)?;
+            match tracee.wait()? {
+                Stop::SyscallExit => {}
+                stop => return Err(unexpected(stop, hs, "waiting for the hand-over")),
+            }
+            let ret = tracee.regs()?.ret();
+            if ret != 1 {
+                return Err(io::Error::other(format!(
+                    "the hand-over of the listener returned {ret}"
+                )));
+            }
+            tracee.resume(Run::Cont, 0)?;
+            match tracee.wait()? {
+                Stop::Seccomp => {}
+                stop => return Err(unexpected(stop, hs, "waiting for execveat")),
+            }
+            (nr, args) = tracee.regs()?.syscall();
+        }
+    }
     if nr != execveat_nr
         || args[0] != stub_fd.as_raw_fd() as u64
         || args[1] != empty.as_ptr() as u64
@@ -416,8 +510,140 @@ pub fn spawn(
         )));
     }
 
+    // The listener, if C made one (a host without user notifications, or
+    // one that refused the filter, leaves C on the trace-only filter).
+    let listener = match &handoff {
+        Some(handoff) => handoff.receive()?,
+        None => None,
+    };
+
     // Step 4 (unmapping the rest) is the caller's.
-    Ok(Spawned { tracee, regs })
+    Ok(Spawned {
+        tracee,
+        regs,
+        listener,
+    })
+}
+
+/// The socket pair the bootstrap hands the listener over with.
+struct Handoff {
+    kernel: OwnedFd,
+    child: OwnedFd,
+}
+
+impl Handoff {
+    fn new() -> io::Result<Handoff> {
+        let mut fds = [-1; 2];
+        // SAFETY: socketpair writes two fds to `fds`.
+        let ret = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if ret != 0 {
+            return Err(context(
+                io::Error::last_os_error(),
+                "socketpair for the listener",
+            ));
+        }
+        // SAFETY: on success both are new fds that we own.
+        unsafe {
+            Ok(Handoff {
+                kernel: OwnedFd::from_raw_fd(fds[0]),
+                child: OwnedFd::from_raw_fd(fds[1]),
+            })
+        }
+    }
+
+    /// The listener C sent, if it sent one. C has made both of its
+    /// bootstrap syscalls by now, so nothing more can come.
+    fn receive(&self) -> io::Result<Option<OwnedFd>> {
+        let mut message = HandoffMessage::new();
+        let header = message.header();
+        // SAFETY: recvmsg fills the buffers `header` points to, which live
+        // in `message`.
+        let n = unsafe {
+            libc::recvmsg(
+                self.kernel.as_raw_fd(),
+                header,
+                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(None);
+            }
+            return Err(context(err, "receiving the listener"));
+        }
+        // SAFETY: `header` describes `message`'s control buffer, which the
+        // host filled; CMSG_* only read within it.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(header);
+            if n != 1
+                || cmsg.is_null()
+                || (*cmsg).cmsg_level != libc::SOL_SOCKET
+                || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+                || (*cmsg).cmsg_len != libc::CMSG_LEN(4) as _
+            {
+                return Err(io::Error::other("a malformed hand-over of the listener"));
+            }
+            let fd = ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::c_int);
+            Ok(Some(OwnedFd::from_raw_fd(fd)))
+        }
+    }
+}
+
+/// The `msghdr` of the hand-over and its buffers, laid out before the fork
+/// (C must not allocate). C writes the listener's number into it.
+#[repr(C)]
+struct HandoffMessage {
+    header: libc::msghdr,
+    iov: libc::iovec,
+    byte: u8,
+    /// Room for one `SCM_RIGHTS` fd, aligned for `cmsghdr`.
+    control: [u64; 4],
+}
+
+impl HandoffMessage {
+    fn new() -> Box<HandoffMessage> {
+        // SAFETY: an all-zero msghdr, iovec and buffers are valid.
+        let mut m: Box<HandoffMessage> = Box::new(unsafe { std::mem::zeroed() });
+        m.iov = libc::iovec {
+            iov_base: (&mut m.byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        m.header.msg_iov = &mut m.iov;
+        m.header.msg_iovlen = 1;
+        m.header.msg_control = m.control.as_mut_ptr().cast();
+        // SAFETY: CMSG_SPACE is a pure computation.
+        m.header.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
+        m
+    }
+
+    fn header(&mut self) -> *mut libc::msghdr {
+        &mut self.header
+    }
+
+    fn header_addr(&self) -> u64 {
+        &self.header as *const libc::msghdr as u64
+    }
+
+    /// Fills in the `SCM_RIGHTS` message for `fd`. Async-signal-safe.
+    ///
+    /// # Safety
+    ///
+    /// Only on a message made by [`HandoffMessage::new`].
+    unsafe fn set_fd(&mut self, fd: libc::c_int) {
+        let cmsg = libc::CMSG_FIRSTHDR(&self.header);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(4) as _;
+        ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut libc::c_int, fd);
+    }
 }
 
 /// The mappings of `pid` other than the stub, and one past the highest of
@@ -460,12 +686,16 @@ pub fn foreign_mappings(pid: libc::pid_t) -> io::Result<(Vec<(u64, u64)>, u64)> 
 ///
 /// Must only be called in a freshly forked child, with pointers to data that
 /// was valid at the time of the fork.
+#[allow(clippy::too_many_arguments)]
 unsafe fn child_bootstrap(
     hs: &Handshake,
     parent: libc::pid_t,
-    // The stub memfd, and an fd to keep open or -1.
-    [stub_fd, keep_fd]: [libc::c_int; 2],
-    prog: *const libc::sock_fprog,
+    // The stub memfd, an fd to keep open or -1, C's end of the hand-over
+    // socket or -1.
+    keep: [libc::c_int; 3],
+    trace_prog: *const libc::sock_fprog,
+    // The notification filter and the hand-over message, for the fast path.
+    notify: Option<(*const libc::sock_fprog, *mut HandoffMessage)>,
     empty: *const libc::c_char,
     argv: *const *const libc::c_char,
     envp: *const *const libc::c_char,
@@ -482,11 +712,25 @@ unsafe fn child_bootstrap(
     if libc::getppid() != parent {
         libc::_exit(127);
     }
-    close_all_fds_except(stub_fd, keep_fd);
+    close_all_fds_except(keep);
     // Its own session: signals the host terminal sends to the kernel's
     // process group (Ctrl-C, window changes) never reach app processes.
     if libc::setsid() < 0 {
         fail(STAGE_SETSID);
+    }
+    // No host signal blocked: K's event-loop thread blocks its wake-up
+    // signal (`wake::KICK`, the same signal that interrupts app tasks), and
+    // execve keeps the mask. K emulates the app's own mask.
+    let empty_set = [0u64; 1];
+    if libc::syscall(
+        libc::SYS_rt_sigprocmask,
+        libc::SIG_SETMASK as libc::c_long,
+        empty_set.as_ptr(),
+        ptr::null_mut::<u64>(),
+        8 as libc::c_long,
+    ) != 0
+    {
+        fail(STAGE_SIGMASK);
     }
 
     if sys::ptrace(sys::PTRACE_TRACEME, 0, 0, 0) != 0 {
@@ -497,20 +741,44 @@ unsafe fn child_bootstrap(
     if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
         fail(STAGE_NO_NEW_PRIVS);
     }
-    if libc::syscall(
-        libc::SYS_seccomp,
-        sys::SECCOMP_SET_MODE_FILTER,
-        0 as libc::c_ulong,
-        prog,
-    ) != 0
+    let mut traced_only = true;
+    if let Some((prog, message)) = notify {
+        let listener = libc::syscall(
+            libc::SYS_seccomp,
+            sys::SECCOMP_SET_MODE_FILTER,
+            sys::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            prog,
+        );
+        if listener >= 0 {
+            traced_only = false;
+            // From here on every syscall goes to K. The hand-over stops for
+            // K, which lets it run (see `filter::notify`).
+            (*message).set_fd(listener as libc::c_int);
+            libc::syscall(
+                libc::SYS_sendmsg,
+                keep[2] as libc::c_long,
+                &(*message).header as *const libc::msghdr,
+                0 as libc::c_long,
+            );
+        }
+        // Otherwise the host has no user notifications (or refused the
+        // filter): the trace-only filter below.
+    }
+    if traced_only
+        && libc::syscall(
+            libc::SYS_seccomp,
+            sys::SECCOMP_SET_MODE_FILTER,
+            0 as libc::c_ulong,
+            trace_prog,
+        ) != 0
     {
         fail(STAGE_SECCOMP);
     }
 
-    // From here on every syscall stops for K.
+    // Every syscall stops for K or goes to it.
     libc::syscall(
         libc::SYS_execveat,
-        stub_fd as libc::c_long,
+        keep[0] as libc::c_long,
         empty,
         argv,
         envp,
@@ -523,15 +791,14 @@ unsafe fn child_bootstrap(
     die_without_syscalls()
 }
 
-/// Closes every fd except `a` and `b` (either may be -1). Async-signal-safe.
-unsafe fn close_all_fds_except(a: libc::c_int, b: libc::c_int) {
-    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    // The fds to keep, ascending, without -1 and duplicates.
-    let keep: [libc::c_int; 2] = [lo, hi];
+/// Closes every fd except those in `keep` (-1 entries are ignored).
+/// Async-signal-safe.
+unsafe fn close_all_fds_except(mut keep: [libc::c_int; 3]) {
+    keep.sort_unstable();
     let mut next: libc::c_uint = 0;
     let mut ok = true;
-    for (i, &fd) in keep.iter().enumerate() {
-        if fd < 0 || (i == 1 && fd == lo) {
+    for &fd in &keep {
+        if fd < 0 || (fd as libc::c_uint) < next {
             continue;
         }
         let fd = fd as libc::c_uint;
@@ -554,7 +821,7 @@ unsafe fn close_all_fds_except(a: libc::c_int, b: libc::c_int) {
     if !ok {
         // close_range needs Linux 5.9.
         for fd in 0..65536 {
-            if fd != a && fd != b {
+            if !keep.contains(&fd) {
                 libc::close(fd);
             }
         }
