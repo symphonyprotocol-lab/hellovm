@@ -7,26 +7,31 @@ permissions:
 jobs:
   memdiag:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with: {ref: main, path: before}
+      - uses: actions/checkout@v7
+        with: {ref: claude/stoic-solomon-795346, path: after}
       - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          cache-workspaces: kernel
+          cache-workspaces: before/kernel
           override: false
       - name: Build
-        working-directory: kernel
-        run: cargo build -p hellovm
-      - name: Host
         run: |
-          uname -a; cat /etc/os-release | head -2; nproc; free -m
-          for f in enabled defrag shmem_enabled khugepaged/defrag; do echo "$f: $(cat /sys/kernel/mm/transparent_hugepage/$f)"; done
-          ls -la /usr/lib/locale/ /usr/lib/locale/* | head -20
-          env | grep -E '^(LANG|LC_)' || true
-          ls -laL /bin/sh /bin/sleep /lib/x86_64-linux-gnu/libc.so.6
-      - name: Default env
-        run: sudo -E sh kernel/dev/memdiag.sh kernel/target/debug/hellovm
-      - name: LC_ALL=C
-        run: sudo -E sh kernel/dev/memdiag.sh kernel/target/debug/hellovm LC_ALL=C
-      - name: Trace of one sleep
-        run: kernel/target/debug/hellovm --root / --trace /bin/sleep 0 2>&1 | grep -E 'open|mmap|brk' | head -60
+          (cd before/kernel && cargo build -p hellovm)
+          (cd after/kernel && cargo build -p hellovm)
+          uname -r; head -1 /etc/os-release; cat /sys/kernel/mm/transparent_hugepage/enabled
+          ls -laL /bin/sleep /usr/bin/python3 /bin/sh
+      - name: Measure
+        run: |
+          for v in before after; do
+            sudo sh kernel/dev/memdiag.sh $PWD/$v/kernel/target/debug/hellovm 40 'sleep 20'
+          done
+          for v in before after; do
+            sudo sh kernel/dev/memdiag.sh $PWD/$v/kernel/target/debug/hellovm 10 'python3 -c "import time; time.sleep(20)"'
+          done
+          for v in before after; do
+            sudo sh kernel/dev/memdiag.sh $PWD/$v/kernel/target/debug/hellovm 10 'LC_ALL=C sleep 20'
+          done
