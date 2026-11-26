@@ -112,8 +112,6 @@ struct Task {
     regs: Regs,
     /// The listener of the task's filter, if it has the fast path.
     listener: Option<Rc<Listener>>,
-    /// The CPU it is kept on while the kernel drives it (see `pin`).
-    pinned: Option<i32>,
 }
 
 /// The live tasks' pidfds, shared with every [`AppKiller`].
@@ -154,10 +152,6 @@ pub struct SeccompPlatform {
     nr_close: u64,
     /// Warm clones (see `snapshot`), once prepared.
     snapshots: Option<Snapshots>,
-    /// The CPUs app processes may run on (the kernel process's own set
-    /// when the platform was made), to put back after `pin`; `None` if the
-    /// host would not tell.
-    cpus: Option<libc::cpu_set_t>,
     /// Whether new app processes get the notification fast path.
     notify: bool,
     /// The listeners of the live tasks' filters, by fd.
@@ -219,7 +213,6 @@ impl SeccompPlatform {
             nr_clone: number(Sysno::Clone),
             nr_close: number(Sysno::Close),
             snapshots: None,
-            cpus: own_cpus(),
             notify: std::env::var_os("HELLOVM_SECCOMP_NOTIF").is_none_or(|v| v != "0"),
             listeners: HashMap::new(),
             ready: Vec::new(),
@@ -514,7 +507,6 @@ impl SeccompPlatform {
                 state: State::Stopped(kind),
                 regs,
                 listener,
-                pinned: None,
             },
         );
         Ok(key)
@@ -609,15 +601,11 @@ impl SeccompPlatform {
             let mut regs = task.regs;
             regs.set_pending_syscall(nr, args);
             task.tracee.replace_syscall(&regs, nr)?;
-            self.in_place += 1;
-            self.pin(key)?;
-            let task = self.task(key)?;
             task.tracee.resume(Run::Syscall, 0)?;
             task.state = State::Stopped(StopKind::SyscallExit);
+            self.in_place += 1;
             return self.finish_injected(key, nr);
         }
-        self.pin(key)?;
-        let (task, kind) = self.stopped(key)?;
         if kind == StopKind::Seccomp {
             // Skip the app's own syscall to reach its exit stop. The app
             // registers stay in `task.regs`.
@@ -656,51 +644,6 @@ impl SeccompPlatform {
         }
         task.tracee.resume(Run::Syscall, 0)?;
         self.finish_injected(key, nr)
-    }
-
-    /// Keeps stopped task `key` on the CPU the kernel thread runs on until
-    /// it resumes for the app ([`Platform::resume`] puts its CPUs back).
-    /// Each injected syscall is two hand-overs between the kernel thread
-    /// and the task (resume it, wait for its stop); on one CPU they are
-    /// plain context switches, where a task woken on another CPU costs a
-    /// wake-up across CPUs, which dominates in a virtual machine. Best
-    /// effort: a host that refuses only makes it slower.
-    fn pin(&mut self, key: TaskKey) -> Result<(), PlatformError> {
-        if self.cpus.is_none() {
-            return Ok(());
-        }
-        let task = self.task(key)?;
-        // SAFETY: plain libc call.
-        let cpu = unsafe { libc::sched_getcpu() };
-        if cpu < 0 || task.pinned == Some(cpu) {
-            return Ok(());
-        }
-        // SAFETY: CPU_SET on a zeroed local set, within its size.
-        let set = unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_SET(cpu as usize, &mut set);
-            set
-        };
-        if set_cpus(task.tracee.pid, &set) {
-            task.pinned = Some(cpu);
-        }
-        Ok(())
-    }
-
-    /// Puts a pinned task's CPUs back before it runs app code again.
-    fn unpin(&mut self, key: TaskKey) -> Result<(), PlatformError> {
-        let Some(cpus) = self.cpus else {
-            return Ok(());
-        };
-        let task = self.task(key)?;
-        if task.pinned.take().is_some() && !set_cpus(task.tracee.pid, &cpus) {
-            // It runs on one CPU from now on: slower, not wrong.
-            log::warn!(
-                "task {key}: putting its CPUs back failed: {}",
-                io::Error::last_os_error()
-            );
-        }
-        Ok(())
     }
 
     /// Whether syscall `nr`, injected at a seccomp stop, can replace the
@@ -868,22 +811,6 @@ fn host_has_pac() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     false
-}
-
-/// The CPUs the calling thread may run on.
-fn own_cpus() -> Option<libc::cpu_set_t> {
-    // SAFETY: an all-zero cpu set is valid; sched_getaffinity fills it.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
-            .then_some(set)
-    }
-}
-
-/// Sets the CPUs host process `pid` may run on; whether the host took it.
-fn set_cpus(pid: libc::pid_t, set: &libc::cpu_set_t) -> bool {
-    // SAFETY: `set` is a valid cpu set of the size given.
-    unsafe { libc::sched_setaffinity(pid, std::mem::size_of::<libc::cpu_set_t>(), set) == 0 }
 }
 
 /// Whether `pc` is in x86_64's legacy vsyscall page, whose calls the host
@@ -1209,11 +1136,8 @@ impl Platform for SeccompPlatform {
         // of the injected call's). Its FP state and thread pointer are the
         // parent's already: injection never touches them.
         let parent = self.task(parent)?;
-        let (regs, listener, pinned) = (parent.regs, parent.listener.clone(), parent.pinned);
-        let key = self.register(tracee, regs, StopKind::Signal, listener)?;
-        // The new process has its parent's CPUs: put them back when it runs.
-        self.task(key)?.pinned = pinned;
-        Ok(key)
+        let (regs, listener) = (parent.regs, parent.listener.clone());
+        self.register(tracee, regs, StopKind::Signal, listener)
     }
 
     fn kill(&mut self, key: TaskKey) -> Result<(), PlatformError> {
@@ -1276,8 +1200,6 @@ impl Platform for SeccompPlatform {
             StopKind::Seccomp => task.tracee.skip_syscall(&regs)?,
             StopKind::SyscallExit | StopKind::Signal => task.tracee.set_regs(&regs)?,
         }
-        self.unpin(key)?;
-        let task = self.task(key)?;
         task.tracee.resume(Run::Cont, 0)?;
         task.state = State::Running;
         Ok(())
@@ -2053,30 +1975,12 @@ mod tests {
         }
     }
 
-    fn cpus_allowed(p: &SeccompPlatform, t: TaskKey) -> String {
-        cpus_in(&format!("/proc/{}/status", p.host_pid(t).unwrap()))
-    }
-
-    fn cpus_in(status: &str) -> String {
-        std::fs::read_to_string(status)
-            .unwrap()
-            .lines()
-            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
-            .unwrap()
-            .trim()
-            .to_string()
-    }
-
     /// A traced app syscall (`mmap`) that the core answers by injecting
-    /// one: the injected `mmap` replaces the pending syscall, the task is
-    /// kept on the kernel thread's CPU meanwhile, and both it and a fork
-    /// made at that stop get their CPUs back when they resume.
+    /// one: the injected `mmap` replaces the pending syscall, and a fork
+    /// made at that stop sees the new mapping.
     #[test]
     fn an_injected_syscall_replaces_the_pending_one() {
         let mut p = SeccompPlatform::new().unwrap();
-        // The kernel thread's CPUs, which app processes start with (a new
-        // one is already pinned: its set-up was injected).
-        let all = cpus_in("/proc/thread-self/status");
         let t = p.spawn().unwrap();
         let addr = 0x2000_0000;
         let spin = syscall_then_spin(&mut p, t, addr);
@@ -2100,14 +2004,10 @@ mod tests {
         }
         assert!(!p.is_notified(t), "mmap stops for the tracer");
         let fresh = 0x3000_0000;
+        let before = p.in_place_injections();
         p.map(t, fresh, page, Prot::RW, Sharing::Private).unwrap();
+        assert_eq!(p.in_place_injections(), before + 1, "replaced in place");
         p.write(t, fresh, b"mapped").unwrap();
-        if p.cpus.is_some() && all.contains(['-', ',']) {
-            assert!(
-                !cpus_allowed(&p, t).contains(['-', ',']),
-                "one CPU while the kernel drives it, not {all}"
-            );
-        }
         let u = p.clone_task(t, false).unwrap();
         let mut buf = [0u8; 6];
         p.read(u, fresh, &mut buf).unwrap();
@@ -2115,9 +2015,6 @@ mod tests {
         p.resume(t, Resume::Return(fresh as i64)).unwrap();
         // The fork resumes at the same point, with its own result.
         p.resume(u, Resume::Return(0)).unwrap();
-        for task in [t, u] {
-            assert_eq!(cpus_allowed(&p, task), all, "CPUs back for {task}");
-        }
         let context = stop_spinning(&mut p, t);
         assert_eq!(ret_of(&context) as u64, fresh);
         assert_eq!(context.pc(), spin);

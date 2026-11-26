@@ -63,8 +63,8 @@ on an M3 Max (Linux 7.0 in a VM, aarch64; release build; `cargo test
 | 1-byte `write` to `/dev/null` | 0.15 µs | 2.9 µs | 30.0 µs |
 | 1-byte pipe `write` + `read`, per call | 0.17 µs | 3.4 µs | 30.6 µs |
 | `clock_gettime` (the syscall) | 0.16 µs | 2.8 µs | 28.6 µs |
-| `python3 -c pass` | 5.0 ms | 20.4 ms (17 ms with cheaper injections, below) | 33.9 ms |
-| `python3 -c 'import asyncio, json, decimal, ...'` | 38.1 ms | 91 ms (76 ms with cheaper injections) | 211 ms |
+| `python3 -c pass` | 5.0 ms | 20.4 ms (18 ms with injections in place, below) | 33.9 ms |
+| `python3 -c 'import asyncio, json, decimal, ...'` | 38.1 ms | 91 ms (83 ms with injections in place) | 211 ms |
 
 A bare seccomp user-notification round trip in the same container (a C
 program answering `getppid` in a loop, no kernel core) costs 1.3 µs with
@@ -75,34 +75,28 @@ native host every column is faster.
 
 **Memory calls.** `mmap`, `munmap`, `mprotect` and `brk` still stop for
 ptrace: the core answers them by injecting `mmap`, `munmap` or `mprotect`
-into the app process. Two things make an injection cheaper:
+into the app process. The first syscall injected at a seccomp stop
+replaces the app's pending one: its number and arguments are rewritten,
+and the host runs it after re-running the filter, which traces it again
+and so lets it through. Only the syscalls after it, and those injected at
+any other stop, go through the stub page. That is one round trip between
+the kernel thread and the task instead of three. Same environment and
+method (`syscall_bench`: 2,000 rounds of each memory case; ranges over
+three runs):
 
-* **In place.** The first syscall injected at a seccomp stop replaces the
-  app's pending one (its number and arguments are rewritten, and the
-  host runs it after re-running the filter, which traces it again and so
-  lets it through). Only the syscalls after it, and those injected at
-  any other stop, go through the stub page. That is one round trip
-  between the kernel thread and the task instead of three.
-* **On one CPU.** While the kernel thread drives a stopped task, the task
-  is kept on the kernel thread's CPU (`sched_setaffinity`). Every resume
-  and every stop between them is then a plain context switch, not a
-  wake-up across CPUs. The task gets its CPUs back (the kernel
-  process's set) before it runs app code again; a fork made meanwhile
-  gets them back too.
+| | native | every injection through the stub | first one in place |
+|---|---|---|---|
+| `mmap` + `munmap` of 64 KiB | 1.0 µs | 202 µs | 63-81 µs |
+| `mprotect` of a page | 0.25 µs | 98 µs | 29-37 µs |
+| `brk` up or down a page, per call | 0.5 µs | 97 µs | 32-50 µs |
 
-Same environment and method (`syscall_bench`: 2,000 rounds of each memory
-case; the platform alone, `inject_timing` in `platform-seccomp/src/app.rs`):
-
-| | native | before | in place | in place, on one CPU |
-|---|---|---|---|---|
-| `mmap` + `munmap` of 64 KiB | 1.0 µs | 202 µs | 106 µs | 70 µs |
-| `mprotect` of a page | 0.25 µs | 98 µs | 52 µs | 35 µs |
-| `brk` up or down a page, per call | 0.5 µs | 97 µs | 53 µs | 36 µs |
-| an injected `mprotect`, task already stopped (platform only) | | 39 µs | | 21 µs |
-
-Routing these calls through notifications as well, and converting the
-task when it needs injecting, was tried: it costs as much as the traced
-stop it saves (about 35 µs per `mprotect`).
+Two other ideas were tried and dropped. Routing these calls through
+notifications as well, and converting the task when it needs injecting,
+cost as much as the traced stop it saves. Keeping a driven task on the
+kernel thread's CPU (`sched_setaffinity`) measured no better than the
+in-place rewrite alone. It also made a task that could have run on an
+idle CPU wait for a busy one, and the control-plane limit tests failed
+with it on GitHub's 4-CPU x86_64 runners.
 
 What runs today (milestone U5b): x86_64 and aarch64 Linux programs,
 static or dynamically linked, with any number of processes and threads.
@@ -1530,7 +1524,7 @@ hellovm: debug: sandbox: resource limits: active (core 0, nofile 4096)
 hellovm: debug: sandbox: no_new_privs: active ()
 hellovm: debug: sandbox: Landlock: active (ABI 8: image read-only, no TCP, signals and abstract sockets scoped)
 hellovm: debug: sandbox: not dumpable: active ()
-hellovm: debug: sandbox: seccomp allowlist: active (63 syscalls, 314 instructions, 5 code ranges)
+hellovm: debug: sandbox: seccomp allowlist: active (61 syscalls, 310 instructions, 5 code ranges)
 ```
 
 *The seccomp allowlist.* App processes are forked from the kernel
@@ -1544,7 +1538,7 @@ the process if it is not on it; a syscall from anywhere else gets
 `SECCOMP_RET_TRACE`, which is what the app's own filter returns anyway
 (and in the kernel process, which nobody traces, `ENOSYS`). The platform
 reserves those code ranges in every app address space, so guest code
-never runs there. The allowlist (66 calls on aarch64, 3 of them for warm
+never runs there. The allowlist (64 calls on aarch64, 3 of them for warm
 clones, see **Warm clones**) was measured with
 `HELLOVM_SECCOMP_LEARN=FILE` (a test-hooks build), which records every
 syscall the kernel process makes and lets it continue, over the whole
@@ -1573,11 +1567,6 @@ only `SECCOMP_SET_MODE_FILTER` with or without a listener, `socketpair`
 only Unix datagram pairs and `sendmsg` and `recvmsg` only the flags of the
 listener's hand-over (a new app process sends K its listener over a pair
 made for it; `recvmsg` with `MSG_CMSG_CLOEXEC` also serves warm clones).
-`sched_setaffinity` (keeping an app process on the kernel thread's CPU
-while it is driven, then putting its CPUs back) cannot be limited to the
-kernel's own app processes by a filter, which cannot tell whose pid it
-is. Like `kill`, it reaches processes of the same user, and it changes
-only which CPUs they run on.
 
 *What it does not stop.* The kernel process drives its app processes
 with ptrace and makes them execute `mmap`, `munmap`, `mprotect` and

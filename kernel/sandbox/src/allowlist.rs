@@ -153,12 +153,6 @@ pub fn entries(stub_fd: i32, tcp: bool, warm: bool) -> Vec<Entry> {
         allow(SYS_set_robust_list),
         allow(SYS_rseq),
         allow(SYS_sched_getaffinity),
-        // The seccomp platform keeps an app process on the kernel thread's
-        // CPU while it drives it, and puts its CPUs back after; `getcpu`
-        // is the C library's `sched_getcpu` where restartable sequences
-        // do not tell the CPU.
-        allow(SYS_sched_setaffinity),
-        allow(SYS_getcpu),
         allow(SYS_exit),
         allow(SYS_exit_group),
         allow(SYS_gettid),
