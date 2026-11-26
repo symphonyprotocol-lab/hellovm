@@ -323,6 +323,19 @@ impl Tracee {
         Ok(())
     }
 
+    /// At a seccomp stop: replaces the pending syscall with `nr` and the
+    /// arguments in `regs`, which become the task's registers.
+    pub fn replace_syscall(&self, regs: &Regs, nr: u64) -> io::Result<()> {
+        self.set_regs(regs)?;
+        // x86_64: `orig_rax` in `regs` is the number. aarch64: the number
+        // the kernel acts on lives in NT_ARM_SYSTEM_CALL.
+        #[cfg(target_arch = "aarch64")]
+        self.set_regset(sys::NT_ARM_SYSTEM_CALL, &(nr as i32))?;
+        #[cfg(target_arch = "x86_64")]
+        let _ = nr;
+        Ok(())
+    }
+
     /// At a seccomp stop: makes the pending syscall a no-op, with every
     /// register (the return value included) as in `regs`.
     pub fn skip_syscall(&self, regs: &Regs) -> io::Result<()> {

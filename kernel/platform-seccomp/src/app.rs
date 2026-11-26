@@ -112,6 +112,8 @@ struct Task {
     regs: Regs,
     /// The listener of the task's filter, if it has the fast path.
     listener: Option<Rc<Listener>>,
+    /// The CPU it is kept on while the kernel drives it (see `pin`).
+    pinned: Option<i32>,
 }
 
 /// The live tasks' pidfds, shared with every [`AppKiller`].
@@ -152,6 +154,10 @@ pub struct SeccompPlatform {
     nr_close: u64,
     /// Warm clones (see `snapshot`), once prepared.
     snapshots: Option<Snapshots>,
+    /// The CPUs app processes may run on (the kernel process's own set
+    /// when the platform was made), to put back after `pin`; `None` if the
+    /// host would not tell.
+    cpus: Option<libc::cpu_set_t>,
     /// Whether new app processes get the notification fast path.
     notify: bool,
     /// The listeners of the live tasks' filters, by fd.
@@ -210,6 +216,7 @@ impl SeccompPlatform {
             nr_clone: number(Sysno::Clone),
             nr_close: number(Sysno::Close),
             snapshots: None,
+            cpus: own_cpus(),
             notify: std::env::var_os("HELLOVM_SECCOMP_NOTIF").is_none_or(|v| v != "0"),
             listeners: HashMap::new(),
             ready: Vec::new(),
@@ -498,6 +505,7 @@ impl SeccompPlatform {
                 state: State::Stopped(kind),
                 regs,
                 listener,
+                pinned: None,
             },
         );
         Ok(key)
@@ -581,6 +589,24 @@ impl SeccompPlatform {
         nr: u64,
         args: [u64; 6],
     ) -> Result<(i64, Option<libc::pid_t>), PlatformError> {
+        let rewritable = self.rewritable(nr);
+        let (task, kind) = self.stopped(key)?;
+        if kind == StopKind::Seccomp && rewritable && !in_vsyscall_page(task.regs.pc()) {
+            // The app's own syscall has not run: make it the injected one
+            // instead of skipping it and making the task execute the stub.
+            // One stop instead of three. The host re-runs the filter on
+            // the changed syscall, which sends these numbers to the tracer
+            // (`filter::trace_numbers`), so it runs (see `rewritable`).
+            let mut regs = task.regs;
+            regs.set_pending_syscall(nr, args);
+            task.tracee.replace_syscall(&regs, nr)?;
+            self.pin(key)?;
+            let task = self.task(key)?;
+            task.tracee.resume(Run::Syscall, 0)?;
+            task.state = State::Stopped(StopKind::SyscallExit);
+            return self.finish_injected(key, nr);
+        }
+        self.pin(key)?;
         let (task, kind) = self.stopped(key)?;
         if kind == StopKind::Seccomp {
             // Skip the app's own syscall to reach its exit stop. The app
@@ -619,6 +645,76 @@ impl SeccompPlatform {
             return Err(self.violation(key, what));
         }
         task.tracee.resume(Run::Syscall, 0)?;
+        self.finish_injected(key, nr)
+    }
+
+    /// Keeps stopped task `key` on the CPU the kernel thread runs on until
+    /// it resumes for the app ([`Platform::resume`] puts its CPUs back).
+    /// Each injected syscall is two hand-overs between the kernel thread
+    /// and the task (resume it, wait for its stop); on one CPU they are
+    /// plain context switches, where a task woken on another CPU costs a
+    /// wake-up across CPUs, which dominates in a virtual machine. Best
+    /// effort: a host that refuses only makes it slower.
+    fn pin(&mut self, key: TaskKey) -> Result<(), PlatformError> {
+        if self.cpus.is_none() {
+            return Ok(());
+        }
+        let task = self.task(key)?;
+        // SAFETY: plain libc call.
+        let cpu = unsafe { libc::sched_getcpu() };
+        if cpu < 0 || task.pinned == Some(cpu) {
+            return Ok(());
+        }
+        // SAFETY: CPU_SET on a zeroed local set, within its size.
+        let set = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu as usize, &mut set);
+            set
+        };
+        if set_cpus(task.tracee.pid, &set) {
+            task.pinned = Some(cpu);
+        }
+        Ok(())
+    }
+
+    /// Puts a pinned task's CPUs back before it runs app code again.
+    fn unpin(&mut self, key: TaskKey) -> Result<(), PlatformError> {
+        let Some(cpus) = self.cpus else {
+            return Ok(());
+        };
+        let task = self.task(key)?;
+        if task.pinned.take().is_some() {
+            set_cpus(task.tracee.pid, &cpus);
+        }
+        Ok(())
+    }
+
+    /// Whether syscall `nr`, injected at a seccomp stop, can replace the
+    /// pending app syscall. The host re-runs the filters on the replaced
+    /// syscall at the app's instruction pointer: the app's own filter
+    /// must stop it for the tracer again, which then lets it through (a
+    /// `SECCOMP_RET_TRACE` on that re-run is "allowed"). That holds for
+    /// every number the trace-only filter sees and, with the notification
+    /// filter, for the numbers it traces: `mmap`, `munmap`, `mprotect`
+    /// and `clone` are among them (`close`, which only a thaw injects, is
+    /// not).
+    fn rewritable(&self, nr: u64) -> bool {
+        [
+            self.nr_mmap,
+            self.nr_munmap,
+            self.nr_mprotect,
+            self.nr_clone,
+        ]
+        .contains(&nr)
+    }
+
+    /// After an injected syscall was let run: waits for its exit stop (and
+    /// the new process, for `clone`) and returns its raw result.
+    fn finish_injected(
+        &mut self,
+        key: TaskKey,
+        nr: u64,
+    ) -> Result<(i64, Option<libc::pid_t>), PlatformError> {
         let mut child = None;
         loop {
             match self.wait_injected(key, Run::Syscall)? {
@@ -758,6 +854,30 @@ fn host_has_pac() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     false
+}
+
+/// The CPUs the calling thread may run on.
+fn own_cpus() -> Option<libc::cpu_set_t> {
+    // SAFETY: an all-zero cpu set is valid; sched_getaffinity fills it.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0)
+            .then_some(set)
+    }
+}
+
+/// Sets the CPUs host process `pid` may run on; whether the host took it.
+fn set_cpus(pid: libc::pid_t, set: &libc::cpu_set_t) -> bool {
+    // SAFETY: `set` is a valid cpu set of the size given.
+    unsafe { libc::sched_setaffinity(pid, std::mem::size_of::<libc::cpu_set_t>(), set) == 0 }
+}
+
+/// Whether `pc` is in x86_64's legacy vsyscall page, whose calls the host
+/// emulates through seccomp without a real syscall instruction: the
+/// syscall made there must not be replaced (the host kills a task whose
+/// tracer changes it).
+fn in_vsyscall_page(pc: u64) -> bool {
+    cfg!(target_arch = "x86_64") && pc >> 32 == 0xffff_ffff
 }
 
 /// Signals the CPU raises for a fault of the task itself.
@@ -1075,8 +1195,11 @@ impl Platform for SeccompPlatform {
         // of the injected call's). Its FP state and thread pointer are the
         // parent's already: injection never touches them.
         let parent = self.task(parent)?;
-        let (regs, listener) = (parent.regs, parent.listener.clone());
-        self.register(tracee, regs, StopKind::Signal, listener)
+        let (regs, listener, pinned) = (parent.regs, parent.listener.clone(), parent.pinned);
+        let key = self.register(tracee, regs, StopKind::Signal, listener)?;
+        // The new process has its parent's CPUs: put them back when it runs.
+        self.task(key)?.pinned = pinned;
+        Ok(key)
     }
 
     fn kill(&mut self, key: TaskKey) -> Result<(), PlatformError> {
@@ -1139,6 +1262,8 @@ impl Platform for SeccompPlatform {
             StopKind::Seccomp => task.tracee.skip_syscall(&regs)?,
             StopKind::SyscallExit | StopKind::Signal => task.tracee.set_regs(&regs)?,
         }
+        self.unpin(key)?;
+        let task = self.task(key)?;
         task.tracee.resume(Run::Cont, 0)?;
         task.state = State::Running;
         Ok(())
@@ -1914,6 +2039,76 @@ mod tests {
         }
     }
 
+    fn cpus_allowed(p: &SeccompPlatform, t: TaskKey) -> String {
+        cpus_in(&format!("/proc/{}/status", p.host_pid(t).unwrap()))
+    }
+
+    fn cpus_in(status: &str) -> String {
+        std::fs::read_to_string(status)
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// A traced app syscall (`mmap`) that the core answers by injecting
+    /// one: the injected `mmap` replaces the pending syscall, the task is
+    /// kept on the kernel thread's CPU meanwhile, and both it and a fork
+    /// made at that stop get their CPUs back when they resume.
+    #[test]
+    fn an_injected_syscall_replaces_the_pending_one() {
+        let mut p = SeccompPlatform::new().unwrap();
+        // The kernel thread's CPUs, which app processes start with (a new
+        // one is already pinned: its set-up was injected).
+        let all = cpus_in("/proc/thread-self/status");
+        let t = p.spawn().unwrap();
+        let addr = 0x2000_0000;
+        let spin = syscall_then_spin(&mut p, t, addr);
+        let page = p.address_space().page_size;
+        let mmap = p.arch().syscall_nr(Sysno::Mmap).unwrap();
+        let mut context = p.context(t).unwrap();
+        context.set_pc(addr);
+        context.set_sp(addr + 2 * page);
+        match &mut context {
+            Context::Aarch64(c) => c.x[8] = mmap,
+            Context::X86_64(c) => c.rax = mmap,
+        }
+        p.set_context(t, &context).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        match next_event(&mut p) {
+            Event {
+                trap: Trap::Syscall(trap),
+                ..
+            } if trap.nr == mmap => {}
+            other => panic!("expected the mmap, got {other:?}"),
+        }
+        assert!(!p.is_notified(t), "mmap stops for the tracer");
+        let fresh = 0x3000_0000;
+        p.map(t, fresh, page, Prot::RW, Sharing::Private).unwrap();
+        p.write(t, fresh, b"mapped").unwrap();
+        if p.cpus.is_some() && all.contains(['-', ',']) {
+            assert!(
+                !cpus_allowed(&p, t).contains(['-', ',']),
+                "one CPU while the kernel drives it, not {all}"
+            );
+        }
+        let u = p.clone_task(t, false).unwrap();
+        let mut buf = [0u8; 6];
+        p.read(u, fresh, &mut buf).unwrap();
+        assert_eq!(&buf, b"mapped");
+        p.resume(t, Resume::Return(fresh as i64)).unwrap();
+        // The fork resumes at the same point, with its own result.
+        p.resume(u, Resume::Return(0)).unwrap();
+        for task in [t, u] {
+            assert_eq!(cpus_allowed(&p, task), all, "CPUs back for {task}");
+        }
+        let context = stop_spinning(&mut p, t);
+        assert_eq!(ret_of(&context) as u64, fresh);
+        assert_eq!(context.pc(), spin);
+    }
+
     #[test]
     fn killer_ends_every_task() {
         let mut p = SeccompPlatform::new().unwrap();
@@ -1959,5 +2154,37 @@ mod tests {
         let killer = thread.join().unwrap();
         killer.kill().unwrap();
         assert_eq!(p.task_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod inject_timing {
+    use super::*;
+
+    /// The platform's own cost of an injected `mprotect` (no core): from a
+    /// syscall-exit stop, and in place of a pending app syscall. Ignored: a
+    /// measurement, not a gate.
+    ///
+    /// ```sh
+    /// cargo test --release -p hellovm-platform-seccomp --lib inject_timing -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn injected_mprotect_cost() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let page = p.address_space().page_size;
+        p.map(t, 0x2000_0000, 16 * page, Prot::RW, Sharing::Private)
+            .unwrap();
+        let n = 2000;
+        let start = Instant::now();
+        for i in 0..n {
+            let prot = if i % 2 == 0 { Prot::READ } else { Prot::RW };
+            p.protect(t, 0x2000_0000, page, prot).unwrap();
+        }
+        println!(
+            "injected mprotect, task already stopped: {:?} each",
+            start.elapsed() / n
+        );
     }
 }
