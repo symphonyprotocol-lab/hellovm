@@ -151,15 +151,9 @@ fn timeout_stops_a_spinning_program() {
 fn unsupported_options_are_refused() {
     let root = std::env::temp_dir();
     for args in [
-        &[
-            "--platform",
-            "kvm",
-            "--template",
-            "/tmp/x",
-            "--root",
-            "/",
-            "/x",
-        ][..],
+        // The kernel process of a KVM warm clone, on the seccomp
+        // platform: no such thing.
+        &["--warm-role", "clone", "--root", "/", "/x"][..],
         &["--vcpus", "2", "--root", "/", "/x"],
         &["--platform", "kvm", "--vcpus", "0", "--root", "/", "/x"],
         &["--platform", "vmware", "--root", "/", "/x"],

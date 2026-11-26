@@ -50,6 +50,38 @@ pub fn apply() -> Result<(), String> {
     Ok(())
 }
 
+/// The layers of the process that serves a warm-clone template's socket
+/// on the KVM platform (README, "Warm clones on KVM"), which starts the
+/// template's and every clone's kernel process: no core dumps, not
+/// dumpable (no other process of its user may trace it or read its
+/// memory), `no_new_privs` (inherited by the kernel processes), and its
+/// soft `RLIMIT_NOFILE` raised to `nofile` (at most the hard limit) for
+/// its connections. No namespaces, Landlock or seccomp: it starts
+/// processes, which would inherit them before they make their VMs.
+pub fn seal_supervisor(nofile: u64) -> Result<(), String> {
+    lower(libc::RLIMIT_CORE, 0)?;
+    // SAFETY: getrlimit/setrlimit with a valid struct; plain prctls.
+    unsafe {
+        let mut cur: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut cur) != 0 {
+            return Err(format!("getrlimit: {}", io::Error::last_os_error()));
+        }
+        let want = nofile.min(cur.rlim_max);
+        if cur.rlim_cur < want {
+            cur.rlim_cur = want;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &cur) != 0 {
+                return Err(format!("setrlimit: {}", io::Error::last_os_error()));
+            }
+        }
+        for (option, arg) in [(libc::PR_SET_NO_NEW_PRIVS, 1), (libc::PR_SET_DUMPABLE, 0)] {
+            if libc::prctl(option, arg as libc::c_ulong, 0, 0, 0) != 0 {
+                return Err(format!("prctl: {}", io::Error::last_os_error()));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

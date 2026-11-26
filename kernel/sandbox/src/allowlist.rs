@@ -264,14 +264,17 @@ const TERMINAL_IOCTLS: [u32; 6] = [
 /// one.
 ///
 /// Measured with `HELLOVM_SECCOMP_LEARN` over the KVM suites (see
-/// README, "The KVM platform"); the rest is as in [`entries`].
-pub fn kvm_entries(vcpus: &[i32], tcp: bool) -> Vec<Entry> {
+/// README, "The KVM platform"); the rest is as in [`entries`]. `pid` is
+/// the process's own (it never forks once confined): the only one its
+/// `tgkill`s may name. `ingress`: a warm clone that receives inbound
+/// connections on an ingress channel (README, "Warm clones on KVM").
+pub fn kvm_entries(vcpus: &[i32], tcp: bool, ingress: bool, pid: i32) -> Vec<Entry> {
     let mut domains = vec![AF_UNIX];
     if tcp {
         domains.push(AF_INET);
     }
     let vcpus: Vec<u32> = vcpus.iter().map(|&fd| fd as u32).collect();
-    vec![
+    let mut list = vec![
         // Most frequent first: the filter checks the entries in order.
         checked_any(
             SYS_ioctl,
@@ -351,9 +354,17 @@ pub fn kvm_entries(vcpus: &[i32], tcp: bool) -> Vec<Entry> {
         allow(SYS_gettimeofday),
         allow(SYS_getrandom),
         // The kick that stops a vCPU's thread; SIGABRT is abort() after a
-        // panic. A filter cannot tell whose thread it is (the process's
-        // own, Landlock's scope keeps it there where the host has ABI 6).
-        checked(SYS_tgkill, vec![one_of(2, &[KVM_KICK_SIGNAL, SIGABRT])]),
+        // panic. Only to this process's own threads: the kernel processes
+        // of a host's sandboxes (a warm template's clones, say) run as one
+        // user, and a filter cannot tell their thread ids apart, but it
+        // can tell their process ids.
+        checked(
+            SYS_tgkill,
+            vec![
+                Check::OneOf(0, vec![pid as u32]),
+                one_of(2, &[KVM_KICK_SIGNAL, SIGABRT]),
+            ],
+        ),
         // Outbound streams to the egress proxy: Unix stream sockets only.
         checked(
             SYS_socket,
@@ -373,7 +384,13 @@ pub fn kvm_entries(vcpus: &[i32], tcp: bool) -> Vec<Entry> {
         allow(SYS_recvfrom),
         allow(SYS_setsockopt),
         allow(SYS_shutdown),
-    ]
+    ];
+    if ingress {
+        // A warm clone's ingress channel: each message brings one
+        // connected socket (`SCM_RIGHTS`), received close-on-exec.
+        list.push(checked(SYS_recvmsg, vec![one_of(2, &[MSG_CMSG_CLOEXEC])]));
+    }
+    list
 }
 
 fn checked_any(nr: c_long, groups: Vec<Vec<Check>>) -> Entry {
@@ -390,7 +407,7 @@ mod tests {
     #[test]
     fn kvm_list_has_no_process_control() {
         use libc::*;
-        let entries = super::kvm_entries(&[5, 6], true);
+        let entries = super::kvm_entries(&[5, 6], true, false, 77);
         let mut nrs: Vec<u32> = entries.iter().map(|e| e.nr).collect();
         nrs.sort_unstable();
         nrs.dedup();
@@ -421,7 +438,7 @@ mod tests {
     fn kvm_ioctls_are_only_the_vcpus() {
         use crate::filter::{self, tests::data, Judge};
         let arch = crate::harden::audit_arch();
-        let entries = super::kvm_entries(&[5, 6], false);
+        let entries = super::kvm_entries(&[5, 6], false, false, 77);
         let prog = filter::build(
             arch,
             std::slice::from_ref(&filter::EVERY_ADDRESS),
@@ -452,14 +469,47 @@ mod tests {
             &data(arch, libc::SYS_ptrace as u32, u64::MAX, [0; 6]),
         );
         assert_eq!(other, kill);
-        let tgkill = |sig: u64| {
+        let tgkill = |pid: u64, sig: u64| {
             crate::bpf::run(
                 &prog,
-                &data(arch, libc::SYS_tgkill as u32, 0x1000, [1, 2, sig, 0, 0, 0]),
+                &data(
+                    arch,
+                    libc::SYS_tgkill as u32,
+                    0x1000,
+                    [pid, 2, sig, 0, 0, 0],
+                ),
             )
         };
-        assert_eq!(tgkill(libc::SIGURG as u64), allow);
-        assert_eq!(tgkill(libc::SIGKILL as u64), kill);
+        assert_eq!(tgkill(77, libc::SIGURG as u64), allow);
+        assert_eq!(tgkill(77, libc::SIGABRT as u64), allow);
+        assert_eq!(tgkill(77, libc::SIGKILL as u64), kill);
+        // Another process's thread (a sibling sandbox's), whatever the
+        // signal.
+        assert_eq!(tgkill(78, libc::SIGURG as u64), kill);
+        assert_eq!(tgkill(1, libc::SIGABRT as u64), kill);
+        // Only a clone with an ingress channel receives fds.
+        let recvmsg = |entries: &[super::Entry], flags: u64| {
+            let prog = filter::build(
+                arch,
+                std::slice::from_ref(&filter::EVERY_ADDRESS),
+                Judge::Allowlist(entries),
+            )
+            .unwrap();
+            crate::bpf::run(
+                &prog,
+                &data(
+                    arch,
+                    libc::SYS_recvmsg as u32,
+                    0x1000,
+                    [3, 0, flags, 0, 0, 0],
+                ),
+            )
+        };
+        let cloexec = libc::MSG_CMSG_CLOEXEC as u64;
+        assert_eq!(recvmsg(&entries, cloexec), kill);
+        let ingress = super::kvm_entries(&[5, 6], false, true, 77);
+        assert_eq!(recvmsg(&ingress, cloexec), allow);
+        assert_eq!(recvmsg(&ingress, 0), kill);
     }
 
     #[test]
@@ -541,17 +591,31 @@ mod tests {
         vcpus.dedup();
         assert!(!vcpus.is_empty(), "no KVM_RUN recorded");
         let arch = crate::harden::audit_arch();
-        let entries = super::kvm_entries(&vcpus, true);
-        let prog = filter::build(
-            arch,
-            std::slice::from_ref(&filter::EVERY_ADDRESS),
-            Judge::Allowlist(&entries),
-        )
-        .unwrap();
+        // The recording comes from many processes: each `tgkill` is
+        // checked against the filter of the process it names (its own:
+        // the measuring filter records the calls, it does not check them).
+        // `tcp`: the `--splice-to` tests; `ingress`: the warm clones.
+        let prog = |pid: i32| {
+            let entries = super::kvm_entries(&vcpus, true, true, pid);
+            filter::build(
+                arch,
+                std::slice::from_ref(&filter::EVERY_ADDRESS),
+                Judge::Allowlist(&entries),
+            )
+            .unwrap()
+        };
+        let any = prog(1);
         let mut refused = Vec::new();
         for call in &calls {
             let args: [u64; 6] = call[1..].try_into().unwrap();
-            let action = crate::bpf::run(&prog, &data(arch, call[0] as u32, 0x1000, args));
+            let own;
+            let prog = if call[0] == libc::SYS_tgkill as u64 {
+                own = prog(args[0] as i32);
+                &own
+            } else {
+                &any
+            };
+            let action = crate::bpf::run(prog, &data(arch, call[0] as u32, 0x1000, args));
             let errno = action & 0xffff_0000 == filter::SECCOMP_RET_ERRNO;
             if action != filter::SECCOMP_RET_ALLOW && !errno {
                 refused.push(format!("syscall {} {args:x?}", call[0]));

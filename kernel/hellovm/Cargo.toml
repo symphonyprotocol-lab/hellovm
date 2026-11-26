@@ -13,7 +13,7 @@ publish.workspace = true
 # Also `--insecure-test-session` (the e2e tests' hardened kernel process),
 # `--insecure-fence-test` and the HELLOVM_SECCOMP_LEARN measurement mode.
 insecure-test-hooks = ["hellovm-host/insecure-test-hooks", "hellovm-sandbox/insecure-test-hooks"]
-# Test-only: builds `tests/kvm_cli.rs`, which needs /dev/kvm
+# Test-only: builds `tests/kvm_cli.rs` and `tests/kvm_warm.rs`, which need /dev/kvm
 # (`kernel/dev/run-kvm-lima.sh` turns it on).
 kvm-tests = []
 
@@ -45,4 +45,8 @@ hellovm-egress = { workspace = true, features = ["insecure-test-hooks"] }
 
 [[test]]
 name = "kvm_cli"
+required-features = ["kvm-tests"]
+
+[[test]]
+name = "kvm_warm"
 required-features = ["kvm-tests"]

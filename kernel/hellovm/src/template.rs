@@ -640,7 +640,7 @@ fn become_clone(
 /// [`warm`]) and hands them to the kernel until the channel closes or
 /// breaks the protocol (then ingress to this sandbox stops; nothing else
 /// does).
-fn ingress_channel(channel: OwnedFd, queue: hellovm_host::InboundQueue) {
+pub(crate) fn ingress_channel(channel: OwnedFd, queue: hellovm_host::InboundQueue) {
     let mut port = [0u8; 2];
     let mut have = 0;
     let mut fds: Vec<OwnedFd> = Vec::new();

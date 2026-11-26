@@ -24,7 +24,7 @@
 //! default 2 GiB): writes past it fail with `ENOSPC`. `--platform` (Linux
 //! only) chooses what runs the program: `seccomp` (the default: app
 //! processes under seccomp and ptrace) or `kvm` (a KVM virtual machine,
-//! on arm64 Linux with `/dev/kvm`; aarch64 programs; no warm clones).
+//! on arm64 Linux with `/dev/kvm`; aarch64 programs).
 //! `--vcpus` (macOS, and `--platform kvm`) sets how many vCPUs run the
 //! program's threads in parallel (1 to 64; default one per host CPU, at
 //! most 8).
@@ -73,13 +73,16 @@
 //! stdout and stderr, whose read of `/dev/hellovm-clone` returns `DATA`
 //! (then end of file), and exits with the clone's status (125 if it could
 //! not be made). `--ready` only waits until the template is frozen.
+//! With `--platform kvm`, and on macOS, the template's and each clone's
+//! kernel process is a new `hellovm` the template's process starts (see
+//! `template_vm`, and README, "Warm clones on macOS" and "Warm clones on
+//! KVM").
 //!
 //! `HELLOVM_LOG` sets the log level (`error`, `warn` (default), `info`,
 //! `debug`, `trace`).
 //!
 //! On macOS on Apple silicon, programs run on the HVF platform
-//! (Hypervisor.framework; aarch64 Linux programs only), and only the
-//! first form works, without `--template`/`--clone`. There the hardening
+//! (Hypervisor.framework; aarch64 Linux programs only). There the hardening
 //! is closing inherited fds, resource limits, clearing the environment,
 //! `PT_DENY_ATTACH` and a Seatbelt profile the process enters itself once
 //! the VM is made (see README, "Hardening"); with `--egress` the profile
@@ -210,8 +213,8 @@ mod clone_client;
 mod fence;
 #[cfg(target_os = "linux")]
 mod template;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod template_macos;
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+mod template_vm;
 
 const USAGE: &str = "usage: hellovm [--trace] [--timeout SECONDS] [--tty | --no-tty] \
      [--egress SOCKET] [--sandbox-id ID] [--fs-limit BYTES] [--platform seccomp|kvm] [--vcpus N] [--sandbox require|best-effort|off] --root DIR \
@@ -310,10 +313,11 @@ struct Options {
     /// `--ready` (with `--clone`).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ready: bool,
-    /// `--warm-role ROLE` (macOS, internal): this process is the kernel
-    /// process of a warm-clone template or of a clone, started by
-    /// `hellovm --template` (see `template_macos`).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// `--warm-role ROLE` (internal; macOS, and arm64 Linux with
+    /// `--platform kvm`): this process is the kernel process of a
+    /// warm-clone template or of a clone, started by `hellovm --template`
+    /// (see `template_vm`).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     warm_role: Option<String>,
 }
 
@@ -403,12 +407,12 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 continue;
             }
             Some("--ready") => ready = true,
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
             Some("--warm-role") => {
                 args.next();
                 let role = args.next().ok_or("--warm-role needs a role")?;
                 let role = role.to_string_lossy().into_owned();
-                if role != template_macos::ROLE_TEMPLATE && role != template_macos::ROLE_CLONE {
+                if role != template_vm::ROLE_TEMPLATE && role != template_vm::ROLE_CLONE {
                     return Err(format!("--warm-role {role}: unknown role"));
                 }
                 warm_role = Some(role);
@@ -596,8 +600,8 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Options, String> {
                 .into(),
         );
     }
-    if platform == PlatformKind::Kvm && template.is_some() {
-        return Err("--template: warm clones run on the seccomp platform, not on KVM".into());
+    if warm_role.is_some() && cfg!(target_os = "linux") && platform != PlatformKind::Kvm {
+        return Err("--warm-role: only with --platform kvm".into());
     }
     #[cfg(feature = "insecure-test-hooks")]
     if platform == PlatformKind::Kvm && (session || splice_to.is_some()) {
@@ -749,6 +753,24 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     use hellovm_host::{ImageDir, StdioHost};
     use hellovm_platform_seccomp::SeccompPlatform;
 
+    // A warm-clone template on KVM: see `template_vm`.
+    #[cfg(target_arch = "aarch64")]
+    if options.platform == PlatformKind::Kvm {
+        match options.warm_role.as_deref() {
+            Some(template_vm::ROLE_TEMPLATE) => template_vm::run_template_kernel(options, fds),
+            Some(_) => template_vm::run_clone_kernel(options, fds),
+            None => {}
+        }
+        if let Some(socket) = &options.template {
+            return template_vm::run(options, socket);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    if options.platform == PlatformKind::Kvm && options.template.is_some() {
+        return Err(
+            "--platform kvm: the KVM platform runs aarch64 programs on arm64 Linux only".into(),
+        );
+    }
     let image = ImageDir::open(&options.root)
         .map_err(|err| format!("image {}: {err}", options.root.display()))?;
     let egress = options
@@ -886,7 +908,10 @@ fn run_kvm(
         egress,
         fds,
         false,
-        hellovm_sandbox::Platform::Kvm { vcpus },
+        hellovm_sandbox::Platform::Kvm {
+            vcpus,
+            ingress: false,
+        },
     )? {
         host.set_egress(path)?;
     }
@@ -1111,7 +1136,8 @@ fn fence_test(test: &str) -> ! {
 }
 
 /// macOS on Apple silicon: the HVF platform, hardened by
-/// `hellovm-sandbox` (a Seatbelt profile and more). No warm clones.
+/// `hellovm-sandbox` (a Seatbelt profile and more); warm clones in
+/// `template_vm`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn std::error::Error>> {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1122,12 +1148,12 @@ fn run(options: &Options, fds: Result<usize, String>) -> Result<Ended, Box<dyn s
     use hellovm_platform_hvf::{HvfConfig, HvfPlatform};
 
     match options.warm_role.as_deref() {
-        Some(template_macos::ROLE_TEMPLATE) => template_macos::run_template_kernel(options, fds),
-        Some(_) => template_macos::run_clone_kernel(options, fds),
+        Some(template_vm::ROLE_TEMPLATE) => template_vm::run_template_kernel(options, fds),
+        Some(_) => template_vm::run_clone_kernel(options, fds),
         None => {}
     }
     if let Some(socket) = &options.template {
-        return template_macos::run(options, socket);
+        return template_vm::run(options, socket);
     }
     let egress = options.egress.as_deref().map(egress_socket).transpose()?;
     // Everything the kernel process needs from the host is opened before

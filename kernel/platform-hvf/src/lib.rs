@@ -74,9 +74,9 @@ mod sys;
 #[cfg(test)]
 mod tests;
 
+pub use hellovm_platform_arm64::layout::PAGE;
 pub use hellovm_platform_arm64::{Flushes, Origin, SaveStats, Trimmed, MAX_VCPUS};
 pub use hvf::{Hvf, HvfVcpu};
-pub use sys::SharedMap;
 
 /// The HVF platform: the shared arm64 platform on Hypervisor.framework.
 /// One per process (the framework allows one VM per process).
