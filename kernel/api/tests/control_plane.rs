@@ -513,12 +513,16 @@ fn idle_lifetime_and_memory_limits_remove_sandboxes() {
     assert_eq!(r.status, 404);
 
     // Processes: more than the limit (40 here) and the sandbox is removed.
+    // `LC_ALL=C`: with a locale named in the environment, every `sleep`
+    // maps the host's whole locale archive (a dozen MiB on GitHub's
+    // runners, and the kernel copies a file mapping in full), and 20 of
+    // them would reach the memory limit before 40 reach the process limit.
     let forker = id_of(&plane.create(ACME, json!({})));
     let r = plane.call_json(
         ACME,
         "POST",
         &format!("/v1/sandboxes/{forker}/exec"),
-        json!({"command": "for i in $(seq 60); do sleep 60 & done; sleep 30", "timeout": 60}),
+        json!({"command": "for i in $(seq 60); do LC_ALL=C sleep 60 & done; sleep 30", "timeout": 60}),
     );
     assert!(
         matches!(r.status, 410 | 502),
