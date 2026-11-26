@@ -88,8 +88,22 @@ Debian system.
   other process is killed.
 - **Waiting**: one event loop serves the whole sandbox. A syscall that has
   to wait (pipe I/O, `wait4`, `futex`, sleeps, `poll`/`ppoll`,
-  `select`/`pselect6`, `sigsuspend`, console input) parks its thread
-  without blocking anything else.
+  `select`/`pselect6`, `epoll_wait`/`epoll_pwait`/`epoll_pwait2`,
+  `sigsuspend`, console input) parks its thread without blocking anything
+  else.
+- **epoll** (`kernel/core/src/epoll.rs`): instances whose watches follow
+  the open file description (they survive `dup` and `fork` and go away
+  with its last fd), level-triggered, `EPOLLONESHOT`, nested instances
+  (loops and more than four levels refused with `ELOOP`), regular files
+  and directories refused with `EPERM`, and each architecture's
+  `epoll_event` layout (packed on x86_64). `EPOLLET` reports a ready event
+  once until the instance has seen it not ready again, which is what a
+  program that reads until `EAGAIN` needs (Linux also reports again when
+  more data arrives while still readable); `EPOLLEXCLUSIVE` and
+  `EPOLLWAKEUP` have no effect. Node.js runs on it (libuv's event loop:
+  timers, the file system, child processes with pipes, worker threads,
+  an HTTP server and its clients on loopback; `kernel/hellovm/tests/node.rs`),
+  and CPython's `selectors.DefaultSelector` and `asyncio` use it.
 - **Pipes** with blocking, end of file, `PIPE_BUF` atomicity and
   `SIGPIPE`/`EPIPE`.
 - **Signals**: handlers on correct signal frames (with FP state) and
@@ -440,8 +454,7 @@ aarch64 the guest does not see BTI or MTE in `AT_HWCAP2`: both need
 `PROT_BTI` / `PROT_MTE` mappings, which the kernel does not provide, and a
 dynamic loader that sees BTI refuses to load marked libraries without it.
 
-Not yet: `epoll` (neither `pip install` nor `git clone` calls it),
-`timerfd`, `inotify`, `clone3` (glibc falls back to `clone`), `fexecve`,
+Not yet: `timerfd`, `inotify`, `clone3` (glibc falls back to `clone`), `fexecve`,
 POSIX timers, `ITIMER_VIRTUAL`/`ITIMER_PROF`, priority-inheritance futexes,
 writable shared *file* mappings (they are private copies), and permission
 checks (the guest is root). Unimplemented syscalls fail with `ENOSYS` and
