@@ -162,6 +162,9 @@ pub struct SeccompPlatform {
     /// to a ptrace stop (diagnostics and tests).
     fast: u64,
     converted: u64,
+    /// Injected syscalls that replaced a pending app syscall (diagnostics
+    /// and tests).
+    in_place: u64,
     event_loop: wake::Loop,
     /// The waker wake-up count [`Platform::wait`] last reported.
     wakes_seen: u32,
@@ -215,6 +218,7 @@ impl SeccompPlatform {
             ready: Vec::new(),
             fast: 0,
             converted: 0,
+            in_place: 0,
             wakes_seen: event_loop.wakes(),
             event_loop,
             _not_send: PhantomData,
@@ -289,6 +293,11 @@ impl SeccompPlatform {
     /// and how many tasks had to be converted from it to a ptrace stop.
     pub fn fast_path_stats(&self) -> (u64, u64) {
         (self.fast, self.converted)
+    }
+
+    /// How many injected syscalls replaced the app's pending one.
+    pub fn in_place_injections(&self) -> u64 {
+        self.in_place
     }
 
     /// Turns the fast path off for app processes spawned from now on (for
@@ -581,6 +590,30 @@ impl SeccompPlatform {
         nr: u64,
         args: [u64; 6],
     ) -> Result<(i64, Option<libc::pid_t>), PlatformError> {
+        let rewritable = self.rewritable(nr);
+        let (task, kind) = self.stopped(key)?;
+        if kind == StopKind::Seccomp && rewritable && !in_vsyscall_page(task.regs.pc()) {
+            // The app's own syscall has not run: make it the injected one
+            // instead of skipping it and making the task execute the stub.
+            // One stop instead of three. The host re-runs the filter on
+            // the changed syscall, which sends these numbers to the tracer
+            // (`filter::trace_numbers`), so it runs (see `rewritable`).
+            let mut regs = task.regs;
+            regs.set_pending_syscall(nr, args);
+            task.tracee.replace_syscall(&regs, nr)?;
+            task.tracee.resume(Run::Syscall, 0)?;
+            task.state = State::Stopped(StopKind::SyscallExit);
+            self.in_place += 1;
+            let (ret, child) = self.finish_injected(key, nr)?;
+            // A host signal pending on the task (an interrupt sent while it
+            // still ran) makes the host refuse some calls with a restart
+            // code: `clone` does not start with a signal pending
+            // (`ERESTARTNOINTR`). Through the stub, below, the task takes
+            // the signal first (it is dropped) and then makes the call.
+            if child.is_some() || !sys::RESTART_ERRNOS.contains(&ret.wrapping_neg()) {
+                return Ok((ret, child));
+            }
+        }
         let (task, kind) = self.stopped(key)?;
         if kind == StopKind::Seccomp {
             // Skip the app's own syscall to reach its exit stop. The app
@@ -619,6 +652,35 @@ impl SeccompPlatform {
             return Err(self.violation(key, what));
         }
         task.tracee.resume(Run::Syscall, 0)?;
+        self.finish_injected(key, nr)
+    }
+
+    /// Whether syscall `nr`, injected at a seccomp stop, can replace the
+    /// pending app syscall. The host re-runs the filters on the replaced
+    /// syscall at the app's instruction pointer: the app's own filter
+    /// must stop it for the tracer again, which then lets it through (a
+    /// `SECCOMP_RET_TRACE` on that re-run is "allowed"). That holds for
+    /// every number the trace-only filter sees and, with the notification
+    /// filter, for the numbers it traces: `mmap`, `munmap`, `mprotect`
+    /// and `clone` are among them (`close`, which only a thaw injects, is
+    /// not).
+    fn rewritable(&self, nr: u64) -> bool {
+        [
+            self.nr_mmap,
+            self.nr_munmap,
+            self.nr_mprotect,
+            self.nr_clone,
+        ]
+        .contains(&nr)
+    }
+
+    /// After an injected syscall was let run: waits for its exit stop (and
+    /// the new process, for `clone`) and returns its raw result.
+    fn finish_injected(
+        &mut self,
+        key: TaskKey,
+        nr: u64,
+    ) -> Result<(i64, Option<libc::pid_t>), PlatformError> {
         let mut child = None;
         loop {
             match self.wait_injected(key, Run::Syscall)? {
@@ -758,6 +820,14 @@ fn host_has_pac() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     false
+}
+
+/// Whether `pc` is in x86_64's legacy vsyscall page, whose calls the host
+/// emulates through seccomp without a real syscall instruction: the
+/// syscall made there must not be replaced (the host kills a task whose
+/// tracer changes it).
+fn in_vsyscall_page(pc: u64) -> bool {
+    cfg!(target_arch = "x86_64") && pc >> 32 == 0xffff_ffff
 }
 
 /// Signals the CPU raises for a fault of the task itself.
@@ -1914,6 +1984,142 @@ mod tests {
         }
     }
 
+    /// A traced app syscall (`mmap`) that the core answers by injecting
+    /// one: the injected `mmap` replaces the pending syscall, and a fork
+    /// made at that stop sees the new mapping.
+    #[test]
+    fn an_injected_syscall_replaces_the_pending_one() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let addr = 0x2000_0000;
+        let spin = syscall_then_spin(&mut p, t, addr);
+        let page = p.address_space().page_size;
+        let mmap = p.arch().syscall_nr(Sysno::Mmap).unwrap();
+        let mut context = p.context(t).unwrap();
+        context.set_pc(addr);
+        context.set_sp(addr + 2 * page);
+        match &mut context {
+            Context::Aarch64(c) => c.x[8] = mmap,
+            Context::X86_64(c) => c.rax = mmap,
+        }
+        p.set_context(t, &context).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        match next_event(&mut p) {
+            Event {
+                trap: Trap::Syscall(trap),
+                ..
+            } if trap.nr == mmap => {}
+            other => panic!("expected the mmap, got {other:?}"),
+        }
+        assert!(!p.is_notified(t), "mmap stops for the tracer");
+        let fresh = 0x3000_0000;
+        let before = p.in_place_injections();
+        p.map(t, fresh, page, Prot::RW, Sharing::Private).unwrap();
+        assert_eq!(p.in_place_injections(), before + 1, "replaced in place");
+        p.write(t, fresh, b"mapped").unwrap();
+        let u = p.clone_task(t, false).unwrap();
+        let mut buf = [0u8; 6];
+        p.read(u, fresh, &mut buf).unwrap();
+        assert_eq!(&buf, b"mapped");
+        p.resume(t, Resume::Return(fresh as i64)).unwrap();
+        // The fork resumes at the same point, with its own result.
+        p.resume(u, Resume::Return(0)).unwrap();
+        let context = stop_spinning(&mut p, t);
+        assert_eq!(ret_of(&context) as u64, fresh);
+        assert_eq!(context.pc(), spin);
+    }
+
+    /// An app `clone`, a traced syscall, that the core answers with
+    /// `clone_task`: the injected `clone` replaces it. Parent and child
+    /// both resume after the syscall instruction with their own results,
+    /// in separate processes with copied memory.
+    #[test]
+    fn an_app_clone_is_replaced_by_the_injected_one() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let addr = 0x2000_0000;
+        let spin = syscall_then_spin(&mut p, t, addr);
+        let page = p.address_space().page_size;
+        let clone = p.arch().syscall_nr(Sysno::Clone).unwrap();
+        let mut context = p.context(t).unwrap();
+        context.set_pc(addr);
+        context.set_sp(addr + 2 * page);
+        match &mut context {
+            Context::Aarch64(c) => c.x[8] = clone,
+            Context::X86_64(c) => c.rax = clone,
+        }
+        p.set_context(t, &context).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        match next_event(&mut p) {
+            Event {
+                trap: Trap::Syscall(trap),
+                ..
+            } if trap.nr == clone => {}
+            other => panic!("expected the clone, got {other:?}"),
+        }
+        let before = p.in_place_injections();
+        let u = p.clone_task(t, false).unwrap();
+        assert_eq!(p.in_place_injections(), before + 1, "replaced in place");
+        assert_ne!(p.host_pid(u), p.host_pid(t));
+        // Copy-on-write: the child's writes stay in the child.
+        let data = addr + page;
+        p.write(t, data, b"parent").unwrap();
+        p.write(u, data, b"child!").unwrap();
+        let mut buf = [0u8; 6];
+        p.read(t, data, &mut buf).unwrap();
+        assert_eq!(&buf, b"parent");
+        p.resume(t, Resume::Return(u as i64)).unwrap();
+        p.resume(u, Resume::Return(0)).unwrap();
+        for (task, ret) in [(t, u as i64), (u, 0)] {
+            let context = stop_spinning(&mut p, task);
+            assert_eq!(ret_of(&context), ret, "task {task}");
+            assert_eq!(context.pc(), spin, "task {task}");
+        }
+    }
+
+    /// An app `clone` whose task has a host signal pending (an interrupt
+    /// sent while it still ran): the host will not start a clone then
+    /// (`ERESTARTNOINTR`), so the platform does it again through the stub,
+    /// where the task takes the signal first. The fork succeeds.
+    #[test]
+    fn a_pending_interrupt_does_not_fail_an_in_place_clone() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let addr = 0x2000_0000;
+        let spin = syscall_then_spin(&mut p, t, addr);
+        let page = p.address_space().page_size;
+        let clone = p.arch().syscall_nr(Sysno::Clone).unwrap();
+        let mut context = p.context(t).unwrap();
+        context.set_pc(addr);
+        context.set_sp(addr + 2 * page);
+        match &mut context {
+            Context::Aarch64(c) => c.x[8] = clone,
+            Context::X86_64(c) => c.rax = clone,
+        }
+        p.set_context(t, &context).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        match next_event(&mut p) {
+            Event {
+                trap: Trap::Syscall(trap),
+                ..
+            } if trap.nr == clone => {}
+            other => panic!("expected the clone, got {other:?}"),
+        }
+        // The task is at the clone's seccomp stop: the signal stays pending.
+        let pid = p.host_pid(t).unwrap();
+        // SAFETY: plain syscall to our tracee.
+        unsafe { libc::syscall(libc::SYS_tgkill, pid, pid, INTERRUPT_SIGNAL) };
+        let u = p.clone_task(t, false).unwrap();
+        assert_ne!(p.host_pid(u), p.host_pid(t));
+        p.resume(t, Resume::Return(u as i64)).unwrap();
+        p.resume(u, Resume::Return(0)).unwrap();
+        for (task, ret) in [(t, u as i64), (u, 0)] {
+            let context = stop_spinning(&mut p, task);
+            assert_eq!(ret_of(&context), ret, "task {task}");
+            assert_eq!(context.pc(), spin, "task {task}");
+        }
+    }
+
     #[test]
     fn killer_ends_every_task() {
         let mut p = SeccompPlatform::new().unwrap();
@@ -1959,5 +2165,38 @@ mod tests {
         let killer = thread.join().unwrap();
         killer.kill().unwrap();
         assert_eq!(p.task_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod inject_timing {
+    use super::*;
+
+    /// The platform's own cost of an injected `mprotect` (no core) on a
+    /// task that is already at a syscall-exit stop, which goes through the
+    /// stub (`syscall_bench` measures the in-place case through the core).
+    /// Ignored: a measurement, not a gate.
+    ///
+    /// ```sh
+    /// cargo test --release -p hellovm-platform-seccomp --lib inject_timing -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn injected_mprotect_cost() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let page = p.address_space().page_size;
+        p.map(t, 0x2000_0000, 16 * page, Prot::RW, Sharing::Private)
+            .unwrap();
+        let n = 2000;
+        let start = Instant::now();
+        for i in 0..n {
+            let prot = if i % 2 == 0 { Prot::READ } else { Prot::RW };
+            p.protect(t, 0x2000_0000, page, prot).unwrap();
+        }
+        println!(
+            "injected mprotect, task already stopped: {:?} each",
+            start.elapsed() / n
+        );
     }
 }

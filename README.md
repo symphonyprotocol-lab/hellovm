@@ -63,8 +63,8 @@ on an M3 Max (Linux 7.0 in a VM, aarch64; release build; `cargo test
 | 1-byte `write` to `/dev/null` | 0.15 µs | 2.9 µs | 30.0 µs |
 | 1-byte pipe `write` + `read`, per call | 0.17 µs | 3.4 µs | 30.6 µs |
 | `clock_gettime` (the syscall) | 0.16 µs | 2.8 µs | 28.6 µs |
-| `python3 -c pass` | 5.0 ms | 20.4 ms | 33.9 ms |
-| `python3 -c 'import asyncio, json, decimal, ...'` | 38.1 ms | 91 ms | 211 ms |
+| `python3 -c pass` | 5.0 ms | 20.4 ms (18 ms with injections in place, below) | 33.9 ms |
+| `python3 -c 'import asyncio, json, decimal, ...'` | 38.1 ms | 91 ms (83 ms with injections in place) | 211 ms |
 
 A bare seccomp user-notification round trip in the same container (a C
 program answering `getppid` in a loop, no kernel core) costs 1.3 µs with
@@ -72,6 +72,31 @@ synchronous wake-ups and 19 µs without; pinning the old ptrace path to
 one CPU (`taskset -c 3`) took it from 25 µs to 4.2 µs a call, which shows
 how much of it was wake-ups across CPUs. These are a VM's numbers; on a
 native host every column is faster.
+
+**Memory calls.** `mmap`, `munmap`, `mprotect` and `brk` still stop for
+ptrace: the core answers them by injecting `mmap`, `munmap` or `mprotect`
+into the app process. The first syscall injected at a seccomp stop
+replaces the app's pending one: its number and arguments are rewritten,
+and the host runs it after re-running the filter, which traces it again
+and so lets it through. Only the syscalls after it, and those injected at
+any other stop, go through the stub page. That is one round trip between
+the kernel thread and the task instead of three. Same environment and
+method (`syscall_bench`: 2,000 rounds of each memory case; ranges over
+three runs):
+
+| | native | every injection through the stub | first one in place |
+|---|---|---|---|
+| `mmap` + `munmap` of 64 KiB | 1.0 µs | 202 µs | 63-81 µs |
+| `mprotect` of a page | 0.25 µs | 98 µs | 29-37 µs |
+| `brk` up or down a page, per call | 0.5 µs | 97 µs | 32-50 µs |
+
+Two other ideas were tried and dropped. Routing these calls through
+notifications as well, and converting the task when it needs injecting,
+cost as much as the traced stop it saves. Keeping a driven task on the
+kernel thread's CPU (`sched_setaffinity`) measured no better than the
+in-place rewrite alone. It also made a task that could have run on an
+idle CPU wait for a busy one, and the control-plane limit tests failed
+with it on GitHub's 4-CPU x86_64 runners.
 
 What runs today (milestone U5b): x86_64 and aarch64 Linux programs,
 static or dynamically linked, with any number of processes and threads.

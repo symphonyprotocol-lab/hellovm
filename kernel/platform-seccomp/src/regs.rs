@@ -57,6 +57,13 @@ impl Regs {
         self.x[..6].copy_from_slice(&args);
     }
 
+    /// At a seccomp stop: makes the pending syscall `nr` with `args`
+    /// (the number itself is in NT_ARM_SYSTEM_CALL, which
+    /// `Tracee::replace_syscall` sets).
+    pub fn set_pending_syscall(&mut self, _nr: u64, args: [u64; 6]) {
+        self.x[..6].copy_from_slice(&args);
+    }
+
     /// At the signal-delivery-stop of a task whose notified syscall a
     /// signal interrupted: makes the registers what they were when the
     /// syscall was reported (as at a seccomp stop), `ip` being the
@@ -227,6 +234,12 @@ impl Regs {
     pub fn prepare_syscall(&mut self, insn: u64, nr: u64, args: [u64; 6]) {
         self.rip = insn;
         self.rax = nr;
+        [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9] = args;
+    }
+
+    /// At a seccomp stop: makes the pending syscall `nr` with `args`.
+    pub fn set_pending_syscall(&mut self, nr: u64, args: [u64; 6]) {
+        self.orig_rax = nr;
         [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9] = args;
     }
 
