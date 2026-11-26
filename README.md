@@ -98,6 +98,26 @@ in-place rewrite alone. It also made a task that could have run on an
 idle CPU wait for a busy one, and the control-plane limit tests failed
 with it on GitHub's 4-CPU x86_64 runners.
 
+**Memory of an app process.** The core lays out every address space
+itself, so a file the app maps is normally anonymous memory filled with
+the file's contents, paid for again by every process. `execve` is the
+exception on this platform: the executable and its program interpreter,
+when they are unmodified image files, are mapped from the host file
+(`MAP_PRIVATE`, the host's page cache, shared by every process until a
+page is written). The files reach the new app process the way a warm
+clone's snapshot does: they are open in it when it is created, mapped by
+injected `mmap` and closed by injected `close` before any app code runs.
+Pages two segments share, partial pages and the libraries the dynamic
+loader maps later are still copies. It matters most for big executables:
+on GitHub's `ubuntu-latest` (Ubuntu 26.04, x86_64) `/bin/sleep` is the
+11.8 MB coreutils multicall binary, and RssAnon + RssShmem of one app
+`sleep` (what noded counts) went from 17,172 kB to 6,416 kB; 40 of them
+from 690 MiB to 259 MiB; a `python3` (a 7.5 MB executable) from about
+16.6 MiB to 9.7 MiB. A `sleep` on Debian bookworm aarch64 (a 68 KB
+executable) went from 1,896 kB to 1,716 kB, most of what is left being
+the copy of libc. Transparent huge pages play no part: they are
+`madvise` on those runners and `AnonHugePages` is 0.
+
 What runs today (milestone U5b): x86_64 and aarch64 Linux programs,
 static or dynamically linked, with any number of processes and threads.
 A busybox shell runs external commands, pipelines, background jobs, traps
@@ -2163,7 +2183,9 @@ take rights away. The memfd is created and sized before the hardening, so
 No layer is weakened. The app processes' residual host-syscall surface
 (see `spawn.rs`) gains, during the rebuild and before any guest code runs
 in the process, `mmap` of the snapshot memfd (only that fd, `MAP_PRIVATE
-| MAP_FIXED`, a range the platform checked) and `close` of it.
+| MAP_FIXED`, a range the platform checked) and `close` of it. `execve`
+uses the same two calls, at the same point, for the image files of the
+executable and its interpreter (see **Memory of an app process**).
 
 The template is trusted more than a clone: everything a clone starts
 from comes from the template's kernel process, which ran the template's

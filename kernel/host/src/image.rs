@@ -240,7 +240,8 @@ impl ImageDir {
         result
     }
 
-    fn open_file(&mut self, path: &ImagePath) -> io::Result<File> {
+    /// Opens a regular file of the image for reading (close-on-exec).
+    pub fn open_file(&mut self, path: &ImagePath) -> io::Result<File> {
         let entry = self.lookup(path)?;
         let name = entry
             .name

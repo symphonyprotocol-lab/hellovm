@@ -11,11 +11,12 @@
 //! free, non-reserved parts of the address space.
 
 use std::fmt;
+use std::fs::File;
 
 use crate::arch::Arch;
 use crate::errno::{Errno, SysResult, E2BIG, ENOEXEC, ENOMEM};
 use crate::mm::{Mm, VmaKind, STACK_SIZE};
-use crate::platform::{AddressSpace, AppMemory, CpuInfo, GuestAddr, Prot};
+use crate::platform::{AddressSpace, AppMemory, CpuInfo, GuestAddr, PlatformError, Prot, Sharing};
 
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
@@ -301,6 +302,24 @@ pub fn load<P: AddressSpace + AppMemory + ?Sized>(
     elf: &Elf,
     placement: Placement,
 ) -> Result<LoadedImage, ElfError> {
+    load_from(mm, space, file, None, elf, placement)
+}
+
+/// [`load`], with the host file `file` was read from (the same bytes), if
+/// the platform got it ([`crate::platform::Platform::spawn_with_files`]).
+/// Whole pages of a segment's file data that no other segment touches are
+/// then mapped from it ([`AddressSpace::map_file`]): the host's copy of
+/// the file, shared with every other process that maps it, until written.
+/// The rest is copied, as without it, and so is everything the platform
+/// will not map. Either way the app sees the same bytes.
+pub fn load_from<P: AddressSpace + AppMemory + ?Sized>(
+    mm: &mut Mm,
+    space: &mut P,
+    file: &[u8],
+    host_file: Option<&File>,
+    elf: &Elf,
+    placement: Placement,
+) -> Result<LoadedImage, ElfError> {
     let page = mm.page_size();
     let align = elf.align.max(page);
     let bias = if elf.pie {
@@ -345,13 +364,25 @@ pub fn load<P: AddressSpace + AppMemory + ?Sized>(
     cuts.dedup();
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut prot_runs: Vec<(u64, u64, Prot)> = Vec::new();
+    // Pieces only one segment's span covers, with that segment's index.
+    let mut owned: Vec<(usize, u64, u64)> = Vec::new();
     for cut in cuts.windows(2) {
         let (start, end) = (cut[0], cut[1]);
-        let mut covering = spans.iter().filter(|s| s.0 <= start && end <= s.1);
-        let Some(first) = covering.next() else {
+        let mut covering = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.0 <= start && end <= s.1);
+        let Some((owner, first)) = covering.next() else {
             continue;
         };
-        let prot = covering.fold(first.2, |prot, s| prot.union(s.2));
+        let mut alone = true;
+        let prot = covering.fold(first.2, |prot, (_, s)| {
+            alone = false;
+            prot.union(s.2)
+        });
+        if alone {
+            owned.push((owner, start, end));
+        }
         match runs.last_mut() {
             Some(run) if run.1 == start => run.1 = end,
             _ => runs.push((start, end)),
@@ -368,11 +399,25 @@ pub fn load<P: AddressSpace + AppMemory + ?Sized>(
         mm.map_fixed(space, start, end - start, Prot::RW, VmaKind::Image)
             .map_err(|_| ElfError::NoRoom)?;
     }
-    for seg in &elf.segments {
-        let data = &file[seg.offset as usize..(seg.offset + seg.filesz) as usize];
-        space
-            .write(seg.vaddr + bias, data)
-            .map_err(|_| ElfError::NoRoom)?;
+    let mapped = match host_file {
+        Some(host_file) => map_from_file(mm, space, host_file, elf, bias, &owned)?,
+        None => Vec::new(),
+    };
+    for (i, seg) in elf.segments.iter().enumerate() {
+        // The segment's data, but for the pages mapped from the file
+        // (in address order, inside the data).
+        let data_start = seg.vaddr + bias;
+        let data_end = data_start + seg.filesz;
+        let mut at = data_start;
+        let holes = mapped.iter().filter(|m| m.0 == i).map(|m| (m.1, m.2));
+        for (from, to) in holes.chain([(data_end, data_end)]) {
+            if at < from {
+                let offset = (seg.offset + (at - data_start)) as usize;
+                let data = &file[offset..offset + (from - at) as usize];
+                space.write(at, data).map_err(|_| ElfError::NoRoom)?;
+            }
+            at = to;
+        }
     }
     for &(start, end, prot) in &prot_runs {
         if prot != Prot::RW {
@@ -387,6 +432,59 @@ pub fn load<P: AddressSpace + AppMemory + ?Sized>(
         bias,
         end: image_end,
     })
+}
+
+/// Maps from `host_file` the whole pages of each segment's file data that
+/// lie in `owned` (pieces only that segment covers), over the anonymous
+/// memory already there. Returns what was mapped, as (segment, start, end)
+/// in address order. A piece the platform does not map stays anonymous
+/// memory (mapped again, in case the failed mapping removed it), for the
+/// caller to copy.
+fn map_from_file<P: AddressSpace + ?Sized>(
+    mm: &Mm,
+    space: &mut P,
+    host_file: &File,
+    elf: &Elf,
+    bias: u64,
+    owned: &[(usize, u64, u64)],
+) -> Result<Vec<(usize, u64, u64)>, ElfError> {
+    let page = mm.page_size();
+    let mut pieces: Vec<(usize, u64, u64)> = Vec::new();
+    for &(i, start, end) in owned {
+        let seg = &elf.segments[i];
+        let data_start = seg.vaddr + bias;
+        let Some(first) = mm.page_up(data_start) else {
+            continue;
+        };
+        let last = mm.page_down(data_start + seg.filesz);
+        let (start, end) = (start.max(first), end.min(last));
+        if start >= end {
+            continue;
+        }
+        match pieces.last_mut() {
+            Some(p) if p.0 == i && p.2 == start => p.2 = end,
+            _ => pieces.push((i, start, end)),
+        }
+    }
+    let mut mapped = Vec::with_capacity(pieces.len());
+    for (i, start, end) in pieces {
+        let seg = &elf.segments[i];
+        let offset = seg.offset + (start - (seg.vaddr + bias));
+        if !offset.is_multiple_of(page) {
+            continue;
+        }
+        match space.map_file(start, end - start, Prot::RW, host_file, offset) {
+            Ok(()) => mapped.push((i, start, end)),
+            Err(PlatformError::Unsupported(_)) => return Ok(mapped),
+            Err(err) => {
+                log::debug!("mapping {start:#x}..{end:#x} from the file failed: {err}");
+                space
+                    .map(start, end - start, Prot::RW, Sharing::Private)
+                    .map_err(|_| ElfError::NoRoom)?;
+            }
+        }
+    }
+    Ok(mapped)
 }
 
 /// What the new program is told about itself.
@@ -639,6 +737,87 @@ pub(crate) mod tests {
     fn setup() -> (Mm, MockApp) {
         let app = MockApp::new(Arch::Aarch64);
         (Mm::new(&app.address_space()), app)
+    }
+
+    #[test]
+    fn whole_pages_are_mapped_from_the_host_file() {
+        let base = 0x40_0000;
+        let text: Vec<u8> = (0..0x3800u32).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..0x2400u32).map(|i| (i % 241) as u8 ^ 0x5a).collect();
+        let file = build_elf(
+            Arch::Aarch64,
+            ET_EXEC,
+            base + 0x1000,
+            &[
+                Seg {
+                    vaddr: base,
+                    offset: 0,
+                    data: &text,
+                    memsz: 0x3800,
+                    flags: PF_R | PF_X,
+                },
+                // Shares the page at base + 0x3000 with the text.
+                Seg {
+                    vaddr: base + 0x3800,
+                    offset: 0x3800,
+                    data: &data,
+                    memsz: 0x4000,
+                    flags: PF_R | PF_W,
+                },
+            ],
+            None,
+        );
+        let elf = parse(&file, Arch::Aarch64).unwrap();
+        let path = std::env::temp_dir().join(format!("hellovm-elf-map-{}", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let host_file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut copied_mm, mut copied) = setup();
+        load(&mut copied_mm, &mut copied, &file, &elf, Placement::Program).unwrap();
+        let (mut mm, mut app) = setup();
+        app.maps_files = true;
+        let image = load_from(
+            &mut mm,
+            &mut app,
+            &file,
+            Some(&host_file),
+            &elf,
+            Placement::Program,
+        )
+        .unwrap();
+        assert_eq!(image.end, base + 0x8000);
+        // The text's whole pages, and the data's one whole page; not the
+        // page the two share, nor the partial pages.
+        assert_eq!(
+            app.file_maps,
+            [(base, 0x3000, 0), (base + 0x4000, 0x1000, 0x4000)]
+        );
+        // The app sees the same memory either way.
+        for page in (base..base + 0x9000).step_by(0x1000) {
+            assert_eq!(app.prot(page), copied.prot(page), "{page:#x}");
+            if copied.is_mapped(page) {
+                assert_eq!(
+                    app.peek(page, 0x1000),
+                    copied.peek(page, 0x1000),
+                    "{page:#x}"
+                );
+            }
+        }
+
+        // A platform that cannot map files gets a copy.
+        let (mut mm, mut app) = setup();
+        load_from(
+            &mut mm,
+            &mut app,
+            &file,
+            Some(&host_file),
+            &elf,
+            Placement::Program,
+        )
+        .unwrap();
+        assert!(app.file_maps.is_empty());
+        assert_eq!(app.peek(base, 0x8000), copied.peek(base, 0x8000));
     }
 
     #[test]

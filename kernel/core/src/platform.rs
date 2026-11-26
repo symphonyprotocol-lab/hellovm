@@ -52,6 +52,7 @@
 //! by the platform).
 
 use std::fmt;
+use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -258,6 +259,26 @@ pub trait AddressSpace {
     fn unmap(&mut self, addr: GuestAddr, len: u64) -> Result<(), PlatformError>;
     /// Changes the protection of a fully mapped range.
     fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), PlatformError>;
+    /// Maps `len` bytes of an image file from `offset` (page-aligned, and
+    /// inside the file) at a fixed address, private and copy-on-write like
+    /// `MAP_PRIVATE`, replacing whatever was mapped there. Its pages are the
+    /// host's own copy of the file, shared with every other mapping of it
+    /// until written. `file` must be one handed to
+    /// [`Platform::spawn_with_files`] for this address space, before
+    /// [`Platform::release_files`]. A platform that cannot map host files
+    /// refuses with [`PlatformError::Unsupported`]; whatever was mapped
+    /// there may be gone after any failure.
+    fn map_file(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+        file: &File,
+        offset: u64,
+    ) -> Result<(), PlatformError> {
+        let _ = (addr, len, prot, file, offset);
+        Err(PlatformError::Unsupported("file mappings"))
+    }
 }
 
 /// What the guest is told about the CPU it runs on.
@@ -499,6 +520,22 @@ pub trait Platform {
     /// runs with [`Resume::Start`].
     fn spawn(&mut self) -> Result<TaskKey, PlatformError>;
 
+    /// [`Platform::spawn`], with image files the core may then map into
+    /// the new task's address space with [`AddressSpace::map_file`] until
+    /// it calls [`Platform::release_files`] (before the task first runs).
+    /// A platform that cannot map host files ignores them.
+    fn spawn_with_files(&mut self, files: &[&File]) -> Result<TaskKey, PlatformError> {
+        let _ = files;
+        self.spawn()
+    }
+
+    /// Drops what the platform holds of the files given to
+    /// [`Platform::spawn_with_files`] for `task`; the mappings stay.
+    fn release_files(&mut self, task: TaskKey) -> Result<(), PlatformError> {
+        let _ = task;
+        Ok(())
+    }
+
     /// Creates a stopped task whose context is a copy of `parent`'s, which
     /// must be stopped. With `share_memory` it uses `parent`'s address space
     /// (threads, `vfork`); otherwise it gets a copy of it, as `fork` does
@@ -555,6 +592,20 @@ pub trait Platform {
         prot: Prot,
         sharing: Sharing,
     ) -> Result<(), PlatformError>;
+
+    /// See [`AddressSpace::map_file`].
+    fn map_file(
+        &mut self,
+        task: TaskKey,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+        file: &File,
+        offset: u64,
+    ) -> Result<(), PlatformError> {
+        let _ = (task, addr, len, prot, file, offset);
+        Err(PlatformError::Unsupported("file mappings"))
+    }
 
     /// See [`AddressSpace::unmap`].
     fn unmap(&mut self, task: TaskKey, addr: GuestAddr, len: u64) -> Result<(), PlatformError>;
@@ -631,6 +682,18 @@ impl<P: Platform + ?Sized> AddressSpace for TaskMem<'_, P> {
 
     fn protect(&mut self, addr: GuestAddr, len: u64, prot: Prot) -> Result<(), PlatformError> {
         self.platform.protect(self.task, addr, len, prot)
+    }
+
+    fn map_file(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+        file: &File,
+        offset: u64,
+    ) -> Result<(), PlatformError> {
+        self.platform
+            .map_file(self.task, addr, len, prot, file, offset)
     }
 }
 

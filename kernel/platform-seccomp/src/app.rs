@@ -36,6 +36,7 @@
 //! notified syscall only as "return this value".
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -112,6 +113,9 @@ struct Task {
     regs: Regs,
     /// The listener of the task's filter, if it has the fast path.
     listener: Option<Rc<Listener>>,
+    /// Image files handed to it at spawn ([`Platform::spawn_with_files`]),
+    /// open in it under the same numbers until [`Platform::release_files`].
+    files: Vec<RawFd>,
 }
 
 /// The live tasks' pidfds, shared with every [`AppKiller`].
@@ -507,6 +511,7 @@ impl SeccompPlatform {
                 state: State::Stopped(kind),
                 regs,
                 listener,
+                files: Vec::new(),
             },
         );
         Ok(key)
@@ -519,7 +524,7 @@ impl SeccompPlatform {
         Some(task)
     }
 
-    fn spawn_task(&mut self, keep: Option<BorrowedFd<'_>>) -> Result<TaskKey, PlatformError> {
+    fn spawn_task(&mut self, keep: &[BorrowedFd<'_>]) -> Result<TaskKey, PlatformError> {
         let profile = profile::host_profile()?;
         // SAFETY: the profile's stub memfd lives as long as the process.
         let stub_fd = unsafe { BorrowedFd::borrow_raw(profile.stub_fd()) };
@@ -986,7 +991,7 @@ impl SeccompPlatform {
         };
         let mut keys = Vec::with_capacity(spaces.len());
         for space in &spaces {
-            let first = self.spawn_task(Some(file.as_fd()))?;
+            let first = self.spawn_task(&[file.as_fd()])?;
             let result = self.thaw_space(first, file.as_fd(), space);
             match result {
                 Ok(space_keys) => keys.push(space_keys),
@@ -1103,7 +1108,28 @@ impl Platform for SeccompPlatform {
     }
 
     fn spawn(&mut self) -> Result<TaskKey, PlatformError> {
-        self.spawn_task(None)
+        self.spawn_task(&[])
+    }
+
+    fn spawn_with_files(&mut self, files: &[&File]) -> Result<TaskKey, PlatformError> {
+        let files = &files[..files.len().min(spawn::MAX_KEPT)];
+        let keep: Vec<BorrowedFd<'_>> = files.iter().map(|f| f.as_fd()).collect();
+        let key = self.spawn_task(&keep)?;
+        self.task(key)?.files = files.iter().map(|f| f.as_raw_fd()).collect();
+        Ok(key)
+    }
+
+    fn release_files(&mut self, key: TaskKey) -> Result<(), PlatformError> {
+        let files = std::mem::take(&mut self.task(key)?.files);
+        for fd in files {
+            self.checked_inject(
+                key,
+                "close of an image file",
+                self.nr_close,
+                [fd as u64, 0, 0, 0, 0, 0],
+            )?;
+        }
+        Ok(())
     }
 
     fn clone_task(
@@ -1315,6 +1341,33 @@ impl Platform for SeccompPlatform {
         Ok(())
     }
 
+    fn map_file(
+        &mut self,
+        key: TaskKey,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+        file: &File,
+        offset: u64,
+    ) -> Result<(), PlatformError> {
+        self.check_range(addr, len)?;
+        let fd = file.as_raw_fd();
+        if !self.task(key)?.files.contains(&fd) {
+            return Err(PlatformError::Unsupported("a file not handed to the task"));
+        }
+        if !offset.is_multiple_of(self.info.page_size) {
+            return Err(PlatformError::BadAddress { addr, len: 0 });
+        }
+        let flags = MAP_PRIVATE | MAP_FIXED;
+        let prot = u64::from(prot.0 & Prot::ALL.0);
+        let args = [addr, len, prot, flags, fd as u64, offset];
+        let ret = self.checked_inject(key, "mmap of an image file", self.nr_mmap, args)?;
+        if ret as u64 != addr {
+            return Err(self.violation(key, format!("mmap returned {ret:#x}, not {addr:#x}")));
+        }
+        Ok(())
+    }
+
     fn unmap(&mut self, key: TaskKey, addr: GuestAddr, len: u64) -> Result<(), PlatformError> {
         self.check_range(addr, len)?;
         self.checked_inject(key, "munmap", self.nr_munmap, [addr, len, 0, 0, 0, 0])?;
@@ -1361,7 +1414,7 @@ pub fn check_clean_spawn() -> io::Result<()> {
     CHECK
         .get_or_init(|| {
             let mut platform = SeccompPlatform::new().map_err(|err| err.to_string())?;
-            let key = platform.spawn_task(None).map_err(|err| err.to_string())?;
+            let key = platform.spawn_task(&[]).map_err(|err| err.to_string())?;
             let pid = platform.tasks[&key].tracee.pid;
             let (left, _) = spawn::foreign_mappings(pid).map_err(|err| err.to_string())?;
             if !left.is_empty() {
@@ -1459,6 +1512,61 @@ mod tests {
             maps.contains(&format!("{:x}-{:x} rw-p", addr + 2 * page, addr + 4 * page)),
             "{maps}"
         );
+    }
+
+    #[test]
+    fn image_files_are_mapped_private_and_closed_before_the_app_runs() {
+        let page = SeccompPlatform::new().unwrap().address_space().page_size;
+        let path = std::env::temp_dir().join(format!("hellovm-map-file-{}", std::process::id()));
+        let contents: Vec<u8> = (0..2 * page).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&path, &contents).unwrap();
+        let file = File::open(&path).unwrap();
+        let other = File::open(&path).unwrap();
+
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn_with_files(&[&file]).unwrap();
+        let pid = p.host_pid(t).unwrap();
+        let fds = || -> Vec<String> {
+            std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        };
+        assert_eq!(fds(), [file.as_raw_fd().to_string()]);
+        let addr = 0x2000_0000;
+        p.map_file(t, addr, 2 * page, Prot::READ, &file, 0).unwrap();
+        // Only files handed over at spawn, at page-aligned offsets.
+        assert!(matches!(
+            p.map_file(t, addr, page, Prot::READ, &other, 0),
+            Err(PlatformError::Unsupported(_))
+        ));
+        assert!(p.map_file(t, addr, page, Prot::READ, &file, 1).is_err());
+        p.release_files(t).unwrap();
+        assert!(fds().is_empty());
+        assert!(matches!(
+            p.map_file(t, addr, page, Prot::READ, &file, 0),
+            Err(PlatformError::Unsupported(_))
+        ));
+
+        let mut buf = vec![0; 2 * page as usize];
+        p.read(t, addr, &mut buf).unwrap();
+        assert_eq!(buf, contents);
+        let maps = maps(&p, t);
+        let line = maps
+            .lines()
+            .find(|l| l.starts_with(&format!("{addr:x}-")))
+            .unwrap();
+        assert!(
+            line.contains(" r--p ") && line.ends_with(path.to_str().unwrap()),
+            "{maps}"
+        );
+        // Copy-on-write: the app's writes stay in the app.
+        p.protect(t, addr, page, Prot::RW).unwrap();
+        p.write(t, addr, b"private").unwrap();
+        p.read(t, addr, &mut buf[..7]).unwrap();
+        assert_eq!(&buf[..7], b"private");
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
