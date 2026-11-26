@@ -97,8 +97,9 @@ fn object_stat(object: FileObject, size: u64, time: Timespec) -> Stat {
         FileObject::Proc { dir: true } => (0x16, 0x20, S_IFDIR | 0o555, 0),
         FileObject::Proc { dir: false } => (0x16, 0x21, S_IFREG | 0o444, 0),
         FileObject::Socket(id) => (0x1d, 0x10_0000 + id as u64, S_IFSOCK | 0o777, 0),
-        // Linux shows eventfds as anonymous inodes.
+        // Linux shows eventfds and epoll instances as anonymous inodes.
         FileObject::EventFd(id) => (0x0e, 0x20_0000 + id as u64, 0o600, 0),
+        FileObject::Epoll(id) => (0x0e, 0x30_0000 + id as u64, 0o600, 0),
         FileObject::Node(_) => unreachable!("nodes have their own stat"),
     };
     Stat {
@@ -280,6 +281,8 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             },
             FileObject::Tty => self.tty_read(id, len),
             FileObject::ConsoleOut(_) | FileObject::PipeWrite(_) => Err(Errno(EBADF)),
+            // Linux: an epoll fd has no read.
+            FileObject::Epoll(_) => Err(Errno(EINVAL)),
             FileObject::Socket(sock) => self.socket_read(sock, len),
             FileObject::EventFd(id) => {
                 if len < 8 {
@@ -402,6 +405,7 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
             FileObject::ConsoleIn | FileObject::PipeRead(_) | FileObject::Proc { .. } => {
                 Err(Errno(EBADF))
             }
+            FileObject::Epoll(_) => Err(Errno(EINVAL)),
             FileObject::Socket(sock) => self.socket_write(sock, data),
             FileObject::EventFd(id) => {
                 let Some(raw) = data.get(..8).and_then(|d| <[u8; 8]>::try_from(d).ok()) else {
@@ -1204,9 +1208,16 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
         let Ok((_, file)) = self.file(fd) else {
             return POLLNVAL;
         };
+        let object = file.object;
+        self.poll_object(object, 0)
+    }
+
+    /// The poll events of an open file's object. `depth` counts the epoll
+    /// instances it is looked at through (nested instances).
+    pub(super) fn poll_object(&mut self, object: FileObject, depth: u32) -> u16 {
         let any_in = POLLIN | POLLRDNORM;
         let any_out = POLLOUT | POLLWRNORM;
-        match file.object {
+        match object {
             FileObject::Node(_) | FileObject::Proc { .. } => any_in | any_out,
             FileObject::EventFd(id) => {
                 let count = self.st.eventfds.get(id).count;
@@ -1245,11 +1256,18 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                     | (if ev.hup { POLLHUP } else { 0 })
                     | (if ev.rdhup { POLLRDHUP } else { 0 })
             }
+            FileObject::Epoll(id) => {
+                if self.epoll_has_events(id, depth) {
+                    any_in
+                } else {
+                    0
+                }
+            }
         }
     }
 
     /// Replaces the signal mask for the duration of a `ppoll`/`pselect6`.
-    fn temporary_mask(&mut self, set: GuestAddr, size: u64) -> SysResult<()> {
+    pub(super) fn temporary_mask(&mut self, set: GuestAddr, size: u64) -> SysResult<()> {
         if set == 0 || self.parked.is_some() {
             return Ok(());
         }

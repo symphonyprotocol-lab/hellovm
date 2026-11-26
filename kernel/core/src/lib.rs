@@ -24,6 +24,7 @@
 pub mod abi;
 pub mod arch;
 pub mod elf;
+mod epoll;
 pub mod errno;
 mod eventfd;
 pub mod fd;

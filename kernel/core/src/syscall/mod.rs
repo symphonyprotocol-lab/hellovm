@@ -12,6 +12,7 @@
 //! changed (see `kernel.rs`). So a handler must not change anything before
 //! it decides to park.
 
+mod epoll;
 mod fs;
 mod futex;
 mod mem;
@@ -262,6 +263,10 @@ impl<H: Host + ?Sized, P: Platform + ?Sized> Ctx<'_, H, P> {
                 self.st.eventfds.remove(id);
                 self.st.changed = true;
             }
+            FileObject::Epoll(id) => {
+                self.st.epolls.remove(id);
+                self.st.changed = true;
+            }
             FileObject::Socket(id) => self.finish_drop(id),
             FileObject::Proc { .. } => {
                 let held = file.contents.as_ref().map_or(0, Vec::len);
@@ -391,6 +396,14 @@ where
         Some(Pipe) => ctx.sys_pipe2(a[0], 0),
         Some(Pipe2) => ctx.sys_pipe2(a[0], a[1]),
         Some(Eventfd2) => ctx.sys_eventfd2(a[0], a[1]),
+        Some(EpollCreate1) => ctx.sys_epoll_create1(a[0]),
+        Some(EpollCreate) => ctx.sys_epoll_create(int(a[0])),
+        Some(EpollCtl) => ctx.sys_epoll_ctl(int(a[0]), int(a[1]), int(a[2]), a[3]),
+        Some(EpollWait) => ctx.sys_epoll_wait(int(a[0]), a[1], int(a[2]), Some(int(a[3])), 0, 0),
+        Some(EpollPwait) => {
+            ctx.sys_epoll_wait(int(a[0]), a[1], int(a[2]), Some(int(a[3])), a[4], a[5])
+        }
+        Some(EpollPwait2) => ctx.sys_epoll_pwait2(int(a[0]), a[1], int(a[2]), a[3], a[4], a[5]),
         Some(Fcntl) => ctx.sys_fcntl(int(a[0]), int(a[1]), a[2]),
         Some(Ioctl) => ctx.sys_ioctl(int(a[0]), a[1], a[2]),
         Some(Poll) => ctx.sys_poll(a[0], a[1], Some(int(a[2]))),
@@ -487,12 +500,8 @@ where
         Some(Setpriority) => Ok(0),
         Some(Membarrier) => Ok(0),
         // Deliberately refused: glibc falls back without restartable
-        // sequences, and without clone3. epoll is not implemented.
-        // CPython's DefaultSelector is EpollSelector and errors if
-        // epoll_create1 returns ENOSYS. Under --trace, neither `pip install`
-        // (CPython 3.11, pip 23) nor `git clone` over HTTPS (git 2.39,
-        // libcurl) calls epoll; subprocess and urllib3 use poll.
-        Some(Rseq | EpollCreate1) => Err(Errno(ENOSYS)),
+        // sequences, and without clone3.
+        Some(Rseq) => Err(Errno(ENOSYS)),
         _ => unimplemented(trap.nr, sysno, &a),
     };
     if let Some(action) = ctx.action.take() {
