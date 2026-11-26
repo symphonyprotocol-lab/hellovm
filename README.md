@@ -10,7 +10,7 @@ The kernel lives in `kernel/`, a Rust workspace:
 |---|---|---|
 | `hellovm-core` | `kernel/core` | Syscall emulation: processes, threads, signals, pipes, ELF loading, memory map, filesystem, terminal, `/proc`, IPv4 sockets; independent of the host OS |
 | `hellovm-host` | `kernel/host` | Host interface implementations: console, image directory, random bytes, clocks, outbound streams to the egress proxy |
-| `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: ptrace and `SECCOMP_RET_TRACE` (see below) |
+| `hellovm-platform-seccomp` | `kernel/platform-seccomp` | Linux platform: seccomp user notifications, ptrace and `SECCOMP_RET_TRACE` (see below) |
 | `hellovm-platform-arm64` | `kernel/platform-arm64` | What the two VM platforms share: stage-1 tables and pools, the VM layout, exception decoding and the scheduler, over a small hypervisor interface; their shared test suites |
 | `hellovm-platform-hvf` | `kernel/platform-hvf` | macOS platform on Apple silicon: a Hypervisor.framework VM with no guest kernel (see **The HVF platform (macOS)**) |
 | `hellovm-platform-kvm` | `kernel/platform-kvm` | arm64 Linux platform: the same VM on KVM (`--platform kvm`, see **The KVM platform (arm64 Linux)**) |
@@ -21,15 +21,57 @@ The kernel lives in `kernel/`, a Rust workspace:
 | `hellovm-test-guest` | `kernel/test-guest` | Small test programs built at build time |
 | `hellovm-noded`, `hellovm-api`, `hellovm-control` | `kernel/noded`, `kernel/api`, `kernel/control` | The control plane: the node daemon, the public API, and what they share (see **Control plane**) |
 
-Syscall interception on Linux is ptrace plus `SECCOMP_RET_TRACE`, not
-seccomp user notification. Every app thread is a host process. Its filter
-returns `SECCOMP_RET_TRACE` for every native-ABI syscall, and one
-event-loop thread is the ptrace tracer of those processes: it emulates the
-syscall and skips it, so the host kernel does not run it. Changes to an
-address space, and new tasks, are injected `mmap`, `munmap`, `mprotect` and
-`clone` through a trusted stub page, with arguments the tracer wrote.
-`kernel/platform-seccomp/src/spawn.rs` is the full argument, including why
-an in-app stub plus user notification was rejected.
+Syscall interception on Linux needs no `/dev/kvm` and no privileges.
+Every app thread is a host process under a seccomp filter, and one
+event-loop thread of the kernel process serves all of a sandbox's app
+processes; the host kernel never runs an app syscall. Most syscalls take
+the **fast path**: the filter returns `SECCOMP_RET_USER_NOTIF`, the app
+thread waits in the host kernel, the event loop receives the notification
+on the filter's listener, the core emulates the call and the event loop
+answers with the result, which the host returns as the syscall's value
+(never "run it"). The rest return `SECCOMP_RET_TRACE` and stop the thread
+for the event loop, which is also its ptrace tracer: the syscalls whose
+emulation changes registers or the address space (`mmap`, `munmap`,
+`mprotect`, `mremap`, `brk`, `clone`, `clone3`, `fork`, `vfork`,
+`execve`, `execveat`, `rt_sigreturn`, x86_64 `arch_prctl`). Changes to an
+address space, and new tasks, are injected `mmap`, `munmap`, `mprotect`
+and `clone` through a trusted stub page, with arguments the tracer wrote.
+When the core needs a notified thread in a ptrace stop after all (a
+signal to deliver, its context), the platform ends the notification with
+`SIGURG` and continues from the signal-delivery-stop with the registers
+the thread had at the syscall. `kernel/platform-seccomp/src/spawn.rs` is
+the full argument for the ptrace side, including why an in-app stub was
+rejected; `src/app.rs` describes the fast path and the conversion, and
+`src/wake.rs` how the event loop waits for notifications, ptrace stops
+and wake-ups at once. `HELLOVM_SECCOMP_NOTIF=0` turns the fast path off
+(every syscall then stops for ptrace, as before); a host without user
+notifications falls back to that by itself.
+
+**Speed of the fast path.** A notification round trip is two context
+switches; with `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP` (Linux 6.6, used when
+the host has it) both wake-ups happen on the CPU that is already running,
+so there is no wake-up across CPUs, which is what dominates a ptrace stop
+in a virtual machine. Measured in the dev container under Docker Desktop
+on an M3 Max (Linux 7.0 in a VM, aarch64; release build; `cargo test
+--release -p hellovm --test syscall_bench -- --ignored --nocapture`,
+`test-guest/c/syscall_bench.c`, 20,000 calls per case; CPython medians of
+5):
+
+| | native | fast path | ptrace only (`HELLOVM_SECCOMP_NOTIF=0`, as before) |
+|---|---|---|---|
+| `getppid` | 0.15 µs | 2.3 µs | 28.1 µs |
+| 1-byte `write` to `/dev/null` | 0.15 µs | 2.9 µs | 30.0 µs |
+| 1-byte pipe `write` + `read`, per call | 0.17 µs | 3.4 µs | 30.6 µs |
+| `clock_gettime` (the syscall) | 0.16 µs | 2.8 µs | 28.6 µs |
+| `python3 -c pass` | 5.0 ms | 20.4 ms | 33.9 ms |
+| `python3 -c 'import asyncio, json, decimal, ...'` | 38.1 ms | 91 ms | 211 ms |
+
+A bare seccomp user-notification round trip in the same container (a C
+program answering `getppid` in a loop, no kernel core) costs 1.3 µs with
+synchronous wake-ups and 19 µs without; pinning the old ptrace path to
+one CPU (`taskset -c 3`) took it from 25 µs to 4.2 µs a call, which shows
+how much of it was wake-ups across CPUs. These are a VM's numbers; on a
+native host every column is faster.
 
 What runs today (milestone U5b): x86_64 and aarch64 Linux programs,
 static or dynamically linked, with any number of processes and threads.
@@ -970,7 +1012,8 @@ minus a run of 0, best of 5), HVF takes 906 ns per `getpid`, and starting
 different environment: the seccomp platform in the dev container under
 Docker Desktop on the same Mac (whose Linux runs in a VM, so every ptrace
 stop goes through that VM's kernel) took about 23 µs per `getpid` with
-the same loop and method. That is not what seccomp costs on a native Linux
+the same loop and method before the notification fast path, and about
+2.3 µs per `getppid` with it (see the start of this README). That is not what seccomp costs on a native Linux
 host, which this Mac cannot measure.
 
 Processes, on the same Mac (release builds; the in-guest times are the
@@ -1443,7 +1486,7 @@ hellovm: debug: sandbox: resource limits: active (core 0, nofile 4096)
 hellovm: debug: sandbox: no_new_privs: active ()
 hellovm: debug: sandbox: Landlock: active (ABI 8: image read-only, no TCP, signals and abstract sockets scoped)
 hellovm: debug: sandbox: not dumpable: active ()
-hellovm: debug: sandbox: seccomp allowlist: active (62 syscalls, 305 instructions, 5 code ranges)
+hellovm: debug: sandbox: seccomp allowlist: active (61 syscalls, 310 instructions, 5 code ranges)
 ```
 
 *The seccomp allowlist.* App processes are forked from the kernel
@@ -1457,7 +1500,7 @@ the process if it is not on it; a syscall from anywhere else gets
 `SECCOMP_RET_TRACE`, which is what the app's own filter returns anyway
 (and in the kernel process, which nobody traces, `ENOSYS`). The platform
 reserves those code ranges in every app address space, so guest code
-never runs there. The allowlist (62 calls on aarch64, 4 of them for warm
+never runs there. The allowlist (64 calls on aarch64, 3 of them for warm
 clones, see **Warm clones**) was measured with
 `HELLOVM_SECCOMP_LEARN=FILE` (a test-hooks build), which records every
 syscall the kernel process makes and lets it continue, over the whole
@@ -1479,7 +1522,13 @@ only the requests of a tracer of its own children (no `PTRACE_ATTACH`
 or `PTRACE_SEIZE`), `openat` read-only without `O_CREAT`, `mmap` and
 `mprotect` never executable, `execveat` only of the stub memfd, `kill`,
 `tgkill` and `pidfd_send_signal` only the signals the platform sends,
-`prctl`, `ioctl` and `fcntl` only the operations used.
+`prctl`, `ioctl` and `fcntl` only the operations used (`ioctl`: the
+terminal ones, and on seccomp listeners receiving, answering and the
+synchronous-wake-up flag, never `SECCOMP_IOCTL_NOTIF_ADDFD`), `seccomp`
+only `SECCOMP_SET_MODE_FILTER` with or without a listener, `socketpair`
+only Unix datagram pairs and `sendmsg` and `recvmsg` only the flags of the
+listener's hand-over (a new app process sends K its listener over a pair
+made for it; `recvmsg` with `MSG_CMSG_CLOEXEC` also serves warm clones).
 
 *What it does not stop.* The kernel process drives its app processes
 with ptrace and makes them execute `mmap`, `munmap`, `mprotect` and
@@ -2064,8 +2113,9 @@ connections' buffers before it does anything else.
 What `--template` adds to the allowlist, for templates and their clones
 only (a sandbox started without it gets the list without these; measured
 with `HELLOVM_SECCOMP_LEARN` over the whole suite, warm-clone tests
-included): `accept4` (`SOCK_CLOEXEC` only) and `recvmsg`
-(`MSG_CMSG_CLOEXEC` only) for the control socket, `fcntl(F_ADD_SEALS)`
+included): `accept4` (`SOCK_CLOEXEC` only) for the control socket
+(`recvmsg` with `MSG_CMSG_CLOEXEC`, which receives each request's fds,
+is on every list now, for app processes' listeners), `fcntl(F_ADD_SEALS)`
 for sealing the snapshot, and `landlock_create_ruleset` and
 `landlock_restrict_self` (flags 0) for the clone's domain, which can only
 take rights away. The memfd is created and sized before the hardening, so
