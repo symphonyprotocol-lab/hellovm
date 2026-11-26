@@ -644,6 +644,11 @@ pub struct Node {
     /// The ids being created, counted against `max_sandboxes` and taken
     /// like those of the sandboxes that exist.
     creating: Mutex<HashSet<SandboxId>>,
+    /// Sandboxes being removed, with their tenant and the reason: out of
+    /// `sandboxes` and not yet among the `ended` (their last measurement
+    /// and the kill come in between), so that a request meanwhile is told
+    /// they ended rather than that they never were.
+    removing: Mutex<HashMap<SandboxId, (String, String)>>,
     ended: Mutex<VecDeque<Tombstone>>,
     /// Refusing new sandboxes (kept in this process only).
     draining: AtomicBool,
@@ -673,6 +678,7 @@ impl Node {
         Node {
             sandboxes: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashSet::new()),
+            removing: Mutex::new(HashMap::new()),
             ended: Mutex::new(VecDeque::new()),
             draining: AtomicBool::new(config.start_drained),
             memory_limit: match config.max_memory_mb {
@@ -774,6 +780,14 @@ impl Node {
             }
             return Err(ApiError::not_found());
         }
+        // Looked at before `ended`: `remove` takes a sandbox out of here
+        // only once its tombstone is there.
+        if let Some((owner, reason)) = lock(&self.removing).get(&id) {
+            if tenant.is_none_or(|t| owner == t) {
+                return Err(ApiError::ended(reason));
+            }
+            return Err(ApiError::not_found());
+        }
         let ended = lock(&self.ended);
         match ended
             .iter()
@@ -790,8 +804,15 @@ impl Node {
 
     /// Removes a sandbox and kills it. Returns whether it was there.
     pub fn remove(&self, id: SandboxId, reason: &str) -> bool {
-        let Some(sandbox) = lock(&self.sandboxes).remove(&id) else {
-            return false;
+        let sandbox = {
+            let mut sandboxes = lock(&self.sandboxes);
+            let Some(sandbox) = sandboxes.remove(&id) else {
+                return false;
+            };
+            // Before `sandboxes` is unlocked: `get` finds it in one of the
+            // two at every moment.
+            lock(&self.removing).insert(id, (sandbox.tenant.clone(), reason.to_string()));
+            sandbox
         };
         // Measured once more while its processes still run: the sampling
         // is once a second, and without this a sandbox would not pay for
@@ -820,6 +841,8 @@ impl Node {
             usage: sandbox.usage(removed),
             seq: None,
         });
+        drop(ended);
+        lock(&self.removing).remove(&id);
         true
     }
 
