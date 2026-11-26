@@ -446,7 +446,6 @@ fn sandboxes_through_the_api() {
 fn idle_lifetime_and_memory_limits_remove_sandboxes() {
     let Some(plane) = Plane::start(PlaneOptions {
         memory_limit_mb: 300,
-        max_processes: 40,
         acme_max: 8,
         ..PlaneOptions::default()
     }) else {
@@ -483,7 +482,11 @@ fn idle_lifetime_and_memory_limits_remove_sandboxes() {
     let r = plane.sh(ACME, &busy, "sleep 2.5; echo done");
     assert_eq!(r["stdout"], "done\n");
 
-    // Memory: past the limit (300 MiB here) the sandbox is removed.
+    // Memory: past the limit (300 MiB here) the sandbox is removed. A
+    // bystander with the default idle timeout shows that others are
+    // untouched (`busy` above may time out as idle meanwhile: waiting for
+    // the once-a-second measurement can take longer than its 1 s).
+    let bystander = id_of(&plane.create(ACME, json!({})));
     let hog = id_of(&plane.create(ACME, json!({})));
     let r = plane.call_json(
         ACME,
@@ -501,7 +504,7 @@ fn idle_lifetime_and_memory_limits_remove_sandboxes() {
     assert!(text.contains("memory"), "{text}");
     assert!(gone(&hog));
     // Others are untouched.
-    assert_eq!(plane.sh(ACME, &busy, "echo ok")["stdout"], "ok\n");
+    assert_eq!(plane.sh(ACME, &bystander, "echo ok")["stdout"], "ok\n");
     // The reason is still told after the API has reconciled with the node
     // (every two seconds) and dropped the sandbox from what runs.
     std::thread::sleep(Duration::from_secs(5));
@@ -511,18 +514,29 @@ fn idle_lifetime_and_memory_limits_remove_sandboxes() {
     // Another tenant learns nothing of it.
     let r = plane.call(BETA, "GET", &format!("/v1/sandboxes/{hog}"), b"");
     assert_eq!(r.status, 404);
+}
 
-    // Processes: more than the limit (40 here) and the sandbox is removed.
-    // `LC_ALL=C`: with a locale named in the environment, every `sleep`
-    // maps the host's whole locale archive (a dozen MiB on GitHub's
-    // runners, and the kernel copies a file mapping in full), and 20 of
-    // them would reach the memory limit before 40 reach the process limit.
+/// More than its process limit (40 here) and a sandbox is removed. A
+/// plane of its own, with a memory limit far above what the processes
+/// take: an app process counts several MiB (16 on GitHub's x86_64
+/// runners), so with the other test's 300 MiB twenty of them would reach
+/// the memory limit before forty reach this one, and which limit trips
+/// first would be a matter of timing.
+#[test]
+fn too_many_processes_remove_a_sandbox() {
+    let Some(plane) = Plane::start(PlaneOptions {
+        memory_limit_mb: 2048,
+        max_processes: 40,
+        ..PlaneOptions::default()
+    }) else {
+        return;
+    };
     let forker = id_of(&plane.create(ACME, json!({})));
     let r = plane.call_json(
         ACME,
         "POST",
         &format!("/v1/sandboxes/{forker}/exec"),
-        json!({"command": "for i in $(seq 60); do LC_ALL=C sleep 60 & done; sleep 30", "timeout": 60}),
+        json!({"command": "for i in $(seq 60); do sleep 60 & done; sleep 30", "timeout": 60}),
     );
     assert!(
         matches!(r.status, 410 | 502),
@@ -536,7 +550,8 @@ fn idle_lifetime_and_memory_limits_remove_sandboxes() {
         "{text}\n{}",
         plane.logs()
     );
-    assert!(gone(&forker));
+    let r = plane.call(ACME, "GET", &format!("/v1/sandboxes/{forker}"), b"");
+    assert!(matches!(r.status, 404 | 410), "{}", r.status);
 }
 
 #[test]
