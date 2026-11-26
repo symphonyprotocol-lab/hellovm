@@ -35,6 +35,22 @@
 //!   then lets it run (`PTRACE_SYSCALL`; seccomp re-runs the filter after a
 //!   tracer stop and allows it). At the exit stop K reads the result and
 //!   restores the app's registers.
+//! * In place: when the task is at the seccomp stop of an app syscall that
+//!   has not run yet, the first syscall K injects (`mmap`, `munmap`,
+//!   `mprotect` or `clone`) replaces that pending syscall instead. K writes
+//!   its number and arguments (`orig_rax` and the argument registers on
+//!   x86_64; x0-x5 and `NT_ARM_SYSTEM_CALL` on aarch64) and lets it run
+//!   with `PTRACE_SYSCALL`; the host re-runs the filters on the changed
+//!   syscall, which return `SECCOMP_RET_TRACE` for these numbers, and that
+//!   re-run counts as already let through by the tracer. The syscall runs
+//!   at the app's instruction pointer, not the stub's, with the number and
+//!   arguments K wrote and nothing else: the task stays stopped between
+//!   K's write and the host's execution. Calls made from the x86_64
+//!   vsyscall page are never replaced (the host kills a task whose tracer
+//!   changes them), and `close`, which a thaw injects and the notification
+//!   filter does not trace, always goes through the stub. Every later
+//!   injection at that stop, and any at another stop, goes through the
+//!   stub.
 //! * Starting the app is setting pc and sp from a syscall-exit stop.
 //!
 //! # Processes and threads (U2)
@@ -81,12 +97,15 @@
 //!   inherited by `fork` and shared with `CLONE_VM`), lies in a range the
 //!   core never maps, unmaps or re-protects, and app `mmap`/`mprotect` are
 //!   emulated, so no task can change the instruction there.
-//! * A syscall runs only after K saw *that* task's seccomp stop with the
-//!   exact pc, number and arguments it prepared. Any other task executing
-//!   the stub's instruction (they all can jump there) traps like any app
-//!   syscall and is emulated; K never resumes an app-initiated seccomp stop
-//!   with the syscall allowed. While injecting, K waits for the one task's
-//!   pid only; stops of other tasks stay queued for the event loop.
+//! * Through the stub, a syscall runs only after K saw *that* task's
+//!   seccomp stop with the exact pc, number and arguments it prepared. Any
+//!   other task executing the stub's instruction (they all can jump there)
+//!   traps like any app syscall and is emulated. K resumes an
+//!   app-initiated seccomp stop with a syscall allowed only in place (see
+//!   above), and only after writing that syscall's number and arguments
+//!   itself into the stopped task: what runs is always K's call, never
+//!   the app's. While injecting, K waits for the one task's pid only;
+//!   stops of other tasks stay queued for the event loop.
 //! * Every new process inherits the seccomp filter and the ptrace options
 //!   (`PTRACE_O_EXITKILL` included). Should a child ever escape tracing, its
 //!   filter's `SECCOMP_RET_TRACE` without a tracer fails every syscall with

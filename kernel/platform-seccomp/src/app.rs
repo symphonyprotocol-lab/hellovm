@@ -168,6 +168,9 @@ pub struct SeccompPlatform {
     /// to a ptrace stop (diagnostics and tests).
     fast: u64,
     converted: u64,
+    /// Injected syscalls that replaced a pending app syscall (diagnostics
+    /// and tests).
+    in_place: u64,
     event_loop: wake::Loop,
     /// The waker wake-up count [`Platform::wait`] last reported.
     wakes_seen: u32,
@@ -222,6 +225,7 @@ impl SeccompPlatform {
             ready: Vec::new(),
             fast: 0,
             converted: 0,
+            in_place: 0,
             wakes_seen: event_loop.wakes(),
             event_loop,
             _not_send: PhantomData,
@@ -296,6 +300,11 @@ impl SeccompPlatform {
     /// and how many tasks had to be converted from it to a ptrace stop.
     pub fn fast_path_stats(&self) -> (u64, u64) {
         (self.fast, self.converted)
+    }
+
+    /// How many injected syscalls replaced the app's pending one.
+    pub fn in_place_injections(&self) -> u64 {
+        self.in_place
     }
 
     /// Turns the fast path off for app processes spawned from now on (for
@@ -600,6 +609,7 @@ impl SeccompPlatform {
             let mut regs = task.regs;
             regs.set_pending_syscall(nr, args);
             task.tracee.replace_syscall(&regs, nr)?;
+            self.in_place += 1;
             self.pin(key)?;
             let task = self.task(key)?;
             task.tracee.resume(Run::Syscall, 0)?;
@@ -683,8 +693,12 @@ impl SeccompPlatform {
             return Ok(());
         };
         let task = self.task(key)?;
-        if task.pinned.take().is_some() {
-            set_cpus(task.tracee.pid, &cpus);
+        if task.pinned.take().is_some() && !set_cpus(task.tracee.pid, &cpus) {
+            // It runs on one CPU from now on: slower, not wrong.
+            log::warn!(
+                "task {key}: putting its CPUs back failed: {}",
+                io::Error::last_os_error()
+            );
         }
         Ok(())
     }
@@ -2109,6 +2123,54 @@ mod tests {
         assert_eq!(context.pc(), spin);
     }
 
+    /// An app `clone`, a traced syscall, that the core answers with
+    /// `clone_task`: the injected `clone` replaces it. Parent and child
+    /// both resume after the syscall instruction with their own results,
+    /// in separate processes with copied memory.
+    #[test]
+    fn an_app_clone_is_replaced_by_the_injected_one() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let addr = 0x2000_0000;
+        let spin = syscall_then_spin(&mut p, t, addr);
+        let page = p.address_space().page_size;
+        let clone = p.arch().syscall_nr(Sysno::Clone).unwrap();
+        let mut context = p.context(t).unwrap();
+        context.set_pc(addr);
+        context.set_sp(addr + 2 * page);
+        match &mut context {
+            Context::Aarch64(c) => c.x[8] = clone,
+            Context::X86_64(c) => c.rax = clone,
+        }
+        p.set_context(t, &context).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        match next_event(&mut p) {
+            Event {
+                trap: Trap::Syscall(trap),
+                ..
+            } if trap.nr == clone => {}
+            other => panic!("expected the clone, got {other:?}"),
+        }
+        let before = p.in_place_injections();
+        let u = p.clone_task(t, false).unwrap();
+        assert_eq!(p.in_place_injections(), before + 1, "replaced in place");
+        assert_ne!(p.host_pid(u), p.host_pid(t));
+        // Copy-on-write: the child's writes stay in the child.
+        let data = addr + page;
+        p.write(t, data, b"parent").unwrap();
+        p.write(u, data, b"child!").unwrap();
+        let mut buf = [0u8; 6];
+        p.read(t, data, &mut buf).unwrap();
+        assert_eq!(&buf, b"parent");
+        p.resume(t, Resume::Return(u as i64)).unwrap();
+        p.resume(u, Resume::Return(0)).unwrap();
+        for (task, ret) in [(t, u as i64), (u, 0)] {
+            let context = stop_spinning(&mut p, task);
+            assert_eq!(ret_of(&context), ret, "task {task}");
+            assert_eq!(context.pc(), spin, "task {task}");
+        }
+    }
+
     #[test]
     fn killer_ends_every_task() {
         let mut p = SeccompPlatform::new().unwrap();
@@ -2161,9 +2223,10 @@ mod tests {
 mod inject_timing {
     use super::*;
 
-    /// The platform's own cost of an injected `mprotect` (no core): from a
-    /// syscall-exit stop, and in place of a pending app syscall. Ignored: a
-    /// measurement, not a gate.
+    /// The platform's own cost of an injected `mprotect` (no core) on a
+    /// task that is already at a syscall-exit stop, which goes through the
+    /// stub (`syscall_bench` measures the in-place case through the core).
+    /// Ignored: a measurement, not a gate.
     ///
     /// ```sh
     /// cargo test --release -p hellovm-platform-seccomp --lib inject_timing -- --ignored --nocapture

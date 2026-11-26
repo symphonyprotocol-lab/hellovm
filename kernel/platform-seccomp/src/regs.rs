@@ -58,7 +58,8 @@ impl Regs {
     }
 
     /// At a seccomp stop: makes the pending syscall `nr` with `args`
-    /// (the number itself is set with `Tracee::set_syscall_nr`).
+    /// (the number itself is in NT_ARM_SYSTEM_CALL, which
+    /// `Tracee::replace_syscall` sets).
     pub fn set_pending_syscall(&mut self, _nr: u64, args: [u64; 6]) {
         self.x[..6].copy_from_slice(&args);
     }
