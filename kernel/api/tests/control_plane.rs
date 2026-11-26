@@ -527,7 +527,11 @@ fn idle_lifetime_and_memory_limits_remove_sandboxes() {
         String::from_utf8_lossy(&r.body)
     );
     let text = String::from_utf8_lossy(&r.body).into_owned();
-    assert!(text.contains("processes"), "{text}");
+    assert!(
+        text.contains("more than 40 processes"),
+        "{text}\n{}",
+        plane.logs()
+    );
     assert!(gone(&forker));
 }
 

@@ -1313,11 +1313,31 @@ impl Node {
                 c.cpu_ms = c.cpu_ms.max(cpu_ms);
             }
             if usage.bytes > s.memory_limit {
+                let largest: Vec<String> = usage
+                    .largest
+                    .iter()
+                    .filter(|&&(pid, _)| pid != 0)
+                    .map(|&(pid, bytes)| {
+                        format!(
+                            "{} (pid {pid}) {} MiB",
+                            crate::memory::command_of(pid),
+                            bytes >> 20
+                        )
+                    })
+                    .collect();
+                log::info!(
+                    "sandbox {} over its memory limit: {} MiB in {} processes; largest: {}",
+                    s.id,
+                    usage.bytes >> 20,
+                    usage.processes,
+                    largest.join(", ")
+                );
                 self.remove(
                     s.id,
                     &format!(
-                        "its memory ({} MiB) went over the limit ({} MiB)",
+                        "its memory ({} MiB in {} processes) went over the limit ({} MiB)",
                         usage.bytes >> 20,
+                        usage.processes,
                         s.memory_limit >> 20
                     ),
                 );

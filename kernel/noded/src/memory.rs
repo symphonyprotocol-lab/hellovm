@@ -38,6 +38,27 @@ pub struct Usage {
     /// root, so its time is in that parent's). Not complete when
     /// `too_many`.
     pub cpu_ticks: u64,
+    /// The address spaces that count most, largest first: a process of
+    /// each and its bytes (pid 0: none). For the log when the sandbox goes
+    /// over its limit.
+    pub largest: [(u32, u64); 3],
+}
+
+impl Usage {
+    fn note(&mut self, pid: u32, bytes: u64) {
+        let Some(at) = self.largest.iter().position(|&(_, b)| bytes > b) else {
+            return;
+        };
+        self.largest.copy_within(at..2, at + 1);
+        self.largest[at] = (pid, bytes);
+    }
+}
+
+/// A process's command name (`/proc/PID/comm`), for logs.
+pub fn command_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|c| c.trim().to_string())
+        .unwrap_or_else(|_| "?".into())
 }
 
 /// What `/proc/PID/stat` says of a process.
@@ -201,6 +222,7 @@ pub fn measure(roots: &[(u32, usize)]) -> HashMap<u32, Usage> {
                 .iter()
                 .filter_map(|pid| cpu.get(pid))
                 .fold(0u64, |a, b| a.saturating_add(*b)),
+            largest: Default::default(),
         };
         if !too_many {
             // One process per address space.
@@ -209,7 +231,9 @@ pub fn measure(roots: &[(u32, usize)]) -> HashMap<u32, Usage> {
                 if known_space(&mut spaces, pid) == Some(true) {
                     continue;
                 }
-                usage.bytes += private_bytes(pid).unwrap_or(0);
+                let bytes = private_bytes(pid).unwrap_or(0);
+                usage.bytes += bytes;
+                usage.note(pid, bytes);
             }
         }
         out.insert(root, usage);
@@ -238,6 +262,15 @@ fn parse_mem_total(meminfo: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_the_largest_three() {
+        let mut usage = Usage::default();
+        for (pid, bytes) in [(1, 10), (2, 30), (3, 20), (4, 5), (5, 40)] {
+            usage.note(pid, bytes);
+        }
+        assert_eq!(usage.largest, [(5, 40), (2, 30), (3, 20)]);
+    }
 
     #[test]
     fn measures_this_process_and_its_threads_once() {
