@@ -123,6 +123,9 @@ macro_rules! common_host_methods {
         ) -> io::Result<usize> {
             self.common.image()?.read(path, offset, buf)
         }
+        fn image_open(&mut self, path: &ImagePath) -> io::Result<File> {
+            self.common.image()?.open_file(path)
+        }
 
         fn random(&mut self, buf: &mut [u8]) -> io::Result<()> {
             self.common.random(buf)

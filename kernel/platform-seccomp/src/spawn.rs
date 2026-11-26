@@ -160,6 +160,16 @@
 //! * `munmap(addr, len)`
 //! * `mprotect(addr, len, prot)`
 //! * `clone(CLONE_PARENT | SIGCHLD [| CLONE_VM], 0, 0, 0, 0)` (U2)
+//! * `mmap(addr, len, prot, MAP_PRIVATE | MAP_FIXED, fd, offset)` and
+//!   `close(fd)`, only in a new process before any app code runs in it,
+//!   and only of an fd K handed to it at [`spawn`]: the snapshot memfd of a
+//!   warm clone, or the image files of the executable and its program
+//!   interpreter at `execve` (opened read-only by K from the image, never
+//!   by the app). Mapping them instead of copying their contents into
+//!   anonymous memory lets every process share the host's page cache for
+//!   them, as on Linux. Every handed-over fd is closed by injection before
+//!   the process first runs (`Platform::release_files`), so no app code
+//!   ever runs with an fd in its host fd table.
 //!
 //! with `prot` limited to `PROT_READ | PROT_WRITE | PROT_EXEC`, `addr` and
 //! `len` page-aligned and inside the app's address range, never touching the
@@ -248,6 +258,7 @@ const STAGE_SECCOMP: i32 = 4;
 const STAGE_EXEC: i32 = 5;
 const STAGE_SETSID: i32 = 6;
 const STAGE_SIGMASK: i32 = 7;
+const STAGE_KEEP: i32 = 8;
 
 fn stage_name(stage: i32) -> &'static str {
     match stage {
@@ -258,6 +269,7 @@ fn stage_name(stage: i32) -> &'static str {
         STAGE_EXEC => "execveat of the stub",
         STAGE_SETSID => "setsid",
         STAGE_SIGMASK => "rt_sigprocmask",
+        STAGE_KEEP => "fcntl(F_SETFD) of a handed-over fd",
         _ => "an unknown step",
     }
 }
@@ -356,17 +368,25 @@ fn unexpected(stop: Stop, hs: &Handshake, what: &str) -> io::Error {
         .unwrap_or_else(|| io::Error::other(format!("{what}: unexpected stop {stop:?}")))
 }
 
+/// Most fds [`spawn`] hands over.
+pub const MAX_KEPT: usize = 2;
+
 /// Starts an app process running the stub under the filter, traced by the
-/// calling thread. `keep`, if given, stays open in the app process (it must
-/// not be close-on-exec): the memfd of a warm-clone snapshot, which the
-/// kernel process maps into it by injection and then closes (see
-/// `snapshot`).
+/// calling thread. The fds in `keep` (at most [`MAX_KEPT`]) stay open in
+/// the app process under the same numbers, close-on-exec or not: the memfd
+/// of a warm-clone snapshot (see `snapshot`), or the image files of the
+/// program being loaded, which the kernel process maps into it by
+/// injection and then closes, before any app code runs.
 pub fn spawn(
     arch: Arch,
     stub_fd: BorrowedFd<'_>,
-    keep: Option<BorrowedFd<'_>>,
+    keep: &[BorrowedFd<'_>],
     notify: bool,
 ) -> io::Result<Spawned> {
+    if keep.len() > MAX_KEPT {
+        return Err(io::Error::other("too many fds to hand over"));
+    }
+    let kept = |i: usize| keep.get(i).map_or(-1, |fd| fd.as_raw_fd());
     let execveat_nr = arch
         .syscall_nr(Sysno::Execveat)
         .expect("execveat exists on every architecture");
@@ -422,7 +442,8 @@ pub fn spawn(
                 parent,
                 [
                     stub_fd.as_raw_fd(),
-                    keep.map_or(-1, |fd| fd.as_raw_fd()),
+                    kept(0),
+                    kept(1),
                     handoff.as_ref().map_or(-1, |h| h.child.as_raw_fd()),
                 ],
                 &trace_prog,
@@ -709,9 +730,9 @@ pub fn foreign_mappings(pid: libc::pid_t) -> io::Result<(Vec<(u64, u64)>, u64)> 
 unsafe fn child_bootstrap(
     hs: &Handshake,
     parent: libc::pid_t,
-    // The stub memfd, an fd to keep open or -1, C's end of the hand-over
+    // The stub memfd, two fds to keep open or -1, C's end of the hand-over
     // socket or -1.
-    keep: [libc::c_int; 3],
+    keep: [libc::c_int; 4],
     trace_prog: *const libc::sock_fprog,
     // The notification filter and the hand-over message, for the fast path.
     notify: Option<(*const libc::sock_fprog, *mut HandoffMessage)>,
@@ -732,6 +753,12 @@ unsafe fn child_bootstrap(
         libc::_exit(127);
     }
     close_all_fds_except(keep);
+    // The fds handed over survive the execveat of the stub.
+    for &fd in &keep[1..3] {
+        if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+            fail(STAGE_KEEP);
+        }
+    }
     // Its own session: signals the host terminal sends to the kernel's
     // process group (Ctrl-C, window changes) never reach app processes.
     if libc::setsid() < 0 {
@@ -775,7 +802,7 @@ unsafe fn child_bootstrap(
             (*message).set_fd(listener as libc::c_int);
             libc::syscall(
                 libc::SYS_sendmsg,
-                keep[2] as libc::c_long,
+                keep[3] as libc::c_long,
                 &(*message).header as *const libc::msghdr,
                 0 as libc::c_long,
             );
@@ -812,7 +839,7 @@ unsafe fn child_bootstrap(
 
 /// Closes every fd except those in `keep` (-1 entries are ignored).
 /// Async-signal-safe.
-unsafe fn close_all_fds_except(mut keep: [libc::c_int; 3]) {
+unsafe fn close_all_fds_except(mut keep: [libc::c_int; 4]) {
     keep.sort_unstable();
     let mut next: libc::c_uint = 0;
     let mut ok = true;

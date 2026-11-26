@@ -133,14 +133,27 @@ fn read_executable<H: Host + ?Sized>(
     vfs: &mut Vfs,
     start: Ino,
     path: &[u8],
-) -> Result<Vec<u8>, LoadError> {
+) -> Result<(Vec<u8>, Ino), LoadError> {
     let ino = vfs
         .resolve(host, start, path, true)
         .map_err(LoadError::errno)?;
     if vfs.file_type(ino) != FileType::Regular || vfs.perm(ino) & 0o111 == 0 {
         return Err(LoadError::errno(Errno(EACCES)));
     }
-    vfs.read_all(host, ino).map_err(LoadError::errno)
+    let data = vfs.read_all(host, ino).map_err(LoadError::errno)?;
+    Ok((data, ino))
+}
+
+/// The host file behind an executable read from the image, when it holds
+/// exactly the bytes that were read (for [`elf::load_from`]).
+fn host_file<H: Host + ?Sized>(
+    host: &mut H,
+    vfs: &Vfs,
+    ino: Ino,
+    data: &[u8],
+) -> Option<std::fs::File> {
+    let file = vfs.image_file(host, ino)?;
+    (vfs.size(ino) == data.len() as u64).then_some(file)
 }
 
 /// Splits a `#!` line into the interpreter and its optional argument.
@@ -191,8 +204,8 @@ pub(crate) fn load_program<H: Host + ?Sized, P: Platform + ?Sized>(
     let mut path = path.to_vec();
     let mut dir = start;
     let mut depth = 0;
-    let (file, parsed) = loop {
-        let file = read_executable(host, vfs, dir, &path)?;
+    let (file, ino, parsed) = loop {
+        let (file, ino) = read_executable(host, vfs, dir, &path)?;
         if file.starts_with(b"#!") {
             depth += 1;
             if depth > MAX_SHEBANG_DEPTH {
@@ -209,11 +222,12 @@ pub(crate) fn load_program<H: Host + ?Sized, P: Platform + ?Sized>(
             continue;
         }
         let parsed = elf::parse(&file, arch).map_err(LoadError::elf)?;
-        break (file, parsed);
+        break (file, ino, parsed);
     };
+    let host_exe = host_file(host, vfs, ino, &file);
     let interp = match &parsed.interpreter {
         Some(interp_path) => {
-            let interp_file = read_executable(host, vfs, vfs.root(), interp_path)?;
+            let (interp_file, interp_ino) = read_executable(host, vfs, vfs.root(), interp_path)?;
             let interp_parsed = elf::parse(&interp_file, arch).map_err(LoadError::elf)?;
             if interp_parsed.interpreter.is_some() {
                 return Err(LoadError {
@@ -221,7 +235,8 @@ pub(crate) fn load_program<H: Host + ?Sized, P: Platform + ?Sized>(
                     reason: "the program interpreter has an interpreter".into(),
                 });
             }
-            Some((interp_file, interp_parsed))
+            let host_interp = host_file(host, vfs, interp_ino, &interp_file);
+            Some((interp_file, interp_parsed, host_interp))
         }
         None => None,
     };
@@ -231,7 +246,12 @@ pub(crate) fn load_program<H: Host + ?Sized, P: Platform + ?Sized>(
         reason: format!("no random bytes: {err}"),
     })?;
 
-    let task = plat.spawn().map_err(|err| LoadError {
+    // The image files the platform may map instead of copying them.
+    let files: Vec<&std::fs::File> = host_exe
+        .iter()
+        .chain(interp.as_ref().and_then(|i| i.2.as_ref()))
+        .collect();
+    let task = plat.spawn_with_files(&files).map_err(|err| LoadError {
         errno: Errno(crate::errno::EAGAIN),
         reason: format!("cannot create a task: {err}"),
     })?;
@@ -240,15 +260,23 @@ pub(crate) fn load_program<H: Host + ?Sized, P: Platform + ?Sized>(
     let mut space = TaskMem::new(plat, task);
     let mut mm = Mm::new(&info);
     let result = (|| {
-        let image = elf::load(&mut mm, &mut space, &file, &parsed, Placement::Program)
-            .map_err(LoadError::elf)?;
+        let image = elf::load_from(
+            &mut mm,
+            &mut space,
+            &file,
+            host_exe.as_ref(),
+            &parsed,
+            Placement::Program,
+        )
+        .map_err(LoadError::elf)?;
         mm.set_brk_start(image.end);
         let (entry, interp_base) = match &interp {
-            Some((interp_file, interp_parsed)) => {
-                let loaded = elf::load(
+            Some((interp_file, interp_parsed, host_interp)) => {
+                let loaded = elf::load_from(
                     &mut mm,
                     &mut space,
                     interp_file,
+                    host_interp.as_ref(),
                     interp_parsed,
                     Placement::Interpreter,
                 )
@@ -277,6 +305,14 @@ pub(crate) fn load_program<H: Host + ?Sized, P: Platform + ?Sized>(
         );
         Ok((entry, stack, trampoline))
     })();
+    // The app never runs with the image files open.
+    let result = result.and_then(|loaded| {
+        plat.release_files(task).map_err(|err| LoadError {
+            errno: Errno(crate::errno::EAGAIN),
+            reason: format!("cannot close the mapped image files: {err}"),
+        })?;
+        Ok(loaded)
+    });
     match result {
         Ok((entry, stack, trampoline)) => {
             let shown = argv.first().unwrap_or(&path);

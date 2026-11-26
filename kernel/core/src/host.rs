@@ -235,6 +235,13 @@ pub trait Host {
         Err(no_image())
     }
 
+    /// Opens an image file for reading, for the platform to map
+    /// ([`crate::platform::AddressSpace::map_file`]). Hosts that have no
+    /// host files to hand out refuse.
+    fn image_open(&mut self, _path: &ImagePath) -> io::Result<std::fs::File> {
+        Err(no_image())
+    }
+
     /// Fills `buf` with cryptographically secure random bytes.
     fn random(&mut self, buf: &mut [u8]) -> io::Result<()>;
 
@@ -388,6 +395,9 @@ impl<H: Host + ?Sized> Host for &mut H {
     }
     fn image_read(&mut self, path: &ImagePath, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         (**self).image_read(path, offset, buf)
+    }
+    fn image_open(&mut self, path: &ImagePath) -> io::Result<std::fs::File> {
+        (**self).image_open(path)
     }
     fn random(&mut self, buf: &mut [u8]) -> io::Result<()> {
         (**self).random(buf)

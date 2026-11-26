@@ -36,6 +36,12 @@ pub struct MockApp {
     regions: BTreeMap<u64, (u64, Prot)>,
     /// Pages that were written.
     data: BTreeMap<u64, Page>,
+    /// Ranges mapped with [`AddressSpace::map_file`], with their file
+    /// offsets, when [`MockApp::maps_files`] is set.
+    pub file_maps: Vec<(GuestAddr, u64, u64)>,
+    /// Whether [`AddressSpace::map_file`] works (as on the seccomp
+    /// platform) or is refused (as on the others).
+    pub maps_files: bool,
 }
 
 impl MockApp {
@@ -229,6 +235,29 @@ impl AddressSpace for MockApp {
             return Err(PlatformError::BadAddress { addr, len: 0 });
         }
         self.set(start, end, Some(prot));
+        Ok(())
+    }
+
+    fn map_file(
+        &mut self,
+        addr: GuestAddr,
+        len: u64,
+        prot: Prot,
+        file: &std::fs::File,
+        offset: u64,
+    ) -> Result<(), PlatformError> {
+        use std::os::unix::fs::FileExt;
+        if !self.maps_files {
+            return Err(PlatformError::Unsupported("file mappings"));
+        }
+        assert!(offset.is_multiple_of(PAGE));
+        self.map(addr, len, prot, Sharing::Private)?;
+        let mut data = vec![0; len as usize];
+        let n = file.read_at(&mut data, offset)?;
+        assert_eq!(n as u64, len, "mapped past the end of the file");
+        self.poke(addr, &data);
+        self.set(addr, addr + len, Some(prot));
+        self.file_maps.push((addr, len, offset));
         Ok(())
     }
 }

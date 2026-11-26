@@ -3,10 +3,14 @@
 //!
 //! The core decides every address. The platform only carries out the
 //! resulting page-level operations through [`AddressSpace`]: map zeroed
-//! memory, unmap, change protection. File-backed private mappings are
-//! anonymous memory filled with the file's contents (there is no host file
-//! to map: the file may live in the in-memory layer, and on KVM there is no
-//! host `mmap` at all).
+//! memory, unmap, change protection. File-backed private mappings made with
+//! `mmap` are anonymous memory filled with the file's contents (there is no
+//! host file to map: the file may live in the in-memory layer, and on KVM
+//! there is no host `mmap` at all). So every process pays for every file it
+//! maps this way, the shared libraries the dynamic loader maps included.
+//! The executable and its program interpreter are the exception where the
+//! platform can map host files: `execve` maps their unmodified image files
+//! (see [`crate::elf::load_from`]).
 //!
 //! Shared anonymous mappings (`MAP_SHARED | MAP_ANONYMOUS`) are shared with
 //! the processes that inherit them through `fork`, as on Linux. Shared

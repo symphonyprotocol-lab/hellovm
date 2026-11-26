@@ -1098,6 +1098,17 @@ impl Vfs {
         }
     }
 
+    /// The host file behind an unmodified image file, opened for reading,
+    /// if the host hands one out and it still has the size the sandbox
+    /// sees. `None` for every other node.
+    pub fn image_file<H: Host + ?Sized>(&self, host: &mut H, ino: Ino) -> Option<std::fs::File> {
+        let Content::File(FileData::Lower { path, size }) = &self.node(ino).content else {
+            return None;
+        };
+        let file = host.image_open(path).ok()?;
+        (file.metadata().ok()?.len() == *size).then_some(file)
+    }
+
     /// The whole contents of a regular file.
     pub fn read_all<H: Host + ?Sized>(&mut self, host: &mut H, ino: Ino) -> SysResult<Vec<u8>> {
         let mut data = vec![0; self.size(ino) as usize];
