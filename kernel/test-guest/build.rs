@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ASM_GUESTS: &[&str] = &["hello", "enosys"];
-const C_GUESTS: &[&str] = &["pie", "signals", "threads", "forks", "smp"];
+const C_GUESTS: &[&str] = &["pie", "signals", "threads", "forks", "smp", "syscall_bench"];
 /// C guests linked dynamically against the build host's libc.
 const DYNAMIC_GUESTS: &[&str] = &["dynamic", "netcheck"];
 /// aarch64-only assembly guests for the HVF and KVM platforms' tests

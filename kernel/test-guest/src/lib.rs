@@ -70,6 +70,14 @@ pub const FORKS: &str = env!("HELLOVM_GUEST_FORKS");
 #[cfg(target_os = "linux")]
 pub const SMP: &str = env!("HELLOVM_GUEST_SMP");
 
+/// A static-PIE glibc program that times system-call round trips
+/// (`syscall_bench [ITERS]`): prints `<case> <ns per call>` for getppid,
+/// 1-byte writes to /dev/null, 1-byte pipe write/read pairs and
+/// clock_gettime (see `hellovm/tests/syscall_bench.rs`). Empty when
+/// cross-compiling.
+#[cfg(target_os = "linux")]
+pub const SYSCALL_BENCH: &str = env!("HELLOVM_GUEST_SYSCALL_BENCH");
+
 /// Dynamically linked glibc program that exercises emulated IPv4 sockets: loopback,
 /// address classification, half-close, `MSG_NOSIGNAL`, ioctl, `/proc/net`,
 /// virtual DNS, and `getaddrinfo` / `getifaddrs`. Empty when cross-compiling.
