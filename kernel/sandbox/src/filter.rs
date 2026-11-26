@@ -3,8 +3,9 @@
 //! # Telling the kernel process from its app processes
 //!
 //! App processes are forked from the kernel process (K), so they inherit
-//! this filter, and their own filter (`SECCOMP_RET_TRACE` for everything,
-//! see `hellovm-platform-seccomp`) stacks on top of it. Seccomp runs every
+//! this filter, and their own filter (`SECCOMP_RET_USER_NOTIF` or
+//! `SECCOMP_RET_TRACE` for everything, see `hellovm-platform-seccomp`)
+//! stacks on top of it. Seccomp runs every
 //! filter and the most severe action wins, so if this filter simply killed
 //! every syscall outside K's allowlist, it would kill app processes making
 //! syscalls K never makes (the guest's `open`, which is trapped and
@@ -19,10 +20,11 @@
 //!   checks; anything else **kills the process**. This is every syscall K
 //!   and its helper threads make, and the bootstrap of a new app process
 //!   before it `execveat`s the stub (it runs K's code).
-//! * From anywhere else: `SECCOMP_RET_TRACE`. In an app process that is
-//!   what its own filter returns anyway, so nothing changes for the guest:
-//!   K sees the stop and emulates or skips the syscall, or lets an
-//!   injected one through. In K itself (which nobody traces) a syscall
+//! * From anywhere else: `SECCOMP_RET_TRACE`. In an app process its own
+//!   filter returns that or `SECCOMP_RET_USER_NOTIF`, which outranks it,
+//!   so nothing changes for the guest: K answers the notification, or
+//!   sees the stop and emulates or skips the syscall, or lets an injected
+//!   one through. In K itself (which nobody traces) a syscall
 //!   from outside its code (say, from a copy of a code page an attacker
 //!   made) fails with `ENOSYS` and is not executed.
 //!

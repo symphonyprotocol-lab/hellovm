@@ -4,12 +4,43 @@
 //! platform (see `spawn` for the mechanism and its safety argument). The
 //! platform keeps, per task, where it is stopped and the app registers it
 //! will resume with; everything the app does goes through the core.
+//!
+//! # The notification fast path
+//!
+//! With the [`crate::filter::notify`] filter, most app syscalls do not stop
+//! the task for ptrace: they wait in the host kernel for a seccomp user
+//! notification, which the event loop receives ([`Platform::wait`]) and
+//! reports as a syscall trap. The task is then [`State::Notified`]: it is
+//! stopped as far as the core is concerned, its memory can be read and
+//! written (`process_vm_*` need no ptrace stop), and
+//! [`Resume::Return`] answers the notification with the result. That round
+//! trip is two context switches (with `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP`,
+//! on one CPU) instead of a ptrace stop, a `SIGCHLD`, `waitpid`, two
+//! register transfers and `PTRACE_CONT`.
+//!
+//! Everything else the core may do with a stopped task (read or set its
+//! context, change its address space, clone it, resume it any other way)
+//! needs a ptrace stop. The platform then **converts** the task: it
+//! interrupts the waiting syscall with `SIGURG`, which ends the
+//! notification (the host returns `-ERESTARTSYS` from it) and brings the
+//! task to a signal-delivery-stop. There the platform puts the registers
+//! back as they were at the syscall (see
+//! `Regs::interrupted_notification`) and treats the task like one
+//! stopped at a signal; the signal is dropped when it resumes. A signal
+//! that interrupts a notification the platform has not received yet
+//! (`Platform::interrupt` racing with a syscall) leaves the task about to
+//! make the syscall again (`Regs::rewind_interrupted_syscall`); it is
+//! reported as an interrupt and makes the syscall again when resumed.
+//!
+//! No notification is ever answered with "run it": the host executes a
+//! notified syscall only as "return this value".
 
 use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,6 +50,7 @@ use hellovm_core::platform::{
 };
 use hellovm_core::{Arch, Sysno};
 
+use crate::notify::{Listener, Notification};
 use crate::profile;
 use crate::regs::{self, Regs, SYSCALL_INSN_LEN};
 use crate::snapshot::{self, AreaImage, Snapshots, SpaceImage, TaskImage};
@@ -60,14 +92,26 @@ enum StopKind {
 enum State {
     Running,
     Stopped(StopKind),
+    /// Waiting in the host kernel for the answer to notification `id`, a
+    /// syscall the core has been told about (see the module documentation).
+    /// `ip` is the address after its syscall instruction.
+    Notified {
+        id: u64,
+        ip: u64,
+        nr: u64,
+        args: [u64; 6],
+    },
 }
 
 #[derive(Debug)]
 struct Task {
     tracee: Tracee,
     state: State,
-    /// While stopped: the registers the app resumes with.
+    /// While stopped: the registers the app resumes with. Not up to date
+    /// while [`State::Notified`].
     regs: Regs,
+    /// The listener of the task's filter, if it has the fast path.
+    listener: Option<Rc<Listener>>,
 }
 
 /// The live tasks' pidfds, shared with every [`AppKiller`].
@@ -108,6 +152,17 @@ pub struct SeccompPlatform {
     nr_close: u64,
     /// Warm clones (see `snapshot`), once prepared.
     snapshots: Option<Snapshots>,
+    /// Whether new app processes get the notification fast path.
+    notify: bool,
+    /// The listeners of the live tasks' filters, by fd.
+    listeners: HashMap<RawFd, Rc<Listener>>,
+    /// Listeners the last `ppoll` found readable.
+    ready: Vec<RawFd>,
+    /// Syscalls answered through the fast path, and tasks converted from it
+    /// to a ptrace stop (diagnostics and tests).
+    fast: u64,
+    converted: u64,
+    event_loop: wake::Loop,
     /// The waker wake-up count [`Platform::wait`] last reported.
     wakes_seen: u32,
     _not_send: PhantomData<*const ()>,
@@ -120,7 +175,7 @@ impl SeccompPlatform {
         let arch = Arch::native().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "unsupported host architecture")
         })?;
-        wake::install()?;
+        let event_loop = wake::Loop::new()?;
         let page_size = sys::page_size();
         let profile = profile::host_profile()?;
         let max_addr = profile.app_max_addr(page_size);
@@ -155,7 +210,13 @@ impl SeccompPlatform {
             nr_clone: number(Sysno::Clone),
             nr_close: number(Sysno::Close),
             snapshots: None,
-            wakes_seen: wake::wakes(),
+            notify: std::env::var_os("HELLOVM_SECCOMP_NOTIF").is_none_or(|v| v != "0"),
+            listeners: HashMap::new(),
+            ready: Vec::new(),
+            fast: 0,
+            converted: 0,
+            wakes_seen: event_loop.wakes(),
+            event_loop,
             _not_send: PhantomData,
         };
         Ok(platform)
@@ -224,18 +285,184 @@ impl SeccompPlatform {
         self.tasks.len()
     }
 
+    /// How many syscalls were answered through the notification fast path,
+    /// and how many tasks had to be converted from it to a ptrace stop.
+    pub fn fast_path_stats(&self) -> (u64, u64) {
+        (self.fast, self.converted)
+    }
+
+    /// Turns the fast path off for app processes spawned from now on (for
+    /// tests and measurements; `HELLOVM_SECCOMP_NOTIF=0` does the same).
+    pub fn set_fast_path(&mut self, on: bool) {
+        self.notify = on;
+    }
+
+    /// Whether a task is waiting for its notification to be answered (for
+    /// tests).
+    pub fn is_notified(&self, key: TaskKey) -> bool {
+        matches!(
+            self.tasks.get(&key).map(|t| &t.state),
+            Some(State::Notified { .. })
+        )
+    }
+
     fn task(&mut self, key: TaskKey) -> Result<&mut Task, PlatformError> {
         self.tasks
             .get_mut(&key)
             .ok_or_else(|| PlatformError::AppGone(format!("no task {key}")))
     }
 
+    /// A stopped task in a ptrace stop: a task waiting for a notification
+    /// is converted first (see the module documentation).
     fn stopped(&mut self, key: TaskKey) -> Result<(&mut Task, StopKind), PlatformError> {
+        if matches!(self.task(key)?.state, State::Notified { .. }) {
+            self.convert(key, true)?;
+        }
         let task = self.task(key)?;
         match task.state {
             State::Stopped(kind) => Ok((task, kind)),
             State::Running => Err(PlatformError::Unsupported("operation on a running task")),
+            State::Notified { .. } => unreachable!("converted above"),
         }
+    }
+
+    /// Brings a task waiting for its notification to a ptrace stop: sends
+    /// it `SIGURG` (unless `kick` is false: a signal already ended the
+    /// notification) and waits for the signal-delivery-stop, where it puts
+    /// the registers back as they were at the syscall.
+    fn convert(&mut self, key: TaskKey, kick: bool) -> Result<(), PlatformError> {
+        let task = self.task(key)?;
+        let pid = task.tracee.pid;
+        if kick {
+            // SAFETY: plain syscall; the pid names our unreaped tracee.
+            unsafe { libc::syscall(libc::SYS_tgkill, pid, pid, INTERRUPT_SIGNAL) };
+        }
+        // A task waiting in the host kernel can only stop for a signal (or
+        // end).
+        let stop = self.task(key)?.tracee.wait()?;
+        match stop {
+            Stop::Signal(sig) if !is_fault(sig) => {
+                self.converted += 1;
+                self.interrupted_notification(key)
+            }
+            stop if stop.ended() => {
+                self.forget(key);
+                Err(PlatformError::AppGone(format!("ended: {stop:?}")))
+            }
+            stop => Err(self.violation(
+                key,
+                format!("unexpected stop {stop:?} while waiting for a notification"),
+            )),
+        }
+    }
+
+    /// At the signal-delivery-stop of task `key`, which was
+    /// [`State::Notified`]: the notification is gone; the task becomes a
+    /// task stopped at a signal, with the registers it had at the syscall.
+    fn interrupted_notification(&mut self, key: TaskKey) -> Result<(), PlatformError> {
+        let task = self.task(key)?;
+        let State::Notified { ip, nr, args, .. } = task.state else {
+            unreachable!("only for notified tasks");
+        };
+        let mut regs = task.tracee.regs()?;
+        // The host left the syscall's number and arguments in place (it
+        // prepares a restart); anything else is not the stop we expect.
+        if regs.syscall() != (nr, args) {
+            let what = format!(
+                "interrupted notification of syscall {nr} {args:#x?}: registers say {:?}",
+                regs.syscall()
+            );
+            return Err(self.violation(key, what));
+        }
+        regs.interrupted_notification(ip);
+        let task = self.task(key)?;
+        task.regs = regs;
+        task.state = State::Stopped(StopKind::Signal);
+        Ok(())
+    }
+
+    /// Receives one notification from listener `fd` and turns it into the
+    /// event the core sees.
+    fn receive(&mut self, fd: RawFd) -> Result<Option<Event>, PlatformError> {
+        let Some(listener) = self.listeners.get(&fd) else {
+            return Ok(None);
+        };
+        let Some(notif) = listener.receive()? else {
+            return Ok(None);
+        };
+        let listener = Rc::clone(listener);
+        self.on_notification(&listener, notif)
+    }
+
+    fn on_notification(
+        &mut self,
+        listener: &Rc<Listener>,
+        notif: Notification,
+    ) -> Result<Option<Event>, PlatformError> {
+        let key = notif.pid as TaskKey;
+        let Some(task) = self.tasks.get_mut(&key) else {
+            // A process the platform does not know: it must not run. (It
+            // is a child of ours, or the host would not have the filter's
+            // listener report it.)
+            log::warn!(
+                "notification from unknown process {}; killing it",
+                notif.pid
+            );
+            let _ = listener.reply(notif.id, -(libc::ENOSYS as i64));
+            let mut stray = Tracee::new(notif.pid);
+            let _ = stray.kill();
+            return Ok(None);
+        };
+        let own = task
+            .listener
+            .as_ref()
+            .is_some_and(|l| Rc::ptr_eq(l, listener));
+        if !own || !matches!(task.state, State::Running) {
+            let what = format!(
+                "notification {} from a task that is {:?} (its own listener: {own})",
+                notif.nr, task.state
+            );
+            return Err(self.violation(key, what));
+        }
+        task.state = State::Notified {
+            id: notif.id,
+            ip: notif.ip,
+            nr: notif.nr,
+            args: notif.args,
+        };
+        Ok(Some(Event {
+            task: key,
+            trap: Trap::Syscall(SyscallTrap {
+                nr: notif.nr,
+                args: notif.args,
+            }),
+        }))
+    }
+
+    /// Waits for a listener to become readable, a kick or `timeout`, and
+    /// records the readable listeners in `self.ready`. Listeners no task
+    /// uses any more are closed first.
+    fn poll_listeners(&mut self, timeout: Option<Duration>) -> Result<(), PlatformError> {
+        self.listeners.retain(|_, l| Rc::strong_count(l) > 1);
+        let mut fds: Vec<libc::pollfd> = self
+            .listeners
+            .keys()
+            .map(|&fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let n = self.event_loop.poll(&mut fds, timeout)?;
+        self.ready.clear();
+        if n > 0 {
+            self.ready.extend(
+                fds.iter()
+                    .filter(|p| p.revents & libc::POLLIN != 0)
+                    .map(|p| p.fd),
+            );
+        }
+        Ok(())
     }
 
     /// Starts tracking a new, stopped host process.
@@ -244,6 +471,7 @@ impl SeccompPlatform {
         tracee: Tracee,
         regs: Regs,
         kind: StopKind,
+        listener: Option<Rc<Listener>>,
     ) -> Result<TaskKey, PlatformError> {
         let pid = tracee.pid;
         // SAFETY: plain syscall; the process is our unreaped child or
@@ -269,6 +497,7 @@ impl SeccompPlatform {
                 tracee,
                 state: State::Stopped(kind),
                 regs,
+                listener,
             },
         );
         Ok(key)
@@ -285,8 +514,19 @@ impl SeccompPlatform {
         let profile = profile::host_profile()?;
         // SAFETY: the profile's stub memfd lives as long as the process.
         let stub_fd = unsafe { BorrowedFd::borrow_raw(profile.stub_fd()) };
-        let spawned = spawn::spawn(self.arch, stub_fd, keep)?;
-        let key = self.register(spawned.tracee, spawned.regs, StopKind::SyscallExit)?;
+        let spawned = spawn::spawn(self.arch, stub_fd, keep, self.notify)?;
+        let listener = spawned.listener.map(|fd| {
+            let listener = Rc::new(Listener::new(fd));
+            self.listeners
+                .insert(listener.raw_fd(), Rc::clone(&listener));
+            listener
+        });
+        let key = self.register(
+            spawned.tracee,
+            spawned.regs,
+            StopKind::SyscallExit,
+            listener,
+        )?;
         // Everything the host put into the new address space (stack, vDSO,
         // vvar) lies outside the stub's range.
         for (start, len) in profile::outside_stub(self.info.page_size, profile.task_size()) {
@@ -463,8 +703,17 @@ impl SeccompPlatform {
                 trap: Trap::Gone,
             }));
         }
-        if !matches!(task.state, State::Running) {
-            return Err(self.violation(key, format!("stop {stop:?} of a stopped task")));
+        match task.state {
+            State::Running => {}
+            // A signal ended the notification the core is handling (an
+            // interrupt sent while the task was still running): the task
+            // is now in a ptrace stop, still at that syscall for the core.
+            State::Notified { .. } if matches!(stop, Stop::Signal(sig) if !is_fault(sig)) => {
+                self.converted += 1;
+                self.interrupted_notification(key)?;
+                return Ok(None);
+            }
+            _ => return Err(self.violation(key, format!("stop {stop:?} of a stopped task"))),
         }
         let trap = match stop {
             Stop::Seccomp => {
@@ -475,7 +724,10 @@ impl SeccompPlatform {
                 Trap::Syscall(SyscallTrap { nr, args })
             }
             Stop::Signal(sig) => {
-                let regs = task.tracee.regs()?;
+                let mut regs = task.tracee.regs()?;
+                // Interrupted while waiting for a notification not
+                // received yet: about to make that syscall again.
+                regs.rewind_interrupted_syscall();
                 task.regs = regs;
                 task.state = State::Stopped(StopKind::Signal);
                 match task.tracee.siginfo() {
@@ -822,8 +1074,9 @@ impl Platform for SeccompPlatform {
         // It resumes with the parent's app registers (its own are a copy
         // of the injected call's). Its FP state and thread pointer are the
         // parent's already: injection never touches them.
-        let regs = self.task(parent)?.regs;
-        self.register(tracee, regs, StopKind::Signal)
+        let parent = self.task(parent)?;
+        let (regs, listener) = (parent.regs, parent.listener.clone());
+        self.register(tracee, regs, StopKind::Signal, listener)
     }
 
     fn kill(&mut self, key: TaskKey) -> Result<(), PlatformError> {
@@ -856,6 +1109,25 @@ impl Platform for SeccompPlatform {
     }
 
     fn resume(&mut self, key: TaskKey, resume: Resume) -> Result<(), PlatformError> {
+        let task = self.task(key)?;
+        if let State::Notified { id, .. } = task.state {
+            match resume {
+                Resume::Return(ret) => {
+                    let listener = task
+                        .listener
+                        .clone()
+                        .expect("a notified task has a listener");
+                    if listener.reply(id, ret)? {
+                        self.task(key)?.state = State::Running;
+                        self.fast += 1;
+                        return Ok(());
+                    }
+                    // A signal ended the notification: its stop is coming.
+                    self.convert(key, false)?;
+                }
+                _ => self.convert(key, true)?,
+            }
+        }
         let (task, kind) = self.stopped(key)?;
         match resume {
             Resume::Start { entry, stack } => task.regs.start(entry, stack),
@@ -881,15 +1153,17 @@ impl Platform for SeccompPlatform {
     }
 
     fn wait(&mut self, timeout: Option<Duration>) -> Result<Option<Event>, PlatformError> {
+        // A warm clone runs a copy of its template's platform on a thread
+        // of its own.
+        self.event_loop.rebind();
         // A timeout too far away to represent is no timeout.
         let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         let mut slept = false;
         loop {
-            let seen = wake::generation();
             // A waker fired since the last report, possibly while the core
-            // was busy: tell the core now. (Read after `seen`: a wake-up
-            // that comes later changes the generation and ends the sleep.)
-            let wakes = wake::wakes();
+            // was busy: tell the core now. (A wake-up that comes later
+            // kicks the thread and ends the sleep.)
+            let wakes = self.event_loop.wakes();
             if wakes != self.wakes_seen {
                 self.wakes_seen = wakes;
                 return Ok(None);
@@ -906,6 +1180,15 @@ impl Platform for SeccompPlatform {
                     Err(err) => return Err(err.into()),
                 }
             }
+            // Notifications: those the last sleep found, or a look now.
+            if !slept && !self.listeners.is_empty() {
+                self.poll_listeners(Some(Duration::ZERO))?;
+            }
+            while let Some(fd) = self.ready.pop() {
+                if let Some(event) = self.receive(fd)? {
+                    return Ok(Some(event));
+                }
+            }
             // Nothing happened after a wake-up: let the core look again.
             if slept {
                 return Ok(None);
@@ -920,13 +1203,13 @@ impl Platform for SeccompPlatform {
                 }
                 None => None,
             };
-            wake::sleep(seen, left);
+            self.poll_listeners(left)?;
             slept = true;
         }
     }
 
     fn waker(&self) -> Waker {
-        wake::waker()
+        self.event_loop.waker()
     }
 
     fn read(&mut self, key: TaskKey, addr: GuestAddr, buf: &mut [u8]) -> Result<(), PlatformError> {
@@ -1372,6 +1655,263 @@ mod tests {
         // Resuming continues the loop.
         p.resume(t, Resume::Continue).unwrap();
         assert_eq!(p.wait(Some(Duration::from_millis(50))).unwrap(), None);
+    }
+
+    /// Code at `addr` that makes one syscall and then loops forever:
+    /// `svc #0; b .` / `syscall; jmp .`. Returns the address of the loop.
+    fn syscall_then_spin(p: &mut SeccompPlatform, t: TaskKey, addr: u64) -> u64 {
+        let page = p.address_space().page_size;
+        #[cfg(target_arch = "aarch64")]
+        let code = [0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x00, 0x14];
+        #[cfg(target_arch = "x86_64")]
+        let code = [0x0f, 0x05, 0xeb, 0xfe];
+        p.map(t, addr, 2 * page, Prot::RW, Sharing::Private)
+            .unwrap();
+        p.write(t, addr, &code).unwrap();
+        p.protect(t, addr, page, Prot::READ.union(Prot::EXEC))
+            .unwrap();
+        addr + SYSCALL_INSN_LEN
+    }
+
+    const ARG0: u64 = 0x1234_5678;
+
+    fn getppid(p: &SeccompPlatform) -> u64 {
+        p.arch().syscall_nr(Sysno::Getppid).unwrap()
+    }
+
+    /// Starts `t` at the code of [`syscall_then_spin`], making `getppid`
+    /// with [`ARG0`] as its first argument.
+    fn start_syscall(p: &mut SeccompPlatform, t: TaskKey) -> u64 {
+        let addr = 0x2000_0000;
+        let spin = syscall_then_spin(p, t, addr);
+        let page = p.address_space().page_size;
+        let nr = getppid(p);
+        let mut context = p.context(t).unwrap();
+        context.set_pc(addr);
+        context.set_sp(addr + 2 * page);
+        match &mut context {
+            Context::Aarch64(c) => {
+                c.x[8] = nr;
+                c.x[0] = ARG0;
+            }
+            Context::X86_64(c) => {
+                c.rax = nr;
+                c.rdi = ARG0;
+            }
+        }
+        p.set_context(t, &context).unwrap();
+        p.resume(t, Resume::Continue).unwrap();
+        spin
+    }
+
+    /// The next event, waiting at most 10 s (`wait` may return `None` for a
+    /// wake-up meant for another test of this process).
+    fn next_event(p: &mut SeccompPlatform) -> Event {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "no event before the deadline");
+            if let Some(event) = p.wait(Some(left)).unwrap() {
+                return event;
+            }
+        }
+    }
+
+    fn expect_syscall(p: &mut SeccompPlatform, t: TaskKey) {
+        let nr = getppid(p);
+        match next_event(p) {
+            Event {
+                task,
+                trap: Trap::Syscall(trap),
+            } if task == t && trap.nr == nr && trap.args[0] == ARG0 => {}
+            other => panic!("expected getppid({ARG0:#x}) of {t}, got {other:?}"),
+        }
+    }
+
+    /// Interrupts the spinning task and returns its context.
+    fn stop_spinning(p: &mut SeccompPlatform, t: TaskKey) -> Context {
+        p.interrupt(t).unwrap();
+        assert_eq!(
+            next_event(p),
+            Event {
+                task: t,
+                trap: Trap::Interrupted
+            }
+        );
+        p.context(t).unwrap()
+    }
+
+    fn ret_of(context: &Context) -> i64 {
+        match context {
+            Context::Aarch64(c) => c.x[0] as i64,
+            Context::X86_64(c) => c.rax as i64,
+        }
+    }
+
+    #[test]
+    fn a_notified_syscall_is_answered_without_a_ptrace_stop() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let spin = start_syscall(&mut p, t);
+        expect_syscall(&mut p, t);
+        assert!(p.is_notified(t), "the fast path is on by default");
+        // Memory is readable while the task waits.
+        let mut code = [0u8; 2];
+        p.read(t, 0x2000_0000, &mut code).unwrap();
+        p.resume(t, Resume::Return(77)).unwrap();
+        assert_eq!(p.fast_path_stats(), (1, 0));
+        let context = stop_spinning(&mut p, t);
+        assert_eq!(ret_of(&context), 77);
+        assert_eq!(context.pc(), spin);
+    }
+
+    #[test]
+    fn the_context_of_a_notified_task_is_the_one_at_the_syscall() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let spin = start_syscall(&mut p, t);
+        expect_syscall(&mut p, t);
+        let context = p.context(t).unwrap();
+        assert!(!p.is_notified(t), "converted to a ptrace stop");
+        assert_eq!(p.fast_path_stats(), (0, 1));
+        assert_eq!(context.pc(), spin, "right after the syscall instruction");
+        match &context {
+            Context::Aarch64(c) => assert_eq!((c.x[8], c.x[0]), (getppid(&p), ARG0)),
+            Context::X86_64(c) => assert_eq!(c.rdi, ARG0),
+        }
+        // The address space can be changed now, and the syscall completes.
+        let page = p.address_space().page_size;
+        p.map(t, 0x3000_0000, page, Prot::RW, Sharing::Private)
+            .unwrap();
+        p.resume(t, Resume::Return(55)).unwrap();
+        let context = stop_spinning(&mut p, t);
+        assert_eq!(ret_of(&context), 55);
+        assert_eq!(context.pc(), spin);
+    }
+
+    /// A signal (an interrupt the core sent while the task still ran) ends
+    /// the notification while the core handles the syscall; the answer
+    /// still arrives, whether the platform sees the stop first, the core's
+    /// answer finds the notification gone, or the answer wins the race.
+    #[test]
+    fn a_late_interrupt_does_not_lose_the_answer() {
+        for stop_seen_first in [false, true] {
+            let mut p = SeccompPlatform::new().unwrap();
+            let t = p.spawn().unwrap();
+            let spin = start_syscall(&mut p, t);
+            expect_syscall(&mut p, t);
+            let pid = p.host_pid(t).unwrap();
+            // SAFETY: plain syscall to our tracee.
+            unsafe { libc::syscall(libc::SYS_tgkill, pid, pid, INTERRUPT_SIGNAL) };
+            if stop_seen_first {
+                std::thread::sleep(Duration::from_millis(50));
+                // The stop is not an event: the core is handling the
+                // syscall already.
+                assert_eq!(p.wait(Some(Duration::from_millis(50))).unwrap(), None);
+                assert!(!p.is_notified(t));
+            }
+            p.resume(t, Resume::Return(9)).unwrap();
+            // Without the stop seen first, the answer may also beat the
+            // signal; the signal then stops the task later, as a spurious
+            // interrupt.
+            let (fast, converted) = p.fast_path_stats();
+            assert_eq!(fast + converted, 1);
+            if stop_seen_first {
+                assert_eq!(converted, 1);
+            }
+            let context = stop_spinning(&mut p, t);
+            assert_eq!(ret_of(&context), 9, "stop seen first: {stop_seen_first}");
+            assert_eq!(context.pc(), spin);
+        }
+    }
+
+    /// An interrupt that comes while the syscall waits for a notification
+    /// the platform has not received: the task stops before the syscall
+    /// and makes it again when resumed.
+    #[test]
+    fn an_interrupted_pending_notification_is_made_again() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        let spin = start_syscall(&mut p, t);
+        // The task is waiting in the host kernel by now; nobody received
+        // its notification.
+        std::thread::sleep(Duration::from_millis(50));
+        p.interrupt(t).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            next_event(&mut p),
+            Event {
+                task: t,
+                trap: Trap::Interrupted
+            }
+        );
+        let context = p.context(t).unwrap();
+        assert_eq!(
+            context.pc(),
+            spin - SYSCALL_INSN_LEN,
+            "on the syscall instruction"
+        );
+        match &context {
+            Context::Aarch64(c) => assert_eq!((c.x[8], c.x[0]), (getppid(&p), ARG0)),
+            Context::X86_64(c) => assert_eq!((c.rax, c.rdi), (getppid(&p), ARG0)),
+        }
+        p.resume(t, Resume::Continue).unwrap();
+        expect_syscall(&mut p, t);
+        p.resume(t, Resume::Return(3)).unwrap();
+        let context = stop_spinning(&mut p, t);
+        assert_eq!(ret_of(&context), 3);
+    }
+
+    #[test]
+    fn without_the_fast_path_syscalls_stop_for_ptrace() {
+        let mut p = SeccompPlatform::new().unwrap();
+        p.set_fast_path(false);
+        let t = p.spawn().unwrap();
+        let spin = start_syscall(&mut p, t);
+        expect_syscall(&mut p, t);
+        assert!(!p.is_notified(t));
+        p.resume(t, Resume::Return(5)).unwrap();
+        assert_eq!(p.fast_path_stats(), (0, 0));
+        let context = stop_spinning(&mut p, t);
+        assert_eq!(ret_of(&context), 5);
+        assert_eq!(context.pc(), spin);
+    }
+
+    /// A forked task shares its parent's listener; both use the fast path.
+    #[test]
+    fn forks_share_the_fast_path() {
+        let mut p = SeccompPlatform::new().unwrap();
+        let t = p.spawn().unwrap();
+        start_syscall(&mut p, t);
+        expect_syscall(&mut p, t);
+        // Fork at the syscall (converts the parent): the child resumes at
+        // the same point and returns too.
+        let u = p.clone_task(t, false).unwrap();
+        p.resume(t, Resume::Return(1)).unwrap();
+        p.resume(u, Resume::Return(2)).unwrap();
+        for (task, ret) in [(t, 1), (u, 2)] {
+            assert_eq!(ret_of(&stop_spinning(&mut p, task)), ret);
+        }
+        // Both make the syscall again, through the fast path.
+        for task in [t, u] {
+            let mut context = p.context(task).unwrap();
+            context.set_pc(0x2000_0000);
+            match &mut context {
+                Context::Aarch64(c) => {
+                    c.x[8] = getppid(&p);
+                    c.x[0] = ARG0;
+                }
+                Context::X86_64(c) => {
+                    c.rax = getppid(&p);
+                    c.rdi = ARG0;
+                }
+            }
+            p.set_context(task, &context).unwrap();
+            p.resume(task, Resume::Continue).unwrap();
+            expect_syscall(&mut p, task);
+            assert!(p.is_notified(task));
+            p.resume(task, Resume::Return(0)).unwrap();
+        }
     }
 
     #[test]

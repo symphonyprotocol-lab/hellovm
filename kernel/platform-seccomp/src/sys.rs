@@ -9,7 +9,58 @@ use hellovm_core::Arch;
 pub const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
 
 pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+pub const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 pub const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
+
+/// `seccomp(SECCOMP_SET_MODE_FILTER)` flag: return a listener fd for the
+/// filter's `SECCOMP_RET_USER_NOTIF` results (close-on-exec).
+pub const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
+
+/// The listener `ioctl`s (`linux/seccomp.h`; the same numbers on every
+/// architecture).
+pub const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
+pub const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
+pub const SECCOMP_IOCTL_NOTIF_SET_FLAGS: libc::c_ulong = 0x4008_2104;
+/// Wake the task that made the syscall, and the listener, on the CPU of the
+/// waker (Linux 6.6): a round trip without cross-CPU wake-ups.
+pub const SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP: u64 = 1;
+
+/// `struct seccomp_data`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SeccompData {
+    pub nr: i32,
+    pub arch: u32,
+    pub instruction_pointer: u64,
+    pub args: [u64; 6],
+}
+
+/// `struct seccomp_notif`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SeccompNotif {
+    pub id: u64,
+    pub pid: u32,
+    pub flags: u32,
+    pub data: SeccompData,
+}
+
+/// `struct seccomp_notif_resp`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SeccompNotifResp {
+    pub id: u64,
+    pub val: i64,
+    pub error: i32,
+    pub flags: u32,
+}
+
+/// The host's internal "restart this syscall" results, which a tracer
+/// sees in the return register when a signal interrupted a syscall
+/// (`linux/errno.h`: `ERESTARTSYS`, `ERESTARTNOINTR`, `ERESTARTNOHAND`,
+/// `ERESTART_RESTARTBLOCK`).
+#[cfg(target_arch = "x86_64")]
+pub const RESTART_ERRNOS: [i64; 4] = [512, 513, 514, 516];
 
 // Syscalls added after 2019 have the same number on every architecture.
 pub const SYS_CLOSE_RANGE: libc::c_long = 436;
