@@ -222,19 +222,33 @@ pub struct NodeProc {
     pub service: Option<Service>,
 }
 
-/// A port for a service that must keep it across restarts. Taken below
+/// A port for a service that must keep it across restarts. Taken outside
 /// the range the host gives out by itself (to `bind` to port 0 and to
-/// outgoing connections), so that nothing takes it between this check and
-/// the service's own `bind`, and never twice in this process.
+/// outgoing connections): below it, or above it on a host whose range
+/// starts low. Then nothing takes it between this check and the
+/// service's own `bind`, and never twice in this process.
 pub fn free_port() -> u16 {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let ephemeral_low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+    let range: Vec<u32> = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
         .ok()
-        .and_then(|t| t.split_whitespace().next()?.parse::<u32>().ok())
-        .unwrap_or(32768);
-    let (low, high) = (10_000u32, ephemeral_low.min(60_000));
+        .map(|t| {
+            t.split_whitespace()
+                .filter_map(|n| n.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let (ephemeral_low, ephemeral_high) = match range[..] {
+        [low, high] => (low, high),
+        _ => (32768, 60999),
+    };
+    let (low, high) = if ephemeral_low.min(60_000) >= 10_000 + 1000 {
+        (10_000u32, ephemeral_low.min(60_000))
+    } else {
+        (ephemeral_high + 1, 65_536)
+    };
     if high < low + 1000 {
-        // No room below it on this host: the old way.
+        // No room outside it on this host: the old way, which an outgoing
+        // connection can race.
         return std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())
             .unwrap()
