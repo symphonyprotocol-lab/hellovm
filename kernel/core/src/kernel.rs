@@ -1341,7 +1341,7 @@ mod tests {
     fn unknown_syscalls_are_enosys() {
         for arch in Arch::ALL {
             let traps = vec![
-                sc(arch, Sysno::EpollCreate1, &[0]),
+                sc(arch, Sysno::Rseq, &[SCRATCH, 32, 0, 0]),
                 sc(arch, Sysno::Clone3, &[SCRATCH, 88]),
                 Trap::Syscall(SyscallTrap {
                     nr: 100_000,
@@ -2166,6 +2166,93 @@ mod tests {
                 0
             ]
         );
+    }
+
+    /// `epoll`: a watch on a pipe's read end reports it once there is
+    /// data, with its data word, in each architecture's `epoll_event`
+    /// layout; `EPOLL_CTL_MOD`, one-shot and edge-triggered watches,
+    /// `EPOLL_CTL_DEL`, and the refusals (a duplicate, an instance in
+    /// itself, a loop of instances, an unknown watch, a regular file); a
+    /// watch goes away with its description's last fd.
+    #[test]
+    fn epoll_watches_a_pipe() {
+        use crate::epoll::{EPOLLET, EPOLLIN, EPOLLONESHOT, EPOLLOUT};
+        use crate::errno::{EINVAL, ELOOP, EPERM};
+        for arch in Arch::ALL {
+            let size: u64 = if arch == Arch::X86_64 { 12 } else { 16 };
+            let event = |events: u32, data: u64| {
+                let mut raw = events.to_le_bytes().to_vec();
+                if size == 16 {
+                    raw.extend_from_slice(&[0; 4]);
+                }
+                raw.extend_from_slice(&data.to_le_bytes());
+                raw
+            };
+            let (ev_in, ev_once, ev_out_et) = (SCRATCH + 0x100, SCRATCH + 0x120, SCRATCH + 0x140);
+            let (out, first, edge) = (SCRATCH + 0x200, SCRATCH + 0x240, SCRATCH + 0x280);
+            let (add, del, modify) = (1, 2, 3);
+            let wait_into = |n: u64, buf: u64| sc(arch, Sysno::EpollPwait, &[5, buf, n, 0, 0, 8]);
+            let wait = |n: u64| wait_into(n, out);
+            let ctl =
+                |ep: u64, op: u64, fd: u64, ev: u64| sc(arch, Sysno::EpollCtl, &[ep, op, fd, ev]);
+            let traps = vec![
+                sc(arch, Sysno::Pipe2, &[SCRATCH, 0]), // 3, 4
+                sc(arch, Sysno::EpollCreate1, &[0]),   // 5
+                ctl(5, add, 3, ev_in),
+                ctl(5, add, 3, ev_in),
+                wait(4),
+                sc(arch, Sysno::Write, &[4, SCRATCH + 0x300, 1]),
+                wait_into(4, first),
+                ctl(5, modify, 3, ev_once),
+                wait(4),
+                wait(4),
+                ctl(5, del, 3, 0),
+                ctl(5, del, 3, 0),
+                ctl(5, add, 5, ev_in),
+                sc(arch, Sysno::EpollCreate1, &[0]), // 6
+                ctl(6, add, 5, ev_in),
+                ctl(5, add, 6, ev_in),
+                ctl(5, add, 4, ev_out_et),
+                wait_into(4, edge),
+                wait(4),
+                sc(arch, Sysno::Close, &[4]),
+                wait(4),
+                sc(
+                    arch,
+                    Sysno::Openat,
+                    &[(-100i64) as u64, SCRATCH + 0x400, 0, 0],
+                ), // 4
+                ctl(5, add, 4, ev_in),
+                sc(arch, Sysno::ExitGroup, &[0]),
+            ];
+            let (a, b, c) = (
+                event(EPOLLIN, 0xabc),
+                event(EPOLLIN | EPOLLONESHOT, 0xdef),
+                event(EPOLLOUT | EPOLLET, 7),
+            );
+            let data: Vec<(u64, &[u8])> = vec![
+                (ev_in, &a),
+                (ev_once, &b),
+                (ev_out_et, &c),
+                (SCRATCH + 0x400, b"/etc/motd\0"),
+            ];
+            let (mut kernel, mut plat) = setup(arch, traps, &data);
+            assert_eq!(kernel.run(&mut plat).unwrap(), ExitStatus::Exited(0));
+            let r = returns(&plat, INIT);
+            assert_eq!(&r[..5], &[0, 5, 0, -EEXIST, 0], "{arch:?}");
+            assert_eq!(&r[5..7], &[1, 1], "{arch:?}: readable");
+            assert_eq!(
+                plat.mem(INIT).peek(first, size as usize),
+                event(EPOLLIN, 0xabc)
+            );
+            assert_eq!(&r[7..10], &[0, 1, 0], "{arch:?}: one-shot");
+            assert_eq!(&r[10..13], &[0, -ENOENT, -EINVAL], "{arch:?}");
+            assert_eq!(&r[13..16], &[6, 0, -ELOOP], "{arch:?}: nesting");
+            assert_eq!(&r[16..19], &[0, 1, 0], "{arch:?}: edge-triggered");
+            assert_eq!(plat.mem(INIT).peek(edge, size as usize), event(EPOLLOUT, 7));
+            assert_eq!(&r[19..21], &[0, 0], "{arch:?}: closed, so not watched");
+            assert_eq!(&r[21..23], &[4, -EPERM], "{arch:?}: a regular file");
+        }
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub enum FileObject {
     EventFd(crate::eventfd::EventFdId),
     /// An emulated socket. The id indexes [`crate::net::Net`].
     Socket(crate::net::SockId),
+    /// An `epoll` instance.
+    Epoll(crate::epoll::EpollId),
 }
 
 /// The access mode an open file allows.
@@ -75,6 +77,10 @@ pub struct OpenFile {
     pub path: Option<Vec<u8>>,
     /// The contents of a generated (`/proc`) file.
     pub contents: Option<Vec<u8>>,
+    /// Unique among the sandbox's descriptions for its lifetime (an id is
+    /// reused once its description is gone, a serial number never):
+    /// `epoll` watches tell their description from a later one with it.
+    pub serial: u64,
     refs: u32,
 }
 
@@ -89,6 +95,7 @@ impl OpenFile {
             listing: None,
             path: None,
             contents: None,
+            serial: 0,
             refs: 0,
         }
     }
@@ -112,6 +119,8 @@ pub const MAX_FILES: usize = 64 * 1024;
 pub struct Files {
     slots: Vec<Option<OpenFile>>,
     free: Vec<FileId>,
+    /// The serial number of the next description.
+    next_serial: u64,
 }
 
 impl Files {
@@ -123,8 +132,21 @@ impl Files {
         self.slots[id].as_mut().expect("live description")
     }
 
+    /// The description `id` if it is still the one with `serial`.
+    pub fn get_serial(&self, id: FileId, serial: u64) -> Option<&OpenFile> {
+        self.slots
+            .get(id)?
+            .as_ref()
+            .filter(|file| file.serial == serial)
+    }
+
     fn add(&mut self, file: OpenFile) -> SysResult<FileId> {
-        let file = OpenFile { refs: 1, ..file };
+        self.next_serial += 1;
+        let file = OpenFile {
+            refs: 1,
+            serial: self.next_serial,
+            ..file
+        };
         if let Some(id) = self.free.pop() {
             self.slots[id] = Some(file);
             return Ok(id);
@@ -342,6 +364,7 @@ crate::snap_enum!(FileObject {
     6 => Proc { dir },
     7 => EventFd(id),
     8 => Socket(id),
+    9 => Epoll(id),
 });
 crate::snap_enum!(Access { 0 => Read, 1 => Write, 2 => ReadWrite, 3 => Path });
 crate::snap_struct!(OpenFile {
@@ -353,6 +376,7 @@ crate::snap_struct!(OpenFile {
     listing,
     path,
     contents,
+    serial,
     refs,
 });
 crate::snap_struct!(Slot { file, cloexec });
@@ -362,11 +386,13 @@ impl crate::snap::Snap for Files {
     fn put(&self, w: &mut crate::snap::Writer) {
         crate::snap::Snap::put(&self.slots, w);
         crate::snap::Snap::put(&self.free, w);
+        crate::snap::Snap::put(&self.next_serial, w);
     }
     fn get(r: &mut crate::snap::Reader<'_>) -> Result<Self, crate::snap::Bad> {
         let files = Files {
             slots: crate::snap::Snap::get(r)?,
             free: crate::snap::Snap::get(r)?,
+            next_serial: crate::snap::Snap::get(r)?,
         };
         if files.slots.len() > MAX_FILES {
             return crate::snap::bad("more open files than a sandbox may have");
